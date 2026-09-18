@@ -1,0 +1,7 @@
+* zener_clipper  (Kuphaldt SEMI_3, DSL; nodes renumbered)
+V1 1 0 AC 20
+R1 1 2 1k
+D1 3 0 DMOD
+D2 3 2 DMOD
+.model DMOD D(Is=1e-14 N=1 Vt=0.02585)
+.end

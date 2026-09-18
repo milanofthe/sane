@@ -1,0 +1,21 @@
+[package]
+name = "sane-veriloga"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Native Verilog-A frontend: parse and lower analog models onto SANE's symbolic DAG"
+
+[dependencies]
+rsdag.workspace = true
+sane-core.workspace = true
+sane-device = { path = "../device" }
+rustc-hash.workspace = true
+
+[dev-dependencies]
+sane-dae = { path = "../dae" }
+sane-mna = { path = "../mna" }
+num-complex.workspace = true
+
+[lints]
+workspace = true

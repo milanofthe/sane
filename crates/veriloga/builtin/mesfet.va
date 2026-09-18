@@ -1,0 +1,85 @@
+// SANE built-in MESFET (SPICE `Z` element), Statz/Raytheon model
+// (ngspice-compatible).
+//
+//   Id = Beta*(vgs-Vto)^2/(1 + B*(vgs-Vto)) * f(vds) * (1 + lambda*vds)
+//
+// with the cubic triode factor f = 1 - (1 - alpha*vds/3)^3 below the knee
+// vds = 3/alpha (saturating to 1 above) -- a smooth triode-to-saturation
+// transition for a GaAs depletion device (Vto < 0). Gate junctions and their
+// charges as for the JFET. `type` folds the polarity (+1 N, -1 P).
+
+`include "constants.vams"
+
+module sane_mesfet(d, g, s);
+    inout d, g, s;
+    electrical d, g, s;
+
+    parameter real type   = 1.0;
+    parameter real Beta   = 1e-4;
+    parameter real Vto    = -2.0;
+    parameter real lambda = 0.0;
+    parameter real alpha  = 2.0;
+    parameter real B      = 0.3;
+    parameter real Is     = 1e-14;
+    parameter real Tnom   = `P_CELSIUS0 + 27.0;
+    parameter real Cgs    = 0.0;
+    parameter real Cgd    = 0.0;
+    parameter real Pb     = 1.0;
+    parameter real M      = 0.5;
+    parameter real FC     = 0.5;
+
+    real vt, beta_t, vgs, vgd, vds, vov, clm, core, ftri, f, on, idchan;
+    real igs, igd, idt_, igt, ist_;
+    real vk, qgs, qgd;
+
+    analog begin
+        vt = `P_K/`P_Q * $temperature;
+        beta_t = Beta * pow($temperature/Tnom, -1.5);
+
+        if (type > 0) begin
+            vgs = $limit(V(g, s), "fetlim", Vto);
+            vgd = V(g, d);
+        end else begin
+            vgs = $limit(V(s, g), "fetlim", Vto);
+            vgd = V(d, g);
+        end
+        vds = vgs - vgd;
+        vov = vgs - Vto;
+
+        core = beta_t*vov*vov / (1.0 + B*vov);
+        clm  = 1.0 + lambda*vds;
+        // f(vds): 1 - (1 - alpha*vds/3)^3 below the knee vds = 3/alpha, else 1.
+        ftri = 1.0 - (1.0 - (1.0/3.0)*(alpha*vds))*(1.0 - (1.0/3.0)*(alpha*vds))
+                     *(1.0 - (1.0/3.0)*(alpha*vds));
+        f    = (vds >= 3.0/alpha) ? 1.0 : ftri;
+        on   = core*f*clm;
+        idchan = (vov <= 0) ? 0.0 : on;
+
+        igs = Is * (limexp(vgs/vt) - 1.0);
+        igd = Is * (limexp(vgd/vt) - 1.0);
+
+        idt_ = idchan - igd;
+        igt  = igs + igd;
+        ist_ = -(idchan + igs);
+        I(d) <+ (type > 0) ? idt_ : -idt_;
+        I(g) <+ (type > 0) ? igt  : -igt;
+        I(s) <+ (type > 0) ? ist_ : -ist_;
+
+        if (($param_given(Cgs) && (Cgs > 0)) || ($param_given(Cgd) && (Cgd > 0))) begin
+            vk  = FC * Pb;
+            qgs = (vgs > vk)
+                ? Cgs*Pb/(1.0 - M)*(1.0 - pow(1.0 - FC, 1.0 - M))
+                  + Cgs/pow(1.0 - FC, 1.0 + M)
+                    * ((1.0 - FC*(1.0 + M))*(vgs - vk) + M/(2.0*Pb)*(vgs*vgs - vk*vk))
+                : Cgs*Pb/(1.0 - M)*(1.0 - pow(1.0 - vgs/Pb, 1.0 - M));
+            qgd = (vgd > vk)
+                ? Cgd*Pb/(1.0 - M)*(1.0 - pow(1.0 - FC, 1.0 - M))
+                  + Cgd/pow(1.0 - FC, 1.0 + M)
+                    * ((1.0 - FC*(1.0 + M))*(vgd - vk) + M/(2.0*Pb)*(vgd*vgd - vk*vk))
+                : Cgd*Pb/(1.0 - M)*(1.0 - pow(1.0 - vgd/Pb, 1.0 - M));
+            I(d) <+ ddt((type > 0) ? -qgd : qgd);
+            I(g) <+ ddt((type > 0) ? qgs + qgd : -(qgs + qgd));
+            I(s) <+ ddt((type > 0) ? -qgs : qgs);
+        end
+    end
+endmodule

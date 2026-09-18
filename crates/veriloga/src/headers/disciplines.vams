@@ -1,0 +1,64 @@
+// Standard Verilog-AMS natures and disciplines (Accellera LRM Annex C),
+// provided as a built-in header so `\`include "disciplines.vams"` resolves.
+// SANE treats all electrical nodes uniformly (V/I access), so the nature
+// attributes are recorded but not otherwise interpreted.
+`ifdef DISCIPLINES_VAMS
+`else
+`define DISCIPLINES_VAMS 1
+
+nature Current
+  units      = "A";
+  access     = I;
+  idt_nature = Charge;
+  abstol     = 1e-12;
+endnature
+
+nature Charge
+  units      = "coul";
+  access     = Q;
+  ddt_nature = Current;
+  abstol     = 1e-14;
+endnature
+
+nature Voltage
+  units      = "V";
+  access     = V;
+  idt_nature = Flux;
+  abstol     = 1e-6;
+endnature
+
+nature Flux
+  units      = "Wb";
+  access     = Phi;
+  ddt_nature = Voltage;
+  abstol     = 1e-9;
+endnature
+
+nature Temperature
+  units      = "K";
+  access     = Temp;
+  abstol     = 1e-4;
+endnature
+
+nature Power
+  units      = "W";
+  access     = Pwr;
+  abstol     = 1e-9;
+endnature
+
+discipline electrical
+  potential    Voltage;
+  flow         Current;
+enddiscipline
+
+discipline thermal
+  potential    Temperature;
+  flow         Power;
+enddiscipline
+
+discipline magnetic
+  potential    Flux;
+  flow         Current;
+enddiscipline
+
+`endif

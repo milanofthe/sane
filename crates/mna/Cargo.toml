@@ -1,0 +1,14 @@
+[package]
+name = "sane-mna"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Circuit IR and symbolic determinant for SANE"
+
+[dependencies]
+rsdag.workspace = true
+sane-core.workspace = true
+
+[lints]
+workspace = true

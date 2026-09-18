@@ -1,0 +1,20 @@
+// SANE built-in ideal (lossless) transmission line (SPICE `T` element).
+//
+// Method of characteristics (Branin): each port sees its characteristic
+// impedance in series with the other port's delayed outgoing wave
+// w = v + z0*i. At DC the fixed point is the transparent line (v1 = v2,
+// i1 = -i2), reached by relaxation on the delay history inputs -- the same
+// mechanics as any `absdelay`.
+
+module sane_tline(p1, n1, p2, n2);
+    inout p1, n1, p2, n2;
+    electrical p1, n1, p2, n2;
+
+    parameter real z0 = 50.0;
+    parameter real td = 1e-9;
+
+    analog begin
+        V(p1, n1) <+ z0*I(p1, n1) + absdelay(V(p2, n2) + z0*I(p2, n2), td);
+        V(p2, n2) <+ z0*I(p2, n2) + absdelay(V(p1, n1) + z0*I(p1, n1), td);
+    end
+endmodule

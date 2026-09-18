@@ -1,0 +1,9 @@
+* cmos_inverter  (own / generic level-1 rewrite)
+VDD 1 0 DC 5
+VIN 2 0 DC 2.5
+M1 3 2 0 0 NMOS1
+M2 3 2 1 1 PMOS1
+CL 3 0 0.1pF
+.model NMOS1 NMOS(Kp=120u W=2 L=1 Vto=0.7)
+.model PMOS1 PMOS(Kp=40u W=4 L=1 Vto=-0.7)
+.end

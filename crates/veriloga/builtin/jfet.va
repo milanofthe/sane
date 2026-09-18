@@ -1,0 +1,86 @@
+// SANE built-in JFET (SPICE `J` element), Shichman-Hodges square law.
+//
+// A depletion device (Vto < 0 for the N-channel default). The gate forms two
+// junction diodes (gate-source, gate-drain) that conduct only when forward
+// biased; their depletion charge gives the gate capacitances. `type` folds the
+// polarity (+1 N-channel, -1 P-channel): every equation is written in
+// N-channel-equivalent form and the terminal currents flip sign.
+
+`include "constants.vams"
+
+module sane_jfet(d, g, s);
+    inout d, g, s;
+    electrical d, g, s;
+
+    parameter real type   = 1.0;
+    parameter real Beta   = 1e-4;
+    parameter real Vto    = -2.0;
+    parameter real lambda = 0.0;
+    parameter real Is     = 1e-14;
+    parameter real Tnom   = `P_CELSIUS0 + 27.0;
+    // Gate-junction depletion charge (0 -> no charge storage).
+    parameter real Cgs    = 0.0;
+    parameter real Cgd    = 0.0;
+    parameter real Pb     = 1.0;
+    parameter real M      = 0.5;
+    parameter real FC     = 0.5;
+
+    real vt, beta_t, vgs, vgd, vds, vov, clm, triode, sat, idchan;
+    real igs, igd, idt_, igt, ist_;
+    real vk, qgs, qgd;
+
+    analog begin
+        vt = `P_K/`P_Q * $temperature;
+        // Transconductance falls with temperature as mobility ~ (T/Tnom)^-1.5.
+        beta_t = Beta * pow($temperature/Tnom, -1.5);
+
+        // N-channel-equivalent gate junction voltages (P-channel negates both);
+        // the channel control vgs is Newton-limited (fetlim).
+        if (type > 0) begin
+            vgs = $limit(V(g, s), "fetlim", Vto);
+            vgd = V(g, d);
+        end else begin
+            vgs = $limit(V(s, g), "fetlim", Vto);
+            vgd = V(d, g);
+        end
+        vds = vgs - vgd;
+        vov = vgs - Vto;
+
+        // Square-law channel current with channel-length modulation.
+        clm    = 1.0 + lambda*vds;
+        triode = beta_t*vds*(2.0*vov - vds)*clm;
+        sat    = beta_t*vov*vov*clm;
+        idchan = (vov <= 0) ? 0.0 : ((vds < vov) ? triode : sat);
+
+        // Gate junction diodes (forward conduction only matters).
+        igs = Is * (limexp(vgs/vt) - 1.0);
+        igd = Is * (limexp(vgd/vt) - 1.0);
+
+        // Terminal currents [d, g, s] in the N-equivalent frame, sign-folded.
+        idt_ = idchan - igd;
+        igt  = igs + igd;
+        ist_ = -(idchan + igs);
+        I(d) <+ (type > 0) ? idt_ : -idt_;
+        I(g) <+ (type > 0) ? igt  : -igt;
+        I(s) <+ (type > 0) ? ist_ : -ist_;
+
+        // Gate-junction depletion charges (SPICE junction-charge form).
+        if (($param_given(Cgs) && (Cgs > 0)) || ($param_given(Cgd) && (Cgd > 0))) begin
+            vk  = FC * Pb;
+            qgs = (vgs > vk)
+                ? Cgs*Pb/(1.0 - M)*(1.0 - pow(1.0 - FC, 1.0 - M))
+                  + Cgs/pow(1.0 - FC, 1.0 + M)
+                    * ((1.0 - FC*(1.0 + M))*(vgs - vk) + M/(2.0*Pb)*(vgs*vgs - vk*vk))
+                : Cgs*Pb/(1.0 - M)*(1.0 - pow(1.0 - vgs/Pb, 1.0 - M));
+            qgd = (vgd > vk)
+                ? Cgd*Pb/(1.0 - M)*(1.0 - pow(1.0 - FC, 1.0 - M))
+                  + Cgd/pow(1.0 - FC, 1.0 + M)
+                    * ((1.0 - FC*(1.0 + M))*(vgd - vk) + M/(2.0*Pb)*(vgd*vgd - vk*vk))
+                : Cgd*Pb/(1.0 - M)*(1.0 - pow(1.0 - vgd/Pb, 1.0 - M));
+            // gate = qgs + qgd, source = -qgs, drain = -qgd (N-equiv); P negates.
+            I(d) <+ ddt((type > 0) ? -qgd : qgd);
+            I(g) <+ ddt((type > 0) ? qgs + qgd : -(qgs + qgd));
+            I(s) <+ ddt((type > 0) ? -qgs : qgs);
+        end
+    end
+endmodule

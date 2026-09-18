@@ -1,0 +1,20 @@
+* imported from symcirc/test_circuits/MOS_Amp_Example5_d.net (github.com/Creapson/symcirc)
+* Schematics Netlist *
+
+
+
+R_R1         3 8 1.4MEG
+R_Rs         1 2 250
+C_C2         4 6 0.1uF 
+R_RD         4 8 15k
+M_M1         4 3 5 5 MbreakN1           
+V_VDD         8 0 15V
+C_Cs         0 9 20uF 
+R_R2         0 3 1MEG
+V_VIN         1 0  AC 1 sin( 0 1 1000hz )
+R_RL         6 0 1Meg
+C_C1         2 3 1uF 
+R_Rsr1         9 5 3k
+R_Rsr2         0 9 12100
+
+.end

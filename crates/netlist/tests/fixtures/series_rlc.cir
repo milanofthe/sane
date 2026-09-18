@@ -1,0 +1,7 @@
+* series_rlc  (Kuphaldt, Lessons in Electric Circuits, DSL)
+* https://www.ibiblio.org/kuphaldt/electricCircuits/AC/AC_6.html
+V1 1 0 AC 1
+R1 1 2 100
+C1 2 3 10u
+L1 3 0 100m
+.end

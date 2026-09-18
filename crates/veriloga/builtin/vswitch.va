@@ -1,0 +1,42 @@
+// SANE built-in voltage-controlled switch (SPICE `S` element).
+//
+// With a positive transition half-width Vh the conductance interpolates
+// smoothly in log space from 1/Roff to 1/Ron as the control V(cp,cn) crosses
+// the window [Vt - Vh, Vt + Vh] (a Hermite smoothstep): differentiable, which
+// Newton and harmonic balance handle far better than a discontinuous step.
+// With Vh = 0 the switch is hard at Vt. Either way the window edges are
+// switching surfaces (`@(cross ...)`) the transient integrator lands on, so
+// the mode changes at a step boundary. Stateless (no bistable hysteresis).
+
+module sane_vswitch(a, b, cp, cn);
+    inout a, b, cp, cn;
+    electrical a, b, cp, cn;
+
+    parameter real Ron  = 1.0;
+    parameter real Roff = 1e6;
+    parameter real Vt   = 0.0;
+    // Transition half-width (SPICE-style VON = Vt + Vh, VOFF = Vt - Vh);
+    // zero selects a hard switch.
+    parameter real Vh   = 1e-3;
+
+    real u, s, g;
+
+    analog begin
+        if (Vh > 0) begin
+            u = (V(cp, cn) - (Vt - Vh)) / (2.0 * Vh);
+            u = (u > 0) ? u : 0.0;
+            u = (u < 1) ? u : 1.0;
+            // smoothstep s = u^2 (3 - 2u): zero slope at both ends -> C1 transition.
+            s = u*u*(3.0 - 2.0*u);
+            // log-conductance interpolation between the off and on conductances.
+            g = exp(ln(1.0/Roff) + s*(ln(1.0/Ron) - ln(1.0/Roff)));
+            // the window edges are the surfaces where the conductance kinks
+            @(cross(V(cp, cn) - (Vt - Vh), 0));
+            @(cross(V(cp, cn) - (Vt + Vh), 0));
+        end else begin
+            g = (V(cp, cn) > Vt) ? 1.0/Ron : 1.0/Roff;
+            @(cross(V(cp, cn) - Vt, 0));
+        end
+        I(a, b) <+ g * V(a, b);
+    end
+endmodule

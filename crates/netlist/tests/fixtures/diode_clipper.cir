@@ -1,0 +1,7 @@
+* diode_clipper  (Kuphaldt SEMI_3, DSL)
+V1 1 0 AC 5
+R1 1 2 1k
+D1 0 2 DMOD
+D2 2 0 DMOD
+.model DMOD D(Is=1e-14 N=1 Vt=0.02585)
+.end

@@ -1,0 +1,71 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/mna",
+    "crates/netlist",
+    "crates/device",
+    "crates/veriloga",
+    "crates/dae",
+    "crates/export",
+    "crates/solve",
+    "crates/analysis",
+    "crates/osdi",
+    "crates/py",
+]
+# The vendored rslab tree is its own workspace (see vendor/rslab/VENDOR.md):
+# consumed as a path dependency, never built/tested as a SANE member. The
+# vendored vectfit crate follows the same policy (vendor/vectfit/VENDOR.md).
+exclude = ["vendor/rslab", "vendor/vectfit", "vendor/rsdag"]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+license = "LicenseRef-PolyForm-Noncommercial-1.0.0"
+authors = ["Milan Rother"]
+
+[workspace.lints.clippy]
+# Curated clippy policy: CI runs `clippy -D warnings`, so the lint set below is
+# deliberately allowed where it conflicts with this numeric/EDA codebase's
+# intentional style, and everything else is denied. Each crate opts in with
+# `[lints] workspace = true`.
+too_many_arguments = "allow"       # solver/physics kernels legitimately take many operands
+type_complexity = "allow"          # matrix / tuple return and cache types are clearer inline
+needless_range_loop = "allow"      # index-coupled numeric loops read better with the index
+neg_cmp_op_on_partial_ord = "allow" # explicit float `!(a < b)` guards are intentional
+doc_lazy_continuation = "allow"    # multi-line doc bullets kept as authored
+if_same_then_else = "allow"        # parallel branches kept distinct for readability
+collapsible_match = "allow"
+needless_borrow = "allow"
+unnecessary_map_or = "allow"
+while_let_loop = "allow"
+
+[workspace.dependencies]
+num-bigint = "0.4"
+num-rational = "0.4"
+num-traits = "0.2"
+num-complex = "0.4"
+rustc-hash = "2"
+# Vendored expression graph, tape and native backend; see vendor/rsdag/VENDOR.md.
+rsdag = { path = "vendor/rsdag/crates/rsdag" }
+rsdag-jit = { path = "vendor/rsdag/crates/rsdag-jit" }
+# Vendored sparse direct solver (KLU path); see vendor/rslab/VENDOR.md.
+rslab = { path = "vendor/rslab" }
+# Vendored vector fitting + Verilog-A macromodel export; see vendor/vectfit/VENDOR.md.
+vectfit = { path = "vendor/vectfit" }
+rayon = "1"
+sane-core = { path = "crates/core" }
+sane-mna = { path = "crates/mna" }
+
+# Release profile: cross-crate inlining (tape interpreter in `core`, solver glue in
+# `solve`, faer) and a single codegen unit so the hot Newton/HB kernels optimize as
+# a whole. `panic = "abort"` is intentionally NOT set: PyO3 relies on catching
+# unwinding panics at the FFI boundary to surface them as Python exceptions, which
+# aborting would break. Kept at the workspace baseline x86-64 (SSE2) for portable
+# wheels; the SoA `Tape::eval_batch` kernel opts into AVX2+FMA via runtime dispatch.
+# Embedders that link this as a library are encouraged to install `mimalloc` as the
+# global allocator: extraction and the parallel passes are allocation-bound (see the
+# `sane-py` note) and the OS heap serialises the many small allocations.
+[profile.release]
+lto = "thin"
+codegen-units = 1

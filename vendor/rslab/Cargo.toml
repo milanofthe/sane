@@ -1,0 +1,56 @@
+﻿# Vendored copy of rslab (https://github.com/milanofthe/rslab) for SANE.
+# See vendor/rslab/VENDOR.md for provenance and the resync procedure. This
+# manifest is the upstream one trimmed to the library: no benches, no bins,
+# no xtask/diagnostics, no optional matgen/tuning features.
+#
+# Its own [workspace] table keeps the vendored tree out of the SANE workspace
+# (SANE's root Cargo.toml also lists `vendor` in `exclude`), so `cargo test
+# --workspace` in SANE never compiles or runs rslab's test suite; rslab is
+# tested in its own repository.
+[workspace]
+members = [
+    ".",
+    "crates/rslab-ordering-core",
+    "crates/rslab-amd",
+    "crates/rslab-amf",
+    "crates/rslab-metis",
+]
+resolver = "2"
+
+[package]
+name = "rslab"
+version = "0.34.0"
+edition = "2021"
+license = "MIT"
+description = "RSLAB - pure-Rust sparse complex/real direct solver (symmetric LDLT + unsymmetric LU) and preconditioner, a PARDISO-style embeddable replacement."
+authors = ["Milan Rother"]
+repository = "https://github.com/milanofthe/rslab"
+
+[lib]
+name = "rslab"
+# The vendored tree carries only the library sources; upstream's bins,
+# benches and integration tests are stripped.
+path = "src/lib.rs"
+
+# Upstream's optional features, declared inert so the source's `#[cfg]` gates
+# are known to check-cfg. They are NOT functional in the vendored tree (their
+# optional dependencies are stripped); never enable them here.
+[features]
+matgen = []
+matgen-download = []
+tuning = []
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+num-complex = "0.4"
+# SIMD backbone for the Schur-update micro-kernel; pinned upstream.
+pulp = { version = "0.22.2", default-features = false, features = ["x86-v3"] }
+rayon = "1.10"
+# Complex/real SIMD GEMM for the multifrontal trailing update.
+gemm = "0.18"
+# Fill-reducing ordering crates behind the OrderingMethod enum.
+rslab-ordering-core = { path = "crates/rslab-ordering-core", version = "0.2" }
+rslab-amd = { path = "crates/rslab-amd", version = "0.2" }
+rslab-amf = { path = "crates/rslab-amf", version = "0.2" }
+rslab-metis = { path = "crates/rslab-metis", version = "0.2" }

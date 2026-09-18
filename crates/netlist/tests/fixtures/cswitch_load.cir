@@ -1,0 +1,9 @@
+* cswitch_load  current-controlled switch (closed by the sense current)
+V1 1 0 5
+R1 1 2 1k
+Vsense 2 0 0
+V2 3 0 5
+W1 3 out Vsense CSW
+Rl out 0 1k
+.model CSW CSW(It=1m Ih=0 Ron=1 Roff=1meg)
+.end

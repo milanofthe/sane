@@ -1,0 +1,5 @@
+* rc_lowpass  (own; classic 1st-order RC low-pass)
+VS 1 0 AC 1
+R1 1 2 1k
+C1 2 0 0.032uF
+.end

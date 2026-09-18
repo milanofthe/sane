@@ -1,0 +1,8 @@
+* sallen_key_lp  (own; ideal op-amp unity-gain buffer)
+VS 1 0 AC 1
+R1 1 2 11.2k
+R2 2 3 11.2k
+C1 2 4 2000pF
+C2 3 0 1000pF
+E_OP 4 0 3 4 1Meg
+.end

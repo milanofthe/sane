@@ -1,0 +1,7 @@
+* rc_timeconst  (Kuphaldt REF_7, DSL)
+* https://www.allaboutcircuits.com/textbook/reference/chpt-7/example-circuits-and-netlists/
+V1 1 0 DC 10
+C1 1 2 47u
+C2 1 2 22u
+R1 2 0 3.3k
+.end

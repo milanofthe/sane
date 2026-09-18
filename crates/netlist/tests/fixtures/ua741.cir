@@ -1,0 +1,62 @@
+* The 741 Op-Amp (transistor level, Sedra-Smith / McGill SPICE deck; see NOTICE.md)
+* power supplies
+Vcc 25 0 DC +15V
+Vee 26 0 DC -15V
+* differential-mode signal level
+Vd 101 0 DC 0V
+Rd 101 0 1
+EV+ 1 100 101 0 +0.5
+EV- 2 100 101 0 -0.5
+* common-mode signal level
+Vcm 100 0 DC 0V
+* 1st or input stage
+Q1 4 1 12 npn
+Q2 4 2 13 npn
+Q3 7 3 12 pnp
+Q4 8 3 13 pnp
+Q5 7 9 10 npn
+Q6 8 9 11 npn
+Q7 25 7 9 npn
+Q8 4 4 25 pnp
+Q9 3 4 25 pnp
+R1 10 26 1k
+R2 11 26 1k
+R3 9 26 50k
+* 2nd stage
+Q13B 16 6 25 pnp 0.75
+Q16 25 8 14 npn
+Q17 16 14 15 npn
+R8 15 26 100
+R9 14 26 50k
+Cc 8 16 30p
+* output or buffer stage
+Q13A 17 6 25 pnp 0.25
+Q14 25 17 23 npn 3
+Q18 17 18 19 npn
+Q19 17 17 18 npn
+Q20 26 19 21 pnp 3
+Q23 26 16 19 pnp
+R6 22 23 27
+R7 21 22 27
+R10 18 19 40k
+* short-circuit protection circuitry
+Q15 17 23 22 npn
+Q21 20 21 22 pnp
+Q22 8 20 26 npn
+Q24 20 20 26 npn
+R11 20 26 50k
+* biasing stage
+Q10 3 5 24 npn
+Q11 5 5 26 npn
+Q12 6 6 25 pnp
+R4 24 26 5k
+R5 6 5 39k
+* transistor model statements
+.model npn NPN ( Bf=200 Br=2.0 VAf=125V Is=10fA Tf=0.35ns
++ Rb=200 Rc=200 Re=2 Cje=1.0pF Vje=0.70V Mje=0.33 Cjc=0.3pF
++ Vjc=0.55V Mjc=0.5 Cjs=3.0pF Vjs=0.52V Mjs=0.5)
+.model pnp PNP ( Bf=50 Br=4.0 VAf=50V Is=10fA Tf=30ns
++ Rb=300 Rc=100 Re=10 Cje=0.3pF Vje=0.55V Mje=0.5 Cjc=1.0pF
++ Vjc=0.55V Mjc=0.5 Cjs=3.0pF Vjs=0.52V Mjs=0.5)
+.OP
+.end

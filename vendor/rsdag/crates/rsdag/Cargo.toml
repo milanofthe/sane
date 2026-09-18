@@ -1,0 +1,45 @@
+[package]
+name = "rsdag"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Rust symbolic graph backend: hash-consed expression graph, differentiation, tape"
+
+[features]
+# The synthetic program generator (`rsdag::synth`). Off by default: it is
+# there for the parity fuzzers and the benchmarks of this workspace and for
+# consumers that want to fuzz their own pipelines, not for production paths.
+synth = []
+
+# Serialization of a module (`Module`, `rsdag::module`): the interchange
+# format for caching analyses, code generation and FMI export. Off by
+# default so a consumer that only builds and evaluates pays nothing.
+serde = ["dep:serde", "num-rational/serde", "num-bigint/serde"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"], optional = true }
+num-bigint.workspace = true
+num-rational.workspace = true
+num-traits.workspace = true
+num-complex.workspace = true
+rustc-hash.workspace = true
+libm.workspace = true
+egg.workspace = true
+
+[dev-dependencies]
+# The crate's own integration tests and the benchmarks draw synthetic
+# programs; a dev-dependency on self is how a test gets an optional feature
+# of its own crate.
+rsdag = { path = ".", features = ["synth", "serde"] }
+# The integration tests link against the crate, not against its
+# dependencies, so the few they name themselves are listed again here.
+num-complex.workspace = true
+num-rational.workspace = true
+num-traits.workspace = true
+rustc-hash.workspace = true
+serde_json = "1"
+
+[lints]
+workspace = true

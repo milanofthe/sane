@@ -1,0 +1,25 @@
+* CMOS Differential Amplifier with current-source biasing (Sedra-Smith / McGill; NOTICE.md)
+* power supplies
+Vdd 4 0 DC +5V
+Vss 5 0 DC -5V
+* differential-mode signal level
+Vd 101 0 DC 0V
+Rd 101 0 1
+EV+ 1 100 101 0 +0.5
+EV- 2 100 101 0 -0.5
+* common-mode signal level
+Vcm 100 0 DC 0V
+* front-end stage
+M1 7 1 6 4 pmos_transistor L=8u W=120u
+M2 8 2 6 4 pmos_transistor L=8u W=120u
+M3 7 7 5 5 nmos_transistor L=10u W=50u
+M4 8 7 5 5 nmos_transistor L=10u W=50u
+* current source biasing stage
+M5 6 9 4 4 pmos_transistor L=10u W=150u
+M6 9 9 4 4 pmos_transistor L=10u W=150u
+Iref 9 5 25uA
+* transistor model statements
+.model pmos_transistor pmos (kp=10u Vto=-1V lambda=0.04 gamma=0)
+.model nmos_transistor nmos (kp=20u Vto=+1V lambda=0.04 gamma=0)
+.OP
+.end

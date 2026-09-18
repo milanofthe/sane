@@ -1,0 +1,12 @@
+* colpitts_oscillator  (S. Dusausay, github.com/nimisbert/Colpitts, MIT)
+VCC A 0 DC 15
+RB2 A B 150k
+RB1 B 0 22k
+Cde B 0 100n
+Q1 C B E 2N2222
+RE E 0 1040
+L1 A C 220n
+C1 C E 30p
+C2 E 0 30p
+.model 2N2222 NPN(Is=14f Vt=0.02585 betaF=100 betaR=1)
+.end

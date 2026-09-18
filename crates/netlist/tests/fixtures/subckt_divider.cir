@@ -1,0 +1,9 @@
+* subckt_divider  (own; .subckt + X instance demo)
+.subckt divider in out
+R1 in mid 10k
+R2 mid out 10k
+.ends
+V1 a 0 DC 10
+X1 a b divider
+R3 b 0 10k
+.end

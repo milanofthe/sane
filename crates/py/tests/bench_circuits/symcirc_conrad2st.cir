@@ -1,0 +1,62 @@
+* imported from symcirc/test_circuits/Conrad2st.net (github.com/Creapson/symcirc)
+* Schematics Netlist *
+
+
+
+Q_T1         4 3 5 BC547B
+R_R2         4 3 390k
+R_R3         4 9 47k
+R_R4         5 0 3.9k
+C_C3         7 10 22u 
+R_R7         0 8 470
+C_C2         6 7 47u 
+R_R6         9 7 2.2k
+V_V2         9 0 DC 20  
+C_C4         8 0 100u 
+Q_T2         7 4 8 BC547B
+R_R5         5 6 39.k
+R_R1         2 3 680
+V_VIN         1 0  AC 1 sin( 0 0.5 1000hz )
+C_C1         1 2 0.22u 
+R_RL         10 0 10k
+
+.model BC547B 
++ NPN                                 
++ IS=14.340000E-15 
++ BF=255.9          
++ NF=1            
++ VAF=74.03         
++ IKF=.2847       
++ ISE=14.340000E-15 
++ NE=1.307        
++ BR=6.092        
++ NR=1            
++ RB=10            
++ RC=1            
++ CJE=22.010000E-12 
++ MJE=.377        
++ CJC=7.306000E-12 
++ MJC=.3416       
++ TF=411.100000E-12 
++ XTF=3            
++ VTF=1.7          
++ ITF=.6          
++ TR=46.910000E-09 
++ XTB=1.5          
++ IB=7.44E-06 
++ IC=4.93E-04 
++ VBE=8.72E-01 
++ VBC=-9.27E-02 
++ VCE=9.65E-01 
++ BETADC=6.62E+01 
++ GM=1.76E-02 
++ RPI=3.48E+03 
++ RX=1.44E+02 
++ RO=6.50E+04 
++ CBE=1.48E-13 
++ CBC=1.87E-15 
++ CJS=6.94E-15 
++ BETAAC=6.10E+01 
++ CBX=8.50E-15 
++ FT=1.76E+10 
+.end

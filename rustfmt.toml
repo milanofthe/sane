@@ -1,0 +1,6 @@
+# SANE formatting policy (rustfmt). Stable-channel options only, so
+# `cargo fmt` / `cargo fmt --check` work on the stable toolchain used in CI.
+edition = "2021"
+max_width = 100
+use_field_init_shorthand = true
+use_try_shorthand = true

@@ -1,0 +1,72 @@
+RSLAB - Rust Sparse Linear Algebra Backend
+Copyright (c) 2026 Milan Rother
+Licensed under the MIT License (see LICENSE).
+
+RSLAB is a fork of feral (https://github.com/jkitchin/feral),
+Copyright (c) 2026 John Kitchin, distributed under the MIT License. feral is the
+basis of this project; its MIT license text is retained in LICENSE. RSLAB builds on
+feral's sparse LDLᵀ core, adds an unsymmetric LU path, complex-symmetric support,
+and solver-in-the-loop tooling (a-priori estimates, diagnostics, tuning).
+
+================================================================================
+Third-Party Attributions
+================================================================================
+
+RSLAB (via feral) incorporates algorithmic content derived from the SPRAL library
+(Science and Technology Facilities Council), specifically the Hungarian matching
+and MC64-style scaling routines. The Rust implementations in:
+
+    src/scaling/hungarian.rs
+    src/scaling/mc64.rs
+
+are translations of the corresponding Fortran routines `hungarian_match`,
+`hungarian_init_heuristic`, and `hungarian_wrapper` in `src/scaling.f90` of
+SPRAL. SPRAL is distributed under the BSD-3-Clause license; the full license
+text is reproduced in LICENSE-THIRD-PARTY.
+
+A small number of numerical constants from SPRAL SSIDS (e.g. the
+`SSIDS_DET_SMALL = 1e-20` zero-pivot threshold from `src/ssids/datatypes.f90`)
+are also used and are cited in source comments.
+
+--------------------------------------------------------------------------------
+Historical note: METIS-derived code in versions 0.20.0 through 0.23.0
+--------------------------------------------------------------------------------
+
+Releases 0.20.0 through 0.23.0 contained a node-separator refinement module
+(`crates/rslab-metis/src/node_refine.rs`) ported from METIS 5.2.0
+(`libmetis/sfm.c`, `libmetis/srefine.c`), Copyright 1995-2013 Regents of the
+University of Minnesota, licensed under the Apache License 2.0. Those releases
+should be used subject to that license for the affected file; the Apache-2.0
+license text is reproduced in LICENSE-THIRD-PARTY. As of version 0.24.0 the
+module has been replaced by an independent implementation written from
+published algorithm descriptions (`crates/rslab-metis/src/sep_refine.rs`);
+no METIS-derived code remains in current releases.
+
+--------------------------------------------------------------------------------
+Scholarly references
+--------------------------------------------------------------------------------
+
+Source comments cite published papers and, in places, the behavior of other
+solvers (MUMPS, SuiteSparse KLU/AMD, METIS, SCOTCH, KaHIP, MKL PARDISO, faer,
+Ipopt) for scholarly purposes: algorithm references, parameter semantics,
+design rationale, and cross-validation targets. Such citations do not indicate
+incorporation of code from those projects.
+
+Two areas deserve explicit characterization:
+
+  - The AMF ordering implements the HAMF4 variant of approximate minimum fill
+    (Amestoy, 1999 habilitation thesis). The complete HAMF4 heuristic is only
+    fully specified by the MUMPS implementation; RSLAB's code is independently
+    written idiomatic Rust whose behavior (formulas, quantization, and merge
+    semantics) matches HAMF4 and is validated against a MUMPS-derived fill
+    oracle over 183k matrices (`tests/amf_corpus_oracle.rs`). No MUMPS source
+    text is incorporated. MUMPS is CeCILL-C licensed and is not distributed
+    with, linked by, or required by RSLAB.
+
+  - The LDLᵀ-aware ordering preprocessing (`src/symbolic/ldlt_compress.rs`)
+    implements the published Duff-Pralet pairing strategy, which MUMPS exposes
+    as ICNTL(12)=2. It is an independent implementation.
+
+Benchmarks may load external reference solvers (MKL PARDISO, Apple Accelerate,
+SuiteSparse KLU) at runtime through their public C interfaces for measurement
+only; nothing from those libraries is distributed with RSLAB.

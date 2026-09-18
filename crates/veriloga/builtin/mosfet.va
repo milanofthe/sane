@@ -1,0 +1,135 @@
+// SANE built-in square-law MOSFET (SPICE `M` element, levels 1-3).
+//
+// Level-1 (Shichman-Hodges) square law over all regions with channel-length
+// modulation, plus level-2/3-style correction terms that are inert at their
+// defaults (body effect gamma, DIBL eta, mobility degradation theta), a
+// C1-stitched subthreshold exponential below von = 2*nsub*Vt, optional gate
+// overlap / channel / body-junction charge storage, channel thermal and
+// flicker noise. This is NOT a BSIM/EKV/PSP compact model -- those come in as
+// user Verilog-A. `type` folds the polarity (+1 NMOS, -1 PMOS).
+
+`include "constants.vams"
+
+module sane_mos(d, g, s, b);
+    inout d, g, s, b;
+    electrical d, g, s, b;
+
+    parameter real type   = 1.0;
+    parameter real Kp     = 2e-5;
+    // W = L default so a deck omitting geometry gets W/L = 1 (not 0/0 = NaN).
+    parameter real W      = 1.0;
+    parameter real L      = 1.0;
+    parameter real Vto    = 0.0;
+    parameter real lambda = 0.0;
+    parameter real gamma  = 0.0;
+    parameter real phi    = 0.6;
+    parameter real theta  = 0.0;
+    parameter real eta    = 0.0;
+    parameter real Tnom   = `P_CELSIUS0 + 27.0;
+    // Subthreshold slope factor n (~1-2); weak-inversion exponential below
+    // von = 2*n*Vt, C1-matched to the square law.
+    parameter real nsub   = 1.0;
+    parameter real Cgso   = 0.0;
+    parameter real Cgdo   = 0.0;
+    parameter real Cox    = 0.0;
+    parameter real Cbd    = 0.0;
+    parameter real Cbs    = 0.0;
+    parameter real PB     = 0.8;
+    parameter real MJ     = 0.5;
+    parameter real FC     = 0.5;
+    // Flicker noise S_i = KF*|Id|^AF / f; KF = 0 -> channel thermal only.
+    parameter real KF     = 0.0;
+    parameter real AF     = 1.0;
+
+    real vt, vgs, vds, vbs, arg, argp, vth, vov;
+    real mob, k0, vovp, k, clm, triode, sat, on;
+    real nvt, von, kvon, idvon, sub, ide, id;
+    real qgso, qgdo, qchan, halfchan, vk, qbd, qbs;
+
+    analog begin
+        vt = `P_K/`P_Q * $temperature;
+
+        // N-channel-equivalent operating voltages (PMOS negates all three and
+        // the threshold); the channel control vgs is Newton-limited (fetlim).
+        if (type > 0) begin
+            vgs = $limit(V(g, s), "fetlim", Vto);
+            vds = V(d, s);
+            vbs = V(b, s);
+            vth = Vto;
+        end else begin
+            vgs = $limit(V(s, g), "fetlim", Vto);
+            vds = V(s, d);
+            vbs = V(s, b);
+            vth = -Vto;
+        end
+        // Body effect vth += gamma*(sqrt(phi - vbs) - sqrt(phi)); the argument
+        // is clamped positive so a sweep cannot hit sqrt of a negative.
+        arg  = phi - vbs;
+        argp = (arg > 1e-3) ? arg : 1e-3;
+        vth  = vth + gamma*(sqrt(argp) - sqrt(phi));
+        // DIBL: threshold drops with drain bias.
+        vth  = vth - eta*vds;
+        vov  = vgs - vth;
+
+        // Square law with channel-length modulation and mobility degradation
+        // 1/(1 + theta*vov); transconductance falls as mobility ~ (T/Tnom)^-1.5.
+        mob  = pow($temperature/Tnom, -1.5);
+        k0   = Kp*mob*(W/L);
+        vovp = (vov > 0) ? vov : 0.0;
+        k    = k0/(1.0 + theta*vovp);
+        clm  = 1.0 + lambda*vds;
+        triode = k*(vov*vds - 0.5*vds*vds)*clm;
+        sat    = 0.5*k*vov*vov*clm;
+        on     = (vds < vov) ? triode : sat;
+
+        // Weak inversion: below von = 2*nsub*Vt the current is exponential in
+        // vov, matched in value to the strong-inversion current at von (the
+        // triode form in the deep-triode corner, else the saturation form).
+        nvt  = nsub*vt;
+        von  = 2.0*nvt;
+        kvon = k0/(1.0 + theta*von);
+        idvon = (vds < von)
+            ? kvon*(von*vds - 0.5*vds*vds)*clm
+            : 0.5*kvon*von*von*clm;
+        sub  = idvon * limexp((vov - von)/nvt);
+        ide  = (vov < von) ? sub : on;
+
+        id = (type > 0) ? ide : -ide;
+        I(d, s) <+ id
+            // Channel thermal noise S_i = (8/3) k T gm (gm = dId/dVg by exact
+            // symbolic ddx) plus optional 1/f flicker, across drain-source.
+            + white_noise(8.0/3.0*`P_K*$temperature * abs(ddx(id, V(g))))
+            + flicker_noise(KF * pow(abs(id), AF), 1.0);
+
+        // Charge storage: linear overlap caps, intrinsic channel charge
+        // ((2/3) Cox vov when inverted, 50/50 drain/source split), and
+        // body-junction depletion charges.
+        if (($param_given(Cgso) && (Cgso > 0)) || ($param_given(Cgdo) && (Cgdo > 0))
+            || ($param_given(Cox) && (Cox > 0)) || ($param_given(Cbd) && (Cbd > 0))
+            || ($param_given(Cbs) && (Cbs > 0))) begin
+            qgso  = Cgso * V(g, s);
+            qgdo  = Cgdo * V(g, d);
+            qchan = (vov <= 0) ? 0.0 : (2.0/3.0)*Cox*vov;
+            qchan = (type > 0) ? qchan : -qchan;
+            halfchan = 0.5*qchan;
+            vk  = FC * PB;
+            qbd = (V(b, d) > vk)
+                ? Cbd*PB/(1.0 - MJ)*(1.0 - pow(1.0 - FC, 1.0 - MJ))
+                  + Cbd/pow(1.0 - FC, 1.0 + MJ)
+                    * ((1.0 - FC*(1.0 + MJ))*(V(b, d) - vk)
+                       + MJ/(2.0*PB)*(V(b, d)*V(b, d) - vk*vk))
+                : Cbd*PB/(1.0 - MJ)*(1.0 - pow(1.0 - V(b, d)/PB, 1.0 - MJ));
+            qbs = (V(b, s) > vk)
+                ? Cbs*PB/(1.0 - MJ)*(1.0 - pow(1.0 - FC, 1.0 - MJ))
+                  + Cbs/pow(1.0 - FC, 1.0 + MJ)
+                    * ((1.0 - FC*(1.0 + MJ))*(V(b, s) - vk)
+                       + MJ/(2.0*PB)*(V(b, s)*V(b, s) - vk*vk))
+                : Cbs*PB/(1.0 - MJ)*(1.0 - pow(1.0 - V(b, s)/PB, 1.0 - MJ));
+            // Terminal charges [d, g, s, b], each summing into its node's KCL.
+            I(d) <+ ddt(-qgdo - halfchan + qbd);
+            I(g) <+ ddt(qgso + qgdo + qchan);
+            I(s) <+ ddt(-qgso - halfchan + qbs);
+            I(b) <+ ddt(-(qbd + qbs));
+        end
+    end
+endmodule

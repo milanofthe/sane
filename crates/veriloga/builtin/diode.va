@@ -1,0 +1,85 @@
+// SANE built-in PN-junction diode (SPICE `D` element).
+//
+// The source of truth for the model equations: forward conduction with
+// temperature-scaled saturation current, optional reverse breakdown (BV),
+// optional junction + diffusion charge storage (Cj0/TT), optional series
+// resistance (Rs) behind an internal anode node, shot + flicker noise on the
+// junction. Structural features fold at lowering from the instance parameters,
+// so a bare card lowers to the bare exponential -- exactly like the retired
+// native Rust model this file replaces.
+
+`include "constants.vams"
+
+module sane_diode(a, c);
+    inout a, c;
+    electrical a, c, ai;
+
+    parameter real Is  = 1e-14;
+    parameter real N   = 1.0;
+    // Temperature model: Vt and Is are evaluated at the global $temperature;
+    // Tnom/Eg/XTI parameterize Is(T). At $temperature = Tnom the scaling is
+    // the identity.
+    parameter real Tnom = `P_CELSIUS0 + 27.0;
+    parameter real Eg  = 1.11;
+    parameter real XTI = 3.0;
+    // Junction / diffusion charge (0 -> no charge storage, no tape cost).
+    parameter real Cj0 = 0.0;
+    parameter real Vj  = 1.0;
+    parameter real M   = 0.5;
+    parameter real FC  = 0.5;
+    parameter real TT  = 0.0;
+    // Reverse breakdown: BV defaults to a huge sentinel (no breakdown); IBV is
+    // the breakdown knee current (SPICE default 1e-3).
+    parameter real BV  = 1e12;
+    parameter real IBV = 1e-3;
+    // Flicker noise S_i = KF*|Id|^AF / f; KF = 0 -> shot noise only.
+    parameter real KF  = 0.0;
+    parameter real AF  = 1.0;
+    // Series resistance (0 -> the internal anode collapses onto the terminal).
+    parameter real Rs  = 0.0;
+
+    real vt, nvt, ist, vd, idf, id, vk, qlo, qknee, qhi, q;
+
+    analog begin
+        // Series resistance: active only when the card provides Rs > 0;
+        // otherwise the internal anode node merges with the terminal. Rs is an
+        // ohmic resistor, so it carries thermal noise 4kT/Rs.
+        if ($param_given(Rs) && (Rs > 0))
+            I(a, ai) <+ V(a, ai) / Rs
+                + white_noise(4.0*`P_K*$temperature / Rs);
+        else
+            V(a, ai) <+ 0;
+
+        vt  = `P_K/`P_Q * $temperature;
+        nvt = N * vt;
+        // Is(T) = Is * (T/Tnom)^(XTI/N) * exp(Eg/(N*k/q) * (1/Tnom - 1/T)).
+        ist = Is * pow($temperature/Tnom, XTI/N)
+                 * exp(Eg/(N * (`P_K/`P_Q)) * (1.0/Tnom - 1.0/$temperature));
+
+        vd  = $limit(V(ai, c), "pnjlim", vt, 0.7);
+        // Forward conduction (also the diffusion-charge kernel below).
+        idf = ist * (limexp(vd/nvt) - 1.0);
+        id  = idf;
+        // Reverse breakdown -IBV*exp(-(vd+BV)/(N*Vt)): negligible in forward /
+        // mild reverse, dominant below -BV.
+        if ($param_given(BV) && (BV > 0))
+            id = id - IBV * limexp(-(vd + BV)/nvt);
+
+        I(ai, c) <+ id
+            + white_noise(2.0*`P_Q * abs(idf))
+            + flicker_noise(KF * pow(abs(idf), AF), 1.0);
+
+        // Junction (depletion) + diffusion charge, SPICE form: below the knee
+        // vk = FC*Vj the integrated Cj0*(1 - v/Vj)^(-M); above it the
+        // C1-continuous linearized-capacitance extrapolation.
+        if (($param_given(Cj0) && (Cj0 > 0)) || ($param_given(TT) && (TT > 0))) begin
+            vk    = FC * Vj;
+            qlo   = Cj0*Vj/(1.0 - M) * (1.0 - pow(1.0 - vd/Vj, 1.0 - M));
+            qknee = Cj0*Vj/(1.0 - M) * (1.0 - pow(1.0 - FC, 1.0 - M));
+            qhi   = qknee + Cj0/pow(1.0 - FC, 1.0 + M)
+                    * ((1.0 - FC*(1.0 + M))*(vd - vk) + M/(2.0*Vj)*(vd*vd - vk*vk));
+            q     = ((vd > vk) ? qhi : qlo) + TT * idf;
+            I(ai, c) <+ ddt(q);
+        end
+    end
+endmodule

@@ -1,0 +1,21 @@
+﻿[package]
+name = "sane-export"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Export SANE DAE systems (residual + Jacobians) to LaTeX and Python"
+
+[dependencies]
+rsdag.workspace = true
+sane-core.workspace = true
+sane-dae = { path = "../dae" }
+num-traits.workspace = true
+
+[dev-dependencies]
+sane-veriloga = { path = "../veriloga" }
+sane-mna.workspace = true
+sane-device = { path = "../device" }
+
+[lints]
+workspace = true

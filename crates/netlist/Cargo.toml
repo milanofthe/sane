@@ -1,0 +1,27 @@
+[package]
+name = "sane-netlist"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "SPICE-like netlist parser producing an SANE circuit"
+
+[dependencies]
+rsdag.workspace = true
+rustc-hash.workspace = true
+sane-core.workspace = true
+sane-mna.workspace = true
+sane-device = { path = "../device" }
+sane-veriloga = { path = "../veriloga" }
+
+[dev-dependencies]
+sane-core.workspace = true
+sane-dae = { path = "../dae" }
+sane-solve = { path = "../solve" }
+num-complex.workspace = true
+
+[lints]
+workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+sane-osdi = { path = "../osdi" }

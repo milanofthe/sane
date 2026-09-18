@@ -1,0 +1,6 @@
+* nmos_curve  (Kuphaldt SEMI_6, DSL; nodes renumbered)
+M1 1 2 0 0 NMOS1
+Vin 2 0 DC 0.5
+V1 1 0 DC 24
+.model NMOS1 NMOS(Kp=20u W=1 L=1 Vto=-1)
+.end

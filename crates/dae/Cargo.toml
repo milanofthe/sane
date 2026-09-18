@@ -1,0 +1,21 @@
+﻿[package]
+name = "sane-dae"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Time-domain nonlinear DAE assembly and extraction for SANE"
+
+[dependencies]
+rsdag.workspace = true
+sane-core.workspace = true
+sane-mna.workspace = true
+sane-device = { path = "../device" }
+rustc-hash.workspace = true
+
+[dev-dependencies]
+sane-veriloga = { path = "../veriloga" }
+num-complex.workspace = true
+
+[lints]
+workspace = true

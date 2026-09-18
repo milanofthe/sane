@@ -1,0 +1,7 @@
+* bjt_emitter_follower  (Kuphaldt SEMI_4, DSL)
+Vin 1 0 DC 3
+Q1 2 1 3 QN
+V1 2 0 DC 15
+Rload 3 0 5k
+.model QN NPN(Is=1e-15 Vt=0.02585 betaF=100 betaR=1)
+.end

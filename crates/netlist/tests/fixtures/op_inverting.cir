@@ -1,0 +1,6 @@
+* op_inverting  (own; ideal op-amp as a high-gain VCVS; gain -R2/R1 = -2)
+VS 1 0 AC 1
+R1 1 2 5k
+R2 2 3 10k
+E_OP 3 0 0 2 1Meg
+.end

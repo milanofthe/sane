@@ -1,0 +1,8 @@
+* mos_current_mirror  (own)
+VDD 1 0 DC 5
+Iref 1 2 DC 100u
+M1 2 2 0 0 NMOS1
+M2 3 2 0 0 NMOS1
+RL 1 3 10k
+.model NMOS1 NMOS(Kp=100u W=10 L=1 Vto=0.7)
+.end

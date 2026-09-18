@@ -1,0 +1,11 @@
+* imported from symcirc/test_circuits/simple_lc.net (github.com/Creapson/symcirc)
+* Schematics Netlist *
+
+
+
+C_C1         1 2 10u 
+V_V1         1 0 DC 0 AC 1 
+L_L1         2 3 2.533m 
+R_R3         3 0 10
+
+.end

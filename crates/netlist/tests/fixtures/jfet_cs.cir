@@ -1,0 +1,8 @@
+* jfet_cs  N-channel JFET common-source, self-biased (NJF, Shichman-Hodges)
+Vdd vdd 0 12
+Rd vdd d 2k
+Rg g 0 1meg
+Rs s 0 1k
+J1 d g s JM
+.model JM NJF(Vto=-2 Beta=1m Lambda=0)
+.end

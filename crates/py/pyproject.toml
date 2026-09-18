@@ -1,0 +1,37 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "sane"
+version = "1.0.0"
+description = "Symbolic circuit analysis: exact component sensitivity (DC/AC/pole/transient) and nonlinear DAE extraction"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "LicenseRef-PolyForm-Noncommercial-1.0.0" }
+authors = [{ name = "Milan Rother" }]
+maintainers = [{ name = "Milan Rother" }]
+keywords = ["circuit-simulation", "spice", "symbolic", "sensitivity", "verilog-a", "eda"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: Other/Proprietary License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Electronic Design Automation (EDA)",
+]
+dependencies = ["numpy", "scipy"]
+
+[project.urls]
+Homepage = "https://github.com/milanofthe/sane"
+Repository = "https://github.com/milanofthe/sane"
+Issues = "https://github.com/milanofthe/sane/issues"
+
+[tool.maturin]
+# Mixed Rust/Python project: the compiled PyO3 extension is `sane._core`, and
+# the ergonomic, fully-documented surface is the pure-Python package overlaid
+# from `python/sane`.
+python-source = "python"
+module-name = "sane._core"
+features = ["pyo3/extension-module"]

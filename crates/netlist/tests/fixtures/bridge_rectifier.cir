@@ -1,0 +1,9 @@
+* bridge_rectifier  (Kuphaldt REF_7, DSL)
+V1 1 0 AC 1
+Rload 1 0 10k
+D1 1 2 DMOD
+D2 0 2 DMOD
+D3 3 1 DMOD
+D4 3 0 DMOD
+.model DMOD D(Is=1e-14 N=1 Vt=0.02585)
+.end

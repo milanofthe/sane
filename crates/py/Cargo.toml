@@ -1,0 +1,44 @@
+﻿[package]
+name = "sane-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Python bindings (PyO3) for SANE symbolic circuit analysis"
+
+[lib]
+# The compiled extension lives at `sane._core`; the ergonomic, documented
+# Python surface is the pure-Python package in `python/sane` (see pyproject).
+name = "_core"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rsdag.workspace = true
+# `extension-module` is added by maturin (see pyproject.toml), not here, so that
+# plain `cargo test` can still link against libpython.
+pyo3 = { version = "0.22", features = ["abi3-py39"] }
+# Extraction is allocation-heavy (parse + symbolic build + AD + tape compile do
+# many small allocations). The OS heap serialises these -- catastrophically so
+# under the worker pool (measured ~4.5x slowdown on the IBM grids). mimalloc cuts
+# single-threaded extract ~24% and lets the parallel passes actually scale.
+mimalloc = "0.1"
+sane-core.workspace = true
+sane-mna.workspace = true
+sane-dae = { path = "../dae" }
+sane-device = { path = "../device" }
+sane-export = { path = "../export" }
+sane-netlist = { path = "../netlist" }
+sane-veriloga = { path = "../veriloga" }
+sane-solve = { path = "../solve", default-features = false }
+sane-analysis = { path = "../analysis", default-features = false }
+num-complex.workspace = true
+vectfit.workspace = true
+
+[features]
+# The engine's native backend, forwarded so a build can drop it
+# (`--no-default-features`) the way the wasm host does. On by default.
+default = ["jit"]
+jit = ["sane-solve/jit", "sane-analysis/jit"]
+
+[lints]
+workspace = true

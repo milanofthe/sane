@@ -1,0 +1,22 @@
+[package]
+name = "rsdag-jit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Native code backend for rsdag programs"
+
+[dependencies]
+rsdag.workspace = true
+rustc-hash.workspace = true
+rayon.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+rsdag = { workspace = true, features = ["synth"] }
+
+[lints]
+workspace = true

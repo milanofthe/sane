@@ -1,0 +1,155 @@
+// SANE built-in BJT (SPICE `Q` element), Gummel-Poon transport form.
+//
+// The transport current carries the normalized base charge qb (base-width
+// modulation / Early effect via VAf/VAr, high-level injection via IKF/IKR),
+// with separate base-emitter / base-collector diffusion and recombination
+// leakage currents (ISE/NE, ISC/NC). Series base / collector / emitter
+// resistances (Rb/Rc/Re) sit behind intrinsic internal nodes that collapse
+// onto the terminals when absent; junction + diffusion charges (Cje/Cjc,
+// TF/TR) are stored on the intrinsic nodes. Collector and base shot noise plus
+// 1/f flicker on the base current. `type` folds the polarity (+1 NPN, -1 PNP).
+// Omitted (as in the retired native model): VBIC/HICUM/Mextram,
+// quasi-saturation, avalanche, self-heating, substrate capacitance.
+
+`include "constants.vams"
+
+module sane_bjt(c, b, e);
+    inout c, b, e;
+    electrical c, b, e, ci, bi, ei;
+
+    parameter real type  = 1.0;
+    parameter real Is    = 1e-16;
+    parameter real betaF = 100.0;
+    parameter real betaR = 1.0;
+    // Temperature: Is(T) at the global $temperature, identity at Tnom.
+    parameter real Tnom  = `P_CELSIUS0 + 27.0;
+    parameter real Eg    = 1.11;
+    parameter real XTI   = 3.0;
+    // VAf/VAr/IKF/IKR default to ~infinity (no Early, no high injection);
+    // ISE/ISC = 0 (no leakage); NE/NC = 2 (matter only when ISE/ISC > 0).
+    parameter real VAf   = 1e12;
+    parameter real VAr   = 1e12;
+    parameter real IKF   = 1e12;
+    parameter real IKR   = 1e12;
+    parameter real ISE   = 0.0;
+    parameter real NE    = 2.0;
+    parameter real ISC   = 0.0;
+    parameter real NC    = 2.0;
+    parameter real Cje   = 0.0;
+    parameter real Vje   = 0.75;
+    parameter real Mje   = 0.33;
+    parameter real Cjc   = 0.0;
+    parameter real Vjc   = 0.75;
+    parameter real Mjc   = 0.33;
+    parameter real FC    = 0.5;
+    parameter real TF    = 0.0;
+    parameter real TR    = 0.0;
+    // Flicker noise S_i = KF*|Ib|^AF / f on the base current.
+    parameter real KF    = 0.0;
+    parameter real AF    = 1.0;
+    // Parasitic series resistances (0 -> intrinsic node collapses).
+    parameter real Rb    = 0.0;
+    parameter real Rc    = 0.0;
+    parameter real Re    = 0.0;
+
+    real vt, ist, vbe, vbc, ebe, ebc, invq1, q2, invqb, ict;
+    real ibe, ibc, ib_, ic_, ie_, icx, ibx, iex;
+    real vk, qbe, qbc, qcol, qbas, qemi;
+
+    analog begin
+        // Series parasitics: each active resistance separates its intrinsic
+        // node; an absent one collapses intrinsic onto the terminal. The
+        // ohmic resistances carry thermal noise 4kT/R.
+        if ($param_given(Rc) && (Rc > 0))
+            I(c, ci) <+ V(c, ci) / Rc
+                + white_noise(4.0*`P_K*$temperature / Rc);
+        else
+            V(c, ci) <+ 0;
+        if ($param_given(Rb) && (Rb > 0))
+            I(b, bi) <+ V(b, bi) / Rb
+                + white_noise(4.0*`P_K*$temperature / Rb);
+        else
+            V(b, bi) <+ 0;
+        if ($param_given(Re) && (Re > 0))
+            I(e, ei) <+ V(e, ei) / Re
+                + white_noise(4.0*`P_K*$temperature / Re);
+        else
+            V(e, ei) <+ 0;
+
+        vt  = `P_K/`P_Q * $temperature;
+        // Is(T) = Is * (T/Tnom)^XTI * exp(Eg/(k/q) * (1/Tnom - 1/T)).
+        ist = Is * pow($temperature/Tnom, XTI)
+                 * exp(Eg/(`P_K/`P_Q)
+                       * (1.0/Tnom - 1.0/$temperature));
+
+        // Junction voltages in the NPN-positive frame (PNP reverses the
+        // pairs), Newton-limited on both junctions.
+        if (type > 0) begin
+            vbe = $limit(V(bi, ei), "pnjlim", vt, 0.7);
+            vbc = $limit(V(bi, ci), "pnjlim", vt, 0.7);
+        end else begin
+            vbe = $limit(V(ei, bi), "pnjlim", vt, 0.7);
+            vbc = $limit(V(ci, bi), "pnjlim", vt, 0.7);
+        end
+        ebe = limexp(vbe/vt);
+        ebc = limexp(vbc/vt);
+
+        // Normalized base charge qb = (q1/2)(1 + sqrt(1 + 4 q2)):
+        //   1/q1 = 1 - vbc/VAf - vbe/VAr        (Early)
+        //   q2   = Is/IKF*(ebe-1) + Is/IKR*(ebc-1)  (high-level injection)
+        invq1 = 1.0 - vbc/VAf - vbe/VAr;
+        q2    = ist/IKF*(ebe - 1.0) + ist/IKR*(ebc - 1.0);
+        invqb = invq1 * 2.0/(1.0 + sqrt(1.0 + 4.0*q2));
+
+        // Transport current and the base-emitter / base-collector currents
+        // (ideal diffusion + recombination leakage).
+        ict = ist*(ebe - ebc)*invqb;
+        ibe = ist/betaF*(ebe - 1.0) + ISE*(limexp(vbe/(NE*vt)) - 1.0);
+        ibc = ist/betaR*(ebc - 1.0) + ISC*(limexp(vbc/(NC*vt)) - 1.0);
+        ib_ = ibe + ibc;
+        ic_ = ict - ibc;
+        ie_ = -(ic_ + ib_);
+        icx = (type > 0) ? ic_ : -ic_;
+        ibx = (type > 0) ? ib_ : -ib_;
+        iex = (type > 0) ? ie_ : -ie_;
+        I(ci) <+ icx;
+        I(bi) <+ ibx;
+        I(ei) <+ iex;
+
+        // Shot noise on the collector and base currents plus base flicker
+        // noise, across the external terminals.
+        I(c, e) <+ white_noise(2.0*`P_Q * abs(icx));
+        I(b, e) <+ white_noise(2.0*`P_Q * abs(ibx))
+                 + flicker_noise(KF * pow(abs(ibx), AF), 1.0);
+
+        // Intrinsic charges: diffusion (TF/TR times the ideal junction
+        // currents) plus SPICE depletion junction charge; stored on the
+        // intrinsic nodes with the terminal-charge convention
+        // collector = -qbc, base = qbe + qbc, emitter = -qbe (PNP negates).
+        if (($param_given(Cje) && (Cje > 0)) || ($param_given(Cjc) && (Cjc > 0))
+            || ($param_given(TF) && (TF > 0)) || ($param_given(TR) && (TR > 0))) begin
+            vk  = FC * Vje;
+            qbe = TF*ist*(ebe - 1.0)
+                + ((vbe > vk)
+                    ? Cje*Vje/(1.0 - Mje)*(1.0 - pow(1.0 - FC, 1.0 - Mje))
+                      + Cje/pow(1.0 - FC, 1.0 + Mje)
+                        * ((1.0 - FC*(1.0 + Mje))*(vbe - vk)
+                           + Mje/(2.0*Vje)*(vbe*vbe - vk*vk))
+                    : Cje*Vje/(1.0 - Mje)*(1.0 - pow(1.0 - vbe/Vje, 1.0 - Mje)));
+            vk  = FC * Vjc;
+            qbc = TR*ist*(ebc - 1.0)
+                + ((vbc > vk)
+                    ? Cjc*Vjc/(1.0 - Mjc)*(1.0 - pow(1.0 - FC, 1.0 - Mjc))
+                      + Cjc/pow(1.0 - FC, 1.0 + Mjc)
+                        * ((1.0 - FC*(1.0 + Mjc))*(vbc - vk)
+                           + Mjc/(2.0*Vjc)*(vbc*vbc - vk*vk))
+                    : Cjc*Vjc/(1.0 - Mjc)*(1.0 - pow(1.0 - vbc/Vjc, 1.0 - Mjc)));
+            qcol = (type > 0) ? -qbc : qbc;
+            qbas = (type > 0) ? qbe + qbc : -(qbe + qbc);
+            qemi = (type > 0) ? -qbe : qbe;
+            I(ci) <+ ddt(qcol);
+            I(bi) <+ ddt(qbas);
+            I(ei) <+ ddt(qemi);
+        end
+    end
+endmodule

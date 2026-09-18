@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = ["crates/rsdag", "crates/rsdag-jit"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "LicenseRef-PolyForm-Noncommercial-1.0.0"
+authors = ["Milan Rother"]
+repository = "https://github.com/milanofthe/rsdag"
+
+[workspace.dependencies]
+rsdag = { path = "crates/rsdag", version = "0.1.0" }
+num-bigint = "0.4"
+num-rational = "0.4"
+num-traits = "0.2"
+num-complex = "0.4"
+rustc-hash = "2"
+libm = "0.2"
+egg = "0.9"
+rayon = "1"
+
+[workspace.lints.clippy]
+too_many_arguments = "allow"
+type_complexity = "allow"
+needless_range_loop = "allow"
+neg_cmp_op_on_partial_ord = "allow"
+doc_lazy_continuation = "allow"
+if_same_then_else = "allow"
+collapsible_match = "allow"
+needless_borrow = "allow"
+unnecessary_map_or = "allow"
+while_let_loop = "allow"
+
+[profile.release]
+debug = 1

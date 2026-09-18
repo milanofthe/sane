@@ -1,0 +1,37 @@
+﻿[package]
+name = "sane-solve"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Numeric DC/Newton solver for SANE DAEs (sparse Jacobian, rsdag graph solve, rslab as the fallback LU)"
+
+[dependencies]
+rsdag.workspace = true
+rustc-hash.workspace = true
+sane-core.workspace = true
+sane-dae = { path = "../dae" }
+rsdag-jit = { workspace = true, optional = true }
+sane-mna.workspace = true
+rslab.workspace = true
+rayon.workspace = true
+realfft = "3.5"
+num-complex = "0.4"
+
+[features]
+# Native compilation of the hot evaluation tapes (step/res/jxd) and the
+# device bodies with rsdag's emitter: after a few interpreted evaluations a
+# background thread compiles the tape and the solver swaps over, bit-identical
+# results. Default-on; SANE_JIT=0 disables at runtime.
+default = ["jit"]
+jit = ["dep:rsdag-jit"]
+
+[dev-dependencies]
+sane-veriloga = { path = "../veriloga" }
+sane-mna.workspace = true
+sane-device = { path = "../device" }
+# examples only: the tape_purity_probe loads a Verilog-A deck end to end
+sane-netlist = { path = "../netlist" }
+
+[lints]
+workspace = true

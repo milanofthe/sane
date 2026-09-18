@@ -1,0 +1,36 @@
+* A Simple Operational Amplifier (3-stage BJT, Sedra-Smith / McGill; NOTICE.md)
+* power supplies
+Vcc 4 0 DC +15V
+Vee 5 0 DC -15V
+* differential-mode signal level
+Vd 101 0 DC 0V
+Rd 101 0 1
+EV+ 1 100 101 0 +0.5
+EV- 2 100 101 0 -0.5
+* common-mode signal level
+Vcm 100 0 DC 0V
+* 1st stage
+R1 4 7 20k
+R2 4 8 20k
+Q1 7 1 6 npn_transistor
+Q2 8 2 6 npn_transistor
+Q3 6 9 5 npn_transistor
+* 2nd stage
+R3 4 11 3k
+Q4 4 7 10 npn_transistor
+Q5 11 8 10 npn_transistor
+Q6 10 9 5 npn_transistor 4
+* 3rd or output stage
+R4 4 12 2.3k
+Q7 13 11 12 pnp_transistor
+R5 13 5 15.7k
+Q8 4 13 3 npn_transistor
+R6 3 5 3k
+* biasing stage
+Rb 0 9 28.6k
+Q9 9 9 5 npn_transistor
+* transistor model statements
+.model npn_transistor npn ( Is=18fA Bf=100 VAf=100V )
+.model pnp_transistor pnp ( Is=18fA Bf=100 VAf=100V )
+.OP
+.end

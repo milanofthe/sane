@@ -1,0 +1,36 @@
+[package]
+name = "sane-analysis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "High-level circuit analyses for SANE (OP, transient, AC, sweeps, pole-zero, sensitivity, noise, model reduction, optimization) over the engine crates"
+
+[dependencies]
+rsdag.workspace = true
+rustc-hash.workspace = true
+sane-core.workspace = true
+sane-mna.workspace = true
+sane-dae = { path = "../dae" }
+sane-export = { path = "../export" }
+sane-netlist = { path = "../netlist" }
+sane-solve = { path = "../solve", default-features = false }
+num-complex.workspace = true
+rslab.workspace = true
+rayon.workspace = true
+serde = { version = "1", features = ["derive"] }
+faer = { version = "0.24", default-features = false, features = ["std", "linalg", "sparse-linalg"] }
+
+[features]
+# Forward the solver's native backend.
+# Default-on so native hosts keep today's behavior; the wasm build opts out of
+# both (no runtime codegen and no threads in the browser sandbox) and runs the
+# bit-identical tape interpreter, sequentially.
+default = ["jit"]
+jit = ["sane-solve/jit"]
+
+[dev-dependencies]
+mimalloc = "0.1"
+
+[lints]
+workspace = true

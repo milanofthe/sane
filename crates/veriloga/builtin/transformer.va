@@ -1,0 +1,19 @@
+// SANE built-in ideal two-winding transformer.
+//
+// With turns ratio n = Np/Ns it enforces V(p) = n*V(s) and conserves power via
+// the ampere-turn balance i_s = -n*i_p. The potential contribution mints the
+// primary branch current; the secondary mirrors it scaled. Ideal: no
+// magnetizing inductance, leakage or loss (a finite-inductance transformer is
+// the mutual coupling `K` between two inductors).
+
+module sane_transformer(pp, pn, sp, sn);
+    inout pp, pn, sp, sn;
+    electrical pp, pn, sp, sn;
+
+    parameter real ratio = 1.0;
+
+    analog begin
+        V(pp, pn) <+ ratio * V(sp, sn);
+        I(sp, sn) <+ -ratio * I(pp, pn);
+    end
+endmodule

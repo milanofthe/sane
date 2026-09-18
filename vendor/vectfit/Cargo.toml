@@ -1,0 +1,16 @@
+# Fast Relaxed Vector Fitting: set-valued rational macromodels with common
+# poles, automatic order (adding-and-skimming), passivity check/enforcement,
+# and deterministic Verilog-A export. Vendored from rapidmom (see VENDOR.md);
+# workspace inheritance replaced by standalone fields, nothing else changed.
+[package]
+name = "vectfit"
+version = "0.1.0"
+edition = "2021"
+license = "LicenseRef-PolyForm-Noncommercial-1.0.0"
+authors = ["Milan Rother"]
+publish = false
+
+[dependencies]
+num-complex = "0.4"
+faer = "0.24"
+rayon = "1"

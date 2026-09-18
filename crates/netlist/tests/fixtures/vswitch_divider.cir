@@ -1,0 +1,8 @@
+* vswitch_divider  voltage-controlled switch (closed) in a resistive divider
+Vin in 0 5
+Vc ctrl 0 5
+R1 in a 1k
+S1 a out ctrl 0 SW
+R2 out 0 1k
+.model SW SW(Vt=2.5 Vh=0 Ron=1 Roff=1meg)
+.end

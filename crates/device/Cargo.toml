@@ -1,0 +1,18 @@
+[package]
+name = "sane-device"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Nonlinear device models (large-signal) emitting symbolic terminal currents"
+
+[dependencies]
+rsdag.workspace = true
+sane-core.workspace = true
+rustc-hash.workspace = true
+
+[dev-dependencies]
+num-complex.workspace = true
+
+[lints]
+workspace = true

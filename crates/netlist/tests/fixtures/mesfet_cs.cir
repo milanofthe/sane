@@ -1,0 +1,7 @@
+* mesfet_cs  GaAs N-MESFET (Statz model) common-source stage
+Vdd vdd 0 5
+Rd vdd d 1k
+Rg g 0 1meg
+Z1 d g 0 ZM
+.model ZM NMF(Vto=-1.5 Beta=2m Alpha=2 Lambda=0.05 B=0.3)
+.end

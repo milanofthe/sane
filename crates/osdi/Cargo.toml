@@ -1,0 +1,22 @@
+[package]
+name = "sane-osdi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "OSDI (0.4) compiled compact-model loader for SANE: OpenVAF-compiled .osdi shared libraries as opaque devices"
+
+[dependencies]
+rsdag.workspace = true
+rustc-hash.workspace = true
+libloading = "0.8"
+sane-core = { path = "../core" }
+sane-device = { path = "../device" }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+sane-dae = { path = "../dae" }
+sane-mna = { path = "../mna" }
+sane-solve = { path = "../solve" }

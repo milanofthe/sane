@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "sane"
-version = "1.0.0"
+version = "1.0.1"
 description = "Symbolic circuit analysis: exact component sensitivity (DC/AC/pole/transient) and nonlinear DAE extraction"
 readme = "README.md"
 requires-python = ">=3.9"

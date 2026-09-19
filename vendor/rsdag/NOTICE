@@ -1,0 +1,16 @@
+rsdag
+Copyright (C) 2024-2026 Milan Rother
+
+This program is free software: you can redistribute it and/or modify it
+under the terms of the GNU Affero General Public License, version 3, as
+published by the Free Software Foundation. See LICENSE.
+
+This program is distributed in the hope that it will be useful, but WITHOUT
+ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+FITNESS FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License
+for more details.
+
+The copyright holder also licenses rsdag on other terms: it is vendored in
+SANE (https://github.com/milanofthe/sane) under that project's PolyForm
+Noncommercial license, and a commercial license is available. Contact
+info@milanrother.com.

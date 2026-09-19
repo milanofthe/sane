@@ -507,7 +507,16 @@ everywhere for comparison.
 
 ## License
 
-SANE is source-available under the [PolyForm Noncommercial License 1.0.0](LICENSE) —
-free for noncommercial use: research, evaluation, education, and academia.
-Commercial use requires a separate license, see [COMMERCIAL.md](COMMERCIAL.md)
-or contact info@milanrother.com.
+SANE is source-available under the [PolyForm Noncommercial License 1.0.0](LICENSE):
+free for noncommercial use, that is research, evaluation, education, and
+academia. Commercial use requires a separate license, see
+[COMMERCIAL.md](COMMERCIAL.md) or contact info@milanrother.com.
+
+The vendored trees under `vendor/` carry their own upstream licenses, and each
+one is redistributed here as part of SANE under the license above:
+
+| Tree | Upstream | Upstream license |
+|---|---|---|
+| `vendor/rsdag` | [rsdag](https://github.com/milanofthe/rsdag) | AGPL-3.0-only, same author, also licensed on other terms (see its `NOTICE`) |
+| `vendor/rslab` | [rslab](https://github.com/milanofthe/rslab) | MIT |
+| `vendor/vectfit` | [rapidmom](https://github.com/milanofthe/rapidmom) | PolyForm Noncommercial 1.0.0 |

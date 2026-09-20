@@ -710,7 +710,9 @@ impl rsdag::ExternBundle for OsdiBundle {
     fn n_outputs(&self) -> usize {
         2 * self.n_active + self.n_jr + self.n_jq + 2 * self.n_noise + 1
     }
-    fn call(&self, args: &[f64], out: &mut [f64]) {
+    fn call_into(&self, args: &[f64], _work: &mut [f64], out: &mut [f64]) {
+        // The compact model keeps its own state behind the lock; nothing of
+        // ours lives in the caller's buffer.
         let mut st = self.state.lock().unwrap();
         let (n, njr, njq, nn) = (self.n_active, self.n_jr, self.n_jq, self.n_noise);
         let (f, rest) = out.split_at_mut(n);

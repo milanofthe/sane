@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use rsdag::{ExprId, Graph, Node, ReduceOp, SymbolId, Tape};
+use rsdag::{Crossing, ExprId, Graph, Node, ReduceOp, SymbolId, Tape};
 use sane_core::constants::*;
 use sane_core::{time_stage, Profile};
 use sane_dae::Dae;
@@ -126,7 +126,27 @@ impl CompiledDc {
         // markers) for the Jacobian-bearing tapes. `tape_res` above keeps the
         // residual-only body it interned; both bodies compute identical bits
         // for the shared outputs (same DAG nodes, per-op deterministic).
-        let event_roots: Vec<ExprId> = dae.events.iter().map(|e| e.g).collect();
+        // The system as a function with roles: the solver then reads what a
+        // guard is, and which way it has to cross, off the graph rather than
+        // off SANE's own event list (which keeps only the names).
+        let sys = dae.register_function(ctx, "dae");
+        let guards = ctx
+            .func(sys)
+            .outputs_with_role(|r| matches!(r, rsdag::OutputRole::Guard { .. }));
+        let event_roots: Vec<ExprId> = guards
+            .iter()
+            .map(|&o| match ctx.func(sys).outputs[o as usize] {
+                rsdag::Output::Expr(e) => e,
+                _ => unreachable!("a guard output is an expression"),
+            })
+            .collect();
+        let event_dirs: Vec<Crossing> = guards
+            .iter()
+            .map(|&o| match ctx.func(sys).output_roles[o as usize] {
+                rsdag::OutputRole::Guard { dir, .. } => dir,
+                _ => unreachable!("selected by role"),
+            })
+            .collect();
         {
             let mut broots = step_roots.clone();
             broots.extend(xe.iter().copied());
@@ -160,7 +180,6 @@ impl CompiledDc {
                 Tape::compile(ctx, &event_roots, &input_syms)
             )
         });
-        let event_dirs: Vec<i8> = dae.events.iter().map(|e| e.dir).collect();
         let event_names: Vec<String> = dae.events.iter().map(|e| e.name.clone()).collect();
 
         // The parameter Jacobian dF/dp and the Lagrangian-Hessian are only needed

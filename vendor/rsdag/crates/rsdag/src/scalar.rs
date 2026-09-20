@@ -91,14 +91,20 @@ pub trait Scalar: Copy + Send + Sync + std::fmt::Debug + 'static {
         crate::semantics::solve_many_generic(a, b, n, k, out)
     }
     /// Call a bundle on arguments in `Self`, its outputs back in `Self`.
-    /// The default converts through `f64` buffers; `f64` calls directly.
+    /// A bundle computes in `f64`, so a scalar that is not `f64` converts
+    /// both ways; `f64` itself calls straight through. The conversion
+    /// buffers are borrowed from a thread-local stack and returned, so a
+    /// call in a loop does not allocate.
     fn call_bundle(b: &dyn crate::extern_fn::ExternBundle, args: &[Self], out: &mut [Self]) {
-        let a: Vec<f64> = args.iter().map(|&x| x.to_f64()).collect();
-        let mut o = vec![0.0; out.len()];
-        b.call(&a, &mut o);
-        for (dst, v) in out.iter_mut().zip(o) {
-            *dst = Self::from_f64(v);
-        }
+        with_f64_scratch(args.len(), out.len(), |a, o| {
+            for (dst, &x) in a.iter_mut().zip(args) {
+                *dst = x.to_f64();
+            }
+            b.call(a, o);
+            for (dst, &v) in out.iter_mut().zip(o.iter()) {
+                *dst = Self::from_f64(v);
+            }
+        })
     }
     /// [`call_bundle`](Self::call_bundle) for `n_groups` argument groups.
     fn call_bundle_batch(
@@ -108,13 +114,42 @@ pub trait Scalar: Copy + Send + Sync + std::fmt::Debug + 'static {
         n_args: usize,
         out: &mut [Self],
     ) {
-        let a: Vec<f64> = args.iter().map(|&x| x.to_f64()).collect();
-        let mut o = vec![0.0; out.len()];
-        b.call_batch(&a, n_groups, n_args, &mut o);
-        for (dst, v) in out.iter_mut().zip(o) {
-            *dst = Self::from_f64(v);
-        }
+        with_f64_scratch(args.len(), out.len(), |a, o| {
+            for (dst, &x) in a.iter_mut().zip(args) {
+                *dst = x.to_f64();
+            }
+            b.call_batch(a, n_groups, n_args, o);
+            for (dst, &v) in out.iter_mut().zip(o.iter()) {
+                *dst = Self::from_f64(v);
+            }
+        })
     }
+}
+
+/// Two `f64` buffers of the requested lengths, borrowed from a thread-local
+/// stack (a bundle that calls a bundle nests) and returned afterwards.
+fn with_f64_scratch<R>(
+    n_args: usize,
+    n_out: usize,
+    f: impl FnOnce(&mut [f64], &mut [f64]) -> R,
+) -> R {
+    thread_local! {
+        static STACK: std::cell::RefCell<Vec<(Vec<f64>, Vec<f64>)>> = const {
+            std::cell::RefCell::new(Vec::new())
+        };
+    }
+    let (mut a, mut o) = STACK
+        .with(|s| s.borrow_mut().pop())
+        .unwrap_or_else(|| (Vec::new(), Vec::new()));
+    if a.len() < n_args {
+        a.resize(n_args, 0.0);
+    }
+    if o.len() < n_out {
+        o.resize(n_out, 0.0);
+    }
+    let r = f(&mut a[..n_args], &mut o[..n_out]);
+    STACK.with(|s| s.borrow_mut().push((a, o)));
+    r
 }
 
 impl Scalar for f64 {

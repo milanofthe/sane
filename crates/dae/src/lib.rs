@@ -15,7 +15,7 @@
 use std::collections::{HashMap, HashSet};
 
 use rsdag::determinant;
-use rsdag::{differentiate, sparse_jacobian, ExprId, Graph, Node, SymbolId};
+use rsdag::{differentiate, sparse_jacobian, Crossing, ExprId, Graph, Node, SymbolId};
 use sane_mna::SourceFn;
 
 // Assembly of the symbolic DAE from a parsed circuit.
@@ -80,7 +80,9 @@ pub struct DelaySpec {
 #[derive(Clone, Debug)]
 pub struct EventSpec {
     pub g: ExprId,
-    pub dir: i8,
+    /// Which sign change of `g` is an event (rsdag's role vocabulary; the
+    /// guard is registered with this direction on the DAE function).
+    pub dir: Crossing,
     pub name: String,
 }
 
@@ -152,6 +154,65 @@ pub struct Dae {
 }
 
 impl Dae {
+    /// Register the system as an rsdag function carrying its roles: the
+    /// unknowns as `State`, their derivatives as `StateDot`, time as `Time`,
+    /// every parameter as `Param`, the residuals as `Residual` outputs and
+    /// every switching surface as a `Guard` output with its crossing
+    /// direction.
+    ///
+    /// Nothing calls this function; it is how the system layer states what it
+    /// is, so a consumer (SANE's own solver, an exporter, another backend)
+    /// reads the structure off the graph instead of off SANE-side metadata.
+    pub fn register_function(&self, ctx: &mut Graph, name: &str) -> rsdag::FuncId {
+        // Idempotent: a DAE compiled twice (an AC run after a DC one, a
+        // transform that recompiles) states its signature once.
+        if let Some(f) = (0..ctx.n_funcs())
+            .map(|i| rsdag::FuncId(i as u32))
+            .find(|&f| ctx.func(f).name == name)
+        {
+            return f;
+        }
+        let mut params: Vec<SymbolId> = Vec::with_capacity(self.x.len() * 2 + 1);
+        let mut roles: Vec<rsdag::ParamRole> = Vec::with_capacity(params.capacity());
+        for (i, &s) in self.x.iter().enumerate() {
+            params.push(s);
+            roles.push(rsdag::ParamRole::State { id: i as u32 });
+        }
+        for (i, sd) in self.xdot.iter().enumerate() {
+            if let Some(s) = *sd {
+                params.push(s);
+                roles.push(rsdag::ParamRole::StateDot { id: i as u32 });
+            }
+        }
+        params.push(self.t);
+        roles.push(rsdag::ParamRole::Time);
+        for &s in self.param_defaults.keys() {
+            params.push(s);
+            roles.push(rsdag::ParamRole::Param);
+        }
+
+        let mut outputs: Vec<ExprId> = self.residuals.clone();
+        let mut out_roles: Vec<rsdag::OutputRole> = (0..self.residuals.len())
+            .map(|i| rsdag::OutputRole::Residual { id: i as u32 })
+            .collect();
+        for (i, ev) in self.events.iter().enumerate() {
+            outputs.push(ev.g);
+            out_roles.push(rsdag::OutputRole::Guard {
+                id: i as u32,
+                dir: ev.dir,
+            });
+        }
+
+        let f = ctx.define_func(name, params, outputs);
+        for (i, r) in roles.into_iter().enumerate() {
+            ctx.set_param_role(f, i as u32, r);
+        }
+        for (i, r) in out_roles.into_iter().enumerate() {
+            ctx.set_output_role(f, i as u32, r);
+        }
+        f
+    }
+
     /// Classify every unknown (see [`UnknownKind`]). Derived from the mint
     /// order rather than stored, so transforms that filter `unknowns` stay
     /// consistent for free. A device state that happens to be named `i_...`

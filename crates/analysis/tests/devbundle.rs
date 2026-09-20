@@ -41,7 +41,15 @@ fn instances_call_one_function() {
     let dae = model.dae();
     let ctx = model.context_arc();
     let ctx = ctx.lock().unwrap();
-    assert_eq!(ctx.n_funcs(), 1, "one template function");
+    // The graph also holds the DAE's own signature function (roles, guards),
+    // which nothing calls; what matters here is that the three instances call
+    // one and the same device function.
+    let called: std::collections::BTreeSet<_> = ctx
+        .free_calls_in(&dae.residuals)
+        .into_iter()
+        .map(|o| ctx.output(o).0)
+        .collect();
+    assert_eq!(called.len(), 1, "one template function");
     let calls = ctx.free_calls_in(&dae.residuals);
     assert!(!calls.is_empty(), "residuals call the function");
     let mut arg_lists = std::collections::BTreeSet::new();

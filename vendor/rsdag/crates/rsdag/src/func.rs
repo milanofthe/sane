@@ -114,15 +114,15 @@ impl ExternBundle for InterpretedBody {
     fn n_outputs(&self) -> usize {
         self.n_out
     }
-    fn call(&self, args: &[f64], out: &mut [f64]) {
-        // A pool rather than one buffer: a body that calls a body nests.
-        thread_local! {
-            static POOL: std::cell::RefCell<Vec<(Vec<f64>, Vec<f64>)>> = Default::default();
-        }
-        let (mut work, mut o) = POOL.with(|p| p.borrow_mut().pop()).unwrap_or_default();
-        self.tape.eval(args, &mut work, &mut o);
+    fn work_len(&self) -> usize {
+        // The tape's own slots, then the outputs it writes before they are
+        // narrowed to the bundle's.
+        self.tape.work_len() + self.tape.out_len()
+    }
+    fn call_into(&self, args: &[f64], work: &mut [f64], out: &mut [f64]) {
+        let (w, o) = work.split_at_mut(self.tape.work_len());
+        self.tape.eval_into(args, w, &mut o[..self.tape.out_len()]);
         out.copy_from_slice(&o[..self.n_out]);
-        POOL.with(|p| p.borrow_mut().push((work, o)));
     }
     fn body(&self) -> Option<&crate::tape::Tape> {
         Some(&self.tape)

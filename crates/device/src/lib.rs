@@ -13,7 +13,7 @@
 //! Model parameters are instance-scoped free symbols named
 //! `"{instance}.{param}"` (e.g. `D1.Is`), so numeric values are bound later.
 
-use rsdag::{ExprId, SymbolId};
+use rsdag::{Crossing, ExprId, SymbolId};
 use sane_core::constants::COMPANION_G;
 
 // Shared symbolic building blocks (overflow-safe exponential, smooth switch).
@@ -120,7 +120,8 @@ pub enum UnknownKind {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FragmentEvent {
     pub g: ExprId,
-    pub dir: i8,
+    /// Which sign change of `g` is an event (rsdag's role vocabulary).
+    pub dir: Crossing,
 }
 
 pub struct BehavioralFragment {

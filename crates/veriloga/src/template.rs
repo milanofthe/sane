@@ -27,7 +27,7 @@
 
 use rustc_hash::FxHashMap as HashMap;
 
-use rsdag::{ExprId, FuncId, Graph, SymbolId};
+use rsdag::{Crossing, ExprId, FuncId, Graph, SymbolId};
 use rustc_hash::FxHashMap;
 use sane_device::{
     BehavioralFragment, FragmentEvent, FragmentLimit, LoweredDelay, Lowerer, NoiseSource, OpVar,
@@ -81,7 +81,7 @@ struct VaTemplate {
     /// Transport delays minted alongside the extras (`absdelay`).
     delays: Vec<TemplDelay>,
     /// Switching-surface directions (the surfaces are function outputs).
-    events: Vec<i8>,
+    events: Vec<Crossing>,
     /// Per-terminal value / derivative symbols (`None` = ground or tied-off).
     terminal_syms: Vec<Option<SymbolId>>,
     terminal_vdot_syms: Vec<Option<SymbolId>>,

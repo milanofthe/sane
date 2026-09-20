@@ -324,8 +324,12 @@ mod tests {
         "#;
         let mut ctx = Graph::new();
         let frag = frag_of(&mut ctx, src);
-        let dirs: Vec<i8> = frag.events.iter().map(|e| e.dir).collect();
-        assert_eq!(dirs, vec![1, 1, 0], "one surface per distinct (expr, dir)");
+        let dirs: Vec<Crossing> = frag.events.iter().map(|e| e.dir).collect();
+        assert_eq!(
+            dirs,
+            vec![Crossing::Rising, Crossing::Rising, Crossing::Either],
+            "one surface per distinct (expr, dir)"
+        );
         // the surface is a real expression over the terminal voltages
         let syms = ctx.free_symbols(frag.events[0].g);
         assert!(!syms.is_empty());
@@ -693,7 +697,7 @@ mod tests {
     use super::device::VerilogADevice;
     use super::elaborate::elaborate;
     use num_complex::Complex64;
-    use rsdag::{eval, Graph, Node, SymbolId};
+    use rsdag::{eval, Crossing, Graph, Node, SymbolId};
     use sane_dae::{assemble_dae, Dae, DeviceInstance};
     use sane_mna::Circuit;
     use std::sync::Arc;

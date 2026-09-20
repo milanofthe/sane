@@ -425,11 +425,50 @@ impl Tape {
         self.n_selects
     }
 
+    /// Work slots an evaluation needs: the slots themselves plus the gather
+    /// scratch. A caller that owns its buffers sizes them with this and
+    /// [`out_len`](Self::out_len) once, before the loop that uses them.
+    pub fn work_len(&self) -> usize {
+        self.buffer_len()
+    }
+
+    /// Number of outputs, the length [`eval_into`](Self::eval_into) writes.
+    pub fn out_len(&self) -> usize {
+        self.outputs.len()
+    }
+
+    /// Evaluate into buffers the caller owns: nothing is allocated, nothing
+    /// is returned, and `out` may point anywhere (a factorization's value
+    /// array, a right-hand side, a numpy array). `work` must be at least
+    /// [`work_len`](Self::work_len) long, `out` exactly
+    /// [`out_len`](Self::out_len).
+    pub fn eval_into<T: Scalar>(&self, inputs: &[T], work: &mut [T], out: &mut [T]) {
+        assert!(work.len() >= self.work_len(), "work buffer too short");
+        assert_eq!(out.len(), self.out_len(), "output buffer of the wrong size");
+        self.run_range(inputs, work, 0, self.ops.len(), &mut NoTrace);
+        self.write(inputs, work, out);
+    }
+
+    /// A holder for the buffers, for callers that would rather read values
+    /// than manage memory: allocates once, lends the outputs out per
+    /// evaluation.
+    pub fn runner<T: Scalar>(&self) -> Runner<'_, T> {
+        Runner {
+            tape: self,
+            work: vec![T::zero(); self.work_len()],
+            out: vec![T::zero(); self.out_len()],
+        }
+    }
+
     /// Evaluate the tape in any execution scalar (`f64`, `f32`,
     /// `Complex<f64>`): constants convert from their `f64` lowering, every
     /// op goes through [`Scalar`]'s reference arithmetic for `T`, so a value
     /// cannot depend on which scalar computed it beyond the scalar itself.
     /// `work` is resized and reused; `out` receives one value per output.
+    ///
+    /// The `Vec` form is the convenience over
+    /// [`eval_into`](Self::eval_into); a caller in an inner loop wants that
+    /// one or [`runner`](Self::runner).
     pub fn eval<T: Scalar>(&self, inputs: &[T], work: &mut Vec<T>, out: &mut Vec<T>) {
         self.eval_with(inputs, work, out, &mut NoTrace);
     }
@@ -461,6 +500,13 @@ impl Tape {
         out.extend(self.outputs.iter().map(|&k| read(inputs, work, k)));
     }
 
+    /// [`collect`](Self::collect) into a slice the caller sized.
+    fn write<T: Scalar>(&self, inputs: &[T], work: &[T], out: &mut [T]) {
+        for (dst, &k) in out.iter_mut().zip(self.outputs.iter()) {
+            *dst = read(inputs, work, k);
+        }
+    }
+
     /// Instruction count of the parameter-pure prolog (0 when compiled without
     /// [`compile_split`](Self::compile_split)).
     pub fn prolog_len(&self) -> usize {
@@ -482,12 +528,27 @@ impl Tape {
     /// [`eval_prolog`](Self::eval_prolog) (prolog results are pinned slots, so
     /// repeated main passes may not clear or resize the buffer).
     pub fn eval_main<T: Scalar>(&self, inputs: &[T], work: &mut [T], out: &mut Vec<T>) {
+        out.resize(self.out_len(), T::zero());
+        self.eval_main_into(inputs, work, out);
+    }
+
+    /// [`eval_main`](Self::eval_main) into a slice the caller sized: the form
+    /// a Newton loop uses, one prolog per parameter binding and this per
+    /// iteration, with no allocation in either.
+    pub fn eval_main_into<T: Scalar>(&self, inputs: &[T], work: &mut [T], out: &mut [T]) {
         assert!(
-            work.len() >= self.buffer_len(),
+            work.len() >= self.work_len(),
             "eval_main requires a work buffer prepared by eval_prolog"
         );
+        assert_eq!(out.len(), self.out_len(), "output buffer of the wrong size");
         self.run_range(inputs, work, self.prolog_ops, self.ops.len(), &mut NoTrace);
-        self.collect(inputs, work, out);
+        self.write(inputs, work, out);
+    }
+
+    /// [`eval_prolog`](Self::eval_prolog) over a buffer the caller sized.
+    pub fn eval_prolog_into<T: Scalar>(&self, inputs: &[T], work: &mut [T]) {
+        assert!(work.len() >= self.work_len(), "work buffer too short");
+        self.run_range(inputs, work, 0, self.prolog_ops, &mut NoTrace);
     }
 
     /// Execute ops `lo..hi` over a fully-sized work buffer, feeding each
@@ -739,6 +800,44 @@ impl Tape {
     /// [`SpecializedTape::n_ops`] for the shrink factor).
     pub fn n_ops(&self) -> usize {
         self.ops.len()
+    }
+}
+
+/// A tape with the buffers to run it, for callers that want values rather
+/// than memory management: [`Tape::runner`] allocates once, every
+/// [`eval`](Runner::eval) writes into the same buffers and lends the outputs
+/// out. One runner per thread, since it owns the work buffer.
+pub struct Runner<'t, T: Scalar> {
+    tape: &'t Tape,
+    work: Vec<T>,
+    out: Vec<T>,
+}
+
+impl<T: Scalar> Runner<'_, T> {
+    /// Evaluate at `inputs` and borrow the outputs. No allocation, no copy;
+    /// a `to_vec` on the result is the caller's choice, not the tape's.
+    pub fn eval(&mut self, inputs: &[T]) -> &[T] {
+        self.tape.eval_into(inputs, &mut self.work, &mut self.out);
+        &self.out
+    }
+
+    /// The parameter-pure prolog, once per parameter binding
+    /// ([`Tape::compile_split`]); [`main`](Runner::main) then runs per
+    /// iteration over the same buffer.
+    pub fn prolog(&mut self, inputs: &[T]) {
+        self.tape.eval_prolog_into(inputs, &mut self.work);
+    }
+
+    /// The main phase over the buffer [`prolog`](Runner::prolog) prepared.
+    pub fn main(&mut self, inputs: &[T]) -> &[T] {
+        self.tape
+            .eval_main_into(inputs, &mut self.work, &mut self.out);
+        &self.out
+    }
+
+    /// The outputs of the last evaluation.
+    pub fn outputs(&self) -> &[T] {
+        &self.out
     }
 }
 

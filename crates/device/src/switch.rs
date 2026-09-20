@@ -3,7 +3,7 @@
 //! Verilog-A cannot express, so it lowers directly in Rust through the same
 //! `lower_behavioral` contract as everything else.
 
-use rsdag::{ExprId, Graph};
+use rsdag::{Crossing, ExprId, Graph};
 
 use crate::common::{param, switch_g};
 use crate::{BehavioralFragment, DeviceModel, FragmentEvent, Lowerer};
@@ -51,9 +51,15 @@ impl CSwitch {
         let hi = ctx.add(it, ih);
         let g_lo = ctx.sub(ictrl, lo);
         let g_hi = ctx.sub(ictrl, hi);
-        let mut events = vec![FragmentEvent { g: g_lo, dir: 0 }];
+        let mut events = vec![FragmentEvent {
+            g: g_lo,
+            dir: Crossing::Either,
+        }];
         if g_hi != g_lo {
-            events.push(FragmentEvent { g: g_hi, dir: 0 });
+            events.push(FragmentEvent {
+                g: g_hi,
+                dir: Crossing::Either,
+            });
         }
         (vec![i, neg_i], events)
     }

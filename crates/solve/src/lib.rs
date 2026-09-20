@@ -58,7 +58,7 @@ pub fn reset_hb_synth_calls() -> usize {
     HB_SYNTH_CALLS.swap(0, Ordering::Relaxed)
 }
 
-use rsdag::{Graph, SymbolId, Tape};
+use rsdag::{Crossing, Graph, SymbolId, Tape};
 use sane_dae::Limit;
 use sane_mna::SourceFn;
 
@@ -376,7 +376,7 @@ pub struct CompiledDc {
     /// events of the most recent transient (interior mutability like the
     /// gmin flags: the solve API is `&self`).
     tape_event: Option<Tape>,
-    event_dirs: Vec<i8>,
+    event_dirs: Vec<Crossing>,
     event_names: Vec<String>,
     last_events: std::sync::Mutex<Vec<TransientEvent>>,
     /// Per-param flag: is this the DC value of an independent source (a `V`/`I`

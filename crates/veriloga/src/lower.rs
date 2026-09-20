@@ -16,7 +16,7 @@
 
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
-use rsdag::{differentiate, time_derivative, CmpOp, ExprId, Graph, Node, SymbolId};
+use rsdag::{differentiate, time_derivative, CmpOp, Crossing, ExprId, Graph, Node, SymbolId};
 use sane_core::constants::{MAX_UNROLL, VERILOGA_K_OVER_Q, WHILE_MAX_UNROLL};
 use sane_device::{
     BehavioralFragment, FragmentEvent, FragmentLimit, LimitKind, LoweredDelay, Lowerer,
@@ -733,8 +733,8 @@ impl<'a, 'b> Lower<'a, 'b> {
         line: u32,
     ) -> Result<(), String> {
         let default_dir = match control {
-            "cross" => 0,
-            "above" => 1,
+            "cross" => Crossing::Either,
+            "above" => Crossing::Rising,
             _ => {
                 return Err(format!(
                     "unsupported analog event '@({control} ...)' (module {}, line {}): SANE lowers one \
@@ -763,9 +763,9 @@ impl<'a, 'b> Lower<'a, 'b> {
         let dir = match args.get(1) {
             None => default_dir,
             Some(d) => match self.const_of_expr(d) {
-                Some(c) if c > 0.0 => 1,
-                Some(c) if c < 0.0 => -1,
-                Some(_) => 0,
+                Some(c) if c > 0.0 => Crossing::Rising,
+                Some(c) if c < 0.0 => Crossing::Falling,
+                Some(_) => Crossing::Either,
                 None => {
                     return Err(format!(
                         "'@({control} ...)' direction must be a compile-time constant (module {}, \

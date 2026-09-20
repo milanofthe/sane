@@ -121,3 +121,43 @@ R1 sw 0 100
         );
     }
 }
+
+/// A switch whose control starts exactly on its threshold: the surface
+/// `V(ctrl) - Vt` is zero at t = 0 and rises from there. The hard switch
+/// compares with `>`, so the model flips as soon as the control leaves the
+/// threshold, and the integrator has to land on that instant rather than
+/// step over it. Detection that demands a strict sign change on the old side
+/// misses this (rsdag #113).
+#[test]
+fn a_surface_that_starts_at_zero_still_fires() {
+    let deck = "\
+* control starts on the threshold and rises
+Vc ctrl 0 PWL(0 0 1m 2)
+Vdd vdd 0 5
+S1 vdd out ctrl 0 SW
+R1 out 0 1k
+.model SW SW(Vt=0 Vh=0 Ron=1 Roff=1meg)
+.end
+";
+    let model = Model::from_netlist(deck).expect("model");
+    let out = model.resolve("out").expect("out");
+    let (t, rows) = tran(&model, 1e-3, 51);
+    let events = model.transient_events();
+    assert_eq!(events.len(), 1, "the surface is left at t = 0: {events:?}");
+    let (name, te, dir) = &events[0];
+    assert_eq!(name, "S1#0");
+    assert_eq!(*dir, 1, "the control rises away from the threshold");
+    // The crossing is at t = 0, where a landing would be a zero step, so the
+    // integrator reports it at the end of its first step. That is still well
+    // before the first output point (20 us).
+    assert!(*te < 2e-5, "event at {te:.3e}, expected the first step");
+    // Everything after the event is the closed switch.
+    let v_on = 5.0 * 1e3 / (1e3 + 1.0);
+    for (tk, row) in t.iter().zip(&rows).skip(1) {
+        assert!(
+            (row[out] - v_on).abs() < 1e-3 * v_on,
+            "t={tk:.3e}: out={} expected {v_on}",
+            row[out]
+        );
+    }
+}

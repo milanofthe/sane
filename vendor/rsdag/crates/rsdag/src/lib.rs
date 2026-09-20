@@ -46,7 +46,7 @@ pub use node::{
     ArgList, BinOp, CmpOp, ConstId, ExprId, Node, Operands, ReduceOp, SymbolId, UnaryOp,
 };
 pub use nonlinearity::{nonlinearity, nonlinearity_of, Degree, Nonlinearity};
-pub use role::{OutputRole, ParamRole};
+pub use role::{Crossing, OutputRole, ParamRole};
 pub use scalar::Scalar;
 pub use scope::Scope;
 pub use semantics::{

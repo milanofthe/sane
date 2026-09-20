@@ -35,7 +35,7 @@
 //! actually crosses is not located again, and a grazing approach that turns
 //! back re-arms cleanly.
 
-use rsdag::Tape;
+use rsdag::{Crossing, Tape};
 use sane_core::constants::*;
 
 use crate::transient::{hermite_point, linear_point, solve_mass};
@@ -201,15 +201,11 @@ impl<'a> Discontinuities<'a> {
 }
 
 /// Did `g` cross zero from `g0` to `g1` in direction `dir` (`0`: either way)?
-fn crossed(dir: i8, g0: f64, g1: f64) -> bool {
-    (g0 < 0.0 && g1 >= 0.0 && dir >= 0) || (g0 > 0.0 && g1 <= 0.0 && dir <= 0)
-}
-
 /// The switching surfaces of one integration: detection, location, arming.
 pub(crate) struct EventTracker<'a> {
     cdc: &'a CompiledDc,
     tape: &'a Tape,
-    dirs: &'a [i8],
+    dirs: &'a [Crossing],
     inputs: Vec<f64>,
     work: Vec<f64>,
     out: Vec<f64>,
@@ -225,8 +221,11 @@ pub(crate) struct EventTracker<'a> {
     armed: Vec<bool>,
     /// Sign of `g_k` when its event fired (the re-arm rule reads it).
     fire_sign: Vec<f64>,
-    /// Surfaces whose located time the current candidate step ends at.
-    landing: Vec<usize>,
+    /// Surfaces whose located time the current candidate step ends at, with
+    /// the direction the candidate step crossed them in: at the landing the
+    /// surface value is on the near side, too close to zero to read the
+    /// direction off again.
+    landing: Vec<(usize, i8)>,
     /// Per-surface located crossing time of the last `locate` (scratch).
     roots: Vec<f64>,
     pub fired: Vec<TransientEvent>,
@@ -236,7 +235,7 @@ impl<'a> EventTracker<'a> {
     pub fn new(
         cdc: &'a CompiledDc,
         tape: &'a Tape,
-        dirs: &'a [i8],
+        dirs: &'a [Crossing],
         x0: &[f64],
         p: &[f64],
         t0: f64,
@@ -290,7 +289,7 @@ impl<'a> EventTracker<'a> {
         self.g_new.clear();
         self.g_new.extend_from_slice(&self.out);
         let flagged: Vec<usize> = (0..self.dirs.len())
-            .filter(|&k| self.armed[k] && crossed(self.dirs[k], self.g_prev[k], self.g_new[k]))
+            .filter(|&k| self.armed[k] && self.dirs[k].crosses(self.g_prev[k], self.g_new[k]))
             .collect();
         if flagged.is_empty() {
             return None;
@@ -348,7 +347,15 @@ impl<'a> EventTracker<'a> {
             flagged
                 .iter()
                 .copied()
-                .filter(|&k| self.roots[k] <= best + tol),
+                .filter(|&k| self.roots[k] <= best + tol)
+                .map(|k| {
+                    let dir = if Crossing::Rising.crosses(self.g_prev[k], self.g_new[k]) {
+                        1
+                    } else {
+                        -1
+                    };
+                    (k, dir)
+                }),
         );
         Some(best)
     }
@@ -363,18 +370,19 @@ impl<'a> EventTracker<'a> {
             let (g0, g1) = (self.g_prev[k], self.out[k]);
             self.scale[k] = self.scale[k].max(g1.abs());
             if self.armed[k] {
-                let on_surface = landed && self.landing.contains(&k);
-                if on_surface || crossed(self.dirs[k], g0, g1) {
-                    let direction = if on_surface {
-                        if g0 < 0.0 {
-                            1
-                        } else {
-                            -1
-                        }
-                    } else if g1 > 0.0 {
-                        1
-                    } else {
-                        -1
+                let landed_on = landed
+                    .then(|| self.landing.iter().find(|&&(i, _)| i == k))
+                    .flatten()
+                    .copied();
+                let on_surface = landed_on.is_some();
+                if on_surface || self.dirs[k].crosses(g0, g1) {
+                    let direction = match landed_on {
+                        // The direction the candidate step crossed in, kept
+                        // from the detection: at the landing itself the value
+                        // is on the near side and says nothing.
+                        Some((_, dir)) => dir,
+                        None if Crossing::Rising.crosses(g0, g1) => 1,
+                        None => -1,
                     };
                     self.fired.push(TransientEvent {
                         t,
@@ -396,20 +404,5 @@ impl<'a> EventTracker<'a> {
         }
         self.landing.clear();
         any
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::crossed;
-
-    #[test]
-    fn crossing_respects_direction() {
-        assert!(crossed(0, -1.0, 1.0) && crossed(0, 1.0, -1.0));
-        assert!(crossed(1, -1.0, 1.0) && !crossed(1, 1.0, -1.0));
-        assert!(crossed(-1, 1.0, -1.0) && !crossed(-1, -1.0, 1.0));
-        // sitting on the surface is not a crossing
-        assert!(!crossed(0, 0.0, 1.0) && !crossed(0, 0.0, -1.0));
-        assert!(!crossed(0, 1.0, 1.0) && !crossed(0, -1.0, -1.0));
     }
 }

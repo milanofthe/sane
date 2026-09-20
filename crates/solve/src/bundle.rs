@@ -118,7 +118,10 @@ impl ExternBundle for TapeBundle {
         self.n_out
     }
 
-    fn call(&self, args: &[f64], out: &mut [f64]) {
+    /// No caller-owned scratch: what this bundle keeps between calls is the
+    /// prolog state per instance, which has to outlive a single call, so it
+    /// stays in the thread-local below.
+    fn call_into(&self, args: &[f64], _work: &mut [f64], out: &mut [f64]) {
         STATES.with(|s| {
             let mut map = s.borrow_mut();
             let st = map.entry(self.uid).or_default();

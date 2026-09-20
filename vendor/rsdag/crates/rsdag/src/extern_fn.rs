@@ -26,7 +26,38 @@ pub trait ExternBundle: Send + Sync {
     /// Evaluate all outputs from the arguments. `out` has length
     /// [`n_outputs`](Self::n_outputs); `args` holds one value per boundary
     /// input, in input order.
-    fn call(&self, args: &[f64], out: &mut [f64]);
+    ///
+    /// The default routes through [`call_into`](Self::call_into) with a
+    /// thread-local buffer, for callers that have none of their own; a
+    /// caller in an inner loop holds one buffer per bundle and calls
+    /// `call_into` directly.
+    fn call(&self, args: &[f64], out: &mut [f64]) {
+        thread_local! {
+            static SCRATCH: std::cell::RefCell<Vec<Vec<f64>>> = const {
+                std::cell::RefCell::new(Vec::new())
+            };
+        }
+        // A stack rather than one buffer: a body that calls a body nests.
+        let mut work = SCRATCH
+            .with(|s| s.borrow_mut().pop())
+            .unwrap_or_else(|| vec![0.0; self.work_len()]);
+        if work.len() < self.work_len() {
+            work.resize(self.work_len(), 0.0);
+        }
+        self.call_into(args, &mut work, out);
+        SCRATCH.with(|s| s.borrow_mut().push(work));
+    }
+
+    /// Scratch values [`call_into`](Self::call_into) needs; `0` for a bundle
+    /// that keeps none (an opaque body with its own state, a native one).
+    fn work_len(&self) -> usize {
+        0
+    }
+
+    /// [`call`](Self::call) over a work buffer the caller owns: the form a
+    /// solver drives per instance per iteration, with nothing allocated and
+    /// nothing hidden in a thread-local.
+    fn call_into(&self, args: &[f64], work: &mut [f64], out: &mut [f64]);
 
     /// Evaluate `n_groups` independent argument groups at once (instance
     /// batching): `args` is group-major (`n_groups * n_args`), `out` likewise

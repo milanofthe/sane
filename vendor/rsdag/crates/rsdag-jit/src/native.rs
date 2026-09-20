@@ -91,6 +91,19 @@ impl NativeBody {
         groups: std::ops::Range<usize>,
     ) {
         work.resize(self.tape.layout.total, 0.0);
+        self.run_groups_into(work, args, n_args, out, groups);
+    }
+
+    /// [`run_groups`](Self::run_groups) over a buffer the caller sized to
+    /// [`work_len`](ExternBundle::work_len).
+    fn run_groups_into(
+        &self,
+        work: &mut [f64],
+        args: &[f64],
+        n_args: usize,
+        out: &mut [f64],
+        groups: std::ops::Range<usize>,
+    ) {
         let n_out = self.n_out;
         for g in groups {
             let ins = &args[g * n_args..(g + 1) * n_args];
@@ -109,14 +122,11 @@ impl ExternBundle for NativeBody {
     fn n_outputs(&self) -> usize {
         self.n_out
     }
-    fn call(&self, args: &[f64], out: &mut [f64]) {
-        // A pool rather than one buffer: a body that calls a body nests.
-        thread_local! {
-            static POOL: std::cell::RefCell<Vec<Vec<f64>>> = Default::default();
-        }
-        let mut work = POOL.with(|p| p.borrow_mut().pop()).unwrap_or_default();
-        self.run_groups(&mut work, args, args.len(), out, 0..1);
-        POOL.with(|p| p.borrow_mut().push(work));
+    fn work_len(&self) -> usize {
+        self.tape.layout.total
+    }
+    fn call_into(&self, args: &[f64], work: &mut [f64], out: &mut [f64]) {
+        self.run_groups_into(work, args, args.len(), out, 0..1);
     }
     fn call_batch(&self, args: &[f64], n_groups: usize, n_args: usize, out: &mut [f64]) {
         if n_groups * self.tape.n_ops < PAR_MIN_OPS || n_groups < 2 {

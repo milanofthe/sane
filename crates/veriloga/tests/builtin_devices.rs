@@ -3,8 +3,9 @@
 //! breakdown, polarity folding, switch conductance, BJT KCL and Early effect.
 
 use num_complex::Complex64;
-use rsdag::{eval, ExprId, Graph, Node, SymbolId};
+use rsdag::{eval, ExprId, Node, SymbolId};
 use sane_core::constants::{K_OVER_Q, TEMP_NOMINAL_K, TEMP_SYMBOL};
+use sane_core::Graph;
 use sane_device::{DeviceModel, Lowerer};
 use sane_veriloga::builtin_device;
 use std::collections::HashMap;

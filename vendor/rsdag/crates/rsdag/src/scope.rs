@@ -24,16 +24,14 @@
 
 use std::ops::{Deref, DerefMut};
 
-use num_rational::BigRational;
-
-use crate::field::Field;
+use crate::field::{Field, F64};
 use crate::func::FuncId;
 use crate::graph::Graph;
 use crate::node::{ExprId, Node, SymbolId};
 use crate::role::{OutputRole, ParamRole};
 
 /// An open function over a graph. See the module docs.
-pub struct Scope<'g, K: Field = BigRational> {
+pub struct Scope<'g, K: Field = F64> {
     graph: &'g mut Graph<K>,
     name: String,
     params: Vec<SymbolId>,

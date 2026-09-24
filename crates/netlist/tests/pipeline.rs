@@ -6,7 +6,8 @@
 use std::collections::HashMap;
 
 use num_complex::Complex64;
-use rsdag::{eval, Graph, Node, SymbolId};
+use rsdag::{eval, Node, SymbolId};
+use sane_core::Graph;
 use sane_dae::{assemble_dae, small_signal_transfer};
 use sane_netlist::parse;
 

@@ -9,8 +9,8 @@
 
 use std::time::Instant;
 
-use rsdag::Graph;
 use sane_core::constants::DC_OP_MAXIT;
+use sane_core::Graph;
 use sane_dae::assemble_dae;
 use sane_netlist::parse;
 use sane_solve::{CompiledDc, Convergence, SolverTricks};

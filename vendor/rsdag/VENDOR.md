@@ -4,7 +4,7 @@ Vendored copy of rsdag, the expression graph, differentiation, tape and
 native backend that `sane-core` re-exports (see `crates/core/src/lib.rs`).
 
 - Upstream: https://github.com/milanofthe/rsdag
-- Vendored from: commit `202c50c`
+- Vendored from: commit `f889b33`
 - Contents: `crates/rsdag/src`, `crates/rsdag-jit/src`, their `Cargo.toml`,
   the workspace manifest (without the Python member), `LICENSE` and `NOTICE`.
   Tests, examples, benchmarks, the Python crate and the CI scripts stay

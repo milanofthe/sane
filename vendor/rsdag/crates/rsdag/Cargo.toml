@@ -8,31 +8,46 @@ repository.workspace = true
 description = "Rust symbolic graph backend: hash-consed expression graph, differentiation, tape"
 
 [features]
+# The core (graph, differentiation, tape, roles, modules) depends on
+# `rustc-hash` and `libm` alone and computes in `f64`. Everything else is
+# opt-in, so a consumer that builds and evaluates pays for nothing more.
+default = []
+
+# Exact rational constants: `Graph<BigRational>`, where folding never rounds
+# (symbolic analysis, closed forms, exact small-signal models).
+exact = ["dep:num-bigint", "dep:num-rational", "dep:num-traits"]
+
+# Equality saturation over exact graphs (`simplify_egraph`), on `egg`.
+# Native only: egg reads a clock, which a plain wasm32 module has not.
+egraph = ["exact", "dep:egg"]
+
+# Evaluation in `Complex64` (frequency-domain analyses).
+complex = ["dep:num-complex"]
+
 # The synthetic program generator (`rsdag::synth`). Off by default: it is
 # there for the parity fuzzers and the benchmarks of this workspace and for
 # consumers that want to fuzz their own pipelines, not for production paths.
 synth = []
 
 # Serialization of a module (`Module`, `rsdag::module`): the interchange
-# format for caching analyses, code generation and FMI export. Off by
-# default so a consumer that only builds and evaluates pays nothing.
-serde = ["dep:serde", "num-rational/serde", "num-bigint/serde"]
+# format for caching analyses, code generation and FMI export.
+serde = ["dep:serde", "num-rational?/serde", "num-bigint?/serde"]
 
 [dependencies]
-serde = { version = "1", features = ["derive"], optional = true }
-num-bigint.workspace = true
-num-rational.workspace = true
-num-traits.workspace = true
-num-complex.workspace = true
 rustc-hash.workspace = true
 libm.workspace = true
-egg.workspace = true
+serde = { version = "1", features = ["derive"], optional = true }
+num-bigint = { workspace = true, optional = true }
+num-rational = { workspace = true, optional = true }
+num-traits = { workspace = true, optional = true }
+num-complex = { workspace = true, optional = true }
+egg = { workspace = true, optional = true }
 
 [dev-dependencies]
 # The crate's own integration tests and the benchmarks draw synthetic
 # programs; a dev-dependency on self is how a test gets an optional feature
 # of its own crate.
-rsdag = { path = ".", features = ["synth", "serde"] }
+rsdag = { path = ".", features = ["synth", "serde", "exact", "complex"] }
 # The integration tests link against the crate, not against its
 # dependencies, so the few they name themselves are listed again here.
 num-complex.workspace = true
@@ -43,3 +58,7 @@ serde_json = "1"
 
 [lints]
 workspace = true
+
+# The e-graph tests, where the feature builds (not wasm32, see `egraph`).
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+rsdag = { path = ".", features = ["egraph"] }

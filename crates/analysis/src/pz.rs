@@ -241,9 +241,11 @@ use crate::symbolic_poly::{poly_in_s, prune_poly};
 #[cfg(test)]
 use crate::{op_env, parse_ic, resolve_out_idx, IcTarget, Model};
 #[cfg(test)]
-use rsdag::{Graph, Node};
+use rsdag::Node;
 #[cfg(test)]
 use sane_core::constants::{DC_OP_MAXIT, DC_OP_TOL};
+#[cfg(test)]
+use sane_core::Graph;
 #[cfg(test)]
 use sane_dae::assemble_dae;
 #[cfg(test)]

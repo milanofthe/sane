@@ -5,7 +5,8 @@
 
 use std::collections::HashMap;
 
-use rsdag::{differentiate, ExprId, Graph, ReduceOp, SymbolId};
+use rsdag::{differentiate, ExprId, ReduceOp, SymbolId};
+use sane_core::Graph;
 
 use crate::{coo, stamp, sym2, Dae, UnknownKind};
 

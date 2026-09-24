@@ -18,7 +18,7 @@
 //! let e = g.sin(x);
 //! let f = g.close("f", vec![e]);
 //! let module = g.to_module();          // plain data, `serde`-serializable
-//! let (mut back, map) = Graph::from_module(&module);
+//! let (mut back, map) = Graph::from_module(&module).unwrap();
 //! assert_eq!(map.funcs[f.0 as usize], f);
 //! # let _ = &mut back;
 //! ```
@@ -75,6 +75,152 @@ pub struct Module<K> {
 /// because an older reader fails on the unknown discriminant anyway.
 pub const MODULE_VERSION: u32 = 1;
 
+/// Why a module cannot be loaded. A module is data from outside (a file, a
+/// cache, another process), so the loader checks it whole before it builds
+/// anything, and reports rather than panics.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ModuleError {
+    /// Written by a build with another [`MODULE_VERSION`].
+    Version { found: u32, expected: u32 },
+    /// Node `node` names something that is not there, or names a node that
+    /// does not precede it.
+    Dangling { node: usize, what: &'static str },
+    /// Node `node` has an operand list of a length its kind cannot have.
+    Shape { node: usize, what: &'static str },
+    /// Function `func` names a symbol, node or role slot that is not there.
+    Function { func: usize, what: &'static str },
+    /// No body was supplied for the extern function of this name.
+    MissingExtern(String),
+}
+
+impl std::fmt::Display for ModuleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ModuleError::Version { found, expected } => write!(
+                f,
+                "module format version {found} cannot be read by this build (expects {expected})"
+            ),
+            ModuleError::Dangling { node, what } => write!(f, "node {node}: dangling {what}"),
+            ModuleError::Shape { node, what } => write!(f, "node {node}: {what}"),
+            ModuleError::Function { func, what } => write!(f, "function {func}: {what}"),
+            ModuleError::MissingExtern(name) => {
+                write!(f, "no body supplied for the extern function '{name}'")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ModuleError {}
+
+impl<K> Module<K> {
+    /// Check that every id the module holds names something that is there
+    /// and, for a node's operands, precedes it; and that every operand list
+    /// has a length its node can have. A module that passes loads without
+    /// a panic.
+    pub fn validate(&self) -> Result<(), ModuleError> {
+        if self.version != MODULE_VERSION {
+            return Err(ModuleError::Version {
+                found: self.version,
+                expected: MODULE_VERSION,
+            });
+        }
+        let n_nodes = self.nodes.len();
+        for (fi, f) in self.funcs.iter().enumerate() {
+            let bad = |what| Err(ModuleError::Function { func: fi, what });
+            if f.params.iter().any(|s| s.0 as usize >= self.symbols.len()) {
+                return bad("parameter symbol out of range");
+            }
+            let dangling = f.outputs.iter().any(|o| match *o {
+                Output::Expr(e) => e.0 as usize >= n_nodes,
+                _ => false,
+            });
+            if dangling {
+                return bad("output node out of range");
+            }
+            if f.param_roles.len() > f.params.len() || f.output_roles.len() > f.outputs.len() {
+                return bad("more roles than slots");
+            }
+        }
+        for &(f, k) in &self.call_outputs {
+            match self.funcs.get(f.0 as usize) {
+                Some(data) if (k as usize) < data.outputs.len() => {}
+                _ => {
+                    return Err(ModuleError::Function {
+                        func: f.0 as usize,
+                        what: "a call names an output that is not there",
+                    })
+                }
+            }
+        }
+        for (i, node) in self.nodes.iter().enumerate() {
+            let dangling = |what| Err(ModuleError::Dangling { node: i, what });
+            let shape = |what| Err(ModuleError::Shape { node: i, what });
+            let before = |e: &ExprId| (e.0 as usize) < i;
+            let list = |l: &crate::node::ArgList| {
+                let (a, n) = (l.start as usize, l.len as usize);
+                self.arg_pool.get(a..a + n)
+            };
+            match *node {
+                Node::Const(c) if c.0 as usize >= self.consts.len() => return dangling("constant"),
+                Node::Symbol(s) if s.0 as usize >= self.symbols.len() => return dangling("symbol"),
+                Node::Const(_) | Node::Symbol(_) => {}
+                Node::Add(a, b) | Node::Mul(a, b) | Node::Cmp(_, a, b) | Node::Binary(_, a, b) => {
+                    if !before(&a) || !before(&b) {
+                        return dangling("operand");
+                    }
+                }
+                Node::Neg(a) | Node::Pow(a, _) | Node::Unary(_, a) => {
+                    if !before(&a) {
+                        return dangling("operand");
+                    }
+                }
+                Node::Select(c, t, e) => {
+                    if !before(&c) || !before(&t) || !before(&e) {
+                        return dangling("operand");
+                    }
+                }
+                Node::Reduce(_, l) | Node::Dot(l) | Node::Solve(l, _) | Node::Call(_, l) => {
+                    let Some(args) = list(&l) else {
+                        return dangling("operand list");
+                    };
+                    if !args.iter().all(before) {
+                        return dangling("operand");
+                    }
+                    let n = args.len();
+                    match *node {
+                        Node::Dot(_) if n % 2 != 0 => return shape("dot of uneven halves"),
+                        Node::Solve(_, k) => {
+                            // `n*n + n` values for some `n`, component below `n`.
+                            let m = ((((4 * n + 1) as f64).sqrt() - 1.0) / 2.0).round() as usize;
+                            if m == 0 || m * m + m != n || k as usize >= m {
+                                return shape("solve list of no square system");
+                            }
+                        }
+                        Node::Call(o, _) => {
+                            let Some(&(f, _)) = self.call_outputs.get(o.0 as usize) else {
+                                return dangling("call output");
+                            };
+                            let data = &self.funcs[f.0 as usize];
+                            if data.params.len() != n {
+                                return shape("call with another argument count than its function");
+                            }
+                            let late = data.outputs.iter().any(|o| match o {
+                                Output::Expr(e) => !before(e),
+                                _ => false,
+                            });
+                            if late {
+                                return dangling("callee output after its call");
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// How the ids of a loaded module map onto the graph it was loaded into.
 /// Loading into an empty graph is the identity, but loading into a graph
 /// that already holds nodes is not, so the caller gets the mapping rather
@@ -127,25 +273,27 @@ impl<K: Field> Graph<K> {
     /// (rather than copying the arena) means a module loaded into a graph
     /// that already holds equal subexpressions shares them, exactly as if it
     /// had been built there.
-    pub fn from_module(module: &Module<K>) -> (Graph<K>, IdMap) {
+    pub fn from_module(module: &Module<K>) -> Result<(Graph<K>, IdMap), ModuleError> {
         let mut g = Graph::new();
-        let map = g.load_module(module);
-        (g, map)
+        let map = g.load_module(module)?;
+        Ok((g, map))
     }
 
     /// Load a module into this graph, returning how its ids map onto it.
     ///
-    /// Panics if the module has an extern function: the body is not part of
-    /// a module, so a module with externs is loaded through
-    /// [`Graph::load_module_with`], which is handed the bodies by name.
-    pub fn load_module(&mut self, module: &Module<K>) -> IdMap {
-        self.load_module_with(module, |name| {
-            panic!("module has an extern function '{name}'; load it with `load_module_with`")
-        })
+    /// A module with an extern function fails with
+    /// [`ModuleError::MissingExtern`]: the body is not part of a module, so
+    /// such a module is loaded through [`Graph::load_module_with`], which
+    /// is handed the bodies by name.
+    pub fn load_module(&mut self, module: &Module<K>) -> Result<IdMap, ModuleError> {
+        self.load_module_with(module, |_| None)
     }
 
     /// As [`Graph::load_module`], with `externs(name)` supplying the body of
-    /// each extern function the module declares.
+    /// each extern function the module declares (`None` when there is none).
+    ///
+    /// The module is [validated](Module::validate) first; nothing is added
+    /// to the graph when it fails.
     ///
     /// Nodes are re-interned in id order, which is a dependency order, so a
     /// node's operands are already mapped when it is built. A symbol is
@@ -162,13 +310,20 @@ impl<K: Field> Graph<K> {
     pub fn load_module_with(
         &mut self,
         module: &Module<K>,
-        mut externs: impl FnMut(&str) -> Arc<dyn ExternBundle>,
-    ) -> IdMap {
-        assert_eq!(
-            module.version, MODULE_VERSION,
-            "module format version {} cannot be read by this build (expects {MODULE_VERSION})",
-            module.version
-        );
+        mut externs: impl FnMut(&str) -> Option<Arc<dyn ExternBundle>>,
+    ) -> Result<IdMap, ModuleError> {
+        module.validate()?;
+        // Every extern body up front, so a missing one fails before the
+        // graph changes.
+        let mut bodies: Vec<Option<Arc<dyn ExternBundle>>> = Vec::with_capacity(module.funcs.len());
+        for data in &module.funcs {
+            bodies.push(match &data.extern_body {
+                Some(name) => {
+                    Some(externs(name).ok_or_else(|| ModuleError::MissingExtern(name.clone()))?)
+                }
+                None => None,
+            });
+        }
         let mut map = LoadMap {
             exprs: Vec::with_capacity(module.nodes.len()),
             // A symbol is created when its node is met in the sweep, not up
@@ -197,7 +352,7 @@ impl<K: Field> Graph<K> {
                 }
                 Node::Call(o, _) => {
                     let (f, _) = out_map[o];
-                    self.define_loaded(module, f, &mut map, &mut externs);
+                    self.define_loaded(module, f, &mut map, &bodies);
                 }
                 _ => {}
             }
@@ -228,9 +383,9 @@ impl<K: Field> Graph<K> {
             map.exprs.push(e);
         }
         for f in 0..module.funcs.len() {
-            self.define_loaded(module, FuncId(f as u32), &mut map, &mut externs);
+            self.define_loaded(module, FuncId(f as u32), &mut map, &bodies);
         }
-        IdMap {
+        Ok(IdMap {
             exprs: map.exprs,
             symbols: map.symbols,
             funcs: map
@@ -238,7 +393,7 @@ impl<K: Field> Graph<K> {
                 .into_iter()
                 .map(|f| f.expect("every function defined"))
                 .collect(),
-        }
+        })
     }
 
     /// Define function `f` of a module being loaded, once.
@@ -247,7 +402,7 @@ impl<K: Field> Graph<K> {
         module: &Module<K>,
         f: FuncId,
         map: &mut LoadMap,
-        externs: &mut impl FnMut(&str) -> Arc<dyn ExternBundle>,
+        bodies: &[Option<Arc<dyn ExternBundle>>],
     ) {
         if map.funcs[f.0 as usize].is_some() {
             return;
@@ -266,9 +421,9 @@ impl<K: Field> Graph<K> {
                 other => other,
             })
             .collect();
-        let id = match &data.extern_body {
-            Some(name) => {
-                self.define_extern_func_with_params(&data.name, params, externs(name), outputs)
+        let id = match &bodies[f.0 as usize] {
+            Some(body) => {
+                self.define_extern_func_with_params(&data.name, params, body.clone(), outputs)
             }
             None => {
                 let exprs: Vec<ExprId> = outputs

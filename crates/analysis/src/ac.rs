@@ -5,9 +5,10 @@ use crate::linalg::{lu_factor_complex, lu_solve_complex};
 use crate::{input_vector, op_env};
 use num_complex::Complex64;
 use rayon::prelude::*;
-use rsdag::{differentiate, Graph, Node};
+use rsdag::{differentiate, Node};
 use sane_core::constants::{DC_OP_MAXIT, DC_OP_TOL};
 use sane_core::log_stage;
+use sane_core::Graph;
 use sane_solve::CompiledDc;
 use std::f64::consts::PI;
 

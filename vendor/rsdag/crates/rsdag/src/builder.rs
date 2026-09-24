@@ -336,10 +336,13 @@ impl<K: Field> Builder for Graph<K> {
         let rows = sparse_rows(self, a);
         let n = b.len();
         let nnz: usize = rows.iter().map(Vec::len).sum();
-        if nnz == n * n {
-            return Graph::solve_dense(self, a.iter().flatten().copied().collect(), b.to_vec());
+        // A structurally singular system has no static LU; it goes to the
+        // dense kernel too, which is exactly what the numeric builder runs
+        // on it, so both paths still agree to the bit.
+        let plan = (nnz < n * n).then(|| plan(&pattern_of(&rows))).flatten();
+        match plan {
+            Some(plan) => solve_planned(self, &rows, &plan, b).x,
+            None => Graph::solve_dense(self, a.iter().flatten().copied().collect(), b.to_vec()),
         }
-        let plan = plan(&pattern_of(&rows)).expect("a structurally nonsingular system");
-        solve_planned(self, &rows, &plan, b).x
     }
 }

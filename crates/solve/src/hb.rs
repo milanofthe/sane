@@ -555,11 +555,11 @@ impl<'a> CompiledHb<'a> {
                                 vec![0.0f64; n],
                                 vec![Vec::<f64>::new(); L],
                                 Vec::<[f64; L]>::new(),
-                                (Vec::<f64>::new(), Vec::<f64>::new()),
+                                (Vec::<f64>::new(), Vec::<f64>::new(), Vec::<f64>::new()),
                                 Vec::<[f64; L]>::new(),
                             )
                         },
-                        |(xv, xdv, inbs, soa, (fb, wb), ob), c| {
+                        |(xv, xdv, inbs, soa, (fb, wb, rb), ob), c| {
                             let base = c * L;
                             let lanes = L.min(m - base);
                             self.fill_soa::<L>(
@@ -567,14 +567,14 @@ impl<'a> CompiledHb<'a> {
                             );
                             let mut v = vec![0.0f64; width * lanes];
                             // Step tape: residual ++ jx values in one evaluation.
-                            self.cdc.tape_step.eval_batch::<L>(soa, fb, wb, ob);
+                            self.cdc.tape_step.eval_lanes::<L>(soa, fb, wb, rb, ob);
                             for o in 0..n + nzx {
                                 let src = if o < n { ob[o] } else { ob[cn + (o - n)] };
                                 for lane in 0..lanes {
                                     v[o * lanes + lane] = src[lane];
                                 }
                             }
-                            self.cdc.tape_jxd.eval_batch::<L>(soa, fb, wb, ob);
+                            self.cdc.tape_jxd.eval_lanes::<L>(soa, fb, wb, rb, ob);
                             for nz in 0..nzd {
                                 for lane in 0..lanes {
                                     v[(n + nzx + nz) * lanes + lane] = ob[nz][lane];

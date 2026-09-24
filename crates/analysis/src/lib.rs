@@ -26,7 +26,8 @@
 //!
 //! UI-free throughout: the analysis stack is a plain Rust library.
 
-use rsdag::{differentiate, Graph, Node, SymbolId};
+use rsdag::{differentiate, Node, SymbolId};
+use sane_core::Graph;
 use sane_core::{log, log_stage};
 use sane_dae::assemble_dae;
 

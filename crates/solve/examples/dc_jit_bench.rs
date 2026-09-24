@@ -5,7 +5,7 @@
 //!
 //!   cargo run -q --release --example dc_jit_bench -- <deck.cir>
 
-use rsdag::Graph;
+use sane_core::Graph;
 use sane_dae::assemble_dae;
 use sane_solve::CompiledDc;
 use std::time::Instant;

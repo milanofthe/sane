@@ -6,8 +6,9 @@ use std::collections::HashMap;
 use std::f64::consts::PI;
 
 use num_complex::Complex64;
-use rsdag::{differentiate, eval, ExprId, Graph, Node, SymbolId};
+use rsdag::{differentiate, eval, ExprId, Node, SymbolId};
 use sane_core::log;
+use sane_core::Graph;
 use sane_dae::{ac_param_derivatives, small_signal_transfer, Dae as CoreDae};
 use sane_solve::CompiledDc;
 

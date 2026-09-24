@@ -21,7 +21,8 @@
 
 use rustc_hash::FxHashMap;
 
-use rsdag::{differentiate, ExprId, Graph, SymbolId};
+use rsdag::{differentiate, ExprId, SymbolId};
+use sane_core::Graph;
 
 use crate::stamp::Stamp;
 use crate::Dae;

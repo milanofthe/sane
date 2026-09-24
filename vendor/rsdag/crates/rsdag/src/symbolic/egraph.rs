@@ -168,10 +168,14 @@ pub fn simplify_egraph(g: &mut Graph<BigRational>, root: ExprId) -> ExprId {
         return root;
     }
     let expr = to_egg(g, root);
+    // Bounded by iterations and e-graph size only: a wall-clock limit (egg
+    // defaults to five seconds) would make the result depend on the
+    // machine and its load.
     let runner = Runner::default()
         .with_expr(&expr)
         .with_iter_limit(40)
         .with_node_limit(100_000)
+        .with_time_limit(std::time::Duration::MAX)
         .run(&rules());
     let extractor = Extractor::new(&runner.egraph, AstSize);
     let (_cost, best) = extractor.find_best(runner.roots[0]);

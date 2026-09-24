@@ -6,7 +6,8 @@ use std::collections::{HashMap, HashSet};
 
 use rustc_hash::FxHashMap;
 
-use rsdag::{differentiate, ExprId, Graph, Node, ReduceOp, SymbolId};
+use rsdag::{differentiate, ExprId, Node, ReduceOp, SymbolId};
+use sane_core::Graph;
 
 use crate::{stamp, Dae, UnknownKind};
 

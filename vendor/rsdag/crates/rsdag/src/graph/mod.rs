@@ -2,9 +2,7 @@ use std::sync::Arc;
 
 use rustc_hash::{FxHashMap as HashMap, FxHashSet};
 
-use num_rational::BigRational;
-
-use crate::field::Field;
+use crate::field::{Field, F64};
 
 use crate::extern_fn::ExternBundle;
 use crate::func::{FuncId, Function, FunctionBody, Output, OutputId};
@@ -27,8 +25,11 @@ use crate::semantics::{binary_f64, unary_f64};
 /// is interned by hashing 16 bytes; a constant is hashed once when it is first
 /// seen; an operand list is interned by content so equal lists share one
 /// window (which is what makes `Reduce`/`Dot`/`Opaque` hash-cons structurally).
-pub struct Graph<K: Field = BigRational> {
+pub struct Graph<K: Field = F64> {
     nodes: Vec<Node>,
+    /// The structural fingerprint of each node (see
+    /// [`fingerprint`](Self::fingerprint)), parallel to `nodes`.
+    shape: Vec<u64>,
     dedup: HashMap<Node, ExprId>,
     consts: Vec<K>,
     const_dedup: HashMap<K, ConstId>,
@@ -114,6 +115,7 @@ impl<K: Field> Graph<K> {
     pub fn new() -> Self {
         let mut ctx = Graph {
             nodes: Vec::new(),
+            shape: Vec::new(),
             dedup: HashMap::default(),
             consts: Vec::new(),
             const_dedup: HashMap::default(),
@@ -218,9 +220,65 @@ impl<K: Field> Graph<K> {
             return id;
         }
         let id = ExprId(self.nodes.len() as u32);
+        let shape = self.shape_of(&node);
         self.nodes.push(node);
+        self.shape.push(shape);
         self.dedup.insert(node, id);
         id
+    }
+
+    /// The structural fingerprint of `e`: a hash of what it computes (its
+    /// op, constant value or symbol name, and its operands' fingerprints),
+    /// never of when it was built, so equal expressions have equal
+    /// fingerprints in any graph, built in any order. Commutative operand
+    /// lists are ordered by it, which is what makes a sum fold in the same
+    /// order however the graph grew; a consumer can key caches on it.
+    #[inline]
+    pub fn fingerprint(&self, e: ExprId) -> u64 {
+        self.shape[e.0 as usize]
+    }
+
+    fn shape_of(&self, node: &Node) -> u64 {
+        use crate::node::shape::{mix, of_hash, Tag};
+        let f = |e: ExprId| self.shape[e.0 as usize];
+        let list = |t: Tag, extra: u64, l: ArgList| {
+            self.args(l)
+                .iter()
+                .fold(mix(t as u64, extra), |h, &a| mix(h, f(a)))
+        };
+        match *node {
+            Node::Const(c) => mix(Tag::Const as u64, self.consts[c.0 as usize].stable_hash()),
+            Node::Symbol(s) => mix(
+                Tag::Symbol as u64,
+                of_hash(self.symbol_names[s.0 as usize].as_str()),
+            ),
+            // Commutative: the pair in fingerprint order, not id order.
+            Node::Add(a, b) | Node::Mul(a, b) => {
+                let (x, y) = (f(a).min(f(b)), f(a).max(f(b)));
+                let t = if matches!(node, Node::Add(..)) {
+                    Tag::Add
+                } else {
+                    Tag::Mul
+                };
+                mix(mix(t as u64, x), y)
+            }
+            Node::Neg(a) => mix(Tag::Neg as u64, f(a)),
+            Node::Pow(a, n) => mix(mix(Tag::Pow as u64, n as u64), f(a)),
+            Node::Unary(op, a) => mix(mix(Tag::Unary as u64, op.code() as u64), f(a)),
+            Node::Binary(op, a, b) => {
+                mix(mix(mix(Tag::Binary as u64, op.code() as u64), f(a)), f(b))
+            }
+            Node::Cmp(op, a, b) => mix(mix(mix(Tag::Cmp as u64, op as u64), f(a)), f(b)),
+            Node::Select(c, t, e) => mix(mix(mix(Tag::Select as u64, f(c)), f(t)), f(e)),
+            Node::Reduce(op, l) => list(Tag::Reduce, op as u64, l),
+            Node::Dot(l) => list(Tag::Dot, 0, l),
+            Node::Solve(l, k) => list(Tag::Solve, k as u64, l),
+            Node::Call(o, l) => {
+                let (func, k) = self.output(o);
+                let callee = of_hash(self.func(func).name.as_str());
+                list(Tag::Call, mix(callee, k as u64), l)
+            }
+        }
     }
 
     /// Intern an operand list by content.
@@ -388,13 +446,19 @@ impl<K: Field> Graph<K> {
         self.intern(Node::Neg(a))
     }
 
-    /// Integer power. Folds constants and collapses nested powers.
+    /// Integer power. Folds constants and collapses nested powers. A
+    /// `Pow` node's exponent fits `i32` (what every backend evaluates);
+    /// a wider one becomes a real power, `Powf` of the exponent's value.
     pub fn pow_i(&mut self, a: ExprId, n: i64) -> ExprId {
         if n == 0 {
             return self.one;
         }
         if n == 1 {
             return a;
+        }
+        if i32::try_from(n).is_err() {
+            let e = self.konst_f64(n as f64);
+            return self.binary(BinOp::Powf, a, e);
         }
         if let Some(x) = self.const_of(a) {
             // `0^(negative)` has no exact rational value (it is `inf` numerically).
@@ -408,7 +472,9 @@ impl<K: Field> Graph<K> {
             }
         }
         if let Node::Pow(base, m) = *self.node(a) {
-            return self.pow_i(base, m * n);
+            if let Some(k) = m.checked_mul(n).filter(|&k| i32::try_from(k).is_ok()) {
+                return self.pow_i(base, k);
+            }
         }
         self.intern(Node::Pow(a, n))
     }
@@ -629,7 +695,10 @@ impl<K: Field> Graph<K> {
             },
             1 => args[0],
             _ => {
-                args.sort_unstable();
+                // By fingerprint, so the fold order is the expression's own,
+                // not the order its terms were built in; the id only breaks
+                // a fingerprint collision.
+                args.sort_unstable_by_key(|&a| (self.shape[a.0 as usize], a.0));
                 let l = self.intern_args(&args);
                 self.intern(Node::Reduce(op, l))
             }

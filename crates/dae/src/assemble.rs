@@ -6,7 +6,8 @@
 
 use std::collections::HashMap;
 
-use rsdag::{CmpOp, ExprId, Graph, ReduceOp, SymbolId};
+use rsdag::{CmpOp, ExprId, ReduceOp, SymbolId};
+use sane_core::Graph;
 use sane_device::Lowerer;
 use sane_mna::{BExpr, BKind, Circuit, Element, Kind};
 

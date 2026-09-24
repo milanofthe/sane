@@ -58,7 +58,8 @@ pub fn reset_hb_synth_calls() -> usize {
     HB_SYNTH_CALLS.swap(0, Ordering::Relaxed)
 }
 
-use rsdag::{Crossing, Graph, SymbolId, Tape};
+use rsdag::{Crossing, SymbolId, Tape};
+use sane_core::Graph;
 use sane_dae::Limit;
 use sane_mna::SourceFn;
 

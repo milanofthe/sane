@@ -2,7 +2,7 @@
 //! defines modules, and `N` instances place them. They must parse, bind their
 //! parameters (instance overrides + module defaults), and assemble into a DAE.
 
-use rsdag::Graph;
+use sane_core::Graph;
 use sane_dae::assemble_dae;
 use sane_netlist::parse;
 

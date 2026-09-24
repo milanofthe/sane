@@ -5,9 +5,10 @@
 use crate::symbolic_poly::{build_poly_expr, poly_in_s, prune_poly};
 use crate::{dominant_subset, finite_pencil_roots, input_vector, solve_complex};
 use num_complex::Complex64;
-use rsdag::{differentiate, Graph, Node, SymbolId};
+use rsdag::{differentiate, Node, SymbolId};
 use sane_core::constants::{DC_OP_MAXIT, DC_OP_TOL};
 use sane_core::log;
+use sane_core::Graph;
 use sane_solve::CompiledDc;
 use std::f64::consts::PI;
 

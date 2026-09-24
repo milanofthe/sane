@@ -125,3 +125,76 @@ fn sensitivity_wrt_bundled_device_param_matches_scalar() {
     assert!(s1.abs() > 1e3, "sensitivity nonzero: {s1}");
     assert!(((s1 - s2) / s1).abs() < 1e-6, "scalar {s1} vs bundled {s2}");
 }
+
+/// A module whose `TYPE` decides its structure through a variable (the
+/// decision reads `k`, which came from `TYPE`) and whose `Is` does not.
+const DECK_SWITCHED: &str = "\
+.veriloga
+module swdiode(a, c);
+  inout a, c; electrical a, c;
+  parameter real Is = 1e-14;
+  parameter real TYPE = 1;
+  real k;
+  analog begin
+    k = TYPE * 2;
+    if (k > 0)
+      I(a, c) <+ Is * (limexp(V(a,c)/0.025852) - 1.0);
+    else
+      I(a, c) <+ V(a, c) / 1e3;
+  end
+endmodule
+.endveriloga
+";
+
+fn switched_deck(instances: &[(usize, &str)]) -> String {
+    let mut d = format!("* shared templates\n{DECK_SWITCHED}");
+    for (k, params) in instances {
+        d.push_str(&format!(
+            "V{k} s{k} 0 2.0\nR{k} s{k} d{k} 1k\nN{k} d{k} 0 swdiode {params}\n"
+        ));
+    }
+    d.push_str(".end\n");
+    d
+}
+
+fn called_functions(model: &Model) -> usize {
+    let dae = model.dae();
+    let ctx = model.context_arc();
+    let ctx = ctx.lock().unwrap();
+    ctx.free_calls_in(&dae.residuals)
+        .into_iter()
+        .map(|o| ctx.output(o).0)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+}
+
+/// Instances that differ only in a parameter no structural decision reads
+/// share one template, one function; a parameter a decision reads, even
+/// through a variable, splits them. Every node voltage is the one of the
+/// instance alone in its own deck, where nothing is shared.
+#[test]
+fn templates_are_shared_across_non_structural_parameters() {
+    let instances = [
+        (1, "Is=1e-14"),
+        (2, "Is=3e-14"),
+        (3, "Is=1e-13"),
+        (4, "TYPE=-1"),
+        (5, "TYPE=-1 Is=5e-14"),
+    ];
+    let model = Model::from_netlist(&switched_deck(&instances)).expect("model");
+    assert_eq!(called_functions(&model), 2, "one function per structure");
+    let op = model.operating_point(&[]).expect("dc");
+    for &(k, params) in &instances {
+        let alone = Model::from_netlist(&switched_deck(&[(k, params)])).expect("alone");
+        let op_alone = alone.operating_point(&[]).expect("dc alone");
+        let node = format!("d{k}");
+        let (shared, single) = (
+            op.vector()[model.resolve(&node).unwrap()],
+            op_alone.vector()[alone.resolve(&node).unwrap()],
+        );
+        assert!(
+            (shared - single).abs() < 1e-10,
+            "{node} ({params}): shared {shared}, alone {single}"
+        );
+    }
+}

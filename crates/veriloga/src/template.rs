@@ -9,32 +9,37 @@
 //! substituting those leaves (`substitute_many`, a cheap memoised DAG copy)
 //! instead of re-walking the analog block.
 //!
-//! Correctness rests on the cache key: two instances share a template only if
+//! Correctness rests on the cache: two instances share a template only if
 //! their lowering is provably identical. The key is
-//! `(module, terminal-connectivity pattern, full parameter signature)`:
-//! - the parameter signature (every resolved parameter value) fixes all
-//!   compile-time-structural decisions (switch branches, loop bounds), since
-//!   those are folded from exactly these values;
+//! `(module, terminal-connectivity pattern, multiplicity)`, and under it each
+//! template carries the values of the parameters that decided its structure
+//! (and, for `$param_given`, whether they were set):
+//! - a parameter's value enters the graph only through a structural decision
+//!   (a branch, a loop bound, a static short, a folded constant); everywhere
+//!   else it is the instance's parameter symbol. The lowering records which
+//!   parameters its decisions read, through the constant shadow of every
+//!   variable they went into;
 //! - the terminal pattern captures which terminals are ground and which are tied
 //!   together, since those collapse `V(a,b)` terms and change the graph shape.
-//! Identical key ⇒ identical fold decisions ⇒ identical graph up to leaf symbols,
-//! which substitution restores. (A coarser key keyed only on the parameters that
-//! actually drive structural folds would share more across differently-sized
-//! instances; that is a later refinement on this same machinery.)
+//! Same key and the same values on those parameters ⇒ the same decisions ⇒ the
+//! same graph up to leaf symbols, which substitution restores. Instances that
+//! differ only in the others (a transistor's W and L, say) share one template
+//! and so one function body, and their parameters are its arguments.
 //!
 //! `SANE_NO_TEMPLATE` in the environment bypasses the cache (every instance is
 //! lowered directly) -- the escape hatch and the differential cross-check.
 
 use rustc_hash::FxHashMap as HashMap;
 
-use rsdag::{Crossing, ExprId, FuncId, Graph, SymbolId};
+use rsdag::{Crossing, ExprId, FuncId, SymbolId};
 use rustc_hash::FxHashMap;
+use sane_core::Graph;
 use sane_device::{
     BehavioralFragment, FragmentEvent, FragmentLimit, LoweredDelay, Lowerer, NoiseSource, OpVar,
 };
 
 use crate::device::VerilogADevice;
-use crate::lower::{lower_analog, sym_of};
+use crate::lower::{lower_analog_structural, sym_of};
 
 /// A minted extra unknown, recorded so a cloned instance re-mints the same one.
 #[derive(Clone)]
@@ -146,11 +151,35 @@ pub(crate) fn lower_templated(
     term_vdot: &[ExprId],
 ) -> BehavioralFragment {
     if !sane_core::config().device_templates {
-        return lower_direct(dev, lo, term_v, term_vdot);
+        return lower_direct(dev, lo, term_v, term_vdot).0;
     }
 
     let key = cache_key(dev, lo.ctx(), term_v);
-    if let Some(tpl) = lo.cache_get::<VaTemplate>(&key) {
+    let bucket = match lo.cache_get::<Bucket>(&key) {
+        Some(b) => b,
+        None => {
+            let b = Bucket::default();
+            lo.cache_put(key, b.clone());
+            b
+        }
+    };
+    let env = instance_param_env(dev);
+    // A structural read: a parameter's value, or whether it was set.
+    let bits_of = |name: &str| -> u64 {
+        match name
+            .strip_prefix("$given(")
+            .and_then(|s| s.strip_suffix(')'))
+        {
+            Some(p) => dev.given.contains(p) as u64,
+            None => env.get(name).map_or(u64::MAX, |v| v.to_bits()),
+        }
+    };
+    let hit = bucket.borrow().iter().find_map(|(sig, tpl)| {
+        sig.iter()
+            .all(|(name, bits)| bits_of(name) == *bits)
+            .then(|| tpl.clone())
+    });
+    if let Some(tpl) = hit {
         let t = sane_core::time::Instant::now();
         let r = instantiate(&tpl, dev, lo, term_v, term_vdot);
         sane_core::profile::record_tpl_clone(t.elapsed().as_nanos());
@@ -161,7 +190,26 @@ pub(crate) fn lower_templated(
     // template from the freshly minted extras (the loop's `lo.extras` was emptied
     // by the assembler after the previous instance, so what is there now is ours).
     let t = sane_core::time::Instant::now();
-    let mut frag = lower_direct(dev, lo, term_v, term_vdot);
+    let (mut frag, structural) = lower_direct(dev, lo, term_v, term_vdot);
+    // The template holds for every instance with these values on the
+    // parameters that decided its structure.
+    let sig: Vec<(String, u64)> = structural
+        .into_iter()
+        .map(|name| {
+            let bits = bits_of(&name);
+            (name, bits)
+        })
+        .collect();
+    sane_core::log::debug(&format!(
+        "template '{}' ({}): structure fixed by {} parameters: {}",
+        dev.module.name,
+        dev.name,
+        sig.len(),
+        sig.iter()
+            .map(|(n, _)| n.as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
+    ));
     let tpl = build_template(dev, lo, term_v, term_vdot, &frag);
     // On a multiply-instantiated module the REPRESENTATIVE also routes through
     // calls (identity argument binding), so all instances execute in the
@@ -194,18 +242,23 @@ pub(crate) fn lower_templated(
             e.g = ctx.call(tpl.func, tpl.out_event + j as u32, &args);
         }
     }
-    lo.cache_put(key, tpl);
+    bucket.borrow_mut().push((sig, tpl));
     sane_core::profile::record_tpl_build(t.elapsed().as_nanos());
     frag
 }
+
+/// The templates of one (module, terminal pattern, multiplicity), each with
+/// the values of the parameters that decided its structure (`$given(X)`:
+/// whether `X` was set, as 0 or 1).
+type Bucket = std::rc::Rc<std::cell::RefCell<Vec<(Vec<(String, u64)>, VaTemplate)>>>;
 
 fn lower_direct(
     dev: &VerilogADevice,
     lo: &mut Lowerer,
     term_v: &[ExprId],
     term_vdot: &[ExprId],
-) -> BehavioralFragment {
-    match lower_analog(
+) -> (BehavioralFragment, std::collections::BTreeSet<String>) {
+    match lower_analog_structural(
         &dev.module,
         &dev.name,
         &dev.params,
@@ -215,7 +268,7 @@ fn lower_direct(
         term_v,
         term_vdot,
     ) {
-        Ok(frag) => frag,
+        Ok(r) => r,
         Err(e) => {
             // validate() runs at load time, so an unsupported construct is already
             // a parse error; reaching here means a real bug -- fail loudly.
@@ -225,25 +278,18 @@ fn lower_direct(
     }
 }
 
-/// `(module, terminal pattern, multiplicity, parameter signature, given set)`
-/// -- see module docs. `mfactor` is in the key because it is baked into the
-/// graph (every flow scales by it), so instances of different multiplicity need
-/// distinct templates. The `given` set is in the key because `$param_given`
-/// folds structural decisions from it, independently of the parameter VALUES --
-/// two instances with identical values but a differently-given parameter can
-/// lower to different graphs.
+/// `(module, terminal pattern, multiplicity)` -- see module docs. `mfactor`
+/// is in the key because it is baked into the graph (every flow scales by
+/// it), so instances of different multiplicity need distinct templates. The
+/// parameter values and `$param_given` answers a template depends on are
+/// checked per template within the key (see [`Bucket`]).
 fn cache_key(dev: &VerilogADevice, ctx: &Graph, term_v: &[ExprId]) -> String {
     let pattern = terminal_pattern(ctx, term_v);
-    let psig = param_signature(dev);
-    let mut given: Vec<&str> = dev.given.iter().map(String::as_str).collect();
-    given.sort_unstable();
     format!(
-        "va\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}",
+        "va\u{1}{}\u{1}{}\u{1}{}",
         dev.module.name,
         pattern,
-        dev.mfactor.to_bits(),
-        psig,
-        given.join(",")
+        dev.mfactor.to_bits()
     )
 }
 
@@ -266,23 +312,6 @@ fn terminal_pattern(ctx: &Graph, term_v: &[ExprId]) -> String {
         out.push(',');
     }
     out
-}
-
-/// Every resolved parameter value (defaults overridden by instance values),
-/// sorted by name; the exact bit pattern so structurally-distinct folds never
-/// collide. Mirrors `lower_analog`'s `param_env` construction.
-fn param_signature(dev: &VerilogADevice) -> String {
-    let env = instance_param_env(dev);
-    let mut kv: Vec<(&String, &f64)> = env.iter().collect();
-    kv.sort_by(|a, b| a.0.cmp(b.0));
-    let mut s = String::new();
-    for (k, v) in kv {
-        s.push_str(k);
-        s.push('=');
-        s.push_str(&v.to_bits().to_string());
-        s.push(';');
-    }
-    s
 }
 
 fn instance_param_env(dev: &VerilogADevice) -> HashMap<String, f64> {

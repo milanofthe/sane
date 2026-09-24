@@ -105,9 +105,26 @@ pub struct Function {
 /// can build from the symbolic outputs alone, so a tape or an arena sweep is
 /// total without a solver-registered body (which only upgrades this to native
 /// code and lane batching).
+///
+/// Parameters with [`ParamRole::Param`] are the body's pure arguments: its
+/// tape is split over them, and a caller that has them in its own prolog
+/// keeps the body's prolog result per instance (see
+/// [`ExternBundle::state_len`]).
 pub struct InterpretedBody {
     tape: crate::tape::Tape,
     n_out: usize,
+    /// One flag per parameter; empty when no parameter is pure.
+    pure: Vec<bool>,
+}
+
+impl InterpretedBody {
+    /// The work layout: the tape's buffer, its outputs, then the arguments
+    /// a prolog is run on.
+    fn parts<'w>(&self, work: &'w mut [f64]) -> (&'w mut [f64], &'w mut [f64], &'w mut [f64]) {
+        let (w, rest) = work.split_at_mut(self.tape.work_len());
+        let (o, a) = rest.split_at_mut(self.tape.out_len());
+        (w, o, &mut a[..self.pure.len()])
+    }
 }
 
 impl ExternBundle for InterpretedBody {
@@ -115,13 +132,37 @@ impl ExternBundle for InterpretedBody {
         self.n_out
     }
     fn work_len(&self) -> usize {
-        // The tape's own slots, then the outputs it writes before they are
-        // narrowed to the bundle's.
-        self.tape.work_len() + self.tape.out_len()
+        self.tape.work_len() + self.tape.out_len() + self.pure.len()
     }
     fn call_into(&self, args: &[f64], work: &mut [f64], out: &mut [f64]) {
-        let (w, o) = work.split_at_mut(self.tape.work_len());
-        self.tape.eval_into(args, w, &mut o[..self.tape.out_len()]);
+        let (w, o, _) = self.parts(work);
+        self.tape.eval_into(args, w, o);
+        out.copy_from_slice(&o[..self.n_out]);
+    }
+    fn state_len(&self) -> usize {
+        self.tape.state_len()
+    }
+    fn pure_args(&self) -> &[bool] {
+        &self.pure
+    }
+    fn prolog_into(&self, pure: &[f64], work: &mut [f64], state: &mut [f64]) {
+        let (w, _, args) = self.parts(work);
+        // The prolog reads the pure arguments only; the others are NaN.
+        let mut p = pure.iter();
+        for (a, &is_pure) in args.iter_mut().zip(&self.pure) {
+            *a = if is_pure {
+                *p.next().expect("one value per pure argument")
+            } else {
+                f64::NAN
+            };
+        }
+        self.tape.eval_prolog_into(args, w);
+        state.copy_from_slice(&w[..state.len()]);
+    }
+    fn main_into(&self, args: &[f64], state: &[f64], work: &mut [f64], out: &mut [f64]) {
+        let (w, o, _) = self.parts(work);
+        w[..state.len()].copy_from_slice(state);
+        self.tape.eval_main_into(args, w, o);
         out.copy_from_slice(&o[..self.n_out]);
     }
     fn body(&self) -> Option<&crate::tape::Tape> {
@@ -181,11 +222,28 @@ impl Function {
                 _ => slot_of.push(None),
             }
         }
-        let tape = crate::tape::Tape::compile(ctx, &roots, &self.params);
+        // Split over the parameters the roles call pure, when there are any.
+        let pure: Vec<bool> = self
+            .param_roles
+            .iter()
+            .map(|r| matches!(r, ParamRole::Param))
+            .collect();
+        let (tape, pure) = if pure.iter().any(|&p| p) {
+            (
+                crate::tape::Tape::compile_split(ctx, &roots, &self.params, &pure),
+                pure,
+            )
+        } else {
+            (
+                crate::tape::Tape::compile(ctx, &roots, &self.params),
+                Vec::new(),
+            )
+        };
         Body {
             bundle: Arc::new(InterpretedBody {
                 tape,
                 n_out: roots.len(),
+                pure,
             }),
             slot_of,
         }

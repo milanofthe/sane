@@ -58,17 +58,114 @@ pub(crate) extern "C" fn h_reduce(op: u64, ptr: *const f64, len: usize) -> f64 {
     reduce_slice(op, xs)
 }
 
-pub(crate) extern "C" fn h_bundle(
-    bundles: *const Bundles,
-    idx: usize,
-    args: *const f64,
-    len: usize,
-    out: *mut f64,
-) {
-    let b = unsafe { &(&*bundles)[idx] };
-    let xs = unsafe { std::slice::from_raw_parts(args, len) };
-    let out = unsafe { std::slice::from_raw_parts_mut(out, b.n_outputs()) };
-    b.call(xs, out);
+// A panic out of a host call, held until the emitted code has returned:
+// unwinding cannot cross the emitted frames (they carry no unwind
+// tables, and an `extern "C"` boundary aborts), so a trampoline catches
+// it, the chunk runs to its end on whatever the failed call left in its
+// outputs, and `resume_panic` raises it again on the caller's side. The
+// first panic of an evaluation is the one kept.
+std::thread_local! {
+    static PANIC: std::cell::Cell<Option<Box<dyn std::any::Any + Send>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Run `f`, holding a panic out of it for [`resume_panic`].
+fn guarded(f: impl FnOnce()) {
+    if let Err(p) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        PANIC.with(|c| {
+            let first = c.take().unwrap_or(p);
+            c.set(Some(first));
+        });
+    }
+}
+
+/// Raise a panic a host call held while the emitted code ran.
+pub(crate) fn resume_panic() {
+    if let Some(p) = PANIC.with(|c| c.take()) {
+        std::panic::resume_unwind(p);
+    }
+}
+
+/// A call site as the emitted code hands it to [`h_call`]: every size
+/// fixed when the tape was compiled, every place a byte offset into the
+/// work array. The descriptors live as long as the code that points at them.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub(crate) struct CallDesc {
+    pub(crate) bundle: u64,
+    pub(crate) kind: u64,
+    pub(crate) batch: u64,
+    pub(crate) n_groups: u64,
+    pub(crate) n_args: u64,
+    pub(crate) n_out: u64,
+    pub(crate) state_len: u64,
+    /// Byte offsets: the gathered arguments, the outputs (the states for a
+    /// prolog), the states (a main phase), the bundle's scratch.
+    pub(crate) args: u64,
+    pub(crate) out: u64,
+    pub(crate) state: u64,
+    pub(crate) scratch: u64,
+    pub(crate) scratch_len: u64,
+}
+
+/// Every bundle call: whole, main phase over its states, or prolog.
+pub(crate) extern "C" fn h_call(bundles: *const Bundles, d: *const CallDesc, work: *mut f64) {
+    let d = unsafe { &*d };
+    let b = unsafe { &(&*bundles)[d.bundle as usize] };
+    let (ng, na, no, sl) = (
+        d.n_groups as usize,
+        d.n_args as usize,
+        d.n_out as usize,
+        d.state_len as usize,
+    );
+    // The regions are disjoint by the layout: the gather area, the output
+    // block, the state block, the scratch.
+    let at = |off: u64| unsafe { work.add(off as usize / 8) };
+    let args = unsafe { std::slice::from_raw_parts(at(d.args), ng * na) };
+    let out = unsafe { std::slice::from_raw_parts_mut(at(d.out), ng * no) };
+    let scratch = unsafe { std::slice::from_raw_parts_mut(at(d.scratch), d.scratch_len as usize) };
+    guarded(|| match d.kind {
+        0 => {
+            assert_eq!(
+                b.n_outputs(),
+                no,
+                "bundle output count changed since compile"
+            );
+            if d.batch != 0 {
+                b.call_batch(args, ng, na, out);
+            } else {
+                b.call_into(args, scratch, out);
+            }
+        }
+        1 => {
+            assert_eq!(
+                b.n_outputs(),
+                no,
+                "bundle output count changed since compile"
+            );
+            assert_eq!(
+                b.state_len(),
+                sl,
+                "bundle state length changed since compile"
+            );
+            let states = unsafe { std::slice::from_raw_parts(at(d.state), ng * sl) };
+            for g in 0..ng {
+                let (a, o) = (&args[g * na..(g + 1) * na], &mut out[g * no..(g + 1) * no]);
+                b.main_into(a, &states[g * sl..(g + 1) * sl], scratch, o);
+            }
+        }
+        _ => {
+            assert_eq!(
+                b.state_len(),
+                sl,
+                "bundle state length changed since compile"
+            );
+            for g in 0..ng {
+                let (a, st) = (&args[g * na..(g + 1) * na], &mut out[g * sl..(g + 1) * sl]);
+                b.prolog_into(a, scratch, st);
+            }
+        }
+    });
 }
 
 pub(crate) extern "C" fn h_solve(a: *const f64, b: *const f64, n: usize, out: *mut f64) {
@@ -76,20 +173,6 @@ pub(crate) extern "C" fn h_solve(a: *const f64, b: *const f64, n: usize, out: *m
     let b = unsafe { std::slice::from_raw_parts(b, n) };
     let out = unsafe { std::slice::from_raw_parts_mut(out, n) };
     rsdag::semantics::solve(a, b, n, out);
-}
-
-pub(crate) extern "C" fn h_bundle_batch(
-    bundles: *const Bundles,
-    idx: usize,
-    args: *const f64,
-    n_groups: usize,
-    n_args: usize,
-    out: *mut f64,
-) {
-    let b = unsafe { &(&*bundles)[idx] };
-    let xs = unsafe { std::slice::from_raw_parts(args, n_groups * n_args) };
-    let out = unsafe { std::slice::from_raw_parts_mut(out, n_groups * b.n_outputs()) };
-    b.call_batch(xs, n_groups, n_args, out);
 }
 
 pub(crate) extern "C" fn h_solve_many(

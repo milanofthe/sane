@@ -26,10 +26,8 @@ pub(crate) enum ROp {
     Select(u32, u32, u32, u32),
     Reduce(u32, ReduceOp, Vec<u32>),
     Dot(u32, Vec<u32>, Vec<u32>),
-    /// `(dst, bundle, args, n_out)`.
-    Call(u32, u32, Vec<u32>, u32),
-    /// `(dst, bundle, args, n_groups, n_args, n_out)`.
-    CallBatch(u32, u32, Vec<u32>, u32, u32, u32),
+    /// A bundle call of any form (see [`CallSite`]).
+    Call(CallSite),
     Gemv {
         dst: u32,
         a: Dense,
@@ -64,6 +62,38 @@ pub(crate) enum ROp {
         n: u32,
         k: u32,
     },
+}
+
+/// What a call computes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u64)]
+pub(crate) enum CallKind {
+    /// The bundle whole, per group.
+    Whole = 0,
+    /// The bundle's main phase over each group's state.
+    Main = 1,
+    /// The bundle's prolog over each group's pure arguments, its outputs
+    /// the states.
+    Prolog = 2,
+}
+
+/// One call site: `n_groups` instances of bundle `bundle` on `args`
+/// (group-major, `n_args` each), `n_out` values per group from `dst` on;
+/// for [`CallKind::Main`], group `g`'s state at `state + g * state_len`.
+/// For a prolog, `n_args` counts pure arguments and `n_out` is the state
+/// length.
+pub(crate) struct CallSite {
+    pub(crate) dst: u32,
+    pub(crate) bundle: u32,
+    pub(crate) args: Vec<u32>,
+    pub(crate) n_groups: u32,
+    pub(crate) n_args: u32,
+    pub(crate) n_out: u32,
+    pub(crate) kind: CallKind,
+    pub(crate) state: u32,
+    pub(crate) state_len: u32,
+    /// Several instances through the bundle's own batch entry.
+    pub(crate) batch: bool,
 }
 
 /// A dense operand: a run of inputs read in place, or slots gathered.
@@ -106,9 +136,8 @@ impl ROp {
                 f(*b);
                 f(*c);
             }
-            ROp::Reduce(_, _, args) | ROp::Call(_, _, args, _) | ROp::CallBatch(_, _, args, ..) => {
-                args.iter().copied().for_each(f)
-            }
+            ROp::Reduce(_, _, args) => args.iter().copied().for_each(f),
+            ROp::Call(c) => c.args.iter().copied().for_each(f),
             ROp::Dot(_, a, b) => a.iter().chain(b).copied().for_each(f),
             ROp::Gemv { a, x, acc, .. } => a
                 .slots()
@@ -158,8 +187,7 @@ impl ROp {
             ROp::Binary(..) => crate::host::h_binary as *const (),
             ROp::Powi(_, _, n) if *n != -1 && *n != 2 => crate::host::h_powi as *const (),
             ROp::Reduce(_, ReduceOp::Min | ReduceOp::Max, _) => crate::host::h_reduce as *const (),
-            ROp::Call(..) => crate::host::h_bundle as *const (),
-            ROp::CallBatch(..) => crate::host::h_bundle_batch as *const (),
+            ROp::Call(..) => crate::host::h_call as *const (),
             ROp::Gemv { acc: None, .. } => crate::host::h_gemv as *const (),
             ROp::Gemv { .. } => crate::host::h_gemv_acc as *const (),
             ROp::Gemm { acc: None, .. } => crate::host::h_gemm as *const (),
@@ -174,7 +202,7 @@ impl ROp {
     pub(crate) fn gather_len(&self) -> usize {
         match self {
             ROp::Reduce(_, ReduceOp::Min | ReduceOp::Max, args) => args.len(),
-            ROp::Call(_, _, args, _) | ROp::CallBatch(_, _, args, ..) => args.len(),
+            ROp::Call(c) => c.args.len(),
             ROp::Gemv { a, x, acc, .. } => {
                 a.slots().len()
                     + x.slots().len()
@@ -254,9 +282,31 @@ impl TapeVisitor for Recorder {
     fn dot(&mut self, dst: u32, a: &[u32], b: &[u32]) {
         self.ops.push(ROp::Dot(dst, a.to_vec(), b.to_vec()));
     }
-    fn call(&mut self, dst: u32, b: &Arc<dyn ExternBundle>, args: &[u32], n_out: u32) {
-        let idx = self.intern(b);
-        self.ops.push(ROp::Call(dst, idx, args.to_vec(), n_out));
+    fn call(
+        &mut self,
+        dst: u32,
+        b: &Arc<dyn ExternBundle>,
+        args: &[u32],
+        n_out: u32,
+        state: Option<u32>,
+    ) {
+        let bundle = self.intern(b);
+        self.ops.push(ROp::Call(CallSite {
+            dst,
+            bundle,
+            args: args.to_vec(),
+            n_groups: 1,
+            n_args: args.len() as u32,
+            n_out,
+            kind: if state.is_some() {
+                CallKind::Main
+            } else {
+                CallKind::Whole
+            },
+            state: state.unwrap_or(0),
+            state_len: b.state_len() as u32,
+            batch: false,
+        }));
     }
     fn call_batch(
         &mut self,
@@ -266,16 +316,41 @@ impl TapeVisitor for Recorder {
         n_groups: u32,
         n_args: u32,
         n_out: u32,
+        state: Option<u32>,
     ) {
-        let idx = self.intern(b);
-        self.ops.push(ROp::CallBatch(
+        let bundle = self.intern(b);
+        self.ops.push(ROp::Call(CallSite {
             dst,
-            idx,
-            args.to_vec(),
+            bundle,
+            args: args.to_vec(),
             n_groups,
             n_args,
             n_out,
-        ));
+            kind: if state.is_some() {
+                CallKind::Main
+            } else {
+                CallKind::Whole
+            },
+            state: state.unwrap_or(0),
+            state_len: b.state_len() as u32,
+            batch: true,
+        }));
+    }
+    fn call_prolog(&mut self, dst: u32, b: &Arc<dyn ExternBundle>, pure: &[u32], n_groups: u32) {
+        let bundle = self.intern(b);
+        let state_len = b.state_len() as u32;
+        self.ops.push(ROp::Call(CallSite {
+            dst,
+            bundle,
+            args: pure.to_vec(),
+            n_groups,
+            n_args: pure.len() as u32 / n_groups.max(1),
+            n_out: state_len,
+            kind: CallKind::Prolog,
+            state: dst,
+            state_len,
+            batch: n_groups > 1,
+        }));
     }
     fn gemv(
         &mut self,

@@ -27,7 +27,8 @@ use symbolic::LockCtx;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
-use rsdag::{ExprId, Graph};
+use rsdag::ExprId;
+use sane_core::Graph;
 use sane_dae::{assemble_dae, small_signal_matrix, small_signal_transfer, DeviceInstance};
 use sane_device::CSwitch;
 use sane_export::{export_latex, latex_expr};

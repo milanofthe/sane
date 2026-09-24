@@ -5,7 +5,8 @@
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::sync::Arc;
 
-use rsdag::{ExprId, Graph};
+use rsdag::ExprId;
+use sane_core::Graph;
 use sane_device::{BehavioralFragment, DeviceModel, Lowerer};
 
 use crate::elaborate::ElaboratedModule;

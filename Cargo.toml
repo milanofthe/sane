@@ -19,7 +19,7 @@ members = [
 exclude = ["vendor/rslab", "vendor/vectfit", "vendor/rsdag"]
 
 [workspace.package]
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 license = "LicenseRef-PolyForm-Noncommercial-1.0.0"
 authors = ["Milan Rother"]
@@ -47,7 +47,9 @@ num-traits = "0.2"
 num-complex = "0.4"
 rustc-hash = "2"
 # Vendored expression graph, tape and native backend; see vendor/rsdag/VENDOR.md.
-rsdag = { path = "vendor/rsdag/crates/rsdag" }
+# Exact rational constants (symbolic analysis) and complex evaluation (AC,
+# reduction); `egraph` is native only and set by the py crate.
+rsdag = { path = "vendor/rsdag/crates/rsdag", features = ["exact", "complex"] }
 rsdag-jit = { path = "vendor/rsdag/crates/rsdag-jit" }
 # Vendored sparse direct solver (KLU path); see vendor/rslab/VENDOR.md.
 rslab = { path = "vendor/rslab" }

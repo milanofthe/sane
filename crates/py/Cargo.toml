@@ -13,7 +13,7 @@ name = "_core"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-rsdag.workspace = true
+rsdag = { workspace = true, features = ["egraph"] }
 # `extension-module` is added by maturin (see pyproject.toml), not here, so that
 # plain `cargo test` can still link against libpython.
 pyo3 = { version = "0.22", features = ["abi3-py39"] }

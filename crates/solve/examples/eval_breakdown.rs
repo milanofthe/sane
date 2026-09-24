@@ -8,7 +8,7 @@
 
 use std::time::Instant;
 
-use rsdag::Graph;
+use sane_core::Graph;
 use sane_dae::{assemble_dae, Dae, DeviceInstance};
 use sane_mna::Circuit;
 use sane_solve::CompiledDc;

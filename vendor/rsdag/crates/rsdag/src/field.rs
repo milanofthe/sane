@@ -12,8 +12,11 @@
 
 use std::hash::Hash;
 
+#[cfg(feature = "exact")]
 use num_bigint::BigInt;
+#[cfg(feature = "exact")]
 use num_rational::BigRational;
+#[cfg(feature = "exact")]
 use num_traits::{One, ToPrimitive, Zero};
 
 /// A field with exact equality and hashing, the constant type of a graph.
@@ -31,7 +34,9 @@ pub trait Field: Clone + PartialEq + Eq + Hash + std::fmt::Debug + Send + Sync +
     fn add(&self, other: &Self) -> Self;
     fn mul(&self, other: &Self) -> Self;
     fn neg(&self) -> Self;
-    /// `self^n` for an integer `n`, `None` for a negative power of zero.
+    /// `self^n` for an integer `n`; `None` leaves the power unfolded: a
+    /// negative power of zero, or an exact power too large to be worth
+    /// its digits.
     fn powi(&self, n: i64) -> Option<Self>;
     fn is_zero(&self) -> bool;
     fn is_one(&self) -> bool;
@@ -42,8 +47,12 @@ pub trait Field: Clone + PartialEq + Eq + Hash + std::fmt::Debug + Send + Sync +
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering>;
     /// Exact textual form for the printer (`3/2`, `-7`, `0.1`).
     fn render(&self) -> String;
+    /// A hash of the value that is the same on every platform and in every
+    /// run (the constants' part of [`Graph::fingerprint`](crate::Graph::fingerprint)).
+    fn stable_hash(&self) -> u64;
 }
 
+#[cfg(feature = "exact")]
 impl Field for BigRational {
     fn zero() -> Self {
         <BigRational as Zero>::zero()
@@ -76,6 +85,11 @@ impl Field for BigRational {
         if Zero::is_zero(self) && n < 0 {
             return None;
         }
+        // Digits grow with the exponent; past this a power of a constant
+        // stays a node and evaluates in floating point.
+        if n.unsigned_abs() > EXACT_POWI_MAX && !One::is_one(&num_traits::Signed::abs(self)) {
+            return None;
+        }
         Some(ratio_powi(self, n))
     }
     fn is_zero(&self) -> bool {
@@ -97,10 +111,23 @@ impl Field for BigRational {
             format!("{}/{}", self.numer(), self.denom())
         }
     }
+    fn stable_hash(&self) -> u64 {
+        // The canonical bytes, not the digits: those are 64 bits wide on a
+        // 64-bit host and 32 on wasm32.
+        let n = crate::node::shape::of_hash(&self.numer().to_signed_bytes_le()[..]);
+        let d = crate::node::shape::of_hash(&self.denom().to_signed_bytes_le()[..]);
+        crate::node::shape::mix(n, d)
+    }
 }
+
+/// Largest exponent [`Field::powi`] folds exactly for a rational base
+/// other than `1` or `-1`.
+#[cfg(feature = "exact")]
+pub const EXACT_POWI_MAX: u64 = 1024;
 
 /// Exact integer power of a rational by repeated squaring (negative
 /// exponents invert; the caller excludes zero to a negative power).
+#[cfg(feature = "exact")]
 pub fn ratio_powi(base: &BigRational, n: i64) -> BigRational {
     if n == 0 {
         return <BigRational as One>::one();
@@ -214,7 +241,7 @@ impl Field for F64 {
         if self.0 == 0.0 && n < 0 {
             return None;
         }
-        Some(F64::new(self.0.powi(n as i32)))
+        Some(F64::new(self.0.powi(i32::try_from(n).ok()?)))
     }
     fn is_zero(&self) -> bool {
         self.0 == 0.0
@@ -230,5 +257,8 @@ impl Field for F64 {
     }
     fn render(&self) -> String {
         format!("{:?}", self.0)
+    }
+    fn stable_hash(&self) -> u64 {
+        crate::node::shape::mix(0, self.0.to_bits())
     }
 }

@@ -5,7 +5,8 @@
 use std::any::Any;
 use std::collections::HashMap;
 
-use rsdag::{ExprId, Graph, Node, SymbolId};
+use rsdag::{ExprId, Node, SymbolId};
+use sane_core::Graph;
 
 /// An extra DAE unknown a behavioral device mints beyond its terminals (a branch
 /// current for a voltage contribution, or an `idt`/laplace state variable), with

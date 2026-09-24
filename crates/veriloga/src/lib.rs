@@ -697,7 +697,8 @@ mod tests {
     use super::device::VerilogADevice;
     use super::elaborate::elaborate;
     use num_complex::Complex64;
-    use rsdag::{eval, Crossing, Graph, Node, SymbolId};
+    use rsdag::{eval, Crossing, Node, SymbolId};
+    use sane_core::Graph;
     use sane_dae::{assemble_dae, Dae, DeviceInstance};
     use sane_mna::Circuit;
     use std::sync::Arc;

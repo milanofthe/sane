@@ -16,6 +16,10 @@ pub mod profile;
 pub mod time;
 
 pub use config::{config, set_config, update_config, Config};
+
+/// The expression graph SANE builds its models in: exact rational
+/// constants, so a model's coefficients stay exact until it is evaluated.
+pub type Graph = rsdag::Graph<rsdag::BigRational>;
 pub use log::{LogLevel, ProgressTracker};
 pub use mathfn::lower_math_call;
 pub use profile::Profile;

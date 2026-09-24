@@ -6,7 +6,7 @@
 use rustc_hash::FxHashMap as HashMap;
 use std::path::PathBuf;
 
-use rsdag::Graph;
+use sane_core::Graph;
 use sane_dae::{assemble_dae, DeviceInstance};
 use sane_mna::Circuit;
 use sane_osdi::{OsdiDevice, OsdiLib};

@@ -2,8 +2,9 @@
 //! (also the lowering of Verilog-A `limexp`) and the smooth switch
 //! conductance. Pure symbolic constructions over the core DAG.
 
-use rsdag::{CmpOp, ExprId, Graph};
+use rsdag::{CmpOp, ExprId};
 use sane_core::constants::EXP_VCRIT;
+use sane_core::Graph;
 
 /// Mint an instance-scoped parameter symbol, e.g. `W1.Ron`.
 pub(crate) fn param(ctx: &mut Graph, instance: &str, name: &str) -> ExprId {

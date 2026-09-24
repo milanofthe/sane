@@ -503,7 +503,8 @@ pub enum Node {
     Mul(ExprId, ExprId),
     /// Unary negation.
     Neg(ExprId),
-    /// Integer power (covers reciprocals via negative exponents).
+    /// Integer power (covers reciprocals via negative exponents). The
+    /// exponent fits `i32` ([`Graph::pow_i`](crate::Graph::pow_i) sees to it).
     Pow(ExprId, i64),
     /// Elementary unary function.
     Unary(UnaryOp, ExprId),
@@ -550,6 +551,84 @@ impl std::ops::Deref for Operands<'_> {
         match self {
             Operands::Inline { buf, n } => &buf[..*n as usize],
             Operands::Slice(s) => s,
+        }
+    }
+}
+
+/// The arithmetic of structural fingerprints (see
+/// [`Graph::fingerprint`](crate::Graph::fingerprint)): a fixed mixing
+/// function and a fixed byte hasher, so a fingerprint is the same on every
+/// platform, in every run and under every version of the hash crates.
+pub(crate) mod shape {
+    use std::hash::{Hash, Hasher};
+
+    /// One tag per node kind, so equal payloads of different kinds differ.
+    #[derive(Clone, Copy)]
+    pub(crate) enum Tag {
+        Const = 1,
+        Symbol,
+        Add,
+        Mul,
+        Neg,
+        Pow,
+        Unary,
+        Binary,
+        Cmp,
+        Select,
+        Reduce,
+        Dot,
+        Solve,
+        Call,
+    }
+
+    /// Fold `x` into `h` (a splitmix64 finalizer over the sum).
+    #[inline]
+    pub(crate) fn mix(h: u64, x: u64) -> u64 {
+        let mut z = h
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_add(x)
+            .wrapping_add(0x6A09_E667_F3BC_C909);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// A value's `Hash` fed through [`mix`], byte for byte.
+    pub(crate) fn of_hash<T: Hash + ?Sized>(v: &T) -> u64 {
+        let mut h = Stable(0);
+        v.hash(&mut h);
+        h.0
+    }
+
+    struct Stable(u64);
+
+    /// Integers in little-endian and `usize` as 64 bits (a length prefix
+    /// hashed on wasm32 must match the one hashed on a 64-bit host).
+    impl Hasher for Stable {
+        fn finish(&self) -> u64 {
+            self.0
+        }
+        fn write_u16(&mut self, i: u16) {
+            self.write(&i.to_le_bytes());
+        }
+        fn write_u32(&mut self, i: u32) {
+            self.write(&i.to_le_bytes());
+        }
+        fn write_u64(&mut self, i: u64) {
+            self.write(&i.to_le_bytes());
+        }
+        fn write_u128(&mut self, i: u128) {
+            self.write(&i.to_le_bytes());
+        }
+        fn write_usize(&mut self, i: usize) {
+            self.write_u64(i as u64);
+        }
+        fn write(&mut self, bytes: &[u8]) {
+            for chunk in bytes.chunks(8) {
+                let mut w = [0u8; 8];
+                w[..chunk.len()].copy_from_slice(chunk);
+                self.0 = mix(self.0, u64::from_le_bytes(w) ^ ((chunk.len() as u64) << 56));
+            }
         }
     }
 }

@@ -4,7 +4,8 @@
 //! generate code.
 
 use num_traits::One;
-use rsdag::{CmpOp, ExprId, Graph, Node, ReduceOp, UnaryOp};
+use rsdag::{CmpOp, ExprId, Node, ReduceOp, UnaryOp};
+use sane_core::Graph;
 use sane_dae::Dae;
 
 /// The residual equations `0 = F_i(x, x', t)` as a LaTeX `aligned` block.
@@ -120,193 +121,65 @@ pub fn latex_expr(ctx: &Graph, id: ExprId) -> String {
 }
 
 /// Render one or more expression roots as a Graphviz DOT digraph of the
-/// hash-consed DAG. Because the graph is shared, a subexpression reached by
-/// several parents appears as a single node with several incoming edges, so
-/// common-subexpression sharing is visible directly; passing several roots
-/// (e.g. a residual and its symbolic derivative) shows the structure they
-/// share. Render with `dot -Tpdf`.
+/// hash-consed DAG ([`rsdag::dot::GraphView`] in [`theme`]). Because the
+/// graph is shared, a subexpression reached by several parents appears as a
+/// single node with several incoming edges, so common-subexpression sharing
+/// is visible directly; passing several roots (e.g. a residual and its
+/// symbolic derivative) shows the structure they share. A named root gets a
+/// residual box below it. Render with `dot -Tpdf`.
 ///
 /// If `highlight` is non-empty, only the nodes reachable from those seed
 /// expressions are drawn at full opacity; every other node (and the edges
-/// between dimmed nodes) is faded to alpha ~0.2, so a transform's added nodes
-/// stand out against the rest of the graph.
+/// between dimmed nodes) is faded, so a transform's added nodes stand out
+/// against the rest of the graph.
 pub fn export_dot(ctx: &Graph, roots: &[(ExprId, String)], highlight: &[ExprId]) -> String {
-    let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
-    let mut order: Vec<ExprId> = Vec::new();
-    fn visit(
-        ctx: &Graph,
-        id: ExprId,
-        seen: &mut std::collections::HashSet<u32>,
-        order: &mut Vec<ExprId>,
-    ) {
-        if !seen.insert(id.0) {
-            return;
-        }
-        for op in operands(ctx, id) {
-            visit(ctx, op, seen, order);
-        }
-        order.push(id);
+    use rsdag::dot::{reachable, GraphView};
+    let all: Vec<ExprId> = roots.iter().map(|(r, _)| *r).collect();
+    // Symbols that are not states are parameters.
+    let params: Vec<rsdag::SymbolId> = reachable(ctx, &all)
+        .into_iter()
+        .filter_map(|e| match ctx.node(e) {
+            Node::Symbol(s) if !is_state(ctx.symbol_name(*s)) => Some(*s),
+            _ => None,
+        })
+        .collect();
+    let mut view = GraphView::new(ctx).theme(theme()).params(&params);
+    for (r, name) in roots {
+        view = view.root(*r, name);
     }
-    for (r, _) in roots {
-        visit(ctx, *r, &mut seen, &mut order);
-    }
-
-    // nodes reachable from the highlight seeds stay at full opacity
-    let mut hi: std::collections::HashSet<u32> = std::collections::HashSet::new();
     if !highlight.is_empty() {
-        let mut h_order = Vec::new();
-        for &h in highlight {
-            visit(ctx, h, &mut hi, &mut h_order);
-        }
+        view = view.focus(reachable(ctx, highlight));
     }
-    let dim = |id: u32| !highlight.is_empty() && !hi.contains(&id);
-
-    let mut s = String::from("digraph G {\n  rankdir=TB;\n  node [fontname=\"Helvetica\"];\n");
-    s.push_str("  edge [arrowsize=0.7];\n");
-    // every expression node is drawn by its operator/leaf style (the root keeps
-    // its operator symbol, e.g. the Reduce sum stays a Sigma); dimmed nodes get
-    // an alpha suffix on the fill plus a faded border and font.
-    for &id in &order {
-        let (label, shape, fill) = dot_node_style(ctx, id);
-        let (fill, font, pen) = if dim(id.0) {
-            (
-                format!("{fill}33"),
-                ", fontcolor=\"#00000033\"",
-                ", color=\"#00000033\"",
-            )
-        } else {
-            (fill.to_string(), "", "")
-        };
-        s.push_str(&format!(
-            "  n{} [label=\"{}\", shape={}, style=filled, fillcolor=\"{}\"{}{}];\n",
-            id.0,
-            dot_escape(&label),
-            shape,
-            fill,
-            font,
-            pen,
-        ));
-    }
-    // Edges run operand -> parent, so leaves rise to the top and the root
-    // expression sinks to the bottom (data flows down toward the residual). An
-    // edge is faded if either end is dimmed, so only edges inside the
-    // highlighted subgraph stay solid.
-    for &id in &order {
-        for op in operands(ctx, id) {
-            let faded = if dim(id.0) || dim(op.0) {
-                " [color=\"#00000033\"]"
-            } else {
-                ""
-            };
-            s.push_str(&format!("  n{} -> n{}{};\n", op.0, id.0, faded));
-        }
-    }
-    // The residual itself is a named endpoint: a red box below the root
-    // expression, fed by it. ("F = ... = 0".)
-    for (i, (r, name)) in roots.iter().enumerate() {
-        if !name.is_empty() {
-            s.push_str(&format!(
-                "  res{} [label=\"{}\", shape=box, style=filled, fillcolor=\"#E89A9A\"];\n  n{} -> res{};\n",
-                i, dot_escape(name), r.0, i
-            ));
-        }
-    }
-    s.push_str("}\n");
-    s
+    view.render()
 }
 
-/// The child expression ids of a node, in operand order.
-fn operands(ctx: &Graph, id: ExprId) -> Vec<ExprId> {
-    ctx.operands(id).to_vec()
-}
-
-/// (label, graphviz shape, fill colour) for a node, by variant. Colours follow
-/// the SANE palette: green leaves are symbols, grey leaves constants, orange a
-/// black-box (opaque) node, blue the operators.
-fn dot_node_style(ctx: &Graph, id: ExprId) -> (String, &'static str, &'static str) {
-    match ctx.node(id) {
-        // a constant: white box (a fixed numeric literal), distinct from the
-        // grey operators, green parameters, and blue state symbols.
-        Node::Const(c) => {
-            use num_traits::ToPrimitive;
-            let r = ctx.const_val(*c);
-            let label = match (r.denom().is_one(), r.numer().to_i64()) {
-                (true, Some(n)) => n.to_string(),
-                _ => fmt_num(r.to_f64().unwrap_or(f64::NAN)),
-            };
-            (label, "box", CONST_FILL)
-        }
-        // a free symbol as its plain name (the descriptor, e.g. R1, D1.Is,
-        // $temp, v1): state (node voltage / derivative / branch current) is a
-        // light-blue box, a parameter a light-green box.
-        Node::Symbol(s) => {
-            let name = ctx.symbol_name(*s);
-            (
-                name.to_string(),
-                "box",
-                if is_state(name) {
-                    STATE_FILL
-                } else {
-                    PARAM_FILL
-                },
-            )
-        }
-        // operators: light-grey nodes. The arity-bearing ones carry a placeholder
-        // dot so it is clear where the operand goes, e.g. (.)^-1, exp(.).
-        Node::Add(..) => ("+".into(), "circle", OP_FILL),
-        Node::Mul(..) => ("\u{00d7}".into(), "circle", OP_FILL), // x
-        Node::Neg(..) => ("\u{2212}(\u{00b7})".into(), "ellipse", OP_FILL), // -(.)
-        Node::Pow(_, n) => (format!("(\u{00b7})^{n}"), "ellipse", OP_FILL), // (.)^-1
-        Node::Unary(op, _) => {
-            let l = format!("{}(\u{00b7})", op.name());
-            (l, "ellipse", OP_FILL)
-        }
-        Node::Cmp(op, ..) => {
-            let sym = match op {
-                CmpOp::Gt => ">",
-                CmpOp::Ge => ">=",
-                CmpOp::Lt => "<",
-                CmpOp::Le => "<=",
-                CmpOp::Eq => "=",
-                CmpOp::Ne => "!=",
-            };
-            (format!("(\u{00b7}) {sym} (\u{00b7})"), "ellipse", OP_FILL)
-        }
-        // a decision (region select): light-yellow ellipse, kept visually distinct.
-        Node::Select(..) => (
-            "(\u{00b7}) ? (\u{00b7}) : (\u{00b7})".into(),
-            "ellipse",
-            SELECT_FILL,
-        ),
-        Node::Reduce(op, _) => {
-            let sym = match op {
-                ReduceOp::Sum => "\u{03a3}",     // Sigma
-                ReduceOp::Product => "\u{03a0}", // Pi
-                ReduceOp::Min => "min",
-                ReduceOp::Max => "max",
-            };
-            (sym.to_string(), "circle", OP_FILL)
-        }
-        Node::Dot(..) => ("<\u{00b7},\u{00b7}>".into(), "ellipse", OP_FILL),
-        Node::Binary(op, ..) => (op.name().into(), "ellipse", OP_FILL),
-        Node::Solve(_, n) => (format!("solve_{n}"), "ellipse", OP_FILL),
-        // black-box (opaque) device value: orange box, kept distinct.
-        Node::Call(o, _) => {
-            let (f, k) = ctx.output(*o);
-            (format!("{}#{k}", ctx.func(f).name), "box", "#E8B06A")
-        }
+/// The SANE palette as a DOT theme: black lines and text, a pale fill per
+/// role (light blue states, light green parameters, white constants, grey
+/// operators, yellow decisions, orange device calls, red residuals) and
+/// mathematical operator labels. The web graph view reads the role from the
+/// fill.
+pub fn theme() -> rsdag::dot::Theme {
+    rsdag::dot::Theme {
+        style: rsdag::dot::Style::Filled,
+        font: "Helvetica",
+        font_size: 11.0,
+        text: "#000000",
+        line: Some("#000000"),
+        fill_alpha: "",
+        fade_alpha: "33",
+        fade_fill_alpha: "33",
+        notation: rsdag::dot::Notation::Math,
+        input: "#CFE7F0",
+        param: "#D7EAC8",
+        constant: "#FFFFFF",
+        op: "#E0E0E0",
+        choice: "#EDD9A3",
+        kernel: "#E0E0E0",
+        call: "#E8B06A",
+        output: "#E89A9A",
+        state: "#000000",
+        ..rsdag::dot::Theme::default()
     }
-}
-
-// node fill colours (light, by role)
-const CONST_FILL: &str = "#FFFFFF"; // constants: white
-const STATE_FILL: &str = "#CFE7F0"; // node voltages / derivatives / branch currents: light blue
-const PARAM_FILL: &str = "#D7EAC8"; // parameters: light green
-const OP_FILL: &str = "#E0E0E0"; //    operators: light grey
-const SELECT_FILL: &str = "#EDD9A3"; // decision (Select) nodes: light yellow
-
-fn dot_escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// Whether a symbol is a state variable (drawn light blue) rather than a
@@ -324,23 +197,6 @@ fn is_state(name: &str) -> bool {
     matches!(name.strip_prefix('v'), Some(r) if digits(r))
 }
 
-/// Compact label for a constant: a short decimal for moderate magnitudes,
-/// scientific for very small/large. (The arena keeps the exact rational; this is
-/// only the picture.)
-fn fmt_num(v: f64) -> String {
-    if v == 0.0 {
-        return "0".into();
-    }
-    if v.fract() == 0.0 && v.abs() < 1e6 {
-        return format!("{}", v as i64);
-    }
-    if v.abs() >= 1e-3 && v.abs() < 1e5 {
-        let s = format!("{v:.4}");
-        return s.trim_end_matches('0').trim_end_matches('.').to_string();
-    }
-    format!("{v:.2e}")
-}
-
 /// Wrap sums/negations in parentheses when they appear as a factor or base.
 fn latex_factor(ctx: &Graph, id: ExprId) -> String {
     match ctx.node(id) {
@@ -356,7 +212,7 @@ fn latex_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rsdag::Graph;
+    use sane_core::Graph;
     use sane_dae::{assemble_dae, DeviceInstance};
     use sane_mna::Circuit;
 
@@ -374,5 +230,38 @@ mod tests {
         assert!(tex.contains("\\begin{aligned}"));
         assert!(tex.contains("\\exp\\left"));
         assert_eq!(tex.matches("0 &=").count(), dae.dim());
+    }
+
+    /// The web graph view reads a node's role from its fill, six hex
+    /// digits: states light blue, parameters light green, residuals red.
+    #[test]
+    fn dot_export_tags_roles_by_fill() {
+        let mut ctx = Graph::new();
+        let mut c = Circuit::new();
+        c.voltage_source("V1", 1, 0).resistor("R", 1, 2);
+        let devs = vec![DeviceInstance::new(
+            Box::new(sane_veriloga::builtin_device("sane_diode", "D1", &[])),
+            vec![2, 0],
+        )];
+        let dae = assemble_dae(&mut ctx, &c, &devs);
+        let roots: Vec<(ExprId, String)> = dae
+            .residuals
+            .iter()
+            .enumerate()
+            .map(|(k, &r)| (r, format!("F[{k}]")))
+            .collect();
+        let dot = export_dot(&ctx, &roots, &[]);
+        let fill_of = |label: &str| {
+            let line = dot
+                .lines()
+                .find(|l| l.contains(&format!("label=\"{label}\"")))
+                .unwrap_or_else(|| panic!("no node {label}: {dot}"));
+            let at = line.find("fillcolor=\"").expect("a fill") + 11;
+            line[at..at + 8].to_string()
+        };
+        assert_eq!(fill_of("v1"), "#CFE7F0\"");
+        assert_eq!(fill_of("F[0]"), "#E89A9A\"");
+        assert!(dot.contains("fillcolor=\"#D7EAC8\""), "a parameter: {dot}");
+        assert_eq!(dot.matches("fillcolor=\"#E89A9A\"").count(), dae.dim());
     }
 }

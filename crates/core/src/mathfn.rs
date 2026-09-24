@@ -5,7 +5,7 @@
 //! translator), so `abs`/`min`/`atan2`/... lower to the *same* graph shape
 //! everywhere instead of each frontend keeping its own drifting copy.
 
-use rsdag::Graph;
+use crate::Graph;
 use rsdag::{CmpOp, ExprId};
 
 /// Division guarded against a constant-zero denominator (avoids `recip(0)`

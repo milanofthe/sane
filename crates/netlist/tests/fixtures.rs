@@ -5,7 +5,8 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 
-use rsdag::{ExprId, Graph, Node};
+use rsdag::{ExprId, Node};
+use sane_core::Graph;
 use sane_dae::assemble_dae;
 use sane_netlist::parse;
 

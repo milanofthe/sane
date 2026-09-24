@@ -58,29 +58,33 @@ fn unary_factor<K: Field>(ctx: &mut Graph<K>, op: UnaryOp, a: ExprId) -> ExprId 
             // one transcendental per junction per evaluation instead of two.
             // Values are identical: for a <= EXP_LIMIT `unary_f64` evaluates
             // the bare `a.exp()`.
+            // The condition names the out-of-range side, so a NaN `a`
+            // takes the exp arm and stays NaN, as the value does.
             let hi = ctx.konst_f64(crate::semantics::EXP_LIMIT);
-            let below = ctx.cmp(CmpOp::Le, a, hi);
+            let above = ctx.cmp(CmpOp::Gt, a, hi);
             let ea = ctx.exp(a);
             let slope = ctx.konst_f64(crate::semantics::EXP_LIMIT.exp());
-            ctx.select(below, ea, slope)
+            ctx.select(above, slope, ea)
         }
         UnaryOp::Ln => {
-            // 1/a above the floor, 0 below it (ln is clamped flat there).
+            // 1/a above the floor, 0 at or below it (ln is clamped flat
+            // there); a NaN `a` takes the 1/a arm.
             let lo = ctx.konst_f64(crate::semantics::LN_FLOOR);
-            let above = ctx.cmp(CmpOp::Gt, a, lo);
+            let clamped = ctx.cmp(CmpOp::Le, a, lo);
             let inv_a = ctx.recip(a);
             let zero = ctx.zero();
-            ctx.select(above, inv_a, zero)
+            ctx.select(clamped, zero, inv_a)
         }
         UnaryOp::Sqrt => {
-            // 1/(2*sqrt(a)) for a>0, else 0 (matches sqrt clamped to 0).
+            // 1/(2*sqrt(a)) for a>0, else 0 (matches sqrt clamped to 0);
+            // a NaN `a` takes the first arm.
             let s = ctx.sqrt(a);
             let rs = ctx.recip(s);
             let half = ctx.ratio(1, 2);
             let d = ctx.mul(half, rs);
             let zero = ctx.zero();
-            let pos = ctx.cmp(CmpOp::Gt, a, zero);
-            ctx.select(pos, d, zero)
+            let clamped = ctx.cmp(CmpOp::Le, a, zero);
+            ctx.select(clamped, zero, d)
         }
         UnaryOp::Sin => ctx.cos(a),
         UnaryOp::Cos => {
@@ -410,13 +414,23 @@ fn diff<K: Field>(ctx: &mut Graph<K>, expr: ExprId, wrt: SymbolId, memo: &mut Me
 /// pairs that are not the structural zero, in ascending column order.
 pub type SparseRows = Vec<Vec<(usize, ExprId)>>;
 
-/// The Jacobian `d(residuals[i]) / d(wrt[j])` as sparse rows.
+/// Rows of this many touched unknowns and more are differentiated in
+/// reverse mode, one adjoint sweep for the whole row; below it, forward
+/// sweeps per unknown, shared by every row that touches it, are cheaper.
+pub const REVERSE_MIN_TOUCHED: usize = 16;
+
+/// Sparse Jacobian of `residuals` with respect to `wrt`: row `i` lists the
+/// nonzero `(column, d residuals[i] / d wrt[column])`, by column.
 ///
-/// Only the symbols a row actually contains can have a nonzero derivative,
-/// so each row costs one free-symbol walk plus one differentiation per
-/// symbol it touches: linear in the residual's size and the pattern's
-/// nonzeros, never in `n_rows * n_wrt`. A row that touches a handful of
-/// unknowns out of a million is a handful of entries.
+/// Only the symbols a row actually contains can have a nonzero derivative.
+/// A row that touches few unknowns is differentiated forward, one sweep
+/// per unknown, and a sweep is shared by every such row that touches that
+/// unknown, so a subexpression common to several rows (a device current
+/// in two node equations) is differentiated once per unknown, not once per
+/// row. A row that touches [`REVERSE_MIN_TOUCHED`] unknowns or more (a
+/// scalar output over a deep shared graph, a node many devices meet at)
+/// takes one reverse sweep instead: its cost is the row's graph once, not
+/// once per unknown.
 pub fn sparse_jacobian<K: Field>(
     ctx: &mut Graph<K>,
     residuals: &[ExprId],
@@ -424,23 +438,48 @@ pub fn sparse_jacobian<K: Field>(
 ) -> SparseRows {
     let col: rustc_hash::FxHashMap<SymbolId, usize> =
         wrt.iter().enumerate().map(|(j, &s)| (s, j)).collect();
-    residuals
+    let touched: Vec<Vec<(usize, SymbolId)>> = residuals
         .iter()
         .map(|&r| {
-            let touched: Vec<(usize, SymbolId)> = ctx
+            let mut t: Vec<(usize, SymbolId)> = ctx
                 .free_symbols(r)
                 .into_iter()
                 .filter_map(|s| col.get(&s).map(|&j| (j, s)))
                 .collect();
-            let mut row: Vec<(usize, ExprId)> = touched
-                .into_iter()
-                .map(|(j, s)| (j, differentiate(ctx, r, s)))
-                .collect();
-            row.retain(|&(_, e)| !ctx.is_zero(e));
-            row.sort_by_key(|&(j, _)| j);
-            row
+            t.sort_unstable_by_key(|&(j, _)| j);
+            t
         })
-        .collect()
+        .collect();
+    let mut rows: SparseRows = vec![Vec::new(); residuals.len()];
+    // Forward rows by the columns they touch, rows in order within one.
+    let mut by_col: Vec<Vec<usize>> = vec![Vec::new(); wrt.len()];
+    for (i, t) in touched.iter().enumerate() {
+        if t.len() >= REVERSE_MIN_TOUCHED {
+            let syms: Vec<SymbolId> = t.iter().map(|&(_, s)| s).collect();
+            let g = gradient(ctx, residuals[i], &syms);
+            rows[i] = t.iter().map(|&(j, _)| j).zip(g).collect();
+        } else {
+            for &(j, _) in t {
+                by_col[j].push(i);
+            }
+        }
+    }
+    let mut memo = ctx.take_memo();
+    for (j, members) in by_col.iter().enumerate() {
+        if members.is_empty() {
+            continue;
+        }
+        memo.begin(ctx.len());
+        for &i in members {
+            let d = diff(ctx, residuals[i], wrt[j], &mut memo);
+            rows[i].push((j, d));
+        }
+    }
+    ctx.put_memo(memo);
+    for row in rows.iter_mut() {
+        row.retain(|&(_, e)| !ctx.is_zero(e));
+    }
+    rows
 }
 
 /// Reverse-mode symbolic gradient: `d(f)/d(wrt[j])` for every `j`, built in ONE

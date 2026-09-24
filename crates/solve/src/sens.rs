@@ -4,9 +4,10 @@
 
 use std::sync::atomic::Ordering;
 
-use rsdag::{Graph, Tape};
+use rsdag::Tape;
 use sane_core::constants::GMIN_DC;
 use sane_core::log_stage;
+use sane_core::Graph;
 use sane_dae::{lagrangian_hessian, Dae};
 
 use crate::{bundle, sparse, CompiledDc, StepEval, FACTOR_FX_CALLS};
@@ -56,7 +57,7 @@ impl CompiledDc {
             return;
         }
         let (r, c, e) = dae.jacobian_hist_coo(ctx);
-        let tape = StepEval::new(Tape::compile(ctx, &e, &self.base_inputs));
+        let tape = crate::eval::step_eval(Tape::compile(ctx, &e, &self.base_inputs));
         let _ = self.hjac.set(HistJac {
             tape,
             rows: r,
@@ -96,7 +97,7 @@ impl CompiledDc {
         bundle::ensure_function_bodies(ctx, &pe, &self.param_syms);
         let tape = log_stage!(
             "sens/param_jac_tape",
-            StepEval::new(Tape::compile(ctx, &pe, &self.base_inputs))
+            crate::eval::step_eval(Tape::compile(ctx, &pe, &self.base_inputs))
         );
         let _ = self.pjac.set(ParamJac {
             tape,
@@ -147,7 +148,7 @@ impl CompiledDc {
             xdp_rc: (hs.xdp.0, hs.xdp.1),
             tape: log_stage!(
                 "sens/hessian_tape",
-                StepEval::new(Tape::compile(ctx, &h_roots, &h_input_syms))
+                crate::eval::step_eval(Tape::compile(ctx, &h_roots, &h_input_syms))
             ),
         };
         let _ = self.chess.set(ch);

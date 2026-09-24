@@ -6,7 +6,8 @@
 use num_complex::Complex64;
 use std::collections::HashMap;
 
-use rsdag::{ExprId, Graph, Node, ReduceOp, SymbolId};
+use rsdag::{ExprId, Node, ReduceOp, SymbolId};
+use sane_core::Graph;
 
 /// Collect an expression as a polynomial in `s` (coefficient ExprId per power),
 /// or None if it is not polynomial in `s`. Subtrees free of `s` are degree-0.

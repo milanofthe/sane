@@ -4,8 +4,9 @@
 
 use std::collections::HashMap;
 
-use rsdag::{Crossing, ExprId, Graph, Node, ReduceOp, SymbolId, Tape};
+use rsdag::{Crossing, ExprId, Node, ReduceOp, SymbolId, Tape};
 use sane_core::constants::*;
+use sane_core::Graph;
 use sane_core::{time_stage, Profile};
 use sane_dae::Dae;
 
@@ -50,29 +51,34 @@ impl CompiledDc {
         };
         let param_syms = time_stage!(prof, "params", dae.params(ctx));
 
-        // Input ordering: x, then differential xdot, then params, then t.
-        let mut input_syms = Vec::new();
-        let mut input_src = Vec::new();
-        for (i, &s) in dae.x.iter().enumerate() {
-            input_syms.push(s);
-            input_src.push(InputSrc::X(i));
-        }
-        for (i, opt) in dae.xdot.iter().enumerate() {
-            if let Some(s) = opt {
-                input_syms.push(*s);
-                input_src.push(InputSrc::Xdot(i));
-            }
-        }
-        for (j, &s) in param_syms.iter().enumerate() {
-            input_syms.push(s);
-            input_src.push(InputSrc::P(j));
-        }
-        input_syms.push(dae.t);
-        input_src.push(InputSrc::T);
-        for (k, dl) in dae.delays.iter().enumerate() {
-            input_syms.push(dl.hist);
-            input_src.push(InputSrc::Hist(k));
-        }
+        // The system as a function with roles; every program over it takes
+        // its inputs in the function's signature: x, the differential xdot,
+        // the parameters, t, the delay histories. The solver also reads what
+        // a guard is, and which way it has to cross, off the roles.
+        let sys = dae.register_function(ctx, "dae");
+        let sig = rsdag::Signature::of(ctx.func(sys));
+        let input_syms = sig.syms.clone();
+        let mut n_param = 0;
+        let input_src: Vec<InputSrc> = sig
+            .roles
+            .iter()
+            .map(|r| match *r {
+                rsdag::ParamRole::State { id } => InputSrc::X(id as usize),
+                rsdag::ParamRole::StateDot { id } => InputSrc::Xdot(id as usize),
+                rsdag::ParamRole::Param => {
+                    n_param += 1;
+                    InputSrc::P(n_param - 1)
+                }
+                rsdag::ParamRole::Time => InputSrc::T,
+                rsdag::ParamRole::History { id } => InputSrc::Hist(id as usize),
+                other => unreachable!("a DAE declares no {other:?} parameter"),
+            })
+            .collect();
+        debug_assert_eq!(
+            input_syms[sig.range(|r| matches!(r, rsdag::ParamRole::Param))],
+            param_syms[..],
+            "the parameters in the parameter vector's order"
+        );
         let delay_src: Vec<usize> = dae.delays.iter().map(|dl| dl.src).collect();
         let tape_tau = (!dae.delays.is_empty()).then(|| {
             let roots: Vec<_> = dae.delays.iter().map(|dl| dl.tau).collect();
@@ -108,14 +114,11 @@ impl CompiledDc {
         // solve-constant, so every op depending only on them (device-card
         // preprocessing, bin interpolation, temperature scalings) hoists into a
         // prefix the Newton loops evaluate once per parameter binding.
-        let pure_inputs: Vec<bool> = input_src
-            .iter()
-            .map(|s| matches!(s, InputSrc::P(_)))
-            .collect();
+        let pure_inputs = sig.pure_mask();
         let tape_res = time_stage!(
             prof,
             "tape_res",
-            StepEval::new(Tape::compile_split(
+            crate::eval::step_eval(Tape::compile_split(
                 ctx,
                 &dae.residuals,
                 &input_syms,
@@ -126,10 +129,6 @@ impl CompiledDc {
         // markers) for the Jacobian-bearing tapes. `tape_res` above keeps the
         // residual-only body it interned; both bodies compute identical bits
         // for the shared outputs (same DAG nodes, per-op deterministic).
-        // The system as a function with roles: the solver then reads what a
-        // guard is, and which way it has to cross, off the graph rather than
-        // off SANE's own event list (which keeps only the names).
-        let sys = dae.register_function(ctx, "dae");
         let guards = ctx
             .func(sys)
             .outputs_with_role(|r| matches!(r, rsdag::OutputRole::Guard { .. }));
@@ -160,7 +159,7 @@ impl CompiledDc {
         let tape_step = time_stage!(
             prof,
             "tape_step",
-            StepEval::new(Tape::compile_split(
+            crate::eval::step_eval(Tape::compile_split(
                 ctx,
                 &step_roots,
                 &input_syms,
@@ -170,7 +169,7 @@ impl CompiledDc {
         let tape_jxd = time_stage!(
             prof,
             "tape_jxd",
-            StepEval::new(Tape::compile(ctx, &xe, &input_syms))
+            crate::eval::step_eval(Tape::compile(ctx, &xe, &input_syms))
         );
         // The switching surfaces, evaluated once per candidate transient step.
         let tape_event = (!event_roots.is_empty()).then(|| {
@@ -242,7 +241,7 @@ impl CompiledDc {
                 let tape = time_stage!(
                     prof,
                     "tape_iscale",
-                    StepEval::new(Tape::compile(ctx, &terms, &input_syms))
+                    crate::eval::step_eval(Tape::compile(ctx, &terms, &input_syms))
                 );
                 (Some(tape), rows)
             } else {

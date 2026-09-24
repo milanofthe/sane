@@ -16,8 +16,9 @@
 
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
-use rsdag::{differentiate, time_derivative, CmpOp, Crossing, ExprId, Graph, Node, SymbolId};
+use rsdag::{differentiate, time_derivative, CmpOp, Crossing, ExprId, Node, SymbolId};
 use sane_core::constants::{MAX_UNROLL, VERILOGA_K_OVER_Q, WHILE_MAX_UNROLL};
+use sane_core::Graph;
 use sane_device::{
     BehavioralFragment, FragmentEvent, FragmentLimit, LimitKind, LoweredDelay, Lowerer,
     NoiseSource, OpVar,
@@ -36,6 +37,33 @@ pub fn lower_analog(
     terminal_v: &[ExprId],
     terminal_vdot: &[ExprId],
 ) -> Result<BehavioralFragment, String> {
+    lower_analog_structural(
+        em,
+        inst,
+        param_values,
+        given,
+        mfactor,
+        lo,
+        terminal_v,
+        terminal_vdot,
+    )
+    .map(|(frag, _)| frag)
+}
+
+/// [`lower_analog`], and the parameters whose values fixed the fragment's
+/// structure: an instance agreeing on those lowers to the same graph up to
+/// its leaf symbols (the others are symbols in it, bound at run time).
+#[allow(clippy::too_many_arguments)]
+pub fn lower_analog_structural(
+    em: &ElaboratedModule,
+    inst: &str,
+    param_values: &HashMap<String, f64>,
+    given: &HashSet<String>,
+    mfactor: f64,
+    lo: &mut Lowerer,
+    terminal_v: &[ExprId],
+    terminal_vdot: &[ExprId],
+) -> Result<(BehavioralFragment, std::collections::BTreeSet<String>), String> {
     // Compile-time environment for structural decisions (switch branches,
     // loop bounds): module defaults overridden by the instance's bound values.
     let mut param_env: HashMap<String, f64> = em
@@ -48,7 +76,7 @@ pub fn lower_analog(
     }
     // Node collapsing: statically-reached `V(a,b) <+ 0` shorts merge their
     // nodes before lowering (see `compute_node_collapses`).
-    let node_alias = compute_node_collapses(em, &param_env, given);
+    let (node_alias, collapse_reads) = compute_node_collapses(em, &param_env, given);
     let mut l = Lower {
         em,
         inst: inst.to_string(),
@@ -57,6 +85,8 @@ pub fn lower_analog(
         node_v: HashMap::default(),
         deriv_of: HashMap::default(),
         param_env,
+        structural: std::cell::RefCell::new(collapse_reads),
+        collect: std::cell::RefCell::new(None),
         param_syms: HashMap::default(),
         given: given.clone(),
         internal_resid_nodes: Vec::new(),
@@ -90,7 +120,7 @@ pub fn lower_analog(
     let zero = l.ctx().zero();
     for (name, _ty) in &em.vars {
         l.st.vars.insert(name.clone(), zero);
-        l.st.const_vars.insert(name.clone(), 0.0);
+        l.st.const_vars.insert(name.clone(), CVal::lit(0.0));
     }
     // `em` is a shared reference independent of `l`'s mutable borrow, so the
     // analog block can be walked in place without cloning the whole AST.
@@ -101,7 +131,31 @@ pub fn lower_analog(
         // committed writes journaled with no rewind -- drop them (never undone).
         l.journal.clear();
     }
-    Ok(l.finish())
+    let structural = l.structural.take();
+    Ok((l.finish(), structural))
+}
+
+/// The parameters a compile-time value was folded from.
+type Deps = std::rc::Rc<std::collections::BTreeSet<String>>;
+
+/// A compile-time value of a variable and the parameters it was folded
+/// from, so a structural decision that reads it knows which parameter
+/// values it depends on (see [`Lower::structural`]).
+#[derive(Clone)]
+struct CVal {
+    v: f64,
+    deps: Deps,
+}
+
+impl CVal {
+    /// A value no parameter went into (a literal, a loop counter the loop's
+    /// own decisions already account for).
+    fn lit(v: f64) -> CVal {
+        CVal {
+            v,
+            deps: Deps::default(),
+        }
+    }
 }
 
 /// Mutable lowering state affected by control flow (everything cloned/merged
@@ -117,7 +171,7 @@ struct State {
     /// value foldable from parameters/literals (e.g. an integer assigned a
     /// parameter) maps to that value, enabling structural loop bounds and `if`
     /// decisions through variables. Dropped when a variable becomes runtime.
-    const_vars: HashMap<String, f64>,
+    const_vars: HashMap<String, CVal>,
 }
 
 /// One undoable write to [`State`], journaled while lowering inside a conditional
@@ -126,7 +180,7 @@ struct State {
 enum Undo {
     Var(String, Option<ExprId>),
     NodeCur(String, Option<ExprId>),
-    Const(String, Option<f64>),
+    Const(String, Option<CVal>),
 }
 
 /// What a conditional arm changed, relative to the pre-branch state: only the
@@ -136,7 +190,7 @@ struct Writes {
     vars: HashMap<String, ExprId>,
     node_cur: HashMap<String, ExprId>,
     /// Final compile-time-const state per touched key (`None` = became runtime).
-    const_vars: HashMap<String, Option<f64>>,
+    const_vars: HashMap<String, Option<CVal>>,
 }
 
 struct Lower<'a, 'b> {
@@ -151,6 +205,13 @@ struct Lower<'a, 'b> {
     /// Compile-time parameter environment (defaults + instance overrides) for
     /// folding structural conditions and loop bounds.
     param_env: HashMap<String, f64>,
+    /// The parameters whose values a structural decision read: an instance
+    /// with the same values on these lowers to the same graph, whatever its
+    /// other parameters (they stay symbols, bound per instance at run time).
+    structural: std::cell::RefCell<std::collections::BTreeSet<String>>,
+    /// While a shadow assignment evaluates: the parameters it reads, which
+    /// are not structural (yet).
+    collect: std::cell::RefCell<Option<std::collections::BTreeSet<String>>>,
     /// Parameter symbols this instance's expressions reference, by name.
     param_syms: HashMap<String, SymbolId>,
     /// Parameter names the deck/instance explicitly set (for `$param_given`).
@@ -437,11 +498,11 @@ impl<'a, 'b> Lower<'a, 'b> {
         self.st.vars.insert(key, val);
     }
 
-    fn set_const(&mut self, key: String, val: f64) {
+    fn set_const(&mut self, key: String, val: CVal) {
         if self.cond_depth > 0 {
             self.journal.push(Undo::Const(
                 key.clone(),
-                self.st.const_vars.get(&key).copied(),
+                self.st.const_vars.get(&key).cloned(),
             ));
         }
         self.st.const_vars.insert(key, val);
@@ -451,7 +512,7 @@ impl<'a, 'b> Lower<'a, 'b> {
         if self.cond_depth > 0 {
             self.journal.push(Undo::Const(
                 key.to_string(),
-                self.st.const_vars.get(key).copied(),
+                self.st.const_vars.get(key).cloned(),
             ));
         }
         self.st.const_vars.remove(key);
@@ -473,7 +534,7 @@ impl<'a, 'b> Lower<'a, 'b> {
                 Undo::Const(k, _) => {
                     w.const_vars
                         .entry(k.clone())
-                        .or_insert_with(|| self.st.const_vars.get(k).copied());
+                        .or_insert_with(|| self.st.const_vars.get(k).cloned());
                 }
             }
         }
@@ -629,9 +690,10 @@ impl<'a, 'b> Lower<'a, 'b> {
             Stmt::Assign { lhs, rhs, .. } => {
                 let v = self.expr(rhs)?;
                 self.set_var(lhs.clone(), v);
-                // Maintain the compile-time-constant shadow.
-                match self.const_of_expr(rhs) {
-                    Some(c) => {
+                // Maintain the compile-time-constant shadow, with the
+                // parameters it came from (not a structural read).
+                match self.const_of_expr_deps(rhs) {
+                    Some((c, deps)) => {
                         // A non-finite compile-time-constant assignment is baked
                         // into the residual as a bias-independent NaN/Inf that
                         // poisons every Newton step. Surface it UNCONDITIONALLY as
@@ -651,7 +713,7 @@ impl<'a, 'b> Lower<'a, 'b> {
                                 ));
                             }
                         }
-                        self.set_const(lhs.clone(), c)
+                        self.set_const(lhs.clone(), CVal { v: c, deps })
                     }
                     None => self.drop_const(lhs),
                 }
@@ -897,11 +959,21 @@ impl<'a, 'b> Lower<'a, 'b> {
         // constant shadow: a variable stays constant only if both arms agree on
         // the same constant value; otherwise it becomes runtime.
         for k in union(then_w, else_w, |w| w.const_vars.keys().cloned().collect()) {
-            let base = self.st.const_vars.get(&k).copied();
-            let t = then_w.const_vars.get(&k).copied().unwrap_or(base);
-            let e = else_w.const_vars.get(&k).copied().unwrap_or(base);
+            let base = self.st.const_vars.get(&k).cloned();
+            let t = then_w.const_vars.get(&k).cloned().unwrap_or(base.clone());
+            let e = else_w.const_vars.get(&k).cloned().unwrap_or(base);
             match (t, e) {
-                (Some(tv), Some(ev)) if tv == ev => self.set_const(k, tv),
+                (Some(tv), Some(ev)) if tv.v == ev.v => {
+                    let deps: std::collections::BTreeSet<String> =
+                        tv.deps.iter().chain(ev.deps.iter()).cloned().collect();
+                    self.set_const(
+                        k,
+                        CVal {
+                            v: tv.v,
+                            deps: Deps::new(deps),
+                        },
+                    )
+                }
                 _ => self.drop_const(&k),
             }
         }
@@ -936,7 +1008,7 @@ impl<'a, 'b> Lower<'a, 'b> {
             }
             let kv = self.ctx().konst_f64(val);
             self.set_var(var.clone(), kv);
-            self.set_const(var.clone(), val);
+            self.set_const(var.clone(), CVal::lit(val));
             self.cond_depth += 1;
             self.stmt(body)?;
             self.cond_depth -= 1;
@@ -1001,7 +1073,7 @@ impl<'a, 'b> Lower<'a, 'b> {
                 }
                 let z = self.ctx().zero();
                 self.set_var(flag.clone(), z);
-                self.set_const(flag.clone(), 0.0);
+                self.set_const(flag.clone(), CVal::lit(0.0));
                 return Ok(());
             }
             if let Some(bound) = self.while_flag_bound(flag, body) {
@@ -1027,7 +1099,7 @@ impl<'a, 'b> Lower<'a, 'b> {
                 // Trigger budget exhausted: the flag is provably clear.
                 let z = self.ctx().zero();
                 self.set_var(flag.clone(), z);
-                self.set_const(flag.clone(), 0.0);
+                self.set_const(flag.clone(), CVal::lit(0.0));
                 return Ok(());
             }
         }
@@ -1499,11 +1571,35 @@ impl<'a, 'b> Lower<'a, 'b> {
         {
             return Some(bool_f64(self.given.contains(p)));
         }
-        self.st
-            .const_vars
-            .get(name)
-            .copied()
-            .or_else(|| self.param_env.get(name).copied())
+        if let Some(c) = self.st.const_vars.get(name) {
+            self.note(c.deps.iter().cloned());
+            return Some(c.v);
+        }
+        let v = self.param_env.get(name).copied();
+        if v.is_some() {
+            self.note(std::iter::once(name.to_string()));
+        }
+        v
+    }
+
+    /// Record parameters a compile-time value was read from: into the
+    /// collection a shadow assignment runs, or else as structural (a
+    /// decision's input: a branch, a bound, a short, a baked constant).
+    fn note(&self, names: impl Iterator<Item = String>) {
+        match &mut *self.collect.borrow_mut() {
+            Some(set) => set.extend(names),
+            None => self.structural.borrow_mut().extend(names),
+        }
+    }
+
+    /// [`const_of_expr`](Self::const_of_expr) for a shadow assignment: the
+    /// value and the parameters it came from, none of them recorded as
+    /// structural (only a later decision that reads the variable makes them so).
+    fn const_of_expr_deps(&self, e: &Expr) -> Option<(f64, Deps)> {
+        let outer = self.collect.replace(Some(Default::default()));
+        let v = self.const_of_expr_raw(e);
+        let deps = std::mem::replace(&mut *self.collect.borrow_mut(), outer).unwrap_or_default();
+        v.map(|v| (v, Deps::new(deps)))
     }
 
     /// Compile-time value of a string expression: a literal, or a string
@@ -1534,6 +1630,15 @@ impl<'a, 'b> Lower<'a, 'b> {
 
     /// Compile-time-constant value of an expression in the current scope, if any.
     fn const_of_expr(&self, e: &Expr) -> Option<f64> {
+        // The parameters an evaluation read count only when it succeeds: a
+        // condition that turns out runtime decided nothing at compile time.
+        let (v, deps) = self.const_of_expr_deps(e)?;
+        self.note(deps.iter().cloned());
+        Some(v)
+    }
+
+    /// The evaluation itself; lookups go wherever `collect` points.
+    fn const_of_expr_raw(&self, e: &Expr) -> Option<f64> {
         if let Expr::Binary { op, lhs, rhs, .. } = e {
             if let Some(v) = self.fold_str_cmp(*op, lhs, rhs) {
                 return Some(v);
@@ -2230,12 +2335,12 @@ impl<'a, 'b> Lower<'a, 'b> {
             ));
         }
         let mut argmap: HashMap<String, ExprId> = HashMap::default();
-        let mut cargmap: HashMap<String, f64> = HashMap::default();
+        let mut cargmap: HashMap<String, CVal> = HashMap::default();
         for (p, e) in func.args.iter().zip(args) {
             let v = self.expr(e)?;
             argmap.insert(p.clone(), v);
-            if let Some(c) = self.const_of_expr(e) {
-                cargmap.insert(p.clone(), c);
+            if let Some((c, deps)) = self.const_of_expr_deps(e) {
+                cargmap.insert(p.clone(), CVal { v: c, deps });
             }
         }
         let saved = std::mem::replace(
@@ -2261,13 +2366,13 @@ impl<'a, 'b> Lower<'a, 'b> {
         self.cond_depth -= 1;
         // Capture `output`/`inout` argument final values to write back to the
         // caller's variables (the actual args must be plain identifiers).
-        let mut writebacks: Vec<(String, ExprId, Option<f64>)> = Vec::new();
+        let mut writebacks: Vec<(String, ExprId, Option<CVal>)> = Vec::new();
         for out in &func.outputs {
             if let Some(idx) = func.args.iter().position(|a| a == out) {
                 if let (Some(Expr::Ident(caller, _)), Some(&v)) =
                     (args.get(idx), self.st.vars.get(out))
                 {
-                    let c = self.st.const_vars.get(out).copied();
+                    let c = self.st.const_vars.get(out).cloned();
                     writebacks.push((caller.clone(), v, c));
                 }
             }
@@ -2481,20 +2586,25 @@ fn compute_node_collapses(
     em: &ElaboratedModule,
     param_env: &HashMap<String, f64>,
     given: &HashSet<String>,
-) -> HashMap<String, String> {
+) -> (HashMap<String, String>, std::collections::BTreeSet<String>) {
     // Escape hatch and differential reference (`Config::node_collapse`): with
     // collapsing off, every static zero-volt branch lowers as an explicit
     // source (flow unknown + constraint row).
     if !sane_core::config().node_collapse {
-        return HashMap::default();
+        return (HashMap::default(), Default::default());
     }
     struct Scan<'a> {
         em: &'a ElaboratedModule,
         param_env: &'a HashMap<String, f64>,
         /// explicitly-set parameter names (for `$param_given` folding).
         given: &'a HashSet<String>,
-        /// compile-time-constant variable shadow (mirrors the lowering's).
-        shadow: HashMap<String, f64>,
+        /// compile-time-constant variable shadow (mirrors the lowering's),
+        /// with the parameters each value came from.
+        shadow: HashMap<String, (f64, Deps)>,
+        /// Parameters a decision of the scan read (see `Lower::structural`).
+        structural: std::cell::RefCell<std::collections::BTreeSet<String>>,
+        /// While a shadow assignment evaluates, the parameters it reads.
+        collect: std::cell::RefCell<Option<std::collections::BTreeSet<String>>>,
         /// statically-reached `V(hi,lo) <+ 0` pairs, in reach order.
         zero: Vec<(String, String)>,
         /// canonical branch keys that must NOT collapse.
@@ -2517,8 +2627,18 @@ fn compute_node_collapses(
             canon(&h, &l).0
         }
         /// Compile-time value over parameters + the constant shadow, with
-        /// string-parameter comparison folding (mirrors `Lower::const_of_expr`).
+        /// string-parameter comparison folding (mirrors `Lower::const_of_expr`):
+        /// a decision, so the parameters it read are structural, when it
+        /// succeeds.
         fn ceval(&self, e: &Expr) -> Option<f64> {
+            let (v, deps) = self.ceval_deps(e)?;
+            match &mut *self.collect.borrow_mut() {
+                Some(set) => set.extend(deps.iter().cloned()),
+                None => self.structural.borrow_mut().extend(deps.iter().cloned()),
+            }
+            Some(v)
+        }
+        fn ceval_raw(&self, e: &Expr) -> Option<f64> {
             if let Expr::Binary { op, lhs, rhs, .. } = e {
                 if matches!(op, BinOp::Eq | BinOp::Ne) {
                     fn cs<'x>(em: &'x ElaboratedModule, x: &'x Expr) -> Option<&'x str> {
@@ -2538,11 +2658,31 @@ fn compute_node_collapses(
                 if let Some(p) = n.strip_prefix("$given(").and_then(|s| s.strip_suffix(')')) {
                     return Some(bool_f64(self.given.contains(p)));
                 }
-                self.shadow
-                    .get(n)
-                    .copied()
-                    .or_else(|| self.param_env.get(n).copied())
+                let note =
+                    |names: &mut dyn Iterator<Item = String>| match &mut *self.collect.borrow_mut()
+                    {
+                        Some(set) => set.extend(names),
+                        None => self.structural.borrow_mut().extend(names),
+                    };
+                if let Some((v, deps)) = self.shadow.get(n) {
+                    note(&mut deps.iter().cloned());
+                    return Some(*v);
+                }
+                let v = self.param_env.get(n).copied();
+                if v.is_some() {
+                    note(&mut std::iter::once(n.to_string()));
+                }
+                v
             })
+        }
+        /// [`ceval_raw`](Self::ceval_raw) with the parameters it read, not
+        /// recorded as structural.
+        fn ceval_deps(&self, e: &Expr) -> Option<(f64, Deps)> {
+            let outer = self.collect.replace(Some(Default::default()));
+            let v = self.ceval_raw(e);
+            let deps =
+                std::mem::replace(&mut *self.collect.borrow_mut(), outer).unwrap_or_default();
+            v.map(|v| (v, Deps::new(deps)))
         }
         /// Block every current-probed branch (`I(a,b)` in an expression).
         fn block_probes(&mut self, e: &Expr) {
@@ -2611,7 +2751,7 @@ fn compute_node_collapses(
                 }
                 Stmt::Assign { lhs, rhs, .. } => {
                     self.block_probes(rhs);
-                    match (decided, self.ceval(rhs)) {
+                    match (decided, self.ceval_deps(rhs)) {
                         (true, Some(c)) => {
                             self.shadow.insert(lhs.clone(), c);
                         }
@@ -2675,6 +2815,8 @@ fn compute_node_collapses(
         param_env,
         given,
         shadow: HashMap::default(),
+        structural: Default::default(),
+        collect: Default::default(),
         zero: Vec::new(),
         blocked: HashSet::default(),
     };
@@ -2721,7 +2863,7 @@ fn compute_node_collapses(
     // Flatten chains so lookups are single-step.
     let flat: HashMap<String, String> =
         alias.keys().map(|k| (k.clone(), find(&alias, k))).collect();
-    flat
+    (flat, sc.structural.into_inner())
 }
 
 /// Desugar a `case` statement to a nested if-chain

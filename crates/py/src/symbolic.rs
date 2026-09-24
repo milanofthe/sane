@@ -23,9 +23,10 @@ use pyo3::types::{PyComplex, PyDict, PyTuple};
 
 use rsdag::simplify_egraph as core_simplify;
 use rsdag::{
-    differentiate as core_diff, eval as core_eval, to_string, ExprId, Graph as CoreCtx, Node,
-    SymbolId, Tape as CoreTape,
+    differentiate as core_diff, eval as core_eval, to_string, ExprId, Node, SymbolId,
+    Tape as CoreTape,
 };
+use sane_core::Graph as CoreCtx;
 
 // CONTEXT ==============================================================================
 

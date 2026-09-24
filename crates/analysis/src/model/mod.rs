@@ -21,9 +21,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use rsdag::{Graph, Node, SymbolId};
+use rsdag::{Node, SymbolId};
 use sane_core::constants::{DC_OP_MAXIT, DC_OP_TOL};
 use sane_core::log_stage;
+use sane_core::Graph;
 use sane_dae::linearize::{linearize_with, Granularity};
 use sane_dae::{eliminate_nodes as dae_eliminate_nodes, reduce_graph};
 use sane_solve::{CompiledDc, Convergence, SolverTricks, TransientMethod};

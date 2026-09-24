@@ -161,3 +161,35 @@ R1 out 0 1k
         );
     }
 }
+
+/// Folding parameters builds a new DAE in the same graph: its guards are
+/// the folded ones, not those of the model it was folded from (whose
+/// parameters are no longer inputs and would read as NaN, so no crossing
+/// would ever be seen).
+#[test]
+fn a_folded_model_keeps_its_events() {
+    let deck = "\
+* hard switch closing on a ramp
+Vc ctrl 0 PWL(0 0 1m 2)
+Vdd vdd 0 5
+S1 vdd out ctrl 0 SW
+R1 out 0 1k
+.model SW SW(Vt=1 Vh=0 Ron=1 Roff=1meg)
+.end
+";
+    let model = Model::from_netlist(deck).expect("model");
+    // The master runs first, so its system function is in the graph.
+    let _ = tran(&model, 1e-3, 21);
+    assert_eq!(model.transient_events().len(), 1);
+    let params: Vec<&str> = model.params().iter().map(String::as_str).collect();
+    assert!(!params.is_empty());
+    let folded = model.fold(&params).expect("fold");
+    let _ = tran(&folded, 1e-3, 21);
+    let events = folded.transient_events();
+    assert_eq!(events.len(), 1, "one crossing: {events:?}");
+    assert!(
+        (events[0].1 - 0.5e-3).abs() < 1e-9,
+        "event at {:.9e}",
+        events[0].1
+    );
+}

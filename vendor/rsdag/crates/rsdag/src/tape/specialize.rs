@@ -31,6 +31,9 @@ impl Tape {
                 Op::CallBatch {
                     n_groups, n_out, ..
                 } => n_groups * n_out,
+                Op::CallProlog {
+                    bundle, n_groups, ..
+                } => n_groups * self.bundles[bundle as usize].state_len() as u32,
                 Op::Gemv { m, .. } => m,
                 Op::Gemm { m, n, .. } => m * n,
                 Op::Solve { n, .. } => n,
@@ -59,13 +62,31 @@ impl Tape {
                 Op::Neg(a) | Op::Powi(a, _) | Op::Unary(_, a) => v.push(a),
                 Op::Reduce(_, s, l) => v.extend_from_slice(pool(s, l)),
                 Op::Dot(s, l) => v.extend_from_slice(pool(s, 2 * l)),
-                Op::Call { start, n_args, .. } => v.extend_from_slice(pool(start, n_args)),
+                Op::Call {
+                    start,
+                    n_args,
+                    state,
+                    ..
+                } => {
+                    v.extend_from_slice(pool(start, n_args));
+                    v.extend((state != super::NO_STATE).then_some(state));
+                }
                 Op::CallBatch {
                     start,
                     n_groups,
                     n_args,
+                    state,
                     ..
-                } => v.extend_from_slice(pool(start, n_groups * n_args)),
+                } => {
+                    v.extend_from_slice(pool(start, n_groups * n_args));
+                    v.extend((state != super::NO_STATE).then_some(state));
+                }
+                Op::CallProlog {
+                    start,
+                    n_groups,
+                    n_pure,
+                    ..
+                } => v.extend_from_slice(pool(start, n_groups * n_pure)),
                 Op::Gemv {
                     a,
                     x,
@@ -285,6 +306,16 @@ impl Tape {
         let mut new_base = vec![u32::MAX; m];
         let mut free: Vec<u32> = Vec::new();
         let mut next: u32 = 0;
+        // The state first, as in `compile`: every emitted prolog op whose
+        // value something after the prolog reads, one block at the start.
+        let mut state_base = vec![u32::MAX; m];
+        for i in 0..self.prolog_ops {
+            if emitted(i) && pinned[i] {
+                state_base[i] = next;
+                next += width(&self.ops[i]);
+            }
+        }
+        let state_len = next as usize;
         let mut max_args = 0usize;
         let mut spec_prolog_ops = 0usize;
         let map_val = |v: Val, new_base: &[u32]| -> u32 {
@@ -358,14 +389,21 @@ impl Tape {
                     bundle,
                     n_args,
                     n_out,
+                    state,
                     ..
                 } => {
                     let o = take(n_args as usize);
+                    let state = if state == super::NO_STATE {
+                        state
+                    } else {
+                        take(1)[0]
+                    };
                     Op::Call {
                         bundle,
                         start: gather(&o, &mut arg_pool, &mut max_args),
                         n_args,
                         n_out,
+                        state,
                     }
                 }
                 Op::CallBatch {
@@ -373,15 +411,36 @@ impl Tape {
                     n_groups,
                     n_args,
                     n_out,
+                    state,
                     ..
                 } => {
                     let o = take((n_groups * n_args) as usize);
+                    let state = if state == super::NO_STATE {
+                        state
+                    } else {
+                        take(1)[0]
+                    };
                     Op::CallBatch {
                         bundle,
                         start: gather(&o, &mut arg_pool, &mut max_args),
                         n_groups,
                         n_args,
                         n_out,
+                        state,
+                    }
+                }
+                Op::CallProlog {
+                    bundle,
+                    n_groups,
+                    n_pure,
+                    ..
+                } => {
+                    let o = take((n_groups * n_pure) as usize);
+                    Op::CallProlog {
+                        bundle,
+                        start: gather(&o, &mut arg_pool, &mut max_args),
+                        n_groups,
+                        n_pure,
                     }
                 }
                 Op::Gemv {
@@ -520,7 +579,9 @@ impl Tape {
                 free.extend(new_base[j]..new_base[j] + w);
             }
             let w = width(&self.ops[i]);
-            let d = if w == 1 {
+            let d = if state_base[i] != u32::MAX {
+                state_base[i]
+            } else if w == 1 {
                 free.pop().unwrap_or_else(|| {
                     let s = next;
                     next += 1;
@@ -557,6 +618,7 @@ impl Tape {
         let n_selects_out = ops.iter().filter(|o| matches!(o, Op::Select(..))).count();
         SpecializedTape {
             tape: Tape {
+                bundle_work: self.bundle_work,
                 ops,
                 dst,
                 n_selects: n_selects_out,
@@ -566,6 +628,8 @@ impl Tape {
                 max_args,
                 bundles: self.bundles.clone(),
                 prolog_ops: spec_prolog_ops,
+                state_len,
+                n_inputs: self.n_inputs,
             },
             n_real,
             expected,

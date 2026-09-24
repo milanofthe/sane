@@ -4,7 +4,8 @@
 //! climb in the tree, Liu's row subtrees), so fill and flops are known in
 //! about the time it takes to read the pattern. A consumer decides on that
 //! number whether a subsystem's solve belongs in the graph or in a sparse
-//! solver: the graph wins below a few hundred ops per unknown.
+//! solver: against a KLU-type library the graph wins below about a
+//! hundred ops per unknown (measured on meshes and random patterns).
 
 use super::Pattern;
 

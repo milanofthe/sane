@@ -23,7 +23,8 @@ use rustc_hash::FxHashMap as HashMap;
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::sync::{Arc, Mutex};
 
-use rsdag::{time_derivative, ExprId, Graph};
+use rsdag::{time_derivative, ExprId};
+use sane_core::Graph;
 use sane_device::{BehavioralFragment, DeviceModel, Lowerer};
 
 mod ffi;

@@ -3,7 +3,8 @@
 //! Verilog-A cannot express, so it lowers directly in Rust through the same
 //! `lower_behavioral` contract as everything else.
 
-use rsdag::{Crossing, ExprId, Graph};
+use rsdag::{Crossing, ExprId};
+use sane_core::Graph;
 
 use crate::common::{param, switch_g};
 use crate::{BehavioralFragment, DeviceModel, FragmentEvent, Lowerer};

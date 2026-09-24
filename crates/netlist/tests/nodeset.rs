@@ -6,7 +6,7 @@
 //! node-set pins one node, breaks the symmetry, and the solve falls into a
 //! stable branch.
 
-use rsdag::Graph;
+use sane_core::Graph;
 use sane_dae::{assemble_dae, Dae};
 use sane_netlist::{parse, ParsedCircuit};
 use sane_solve::{CompiledDc, Convergence};

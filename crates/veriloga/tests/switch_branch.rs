@@ -1,5 +1,6 @@
 use num_complex::Complex64;
-use rsdag::{eval, Graph, Node, SymbolId};
+use rsdag::{eval, Node, SymbolId};
+use sane_core::Graph;
 use sane_dae::{assemble_dae, DeviceInstance};
 use sane_mna::Circuit;
 use sane_veriloga::{device::VerilogADevice, elaborate, parse_modules};

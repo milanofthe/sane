@@ -3,7 +3,8 @@
 
 use num_complex::Complex64;
 use rayon::prelude::*;
-use rsdag::{Graph, Node, SymbolId};
+use rsdag::{Node, SymbolId};
+use sane_core::Graph;
 use sane_core::{log_stage, ProgressTracker};
 use sane_solve::CompiledDc;
 use std::f64::consts::PI;

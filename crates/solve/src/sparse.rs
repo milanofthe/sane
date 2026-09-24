@@ -131,14 +131,6 @@ const GRAPH_LU_MAX_NNZ_PER_UNKNOWN: usize = 16;
 /// library backend (its pivoting factorization, as a library does after a
 /// failed numeric-only refactorization).
 const GRAPH_LU_REPIVOT_GAP: u32 = 32;
-/// The supernodal program serves a pattern when at least this share of
-/// its unknowns lies in panels of [`GRAPH_LU_PANEL_WIDTH`] or wider (the
-/// width from which the panels' products are kernels); the scalar
-/// program (one dot per entry) serves the rest.
-const GRAPH_LU_PANEL_SHARE: f64 = 0.5;
-const GRAPH_LU_PANEL_WIDTH: usize = 8;
-/// Below this many unknowns the panel analysis is skipped.
-const GRAPH_LU_PANEL_MIN_N: usize = 64;
 /// Repivots a pattern's program takes over its lifetime: a few adapt the
 /// pivot rows to the values a circuit actually has (the transversal's
 /// diagonal is only a structural choice), after which the order is fixed,
@@ -254,140 +246,58 @@ enum Sym {
     Mf(Box<LuSymbolic>),
 }
 
-/// rsdag's guarded static LU of a pattern as one program: the entry values
-/// are the parameter-pure inputs and the right-hand side the main inputs, so
-/// a numeric refactorization is the prolog pass and a solve the main pass
-/// (see `rsdag::symbolic::solve`). The pivot rows are fixed at build time
-/// and guarded; a guard failure repivots on the values and rebuilds.
+/// rsdag's guarded static LU of a pattern as one program
+/// ([`rsdag::symbolic::solve::LuProgram`]): a numeric refactorization is its
+/// prolog, a solve its main phase, natively where the JIT is on.
 struct GraphLu {
-    n: usize,
-    pattern: rsdag::symbolic::Pattern,
-    plan: rsdag::symbolic::Plan,
-    /// The input layout: entry `k` at `entry_pos[k]`, the right-hand side
-    /// of unknown `i` at `nnz + rhs_pos[i]`. The supernodal program orders
-    /// both so its kernels read them in place; the scalar program keeps
-    /// slot order.
-    entry_pos: Vec<usize>,
-    rhs_pos: Vec<usize>,
-    tape: Arc<rsdag::Tape>,
+    prog: rsdag::symbolic::solve::LuProgram,
     #[cfg(feature = "jit")]
-    native: Option<Arc<rsdag_jit::NativeTape>>,
+    native: Option<rsdag_jit::NativeTape>,
 }
 
 impl GraphLu {
-    /// The program for the entries (one symbol per value slot, in slot
-    /// order) along `plan`, or `None` when the plan's cost is beyond the
-    /// graph solve's range.
-    fn build(
-        n: usize,
-        entries: &[(usize, usize)],
-        pattern: rsdag::symbolic::Pattern,
-        plan: rsdag::symbolic::Plan,
-        unbounded: bool,
-    ) -> Option<Self> {
-        if !unbounded
-            && (plan.flops_per_unknown() > GRAPH_LU_MAX_FLOPS_PER_UNKNOWN
-                || plan.cost.flops > GRAPH_LU_MAX_FLOPS)
+    /// The program for the entries along `plan`, or `None` when the plan's
+    /// cost is beyond the graph solve's range.
+    fn build(n: usize, entries: &[(usize, usize)], plan: rsdag::symbolic::Plan) -> Option<Self> {
+        if plan.flops_per_unknown() > GRAPH_LU_MAX_FLOPS_PER_UNKNOWN
+            || plan.cost.flops > GRAPH_LU_MAX_FLOPS
         {
             return None;
         }
+        Some(Self::compile(rsdag::symbolic::solve::LuProgram::build(
+            n,
+            entries.to_vec(),
+            plan,
+            Some(rsdag::symbolic::solve::Panels::default()),
+        )))
+    }
+
+    fn compile(prog: rsdag::symbolic::solve::LuProgram) -> Self {
         let t0 = sane_core::time::Instant::now();
-        let mut g: rsdag::Graph<rsdag::F64> = rsdag::Graph::new();
-        let nnz = entries.len();
-        // The supernodal program where the panels cover the unknowns, the
-        // scalar one where the pattern gives the elimination no panels; a
-        // system too small for panels skips the analysis (its build time
-        // is the whole solve of a tiny circuit).
-        let sn = (n >= GRAPH_LU_PANEL_MIN_N)
-            .then(|| rsdag::symbolic::solve::supernodes(&pattern, &plan))
-            .filter(|sn| {
-                let wide: usize = sn
-                    .widths()
-                    .iter()
-                    .filter(|&&w| w >= GRAPH_LU_PANEL_WIDTH)
-                    .sum();
-                wide as f64 >= GRAPH_LU_PANEL_SHARE * n.max(1) as f64
-            });
-        let (entry_pos, rhs_pos) = match &sn {
-            Some(sn) => (sn.value_order(entries), sn.rhs_order()),
-            None => ((0..nnz).collect(), (0..n).collect()),
-        };
-        // One symbol per input position: the entries (by position), then
-        // the right-hand side (by position).
-        let mut names: Vec<String> = vec![String::new(); nnz + n];
-        for (k, &p) in entry_pos.iter().enumerate() {
-            names[p] = format!("a{k}");
-        }
-        for (i, &p) in rhs_pos.iter().enumerate() {
-            names[nnz + p] = format!("b{i}");
-        }
-        let mut syms: Vec<rsdag::SymbolId> = Vec::with_capacity(nnz + n);
-        let es: Vec<rsdag::ExprId> = names
-            .iter()
-            .map(|nm| sym_in(&mut g, nm, &mut syms))
-            .collect();
-        let mut rows: rsdag::symbolic::solve::SparseRows = vec![Vec::new(); n];
-        for (k, &(i, j)) in entries.iter().enumerate() {
-            rows[i].push((j, es[entry_pos[k]]));
-        }
-        let b: Vec<rsdag::ExprId> = (0..n).map(|i| es[nnz + rhs_pos[i]]).collect();
-        let solved = match &sn {
-            Some(sn) => {
-                rsdag::symbolic::solve::solve_supernodal_planned(&mut g, &rows, &plan, sn, &b)
-            }
-            None => rsdag::symbolic::solve::solve_planned(&mut g, &rows, &plan, &b),
-        };
-        let mut roots = solved.x;
-        roots.push(solved.pivots_ok);
-        let fill = solved.fill;
-        let t_graph = t0.elapsed().as_secs_f64() * 1e3;
-        let mut pure = vec![true; nnz];
-        pure.resize(nnz + n, false);
-        let tape = Arc::new(rsdag::Tape::compile_split(&g, &roots, &syms, &pure));
-        let t_tape = t0.elapsed().as_secs_f64() * 1e3 - t_graph;
         #[cfg(feature = "jit")]
         let native = if crate::jit_enabled() {
-            rsdag_jit::NativeTape::compile(&tape).ok().map(Arc::new)
+            rsdag_jit::NativeTape::compile(prog.tape()).ok()
         } else {
             None
         };
         sane_core::log::debug(&format!(
-            "graph solve{}: n={n} nnz={nnz} fill={fill} flops/unknown={:.0} program={} ops, built in {:.1} ms (graph {t_graph:.1}, tape {t_tape:.1})",
-            match &sn {
-                Some(sn) => format!(
-                    " (supernodal, {} panels, widest {})",
-                    sn.n_panels(),
-                    sn.max_width()
-                ),
+            "graph solve{}: n={} nnz={} fill={} flops/unknown={:.0} program={} ops, native in {:.1} ms",
+            match prog.supernodal() {
+                Some((panels, widest)) => format!(" (supernodal, {panels} panels, widest {widest})"),
                 None => String::new(),
             },
-            plan.flops_per_unknown(),
-            tape.n_ops(),
+            prog.n(),
+            prog.entries().len(),
+            prog.fill(),
+            prog.plan().flops_per_unknown(),
+            prog.tape().n_ops(),
             t0.elapsed().as_secs_f64() * 1e3
         ));
-        Some(GraphLu {
-            n,
-            pattern,
-            entry_pos,
-            rhs_pos,
-            plan,
-            tape,
+        GraphLu {
+            prog,
             #[cfg(feature = "jit")]
             native,
-        })
-    }
-
-    /// The same entries with the pivot rows a numeric elimination takes on
-    /// the values of magnitude `mags` (slot order).
-    fn repivoted(&self, entries: &[(usize, usize)], mags: &[f64]) -> Option<Self> {
-        let mut at: rustc_hash::FxHashMap<(usize, usize), f64> = rustc_hash::FxHashMap::default();
-        for (k, &(i, j)) in entries.iter().enumerate() {
-            at.insert((i, j), mags[k]);
         }
-        let plan = self.plan.repivot(&self.pattern, |i, j| {
-            at.get(&(i, j)).copied().unwrap_or(0.0)
-        });
-        Self::build(self.n, entries, self.pattern.clone(), plan, true)
     }
 
     /// The factorization: the prolog over the entry values.
@@ -397,33 +307,18 @@ impl GraphLu {
             nt.eval_prolog(inputs, work);
             return;
         }
-        self.tape.eval_prolog(inputs, work);
+        self.prog.tape().eval_prolog(inputs, work);
     }
 
-    /// The substitution over a prepared prolog: `out` receives the unknowns
-    /// and, last, the pivot guard.
+    /// The substitution over a prepared prolog.
     fn substitute(&self, inputs: &[f64], work: &mut [f64], out: &mut Vec<f64>) {
         #[cfg(feature = "jit")]
         if let Some(nt) = &self.native {
             nt.eval_main(inputs, work, out);
             return;
         }
-        self.tape.eval_main(inputs, work, out);
+        self.prog.tape().eval_main(inputs, work, out);
     }
-}
-
-/// A symbol of the program, its id recorded in `syms`.
-fn sym_in(
-    g: &mut rsdag::Graph<rsdag::F64>,
-    name: &str,
-    syms: &mut Vec<rsdag::SymbolId>,
-) -> rsdag::ExprId {
-    let e = g.sym(name);
-    match g.node(e) {
-        rsdag::Node::Symbol(s) => syms.push(*s),
-        _ => unreachable!(),
-    }
-    e
 }
 
 /// A sparse system as the graph solve sees it: `n` unknowns, the entries
@@ -482,15 +377,7 @@ impl GraphSystem {
         };
         let built = planned
             .as_ref()
-            .and_then(|plan| {
-                GraphLu::build(
-                    self.n,
-                    &self.entries,
-                    self.pattern.clone(),
-                    plan.clone(),
-                    false,
-                )
-            })
+            .and_then(|plan| GraphLu::build(self.n, &self.entries, plan.clone()))
             .map(Arc::new);
         if built.is_none() {
             sane_core::log::debug(&format!(
@@ -564,11 +451,11 @@ impl GraphFactorizer {
         let n = self.sys.n;
         let nnz = values.len();
         debug_assert_eq!(nnz, self.sys.entries.len());
-        self.lu = Some(lu);
         let mut scratch = self.scratch.borrow_mut();
-        let (inputs, work, out) = &mut *scratch;
+        let (inputs, work, _) = &mut *scratch;
         inputs.clear();
-        inputs.resize(nnz + n, 0.0);
+        inputs.resize(lu.prog.input_len(), 0.0);
+        self.lu = Some(lu);
         self.row_scale.clear();
         if row_scaling {
             self.row_scale.resize(n, 0.0);
@@ -588,35 +475,23 @@ impl GraphFactorizer {
             let lu = self.lu.as_ref().unwrap();
             // The entries at the program's positions (a repivoted program
             // has its own).
-            for (k, &(i, _)) in self.sys.entries.iter().enumerate() {
-                let sc = if row_scaling { self.row_scale[i] } else { 1.0 };
-                inputs[lu.entry_pos[k]] = values[k] * sc;
-            }
+            let scale = row_scaling.then_some(&self.row_scale[..]);
+            lu.prog.write_values(values, scale, inputs);
             lu.factor(inputs, work);
-            // The guard and the pivots' finiteness, from one substitution of
-            // a zero right-hand side.
-            lu.substitute(inputs, work, out);
-            let guard = out[n];
-            let finite = out[..n].iter().all(|v| v.is_finite());
-            if finite && guard == 1.0 {
+            // The guard and the factors' finiteness, from the prolog state.
+            if lu.prog.factored(inputs, work) {
                 return Some(true);
             }
             if attempt == 0 && self.since_repivot >= GRAPH_LU_REPIVOT_GAP && self.sys.take_repivot()
             {
                 let mags: Vec<f64> = values.iter().map(|v| v.abs()).collect();
-                let re = lu.repivoted(&self.sys.entries, &mags)?;
-                let re = Arc::new(re);
+                let re = Arc::new(GraphLu::compile(lu.prog.repivot(&mags)));
                 *self.sys.program.lock().unwrap() = Some(Some(re.clone()));
                 self.lu = Some(re);
                 self.since_repivot = 0;
-                sane_core::log::debug(&format!(
-                    "graph solve: {}, repivoted on the values",
-                    if finite {
-                        "pivot guard failed"
-                    } else {
-                        "factorization broke down"
-                    }
-                ));
+                sane_core::log::debug(
+                    "graph solve: pivot guard failed or factorization broke down, repivoted on the values",
+                );
             } else {
                 break;
             }
@@ -626,17 +501,13 @@ impl GraphFactorizer {
 
     /// Solve against the last successful [`factor`](Self::factor).
     pub fn solve(&self, rhs: &[f64]) -> Vec<f64> {
-        let nnz = self.sys.entries.len();
-        let n = self.sys.n;
         let mut scratch = self.scratch.borrow_mut();
         let (inputs, work, out) = &mut *scratch;
         let lu = self.lu.as_ref().expect("factored");
-        for (i, &v) in rhs.iter().enumerate() {
-            let sc = self.row_scale.get(i).copied().unwrap_or(1.0);
-            inputs[nnz + lu.rhs_pos[i]] = v * sc;
-        }
+        let scale = (!self.row_scale.is_empty()).then_some(&self.row_scale[..]);
+        lu.prog.write_rhs(rhs, scale, inputs);
         lu.substitute(inputs, work, out);
-        out[..n].to_vec()
+        lu.prog.solution(out).to_vec()
     }
 }
 

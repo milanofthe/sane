@@ -37,7 +37,7 @@ use std::sync::Arc;
 use crate::host::{self, Bundles};
 use crate::ir::{Dense, ROp, Recorder};
 use crate::isa::{Arg, Arith, Base, IArg, Isa, Round};
-use crate::{JitError, CHUNK_OPS};
+use crate::{Batch, JitError, Options};
 
 #[cfg(target_arch = "aarch64")]
 type Arch = crate::aarch64::A64;
@@ -60,19 +60,35 @@ pub struct NativeTape {
     layout: Layout,
     n_inputs: usize,
     n_ops: usize,
+    /// The tape's state prefix (see [`Tape::state_len`]); the slot layout
+    /// is the tape's, so an interpreter's state serves here and back.
+    state_len: usize,
 }
 
 /// A function body compiled natively, behind the bundle interface the
 /// tape calls bodies through: emitted once, called per instance. A batch
-/// of instances runs on the rayon pool when it is worth a fork; either way
-/// the result is the serial loop's, bit for bit.
+/// of instances runs as its [`Batch`] says; either way the result is the
+/// serial loop's, bit for bit.
 struct NativeBody {
     tape: NativeTape,
     n_out: usize,
+    /// The pure-argument flags of the body it replaces: its prolog runs on
+    /// those, the rest NaN.
+    pure: Vec<bool>,
+    batch: Batch,
 }
 
-/// Ops per batched call below which the loop stays on the calling thread.
-const PAR_MIN_OPS: usize = 1 << 16;
+/// Run `f` on a work buffer of this thread's, kept for its next call (a
+/// stack, so a body calling bodies takes one each).
+fn with_work<R>(f: impl FnOnce(&mut Vec<f64>) -> R) -> R {
+    thread_local! {
+        static FREE: std::cell::RefCell<Vec<Vec<f64>>> = Default::default();
+    }
+    let mut work = FREE.with(|p| p.borrow_mut().pop()).unwrap_or_default();
+    let r = f(&mut work);
+    FREE.with(|p| p.borrow_mut().push(work));
+    r
+}
 /// A min or max over at most this many terms is a chain of instructions
 /// where the ISA has one; longer ones go through the host routine, whose
 /// call costs about as much as this many terms.
@@ -123,42 +139,84 @@ impl ExternBundle for NativeBody {
         self.n_out
     }
     fn work_len(&self) -> usize {
-        self.tape.layout.total
+        self.tape.layout.total + self.pure.len()
     }
     fn call_into(&self, args: &[f64], work: &mut [f64], out: &mut [f64]) {
-        self.run_groups_into(work, args, args.len(), out, 0..1);
+        let w = &mut work[..self.tape.layout.total];
+        self.run_groups_into(w, args, args.len(), out, 0..1);
+    }
+    fn state_len(&self) -> usize {
+        self.tape.state_len
+    }
+    fn pure_args(&self) -> &[bool] {
+        &self.pure
+    }
+    fn prolog_into(&self, pure: &[f64], work: &mut [f64], state: &mut [f64]) {
+        let (w, a) = work.split_at_mut(self.tape.layout.total);
+        let a = &mut a[..self.pure.len()];
+        let mut p = pure.iter();
+        for (x, &is_pure) in a.iter_mut().zip(&self.pure) {
+            *x = if is_pure {
+                *p.next().expect("one value per pure argument")
+            } else {
+                f64::NAN
+            };
+        }
+        self.tape.run(0..self.tape.prolog_chunks, a, w);
+        state.copy_from_slice(&w[..state.len()]);
+    }
+    fn main_into(&self, args: &[f64], state: &[f64], work: &mut [f64], out: &mut [f64]) {
+        let w = &mut work[..self.tape.layout.total];
+        w[..state.len()].copy_from_slice(state);
+        self.tape
+            .run(self.tape.prolog_chunks..self.tape.chunks.len(), args, w);
+        for (k, &slot) in self.tape.outputs[..self.n_out].iter().enumerate() {
+            out[k] = match input_index(slot) {
+                Some(i) => args.get(i as usize).copied().unwrap_or(f64::NAN),
+                None => w[slot as usize],
+            };
+        }
     }
     fn call_batch(&self, args: &[f64], n_groups: usize, n_args: usize, out: &mut [f64]) {
-        if n_groups * self.tape.n_ops < PAR_MIN_OPS || n_groups < 2 {
-            thread_local! {
-                static POOL: std::cell::RefCell<Vec<Vec<f64>>> = Default::default();
+        let parallel = match self.batch {
+            Batch::Serial => false,
+            Batch::Parallel { min_ops } => {
+                n_groups >= 2 && self.n_out > 0 && n_groups * self.tape.n_ops >= min_ops
             }
-            let mut work = POOL.with(|p| p.borrow_mut().pop()).unwrap_or_default();
-            self.run_groups(&mut work, args, n_args, out, 0..n_groups);
-            POOL.with(|p| p.borrow_mut().push(work));
+        };
+        if !parallel {
+            with_work(|work| self.run_groups(work, args, n_args, out, 0..n_groups));
             return;
         }
-        // Blocks of instances per task, so a thread amortises its buffer
-        // and the scheduler's hand-offs over many bodies.
-        let block = (n_groups / (rayon::current_num_threads() * 4)).clamp(1, 4096);
-        let n_out = self.n_out.max(1);
-        out.par_chunks_mut(block * n_out)
+        // Blocks of instances per task, so a thread amortises the
+        // scheduler's hand-offs over many bodies.
+        let block = blocks(n_groups);
+        out.par_chunks_mut(block * self.n_out)
             .enumerate()
-            .for_each_init(Vec::new, |work, (b, dst)| {
+            .for_each(|(b, dst)| {
                 let g0 = b * block;
                 let g1 = (g0 + block).min(n_groups);
                 let ins = &args[g0 * n_args..g1 * n_args];
-                self.run_groups(work, ins, n_args, dst, 0..g1 - g0);
+                with_work(|work| self.run_groups(work, ins, n_args, dst, 0..g1 - g0));
             });
     }
 }
 
-/// The work array: the tape's slots, then the bundle scratch, then the
-/// gather area for host calls.
+/// Instances per parallel task: about four tasks per thread of the
+/// current pool.
+fn blocks(n: usize) -> usize {
+    (n / (rayon::current_num_threads() * 4)).clamp(1, 4096)
+}
+
+/// The work array: the tape's slots, then the gather area for host calls,
+/// then the scratch a called bundle gets.
 #[derive(Clone, Copy)]
 struct Layout {
     /// First element of the gather area (after the slots).
     gather: usize,
+    /// First element of the bundle scratch, and its length.
+    scratch: usize,
+    scratch_len: usize,
     total: usize,
 }
 
@@ -167,6 +225,8 @@ struct Code {
     /// Kept alive for the code it holds; `func` points into it.
     _map: Mapping,
     func: ChunkFn,
+    /// The call descriptors the code holds the addresses of.
+    _descs: Vec<host::CallDesc>,
 }
 // The mapping is immutable after `Mapping::new`, so calling the code from
 // any thread is sound and the chunks can be built on a rayon pool.
@@ -175,24 +235,25 @@ unsafe impl Sync for Code {}
 
 impl NativeTape {
     pub fn compile(tape: &Tape) -> Result<NativeTape, JitError> {
-        Self::compile_with(tape, CHUNK_OPS)
+        Self::compile_opts(tape, &Options::default(), &[])
     }
 
     /// Compile with `chunk_ops` ops per emitted function.
     pub fn compile_with(tape: &Tape, chunk_ops: usize) -> Result<NativeTape, JitError> {
-        Self::compile_live(tape, chunk_ops, &[])
+        let opts = Options {
+            chunk_ops,
+            ..Options::default()
+        };
+        Self::compile_opts(tape, &opts, &[])
     }
 
-    /// Compile with `chunk_ops` ops per emitted function, keeping the slots
-    /// `live` written to the work array at the end of the program, as the
-    /// outputs are: what a consumer that reads a specialized tape's
-    /// prolog guards from `work` after [`eval_prolog`](Self::eval_prolog)
-    /// passes ([`rsdag::SpecializedTape::prolog_guards`]).
-    pub fn compile_live(
-        tape: &Tape,
-        chunk_ops: usize,
-        live: &[u32],
-    ) -> Result<NativeTape, JitError> {
+    /// Compile as `opts` says, keeping the slots `live` written to the work
+    /// array at the end of the program, as the outputs are: what a consumer
+    /// that reads a specialized tape's prolog guards from `work` after
+    /// [`eval_prolog`](Self::eval_prolog) passes
+    /// ([`rsdag::SpecializedTape::prolog_guards`]).
+    pub fn compile_opts(tape: &Tape, opts: &Options, live: &[u32]) -> Result<NativeTape, JitError> {
+        let chunk_ops = opts.chunk_ops;
         if !cfg!(any(target_arch = "aarch64", target_arch = "x86_64")) {
             return Err(JitError::Unsupported);
         }
@@ -204,8 +265,10 @@ impl NativeTape {
             .iter()
             .map(|b| match b.body() {
                 Some(body) => Ok(Arc::new(NativeBody {
-                    tape: NativeTape::compile_with(body, chunk_ops)?,
+                    tape: NativeTape::compile_opts(body, opts, &[])?,
                     n_out: b.n_outputs(),
+                    pure: b.pure_args().to_vec(),
+                    batch: opts.batch,
                 }) as Arc<dyn ExternBundle>),
                 None => Ok(b.clone()),
             })
@@ -285,9 +348,12 @@ impl NativeTape {
                 last_use[o as usize] = u32::MAX;
             }
         }
+        let scratch_len = rec.bundles.iter().map(|b| b.work_len()).max().unwrap_or(0);
         let layout = Layout {
             gather: n_work,
-            total: (n_work + gather_len).max(1),
+            scratch: n_work + gather_len,
+            scratch_len,
+            total: (n_work + gather_len + scratch_len).max(1),
         };
         // Chunk the prolog and main phases separately so no chunk straddles
         // the split; the recorded stream is 1:1 with the tape's ops.
@@ -321,6 +387,7 @@ impl NativeTape {
             layout,
             n_inputs,
             n_ops: tape.n_ops(),
+            state_len: tape.state_len(),
         })
     }
 
@@ -354,6 +421,7 @@ impl NativeTape {
         );
         for c in &self.chunks[range] {
             (c.func)(wp, ip, bp);
+            host::resume_panic();
         }
     }
 
@@ -397,25 +465,57 @@ impl NativeTape {
         self.collect(ins, work, out);
     }
 
-    /// Evaluate many instances at once: `inputs` holds `n` input vectors of
-    /// `stride` values back to back, `out` receives the `n` output vectors
-    /// back to back. Instances share nothing, so they run on the rayon pool
-    /// with a work buffer per thread; this is what a batch of identical
-    /// devices, a parameter sweep or an ensemble amounts to.
+    /// Write the outputs from `work` (and `inputs`, for an output that is
+    /// an input) into a slice the caller sized.
+    fn write(&self, inputs: &[f64], work: &[f64], out: &mut [f64]) {
+        assert_eq!(
+            out.len(),
+            self.outputs.len(),
+            "output buffer of the wrong size"
+        );
+        for (dst, &s) in out.iter_mut().zip(&self.outputs) {
+            *dst = match input_index(s) {
+                Some(i) => inputs.get(i as usize).copied().unwrap_or(f64::NAN),
+                None => work[s as usize],
+            };
+        }
+    }
+
+    /// Evaluate many instances in parallel: `inputs` holds `n` input
+    /// vectors of `stride` values back to back (NaN-padded when shorter
+    /// than the program's), `out` receives the `n` output vectors back to
+    /// back. Instances share nothing, so blocks of them run on the current
+    /// rayon pool (the caller's `install`, else the global one), each over
+    /// a work buffer of its thread's; this is what a batch of identical
+    /// devices, a parameter sweep or an ensemble amounts to. The serial
+    /// form is [`Program::eval_many_into`](rsdag::Program::eval_many_into).
     pub fn eval_many(&self, inputs: &[f64], stride: usize, out: &mut Vec<f64>) {
+        use rsdag::Program;
         let n = inputs.len().checked_div(stride).unwrap_or(0);
         let n_out = self.outputs.len();
         out.clear();
         out.resize(n * n_out, 0.0);
-        out.par_chunks_mut(n_out.max(1))
-            .zip(inputs.par_chunks(stride.max(1)))
-            .for_each_init(
-                || (Vec::new(), Vec::new()),
-                |(work, o), (dst, ins)| {
-                    self.eval(ins, work, o);
-                    dst.copy_from_slice(o);
-                },
-            );
+        if n == 0 || n_out == 0 {
+            return;
+        }
+        let block = blocks(n);
+        let n_in = self.n_inputs.max(stride);
+        out.par_chunks_mut(block * n_out)
+            .zip(inputs.par_chunks(block * stride))
+            .for_each(|(dst, ins)| {
+                with_work(|work| {
+                    work.resize(self.layout.total, 0.0);
+                    if n_in == stride {
+                        self.eval_many_into(ins, stride, work, dst);
+                        return;
+                    }
+                    let mut padded = vec![f64::NAN; ins.len() / stride * n_in];
+                    for (p, i) in padded.chunks_exact_mut(n_in).zip(ins.chunks_exact(stride)) {
+                        p[..stride].copy_from_slice(i);
+                    }
+                    self.eval_many_into(&padded, n_in, work, dst);
+                });
+            });
     }
 }
 
@@ -447,6 +547,10 @@ struct Emitter<'a, I: Isa> {
     /// Round-robin victim pointers of the callee-saved and caller-saved pools.
     next: [usize; 2],
     pinned: Vec<bool>,
+    /// The chunk's call descriptors, allocated for all of them before the
+    /// first is emitted (their addresses go into the code).
+    descs: Vec<host::CallDesc>,
+    descs_cap: usize,
 }
 
 impl<'a, I: Isa> Emitter<'a, I> {
@@ -467,6 +571,8 @@ impl<'a, I: Isa> Emitter<'a, I> {
             index,
             next: [0, 0],
             pinned: vec![false; I::CACHE.len()],
+            descs: Vec::new(),
+            descs_cap: 0,
         }
     }
 
@@ -785,30 +891,38 @@ impl<'a, I: Isa> Emitter<'a, I> {
                 let r = self.fold(Arith::Add, 0.0, a, Some(b));
                 self.put(dst, r);
             }
-            ROp::Call(dst, idx, ref args, n_out) => {
-                let at = self.gather(args);
+            ROp::Call(ref c) => {
+                let at = self.gather(&c.args);
+                let d = self.descs.len();
+                assert!(
+                    d < self.descs_cap,
+                    "call descriptors counted before emission"
+                );
+                let desc = host::CallDesc {
+                    bundle: c.bundle as u64,
+                    kind: c.kind as u64,
+                    batch: c.batch as u64,
+                    n_groups: c.n_groups as u64,
+                    n_args: c.n_args as u64,
+                    n_out: c.n_out as u64,
+                    state_len: c.state_len as u64,
+                    args: at as u64,
+                    out: c.dst as u64 * 8,
+                    state: c.state as u64 * 8,
+                    scratch: self.layout.scratch as u64 * 8,
+                    scratch_len: self.layout.scratch_len as u64,
+                };
+                // The table was sized up front: pushing never moves it, so
+                // the address baked into the code stays valid.
+                self.descs.push(desc);
+                let ptr = &self.descs[d] as *const host::CallDesc as u64;
                 let args = [
                     Arg::I(IArg::Bundles),
-                    Arg::I(IArg::Imm(idx as u64)),
-                    Arg::I(IArg::WorkAddr(at)),
-                    Arg::I(IArg::Imm(args.len() as u64)),
-                    Arg::I(IArg::WorkAddr(dst as usize * 8)),
+                    Arg::I(IArg::Imm(ptr)),
+                    Arg::I(IArg::WorkAddr(0)),
                 ];
-                self.call(host::h_bundle as *const (), &args);
-                self.invalidate(dst, n_out);
-            }
-            ROp::CallBatch(dst, idx, ref args, n_groups, n_args, n_out) => {
-                let at = self.gather(args);
-                let args = [
-                    Arg::I(IArg::Bundles),
-                    Arg::I(IArg::Imm(idx as u64)),
-                    Arg::I(IArg::WorkAddr(at)),
-                    Arg::I(IArg::Imm(n_groups as u64)),
-                    Arg::I(IArg::Imm(n_args as u64)),
-                    Arg::I(IArg::WorkAddr(dst as usize * 8)),
-                ];
-                self.call(host::h_bundle_batch as *const (), &args);
-                self.invalidate(dst, n_groups * n_out);
+                self.call(host::h_call as *const (), &args);
+                self.invalidate(c.dst, c.n_groups * c.n_out);
             }
             ROp::Gemv {
                 dst,
@@ -944,11 +1058,11 @@ impl<'a, I: Isa> Emitter<'a, I> {
         let r = self.fresh_for(dst);
         let inline = match uop {
             UnaryOp::Sqrt => {
-                // x > 0 ? sqrt(x) : 0, the reference's guard.
+                // x <= 0 ? 0 : sqrt(x), the reference's guard (NaN stays NaN).
                 let zero = self.fconst(0.0);
                 let s = self.fresh();
                 self.isa.sqrt(s, x);
-                self.isa.cmp_select(CmpOp::Gt, x, zero, s, zero, r);
+                self.isa.cmp_select(CmpOp::Le, x, zero, zero, s, r);
                 true
             }
             UnaryOp::Floor => self.isa.round(Round::Floor, r, x),
@@ -1063,6 +1177,9 @@ fn emit_chunk(
         };
     }
     let mut e: Emitter<Arch> = Emitter::new(layout, last_use, &hot);
+    let n_calls = ops.iter().filter(|op| matches!(op, ROp::Call(_))).count();
+    e.descs = Vec::with_capacity(n_calls);
+    e.descs_cap = n_calls;
     e.isa.prologue();
     for (k, op) in ops.iter().enumerate() {
         e.pos = (start + k) as u32;
@@ -1071,9 +1188,14 @@ fn emit_chunk(
     }
     e.flush();
     e.isa.epilogue();
+    let descs = std::mem::take(&mut e.descs);
     let map = Mapping::new(&e.isa.finish())?;
     let func: ChunkFn = unsafe { std::mem::transmute(map.ptr) };
-    Ok(Code { _map: map, func })
+    Ok(Code {
+        _map: map,
+        func,
+        _descs: descs,
+    })
 }
 
 // --- executable memory -----------------------------------------------------------
@@ -1087,25 +1209,28 @@ struct Mapping {
 
 #[cfg(unix)]
 impl Mapping {
+    /// The code is never writable and executable at once: mapped writable,
+    /// filled, then switched to read and execute (macOS toggles its JIT
+    /// write protection per thread instead, `MAP_JIT` requires it).
     fn new(bytes: &[u8]) -> Result<Mapping, JitError> {
         let len = bytes.len().max(1);
         unsafe {
             #[cfg(target_os = "macos")]
-            let flags = libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_JIT;
-            #[cfg(not(target_os = "macos"))]
-            let flags = libc::MAP_PRIVATE | libc::MAP_ANON;
-            let ptr = libc::mmap(
-                std::ptr::null_mut(),
-                len,
+            let (flags, prot) = (
+                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_JIT,
                 libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-                flags,
-                -1,
-                0,
             );
+            #[cfg(not(target_os = "macos"))]
+            let (flags, prot) = (
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                libc::PROT_READ | libc::PROT_WRITE,
+            );
+            let ptr = libc::mmap(std::ptr::null_mut(), len, prot, flags, -1, 0);
             if ptr == libc::MAP_FAILED {
                 return Err(JitError::Codegen("mmap of executable memory failed".into()));
             }
             let ptr = ptr as *mut u8;
+            let map = Mapping { ptr, len };
             #[cfg(target_os = "macos")]
             pthread_jit_write_protect_np(0);
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
@@ -1116,17 +1241,18 @@ impl Mapping {
             }
             #[cfg(not(target_os = "macos"))]
             {
-                libc::mprotect(
-                    ptr as *mut libc::c_void,
-                    len,
-                    libc::PROT_READ | libc::PROT_EXEC,
-                );
+                let rx = libc::PROT_READ | libc::PROT_EXEC;
+                if libc::mprotect(ptr as *mut libc::c_void, len, rx) != 0 {
+                    return Err(JitError::Codegen(
+                        "mprotect of the code to read and execute failed".into(),
+                    ));
+                }
                 __clear_cache(
                     ptr as *mut libc::c_char,
                     ptr.add(bytes.len()) as *mut libc::c_char,
                 );
             }
-            Ok(Mapping { ptr, len })
+            Ok(map)
         }
     }
 }
@@ -1155,31 +1281,41 @@ extern "C" {
 extern "system" {
     fn VirtualAlloc(addr: *mut u8, size: usize, kind: u32, protect: u32) -> *mut u8;
     fn VirtualFree(addr: *mut u8, size: usize, kind: u32) -> i32;
+    fn VirtualProtect(addr: *mut u8, size: usize, protect: u32, old: *mut u32) -> i32;
     fn GetCurrentProcess() -> isize;
     fn FlushInstructionCache(process: isize, addr: *const u8, size: usize) -> i32;
 }
 
 #[cfg(windows)]
 impl Mapping {
+    /// Committed writable, filled, then switched to read and execute.
     fn new(bytes: &[u8]) -> Result<Mapping, JitError> {
         const MEM_COMMIT_RESERVE: u32 = 0x1000 | 0x2000;
-        const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+        const PAGE_READWRITE: u32 = 0x04;
+        const PAGE_EXECUTE_READ: u32 = 0x20;
         let len = bytes.len().max(1);
         unsafe {
             let ptr = VirtualAlloc(
                 std::ptr::null_mut(),
                 len,
                 MEM_COMMIT_RESERVE,
-                PAGE_EXECUTE_READWRITE,
+                PAGE_READWRITE,
             );
             if ptr.is_null() {
                 return Err(JitError::Codegen(
                     "VirtualAlloc of executable memory failed".into(),
                 ));
             }
+            let map = Mapping { ptr, len };
             std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
+            let mut old = 0u32;
+            if VirtualProtect(ptr, len, PAGE_EXECUTE_READ, &mut old) == 0 {
+                return Err(JitError::Codegen(
+                    "VirtualProtect of the code to read and execute failed".into(),
+                ));
+            }
             FlushInstructionCache(GetCurrentProcess(), ptr, bytes.len());
-            Ok(Mapping { ptr, len })
+            Ok(map)
         }
     }
 }
@@ -1191,5 +1327,31 @@ impl Drop for Mapping {
         unsafe {
             VirtualFree(self.ptr, 0, MEM_RELEASE);
         }
+    }
+}
+
+impl rsdag::Program for NativeTape {
+    fn n_inputs(&self) -> usize {
+        self.n_inputs
+    }
+    fn work_len(&self) -> usize {
+        self.layout.total
+    }
+    fn out_len(&self) -> usize {
+        self.outputs.len()
+    }
+    fn state_len(&self) -> usize {
+        self.state_len
+    }
+    fn eval_into(&self, inputs: &[f64], work: &mut [f64], out: &mut [f64]) {
+        self.run(0..self.chunks.len(), inputs, work);
+        self.write(inputs, work, out);
+    }
+    fn eval_prolog_into(&self, inputs: &[f64], work: &mut [f64]) {
+        self.run(0..self.prolog_chunks, inputs, work);
+    }
+    fn eval_main_into(&self, inputs: &[f64], work: &mut [f64], out: &mut [f64]) {
+        self.run(self.prolog_chunks..self.chunks.len(), inputs, work);
+        self.write(inputs, work, out);
     }
 }

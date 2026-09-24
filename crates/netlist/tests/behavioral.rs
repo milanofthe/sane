@@ -2,7 +2,7 @@
 //! hard parse errors (never a silent zero), and the comparison operators + the
 //! `if(cond, then, else)` conditional lower correctly through to the DC solve.
 
-use rsdag::Graph;
+use sane_core::Graph;
 use sane_dae::assemble_dae;
 use sane_netlist::parse;
 use sane_solve::CompiledDc;

@@ -31,6 +31,74 @@ pub enum ParamRole {
     Time,
     /// A discrete memory slot element.
     Memory { slot: u32, offset: u32 },
+    /// A past value a consumer supplies, delay line `id`'s output (a
+    /// transport delay's interpolated history).
+    History { id: u32 },
+}
+
+impl ParamRole {
+    /// Where the role's group sits in a [`Signature`], and the parameter's
+    /// place within it.
+    fn place(&self) -> (u8, u32, u32) {
+        match *self {
+            ParamRole::State { id } => (0, id, 0),
+            ParamRole::StateDot { id } => (1, id, 0),
+            ParamRole::Input { port, elem } => (2, port, elem),
+            ParamRole::Param => (3, 0, 0),
+            ParamRole::Time => (4, 0, 0),
+            ParamRole::Memory { slot, offset } => (5, slot, offset),
+            ParamRole::History { id } => (6, id, 0),
+            ParamRole::Free => (7, 0, 0),
+        }
+    }
+}
+
+/// A function's parameters in the order a program over it takes its inputs:
+/// grouped by role (states, their derivatives, inputs, parameters, time,
+/// memory, histories, the rest), each group by its index (a state's id, an
+/// input's port and element) and otherwise in declaration order. One
+/// ordering, so the function's roles and the programs compiled over it
+/// state the same signature, and a consumer fills a group as one slice.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Signature {
+    /// The input symbols, in input order.
+    pub syms: Vec<crate::node::SymbolId>,
+    /// Their roles.
+    pub roles: Vec<ParamRole>,
+}
+
+impl Signature {
+    /// The signature of `f`'s parameters.
+    pub fn of(f: &crate::func::Function) -> Signature {
+        let mut order: Vec<usize> = (0..f.params.len()).collect();
+        // Stable: parameters of one place keep their declaration order.
+        order.sort_by_key(|&i| f.param_roles[i].place());
+        Signature {
+            syms: order.iter().map(|&i| f.params[i]).collect(),
+            roles: order.iter().map(|&i| f.param_roles[i]).collect(),
+        }
+    }
+
+    /// The inputs whose role satisfies `role`, as one range: the groups
+    /// are contiguous, so a group (or a run of groups) is.
+    pub fn range(&self, role: impl Fn(&ParamRole) -> bool) -> std::ops::Range<usize> {
+        let first = self
+            .roles
+            .iter()
+            .position(&role)
+            .unwrap_or(self.roles.len());
+        let len = self.roles[first..].iter().take_while(|r| role(r)).count();
+        first..first + len
+    }
+
+    /// The prolog split a program over the signature takes: the `Param`
+    /// inputs are pure.
+    pub fn pure_mask(&self) -> Vec<bool> {
+        self.roles
+            .iter()
+            .map(|r| matches!(r, ParamRole::Param))
+            .collect()
+    }
 }
 
 /// The direction of a sign change that counts as a crossing: Verilog-A's

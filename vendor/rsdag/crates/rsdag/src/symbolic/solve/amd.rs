@@ -28,9 +28,11 @@ pub fn amd(adj: &[Vec<usize>]) -> Vec<usize> {
     let dense = ((10.0 * (n as f64).sqrt()) as usize).max(16);
     let mut queue: BTreeSet<(usize, usize)> = BTreeSet::new();
     let mut deferred: Vec<usize> = Vec::new();
+    let mut hub = vec![false; n];
     for i in 0..n {
         if degree[i] > dense && n > 2 * dense {
             deferred.push(i);
+            hub[i] = true;
         } else {
             queue.insert((degree[i], i));
         }
@@ -45,7 +47,8 @@ pub fn amd(adj: &[Vec<usize>]) -> Vec<usize> {
                      degree: &mut Vec<usize>,
                      queue: &mut BTreeSet<(usize, usize)>,
                      mark: &mut Vec<usize>,
-                     stamp: &mut usize| {
+                     stamp: &mut usize,
+                     hub: &[bool]| {
         // The new element: p's variables and the members of p's elements.
         mark[p] = p;
         let mut new: Vec<usize> = Vec::new();
@@ -103,7 +106,10 @@ pub fn amd(adj: &[Vec<usize>]) -> Vec<usize> {
                 }
             }
             degree[v] = d;
-            queue.insert((d, v));
+            // A deferred hub keeps its degree for the end, out of the queue.
+            if !hub[v] {
+                queue.insert((d, v));
+            }
         }
     };
     while let Some(&(d, p)) = queue.iter().next() {
@@ -118,6 +124,7 @@ pub fn amd(adj: &[Vec<usize>]) -> Vec<usize> {
             &mut queue,
             &mut mark,
             &mut next_stamp,
+            &hub,
         );
     }
     // The deferred hubs, by their degree at the end.
@@ -134,6 +141,7 @@ pub fn amd(adj: &[Vec<usize>]) -> Vec<usize> {
             &mut queue,
             &mut mark,
             &mut next_stamp,
+            &hub,
         );
     }
     order

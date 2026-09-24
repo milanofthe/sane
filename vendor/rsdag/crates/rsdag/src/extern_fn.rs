@@ -59,6 +59,35 @@ pub trait ExternBundle: Send + Sync {
     /// nothing hidden in a thread-local.
     fn call_into(&self, args: &[f64], work: &mut [f64], out: &mut [f64]);
 
+    /// Values a call keeps for its instance between evaluations: what the
+    /// bundle computes from its parameter-pure arguments
+    /// ([`pure_args`](Self::pure_args)) once per parameter binding. A
+    /// calling tape with a prolog split keeps this block per call site in
+    /// its own work buffer: [`prolog_into`](Self::prolog_into) fills it in
+    /// the caller's prolog, [`main_into`](Self::main_into) reads it per
+    /// evaluation. `0` for a bundle without such a phase.
+    fn state_len(&self) -> usize {
+        0
+    }
+
+    /// Which arguments the state depends on, one flag per argument; empty
+    /// when [`state_len`](Self::state_len) is `0`.
+    fn pure_args(&self) -> &[bool] {
+        &[]
+    }
+
+    /// The state of an instance from its pure arguments (`pure`, in
+    /// argument order, only the flagged ones). `work` is scratch of
+    /// [`work_len`](Self::work_len) values.
+    fn prolog_into(&self, _pure: &[f64], _work: &mut [f64], _state: &mut [f64]) {}
+
+    /// The outputs from all arguments and the instance's state as
+    /// [`prolog_into`](Self::prolog_into) left it. The default ignores the
+    /// state and evaluates everything.
+    fn main_into(&self, args: &[f64], _state: &[f64], work: &mut [f64], out: &mut [f64]) {
+        self.call_into(args, work, out);
+    }
+
     /// Evaluate `n_groups` independent argument groups at once (instance
     /// batching): `args` is group-major (`n_groups * n_args`), `out` likewise
     /// (`n_groups * n_outputs`). The default loops over [`call`](Self::call);

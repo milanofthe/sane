@@ -19,7 +19,8 @@
 //! SANE carries no separate small-signal source spec. If an `AC mag phase` spec is
 //! ever added, its stamp belongs alongside `lower` as one more method.
 
-use rsdag::{CmpOp, ExprId, Graph};
+use rsdag::{CmpOp, ExprId};
+use sane_core::Graph;
 
 /// Time-domain stimulus shape of an independent source. `None` on an element (the
 /// default) means a constant whose value is the element's own symbol.

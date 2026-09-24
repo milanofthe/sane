@@ -20,7 +20,7 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::FxHashMap as HashMap;
 
 use super::{Fold, Op, Src, Tape, INPUT};
 use crate::extern_fn::ExternBundle;
@@ -31,6 +31,15 @@ use crate::node::{ExprId, Node, SymbolId};
 
 /// Row dots against one vector fuse into a `Gemv` from this many rows on.
 const GEMV_MIN_ROWS: usize = 8;
+
+/// A call's operands and the slot of its state block (the last operand of
+/// a stateful call), or [`NO_STATE`](super::NO_STATE).
+fn split_state(o: &[u32], stateful: bool) -> (&[u32], u32) {
+    match (stateful, o.split_last()) {
+        (true, Some((&state, args))) => (args, state),
+        _ => (o, super::NO_STATE),
+    }
+}
 
 /// Append operands to the pool; their range.
 fn pooled(pool: &mut Vec<Ref>, ins: Vec<Ref>) -> (u32, u32) {
@@ -78,7 +87,83 @@ impl Tape {
         let mut program = timed("tape lower", || forest.lower(ctx, roots));
         timed("tape fuse", || program.fuse_accumulators(pure_inputs));
         let order = timed("tape schedule", || program.schedule());
-        timed("tape emit", || program.emit(&order, pure_inputs.is_some()))
+        let mut tape = timed("tape emit", || program.emit(&order, pure_inputs.is_some()));
+        tape.n_inputs = input_syms.len();
+        tape
+    }
+}
+
+/// Dense tables over a graph's nodes and symbols, reused by every
+/// compilation on a thread: allocated once to the largest graph seen and
+/// valid by generation stamp, so compiling a small tape out of a large
+/// graph costs the tape, not the graph. A compilation takes the thread's
+/// tables and gives them back when its [`Forest`] drops (a nested one, a
+/// body compiled while lowering, gets fresh tables).
+#[derive(Default)]
+struct Scratch {
+    generation: u32,
+    /// Node `k` is in this compilation's forest when `seen[k]` is the
+    /// generation; `pos[k]` is then its base position.
+    seen: Vec<u32>,
+    pos: Vec<u32>,
+    /// Symbol `s` is input `input[s]` when `input_seen[s]` is the generation.
+    input_seen: Vec<u32>,
+    input: Vec<u32>,
+}
+
+std::thread_local! {
+    static SCRATCH: std::cell::Cell<Option<Scratch>> = const { std::cell::Cell::new(None) };
+}
+
+impl Scratch {
+    fn take(n_nodes: usize, n_symbols: usize) -> Scratch {
+        let mut t = SCRATCH.with(|c| c.take()).unwrap_or_default();
+        t.generation = t.generation.wrapping_add(1);
+        if t.generation == 0 {
+            // Every stamp could be a stale match after a wrap: start over.
+            t.seen.fill(0);
+            t.input_seen.fill(0);
+            t.generation = 1;
+        }
+        if t.seen.len() < n_nodes {
+            t.seen.resize(n_nodes, 0);
+            t.pos.resize(n_nodes, u32::MAX);
+        }
+        if t.input_seen.len() < n_symbols {
+            t.input_seen.resize(n_symbols, 0);
+            t.input.resize(n_symbols, u32::MAX);
+        }
+        t
+    }
+
+    /// Mark node `e`; whether it was unmarked.
+    #[inline]
+    fn mark(&mut self, e: ExprId) -> bool {
+        let k = e.0 as usize;
+        let fresh = self.seen[k] != self.generation;
+        self.seen[k] = self.generation;
+        fresh
+    }
+
+    /// Input `k` is symbol `s` (a later listing of one symbol wins).
+    fn set_input(&mut self, s: SymbolId, k: u32) {
+        if let Some(slot) = self.input.get_mut(s.0 as usize) {
+            *slot = k;
+            self.input_seen[s.0 as usize] = self.generation;
+        }
+    }
+
+    #[inline]
+    fn input(&self, s: SymbolId) -> Option<u32> {
+        let k = s.0 as usize;
+        (self.input_seen.get(k) == Some(&self.generation)).then(|| self.input[k])
+    }
+}
+
+impl Drop for Forest {
+    fn drop(&mut self) {
+        let t = std::mem::take(&mut self.tables);
+        SCRATCH.with(|c| c.set(Some(t)));
     }
 }
 
@@ -87,13 +172,17 @@ impl Tape {
 /// [`Forest::base`], not the arena id).
 struct Forest {
     base: Vec<ExprId>,
-    bpos: Vec<u32>,
-    input_of: HashMap<SymbolId, u32>,
+    /// Base positions and input indices, in tables sized to the arena but
+    /// valid only for this compilation's nodes and inputs (see [`Scratch`]).
+    tables: Scratch,
     /// Parameter-purity for the prolog split; all false without one.
     pure: Vec<bool>,
     /// `fused_into[p]` is the base position of the `Add` that absorbed the
     /// node at `p` as a superinstruction operand.
     fused_into: Vec<Option<usize>>,
+    /// Compiled with a prolog split: a call's parameter-pure part can run
+    /// in the prolog (see [`Forest::stateful`]).
+    split: bool,
 }
 
 /// One instruction of the lowered program, before scheduling.
@@ -139,13 +228,24 @@ pub enum Kind {
     Reduce(crate::node::ReduceOp),
     /// `n` pairs.
     Dot(u32),
+    /// With `stateful`, the last operand is the instance state block (the
+    /// value of a [`Kind::CallProlog`]).
     Call {
         bundle: u32,
+        stateful: bool,
     },
     CallBatch {
         bundle: u32,
         n_groups: u32,
         n_args: u32,
+        stateful: bool,
+    },
+    /// The prolog of `n_groups` instances over their pure arguments,
+    /// `n_pure` per group; a block of their states.
+    CallProlog {
+        bundle: u32,
+        n_groups: u32,
+        n_pure: u32,
     },
     /// With `acc`, the fold code per output and an accumulator operand per
     /// output after the factors.
@@ -177,12 +277,46 @@ struct Program {
     pool: Vec<Ref>,
     bundles: Vec<Arc<dyn ExternBundle>>,
     roots: Vec<Ref>,
+    /// The accumulator operand of the kernels' plain folds (see
+    /// [`Program::fuse_accumulators`]): never read, so never part of the state.
+    placeholder: Option<u32>,
 }
 
 impl Program {
     fn ins(&self, i: usize) -> &[Ref] {
         let (s, l) = self.insts[i].ins;
         &self.pool[s as usize..(s + l) as usize]
+    }
+
+    /// The operand each foldable kernel output would take as its
+    /// accumulator, `(operand, kernel)` sorted: [`Topo`] starts with it
+    /// before the kernel where it can.
+    fn fold_hints(&self, uses: &HashMap<(u32, u32), (u32, u32)>) -> Vec<(u32, u32)> {
+        let mut hints: Vec<(u32, u32)> = Vec::new();
+        for (&(k, c), &(count, j)) in uses {
+            if count != 1 || j == u32::MAX {
+                continue;
+            }
+            let this = Ref::Value(k, c);
+            let ins = self.ins(j as usize);
+            let other = match self.insts[j as usize].kind {
+                Kind::Sub if ins[1] == this => ins[0],
+                Kind::Add if ins[0] == this => ins[1],
+                Kind::Add => ins[0],
+                _ => continue,
+            };
+            // Another output of the kernel, or a value read off one, is
+            // no accumulator to place first.
+            if let Ref::Value(x, _) = other {
+                let off_k = |r: &Ref| matches!(*r, Ref::Value(y, _) if y == k);
+                if x != k && !self.ins(x as usize).iter().any(off_k) {
+                    hints.push((x, k));
+                }
+            }
+        }
+        hints.sort_unstable();
+        hints.dedup();
+        hints
     }
 
     /// Pass 3: the accumulator fusion of the product kernels. An output of
@@ -194,8 +328,8 @@ impl Program {
     /// before its own fold). Outputs with other consumers stay plain. An
     /// accumulator may be defined after the kernel in this list (the
     /// scheduler orders by dependencies) as long as it does not depend on
-    /// it, and a pure kernel takes only pure accumulators (the prolog
-    /// keeps it).
+    /// it, which [`Topo`] answers, and a pure kernel takes only pure
+    /// accumulators (the prolog keeps it).
     fn fuse_accumulators(&mut self, pure_inputs: Option<&[bool]>) {
         let m = self.insts.len();
         let kernels: Vec<usize> = (0..m)
@@ -234,10 +368,9 @@ impl Program {
             |k: u32| pure_inputs.is_some_and(|p| p.get(k as usize).copied().unwrap_or(true));
         let mut alias: HashMap<u32, Ref> = HashMap::default();
         let mut dead = vec![false; m];
-        // The first kernel that took an accumulator defined after it: an
-        // instruction before it reads only instructions before itself, so
-        // it reaches no later one, and the dependency walk stops there.
-        let mut first_forward = usize::MAX;
+        // Built at the first accumulator after its kernel: until then the
+        // lowering order is a topological order that every fold kept.
+        let mut topo: Option<Topo> = None;
         // The placeholder accumulator of a plain, self or negating fold: a
         // NaN constant, never read.
         let mut placeholder_inst: Option<Ref> = None;
@@ -253,11 +386,14 @@ impl Program {
                     pure: true,
                 });
                 dead.push(false);
+                self.placeholder = Some(self.insts.len() as u32 - 1);
                 Ref::Value(self.insts.len() as u32 - 1, 0)
             });
             let mut accs: Vec<Ref> = vec![placeholder; n_out as usize];
             let mut fused: Vec<(u32, u32)> = Vec::new(); // (output, consumer)
-                                                         // Outputs read as another output's accumulator stay plain.
+                                                         // The instructions this kernel reads as accumulators so far.
+            let mut taken: Vec<u32> = Vec::new();
+            // Outputs read as another output's accumulator stay plain.
             let mut held = vec![false; n_out as usize];
             for c in 0..n_out {
                 let Some(&(count, j)) = uses.get(&(k as u32, c)) else {
@@ -297,13 +433,19 @@ impl Program {
                         if kernel_pure && !self.insts[i as usize].pure {
                             continue;
                         }
-                        // An earlier instruction reaches this kernel only
-                        // through a fused kernel's forward accumulator.
-                        if (i as usize > k || first_forward < i as usize)
-                            && self.depends_on(i as usize, k, first_forward)
-                        {
+                        let fits = match topo.as_mut() {
+                            Some(t) => t.read(self, k as u32, i),
+                            None if (i as usize) < k => true,
+                            None => {
+                                let hints = self.fold_hints(&uses);
+                                topo.insert(Topo::new(self, &hints, k as u32, &taken))
+                                    .read(self, k as u32, i)
+                            }
+                        };
+                        if !fits {
                             continue;
                         }
+                        taken.push(i);
                         (code, acc)
                     }
                     Ref::Input(i) if code != Fold::NEG.0 => {
@@ -320,12 +462,6 @@ impl Program {
             }
             if fused.is_empty() {
                 continue;
-            }
-            if accs
-                .iter()
-                .any(|r| matches!(*r, Ref::Value(i, _) if i as usize > k))
-            {
-                first_forward = first_forward.min(k);
             }
             let start = self.pool.len() as u32;
             let old: Vec<Ref> = self.ins(k).to_vec();
@@ -377,6 +513,7 @@ impl Program {
         for r in self.roots.iter_mut() {
             *r = map(*r);
         }
+        self.placeholder = self.placeholder.map(|i| renumber[i as usize]);
         let old = std::mem::take(&mut self.insts);
         self.insts = old
             .into_iter()
@@ -385,35 +522,375 @@ impl Program {
             .map(|(inst, _)| inst)
             .collect();
     }
+}
 
-    /// Whether instruction `i` reads instruction `k` (transitively). The
-    /// list is in lowering order, so an instruction reaches a later one
-    /// only through a fused kernel's forward accumulator: the walk stops
-    /// at instructions before `k` that also precede the first such kernel.
-    fn depends_on(&self, i: usize, k: usize, first_forward: usize) -> bool {
-        let mut stack = vec![i as u32];
-        let mut seen: HashSet<u32> = HashSet::default();
-        while let Some(i) = stack.pop() {
-            if i as usize == k {
-                return true;
+/// A topological order of a program's instructions that the fold pass
+/// keeps valid as kernels take accumulators, by two-way search (Haeupler,
+/// Kavitha, Mathew, Sen and Tarjan). Whether accumulator `a` depends on
+/// kernel `k` is only a question when `a` comes after `k`; then the
+/// readers of `k` searched forward up to `a`, and what `a` reads searched
+/// backward down to `k`, step in turn. Either finding the other end is a
+/// cycle. The side that runs out first is closed under its direction
+/// between the two and moves, the backward side right before `k` or the
+/// forward side right after `a`, so a question costs the smaller side.
+/// Instructions added after the order was taken (the placeholder) are
+/// constants and take part in no edge.
+struct Topo {
+    order: Order,
+    /// Readers of each instruction (`readers[start[i]..start[i + 1]]`),
+    /// and the ones the pass added.
+    start: Vec<u32>,
+    readers: Vec<u32>,
+    added: HashMap<u32, Vec<u32>>,
+    seen: Vec<u32>,
+    stamp: u32,
+    stack_f: Vec<(u32, u32)>,
+    stack_b: Vec<(u32, u32)>,
+    fwd: Vec<u32>,
+    back: Vec<u32>,
+}
+
+impl Topo {
+    /// The order of `p` with kernel `k` also reading `taken`, the
+    /// accumulators it took before the order was needed.
+    fn new(p: &Program, hints: &[(u32, u32)], k: u32, taken: &[u32]) -> Topo {
+        let m = p.insts.len();
+        // Every edge `(j, i)`, instruction `i` reading `j`, once.
+        let edges = |f: &mut dyn FnMut(u32, u32)| {
+            let mut last = vec![u32::MAX; m];
+            for i in 0..m {
+                for r in p.ins(i) {
+                    if let Ref::Value(j, _) = *r {
+                        if last[j as usize] != i as u32 {
+                            last[j as usize] = i as u32;
+                            f(j, i as u32);
+                        }
+                    }
+                }
             }
-            if ((i as usize) < k && (i as usize) < first_forward) || !seen.insert(i) {
-                continue;
+            for &a in taken {
+                if last[a as usize] != k {
+                    last[a as usize] = k;
+                    f(a, k);
+                }
             }
-            for r in self.ins(i as usize) {
-                if let Ref::Value(j, _) = *r {
-                    stack.push(j);
+        };
+        let mut count = vec![0u32; m + 1];
+        edges(&mut |j, _| count[j as usize + 1] += 1);
+        for i in 0..m {
+            count[i + 1] += count[i];
+        }
+        let mut fill = count.clone();
+        let mut readers = vec![0u32; count[m] as usize];
+        edges(&mut |j, i| {
+            readers[fill[j as usize] as usize] = i;
+            fill[j as usize] += 1;
+        });
+        // The starting order: a kernel after the accumulators `hints`
+        // offers it (`(operand, kernel)`, sorted) where the program allows,
+        // and otherwise as late as its readers allow. The lowering places a
+        // kernel with its first consumer, before the accumulators of its
+        // other outputs and before the kernels those depend on, so most
+        // accumulators would otherwise come after their kernel. When
+        // nothing else can go, the kernel with the fewest hints open does
+        // (a hint that depends on its kernel never closes).
+        let kernel = |i: usize| matches!(p.insts[i].kind, Kind::Gemv { .. } | Kind::Gemm { .. });
+        let mut pending = vec![0u32; m];
+        for &r in &readers {
+            pending[r as usize] += 1;
+        }
+        let mut hinted = vec![0u32; m];
+        for &(_, k) in hints {
+            hinted[k as usize] += 1;
+        }
+        let hints_of = |x: u32| {
+            let lo = hints.partition_point(|&(y, _)| y < x);
+            let hi = hints.partition_point(|&(y, _)| y <= x);
+            &hints[lo..hi]
+        };
+        let mut ready: Vec<u32> = Vec::new();
+        let mut ready_kernels: BTreeSet<u32> = BTreeSet::new();
+        // Kernels whose operands are there, by their hints still open.
+        let mut blocked: BTreeSet<(u32, u32)> = BTreeSet::new();
+        let release = |r: u32,
+                       hinted: &[u32],
+                       ready: &mut Vec<u32>,
+                       ready_kernels: &mut BTreeSet<u32>,
+                       blocked: &mut BTreeSet<(u32, u32)>| {
+            if !kernel(r as usize) {
+                ready.push(r);
+            } else if hinted[r as usize] == 0 {
+                ready_kernels.insert(r);
+            } else {
+                blocked.insert((hinted[r as usize], r));
+            }
+        };
+        for i in (0..m as u32).rev() {
+            if pending[i as usize] == 0 {
+                release(i, &hinted, &mut ready, &mut ready_kernels, &mut blocked);
+            }
+        }
+        let mut at: Vec<u32> = Vec::with_capacity(m);
+        while let Some(i) = ready
+            .pop()
+            .or_else(|| ready_kernels.pop_first())
+            .or_else(|| blocked.pop_first().map(|(_, k)| k))
+        {
+            at.push(i);
+            for &(_, k) in hints_of(i) {
+                let h = hinted[k as usize];
+                hinted[k as usize] = h - 1;
+                if blocked.remove(&(h, k)) {
+                    if h == 1 {
+                        ready_kernels.insert(k);
+                    } else {
+                        blocked.insert((h - 1, k));
+                    }
+                }
+            }
+            for &r in &readers[count[i as usize] as usize..count[i as usize + 1] as usize] {
+                pending[r as usize] -= 1;
+                if pending[r as usize] == 0 {
+                    release(r, &hinted, &mut ready, &mut ready_kernels, &mut blocked);
                 }
             }
         }
-        false
+        debug_assert_eq!(at.len(), m, "the lowered program is acyclic");
+        Topo {
+            order: Order::new(&at),
+            start: count,
+            readers,
+            added: HashMap::default(),
+            seen: vec![0; m],
+            stamp: 0,
+            stack_f: Vec::new(),
+            stack_b: Vec::new(),
+            fwd: Vec::new(),
+            back: Vec::new(),
+        }
+    }
+
+    /// Lets kernel `k` read instruction `a` unless `a` depends on `k`;
+    /// whether it did.
+    fn read(&mut self, p: &Program, k: u32, a: u32) -> bool {
+        let n = self.seen.len() as u32;
+        if a >= n {
+            return true;
+        }
+        let label = &self.order.label;
+        let (lb, ub) = (label[k as usize], label[a as usize]);
+        if ub < lb {
+            self.added.entry(a).or_default().push(k);
+            return true;
+        }
+        // Forward marks are `sf`, backward ones `sb`. The sides take one
+        // edge each in turn (a kernel's readers can be thousands), each a
+        // stack of nodes with the next edge to look at.
+        if self.stamp > u32::MAX - 4 {
+            self.seen.fill(0);
+            self.stamp = 0;
+        }
+        self.stamp += 2;
+        let (sf, sb) = (self.stamp, self.stamp + 1);
+        self.stack_f.clear();
+        self.stack_b.clear();
+        self.fwd.clear();
+        self.back.clear();
+        self.stack_f.push((k, 0));
+        self.fwd.push(k);
+        self.seen[k as usize] = sf;
+        self.stack_b.push((a, 0));
+        self.back.push(a);
+        self.seen[a as usize] = sb;
+        let backward = loop {
+            // One forward edge.
+            let Some(&(w, e)) = self.stack_f.last() else {
+                break false;
+            };
+            let (s0, s1) = (self.start[w as usize], self.start[w as usize + 1]);
+            let deg = s1 - s0;
+            let r = if e < deg {
+                Some(self.readers[(s0 + e) as usize])
+            } else {
+                self.added
+                    .get(&w)
+                    .and_then(|v| v.get((e - deg) as usize))
+                    .copied()
+            };
+            match r {
+                None => {
+                    self.stack_f.pop();
+                }
+                Some(r) => {
+                    self.stack_f.last_mut().unwrap().1 += 1;
+                    if r == a {
+                        return false;
+                    }
+                    if self.seen[r as usize] != sf && label[r as usize] < ub {
+                        self.seen[r as usize] = sf;
+                        self.fwd.push(r);
+                        self.stack_f.push((r, 0));
+                    }
+                }
+            }
+            // One backward edge.
+            let Some(&(w, e)) = self.stack_b.last() else {
+                break true;
+            };
+            match p.ins(w as usize).get(e as usize) {
+                None => {
+                    self.stack_b.pop();
+                }
+                Some(&r) => {
+                    self.stack_b.last_mut().unwrap().1 += 1;
+                    if let Ref::Value(j, _) = r {
+                        if j == k {
+                            return false;
+                        }
+                        if j < n && self.seen[j as usize] != sb && label[j as usize] > lb {
+                            self.seen[j as usize] = sb;
+                            self.back.push(j);
+                            self.stack_b.push((j, 0));
+                        }
+                    }
+                }
+            }
+        };
+        let order = &mut self.order;
+        let set = if backward {
+            &mut self.back
+        } else {
+            &mut self.fwd
+        };
+        set.sort_unstable_by_key(|&w| order.label[w as usize]);
+        for &w in set.iter() {
+            order.unlink(w);
+        }
+        let mut at = if backward { order.prev[k as usize] } else { a };
+        for &w in set.iter() {
+            order.insert_after(at, w);
+            at = w;
+        }
+        self.added.entry(a).or_default().push(k);
+        true
+    }
+}
+
+/// A list whose order is compared by labels (the order maintenance of
+/// Bender, Cole, Demaine, Farach-Colton and Zito): an element moved in
+/// takes the middle of the gap it lands in, and a gap too narrow relabels
+/// the smallest aligned label range around it that is sparse enough, its
+/// allowance shrinking with its size, amortized O(log n) labels a move.
+struct Order {
+    label: Vec<u64>,
+    prev: Vec<u32>,
+    next: Vec<u32>,
+}
+
+impl Order {
+    /// The elements `0..n` in `order`, between a head (`n`, label 0) and a
+    /// tail (`n + 1`, the largest label).
+    fn new(order: &[u32]) -> Order {
+        let n = order.len();
+        let (head, tail) = (n as u32, n as u32 + 1);
+        let mut label = vec![0u64; n + 2];
+        let mut prev = vec![0u32; n + 2];
+        let mut next = vec![0u32; n + 2];
+        let step = u64::MAX / (n as u64 + 2);
+        let mut last = head;
+        for (q, &w) in order.iter().enumerate() {
+            label[w as usize] = (q as u64 + 1) * step;
+            prev[w as usize] = last;
+            next[last as usize] = w;
+            last = w;
+        }
+        next[last as usize] = tail;
+        prev[tail as usize] = last;
+        label[tail as usize] = u64::MAX;
+        Order { label, prev, next }
+    }
+
+    fn unlink(&mut self, w: u32) {
+        let (p, q) = (self.prev[w as usize], self.next[w as usize]);
+        self.next[p as usize] = q;
+        self.prev[q as usize] = p;
+    }
+
+    /// Links `w` right after `x`.
+    fn insert_after(&mut self, x: u32, w: u32) {
+        let y = self.next[x as usize];
+        self.prev[w as usize] = x;
+        self.next[w as usize] = y;
+        self.next[x as usize] = w;
+        self.prev[y as usize] = w;
+        let (lo, hi) = (self.label[x as usize], self.label[y as usize]);
+        if hi - lo >= 2 {
+            self.label[w as usize] = lo + (hi - lo) / 2;
+            return;
+        }
+        let head = self.label.len() as u32 - 2;
+        let tail = head + 1;
+        for i in 1..=64u32 {
+            let size = 1u128 << i;
+            let base = lo as u128 & !(size - 1);
+            let end = base + size;
+            let mut first = w;
+            let mut c = 1u128;
+            let mut v = x;
+            while v != head && self.label[v as usize] as u128 >= base {
+                first = v;
+                c += 1;
+                v = self.prev[v as usize];
+            }
+            let mut v = y;
+            while v != tail && (self.label[v as usize] as u128) < end {
+                c += 1;
+                v = self.next[v as usize];
+            }
+            // Sparse enough: fewer than (2 / 1.5)^i elements in 2^i labels.
+            if i == 64 || (c as f64) < (4.0f64 / 3.0).powi(i as i32) {
+                let from = base.max(1);
+                let to = end.min(u64::MAX as u128);
+                let gap = (to - from) / (c + 1);
+                let mut v = first;
+                for j in 0..c {
+                    self.label[v as usize] = (from + gap * (j + 1)) as u64;
+                    v = self.next[v as usize];
+                }
+                return;
+            }
+        }
     }
 }
 
 impl Forest {
     #[inline]
     fn pos(&self, e: ExprId) -> usize {
-        self.bpos[e.0 as usize] as usize
+        self.tables.pos[e.0 as usize] as usize
+    }
+
+    /// Whether calls of `b` on `lists` (argument lists of one or more
+    /// instances, all impure as a whole) keep their state in the caller:
+    /// under a split, when the bundle has a state and every argument it
+    /// flags pure is parameter-pure here, so its prolog can run in ours.
+    fn stateful(&self, b: &dyn ExternBundle, lists: &[&[ExprId]]) -> bool {
+        let mask = b.pure_args();
+        self.split
+            && b.state_len() > 0
+            && mask.iter().any(|&p| p)
+            && lists.iter().all(|args| {
+                args.len() == mask.len()
+                    && args
+                        .iter()
+                        .zip(mask)
+                        .all(|(&a, &p)| !p || self.pure[self.pos(a)])
+            })
+    }
+
+    /// The input index of symbol `s`, if it is one.
+    #[inline]
+    fn input(&self, s: SymbolId) -> Option<u32> {
+        self.tables.input(s)
     }
 
     /// Pass 1: reachability, purity, use counts and superinstruction fusion.
@@ -423,31 +900,28 @@ impl Forest {
         input_syms: &[SymbolId],
         pure_inputs: Option<&[bool]>,
     ) -> Forest {
-        let mut input_of: HashMap<SymbolId, u32> =
-            HashMap::with_capacity_and_hasher(input_syms.len(), Default::default());
+        let mut t = Scratch::take(ctx.len(), ctx.n_symbols());
         for (k, &s) in input_syms.iter().enumerate() {
-            input_of.insert(s, k as u32);
+            t.set_input(s, k as u32);
         }
-        let n_arena = ctx.len();
-        let mut mark = vec![false; n_arena];
+        // The reachable nodes, marked in the stamped table; ascending ids
+        // are a dependency order. The walk and the sort cost the forest's
+        // size, not the graph's.
+        let mut base: Vec<ExprId> = Vec::new();
         let mut stack = roots.to_vec();
         while let Some(id) = stack.pop() {
-            let k = id.0 as usize;
-            if mark[k] {
+            if !t.mark(id) {
                 continue;
             }
-            mark[k] = true;
+            base.push(id);
             stack.extend_from_slice(&ctx.operands(id));
         }
-        let base: Vec<ExprId> = (0..n_arena)
-            .filter(|&k| mark[k])
-            .map(|k| ExprId(k as u32))
-            .collect();
+        base.sort_unstable_by_key(|e| e.0);
         let m = base.len();
-        let mut bpos = vec![u32::MAX; n_arena];
         for (i, id) in base.iter().enumerate() {
-            bpos[id.0 as usize] = i as u32;
+            t.pos[id.0 as usize] = i as u32;
         }
+        let bpos = &t.pos;
         let bp = |e: ExprId| bpos[e.0 as usize] as usize;
 
         // Purity: a node is parameter-pure when every operand is; an
@@ -457,9 +931,9 @@ impl Forest {
             for (i, id) in base.iter().enumerate() {
                 pure[i] = match ctx.node(*id) {
                     Node::Const(_) => true,
-                    Node::Symbol(s) => match input_of.get(s) {
+                    Node::Symbol(s) => match t.input(*s) {
                         None => true,
-                        Some(&k) => mask.get(k as usize).copied().unwrap_or(false),
+                        Some(k) => mask.get(k as usize).copied().unwrap_or(false),
                     },
                     _ => ctx.operands(*id).iter().all(|a| pure[bp(*a)]),
                 };
@@ -498,10 +972,10 @@ impl Forest {
         }
         Forest {
             base,
-            bpos,
-            input_of,
+            tables: t,
             pure,
             fused_into,
+            split: pure_inputs.is_some(),
         }
     }
 
@@ -811,8 +1285,12 @@ impl Forest {
         // over thousands of rows names its operands hundreds of thousands
         // of times.
         let mut stamp: Vec<usize> = vec![usize::MAX; m];
-        let mut deps_of_unit = |u: usize| -> Vec<usize> {
-            let mut raw = Vec::new();
+        // One buffer for every unit's raw operands and one for the distinct
+        // ones, reused: a million units are not two million allocations.
+        let mut raw: Vec<usize> = Vec::new();
+        let mut deps: Vec<usize> = Vec::new();
+        let mut deps_of_unit = |u: usize, deps: &mut Vec<usize>| {
+            raw.clear();
             match kernel_of[u] {
                 Some(g) => {
                     for &mi in &groups[g].1 {
@@ -821,14 +1299,13 @@ impl Forest {
                 }
                 None => deps_of_node(u, &mut raw),
             }
-            let mut out = Vec::with_capacity(raw.len().min(64));
-            for d in raw {
+            deps.clear();
+            for &d in &raw {
                 if stamp[d] != u {
                     stamp[d] = u;
-                    out.push(d);
+                    deps.push(d);
                 }
             }
-            out
         };
         let mut done = vec![false; m];
         let mut order: Vec<usize> = Vec::with_capacity(m);
@@ -846,7 +1323,8 @@ impl Forest {
                 continue;
             }
             stack.push((u, true));
-            for d in deps_of_unit(u) {
+            deps_of_unit(u, &mut deps);
+            for &d in &deps {
                 if !done[d] {
                     stack.push((d, false));
                 }
@@ -856,9 +1334,7 @@ impl Forest {
         // --- the instructions, in that order --------------------------------
         let leaf = |e: ExprId| -> Option<Ref> {
             match ctx.node(e) {
-                Node::Symbol(s) => Some(Ref::Input(
-                    self.input_of.get(s).copied().unwrap_or(u32::MAX),
-                )),
+                Node::Symbol(s) => Some(Ref::Input(self.input(*s).unwrap_or(u32::MAX))),
                 _ => None,
             }
         };
@@ -942,12 +1418,40 @@ impl Forest {
                         let n_args = arg_lists[0].len() as u32;
                         let n_groups = arg_lists.len() as u32;
                         let pure = members.iter().all(|&mi| self.pure[mi]);
+                        let b = bundles[bundle as usize].clone();
+                        let lists: Vec<&[ExprId]> = arg_lists.iter().map(Vec::as_slice).collect();
+                        let stateful = !pure && self.stateful(&*b, &lists);
+                        if stateful {
+                            let mask = b.pure_args();
+                            let ps = pool.len() as u32;
+                            for args in &arg_lists {
+                                pool.extend(
+                                    args.iter()
+                                        .zip(mask)
+                                        .filter(|&(_, &p)| p)
+                                        .map(|(&a, _)| val(a, &value)),
+                                );
+                            }
+                            let n_pure = mask.iter().filter(|&&p| p).count() as u32;
+                            insts.push(Inst {
+                                kind: Kind::CallProlog {
+                                    bundle,
+                                    n_groups,
+                                    n_pure,
+                                },
+                                ins: (ps, pool.len() as u32 - ps),
+                                n_out: n_groups * b.state_len() as u32,
+                                pure: true,
+                            });
+                            ins.push(Ref::Value(insts.len() as u32 - 1, 0));
+                        }
                         let inst = insts.len() as u32;
                         insts.push(Inst {
                             kind: Kind::CallBatch {
                                 bundle,
                                 n_groups,
                                 n_args,
+                                stateful,
                             },
                             ins: pooled(&mut pool, ins),
                             n_out: n_groups * n_out,
@@ -1094,7 +1598,9 @@ impl Forest {
             }
             // An ordinary node, one instruction; an Add with a fused
             // operand reads through it.
-            let (kind, ins): (Kind, Vec<Ref>) = match node {
+            // The operands go straight into the program's pool.
+            let start = pool.len() as u32;
+            let kind = match node {
                 Node::Add(a, b) => {
                     let (pa, pb) = (self.pos(a), self.pos(b));
                     if self.fused_into[pa] == Some(i) || self.fused_into[pb] == Some(i) {
@@ -1104,43 +1610,68 @@ impl Forest {
                             (b, a)
                         };
                         match *ctx.node(fused) {
-                            Node::Mul(x, y) => (
-                                Kind::MulAdd,
-                                vec![val(x, &value), val(y, &value), val(other, &value)],
-                            ),
-                            Node::Neg(x) => (Kind::Sub, vec![val(other, &value), val(x, &value)]),
+                            Node::Mul(x, y) => {
+                                pool.extend_from_slice(&[
+                                    val(x, &value),
+                                    val(y, &value),
+                                    val(other, &value),
+                                ]);
+                                Kind::MulAdd
+                            }
+                            Node::Neg(x) => {
+                                pool.extend_from_slice(&[val(other, &value), val(x, &value)]);
+                                Kind::Sub
+                            }
                             _ => unreachable!("only a Mul or a Neg fuses"),
                         }
                     } else {
-                        (Kind::Add, vec![val(a, &value), val(b, &value)])
+                        {
+                            pool.extend_from_slice(&[val(a, &value), val(b, &value)]);
+                            Kind::Add
+                        }
                     }
                 }
-                Node::Mul(a, b) => (Kind::Mul, vec![val(a, &value), val(b, &value)]),
-                Node::Neg(a) => (Kind::Neg, vec![val(a, &value)]),
-                Node::Pow(a, n) => (Kind::Powi(n as i32), vec![val(a, &value)]),
-                Node::Unary(op, a) => (Kind::Unary(op), vec![val(a, &value)]),
-                Node::Binary(op, a, b) => (Kind::Binary(op), vec![val(a, &value), val(b, &value)]),
-                Node::Cmp(op, a, b) => (Kind::Cmp(op), vec![val(a, &value), val(b, &value)]),
-                Node::Select(c, t, e) => (
-                    Kind::Select,
-                    vec![val(c, &value), val(t, &value), val(e, &value)],
-                ),
-                Node::Reduce(op, l) => (
-                    Kind::Reduce(op),
-                    ctx.args(l).iter().map(|&a| val(a, &value)).collect(),
-                ),
+                Node::Mul(a, b) => {
+                    pool.extend_from_slice(&[val(a, &value), val(b, &value)]);
+                    Kind::Mul
+                }
+                Node::Neg(a) => {
+                    pool.extend_from_slice(&[val(a, &value)]);
+                    Kind::Neg
+                }
+                Node::Pow(a, n) => {
+                    pool.extend_from_slice(&[val(a, &value)]);
+                    Kind::Powi(n as i32)
+                }
+                Node::Unary(op, a) => {
+                    pool.extend_from_slice(&[val(a, &value)]);
+                    Kind::Unary(op)
+                }
+                Node::Binary(op, a, b) => {
+                    pool.extend_from_slice(&[val(a, &value), val(b, &value)]);
+                    Kind::Binary(op)
+                }
+                Node::Cmp(op, a, b) => {
+                    pool.extend_from_slice(&[val(a, &value), val(b, &value)]);
+                    Kind::Cmp(op)
+                }
+                Node::Select(c, t, e) => {
+                    pool.extend_from_slice(&[val(c, &value), val(t, &value), val(e, &value)]);
+                    Kind::Select
+                }
+                Node::Reduce(op, l) => {
+                    pool.extend(ctx.args(l).iter().map(|&a| val(a, &value)));
+                    Kind::Reduce(op)
+                }
                 Node::Dot(l) => {
                     let (a, b) = ctx.dot_args(l);
-                    (
-                        Kind::Dot(a.len() as u32),
-                        a.iter().chain(b).map(|&e| val(e, &value)).collect(),
-                    )
+                    pool.extend(a.iter().chain(b).map(|&e| val(e, &value)));
+                    Kind::Dot(a.len() as u32)
                 }
                 Node::Call(o, l) => {
                     // A single call: its outputs a block, this node one of
                     // them; other outputs of the same call join it.
                     let (f, _) = ctx.output(o);
-                    let args = ctx.args(l).to_vec();
                     let (set, outs) = needed(f.0, l);
                     let body = bodies
                         .entry((f.0, set))
@@ -1151,11 +1682,36 @@ impl Forest {
                         bundles.len() as u32 - 1
                     });
                     let n_out = body.bundle.n_outputs() as u32;
+                    let args = ctx.args(l);
+                    let stateful = !self.pure[i] && self.stateful(&*body.bundle, &[args]);
+                    let state = stateful.then(|| {
+                        let mask = body.bundle.pure_args();
+                        let ps = pool.len() as u32;
+                        pool.extend(
+                            args.iter()
+                                .zip(mask)
+                                .filter(|&(_, &p)| p)
+                                .map(|(&a, _)| val(a, &value)),
+                        );
+                        insts.push(Inst {
+                            kind: Kind::CallProlog {
+                                bundle,
+                                n_groups: 1,
+                                n_pure: pool.len() as u32 - ps,
+                            },
+                            ins: (ps, pool.len() as u32 - ps),
+                            n_out: body.bundle.state_len() as u32,
+                            pure: true,
+                        });
+                        Ref::Value(insts.len() as u32 - 1, 0)
+                    });
+                    let start = pool.len() as u32;
+                    pool.extend(args.iter().map(|&a| val(a, &value)));
+                    pool.extend(state);
                     let inst = insts.len() as u32;
-                    let ins: Vec<Ref> = args.iter().map(|&a| val(a, &value)).collect();
                     insts.push(Inst {
-                        kind: Kind::Call { bundle },
-                        ins: pooled(&mut pool, ins),
+                        kind: Kind::Call { bundle, stateful },
+                        ins: (start, pool.len() as u32 - start),
                         n_out,
                         pure: self.pure[i],
                     });
@@ -1186,7 +1742,7 @@ impl Forest {
             };
             insts.push(Inst {
                 kind,
-                ins: pooled(&mut pool, ins),
+                ins: (start, pool.len() as u32 - start),
                 n_out: 1,
                 pure: self.pure[i],
             });
@@ -1201,6 +1757,7 @@ impl Forest {
             pool,
             bundles,
             roots,
+            placeholder: None,
         }
     }
 }
@@ -1219,28 +1776,29 @@ impl Program {
         let m = self.insts.len();
         let is_const = |i: usize| matches!(self.insts[i].kind, Kind::Const(_));
         // Distinct value dependencies of each instruction, as instruction
-        // indices; a constant is placed on demand and counts as no
-        // dependency.
+        // indices, in one flat list (`dep_list[dep_start[i]..dep_start[i+1]]`);
+        // a constant is placed on demand and counts as no dependency.
         let mut stamp: Vec<u32> = vec![u32::MAX; m];
-        let deps: Vec<Vec<u32>> = (0..m)
-            .map(|i| {
-                let mut d: Vec<u32> = Vec::new();
-                for r in self.ins(i) {
-                    if let Ref::Value(j, _) = *r {
-                        if stamp[j as usize] != i as u32 {
-                            stamp[j as usize] = i as u32;
-                            d.push(j);
-                        }
+        let mut dep_start: Vec<u32> = Vec::with_capacity(m + 1);
+        let mut dep_list: Vec<u32> = Vec::with_capacity(self.pool.len());
+        dep_start.push(0);
+        for i in 0..m {
+            for r in self.ins(i) {
+                if let Ref::Value(j, _) = *r {
+                    if stamp[j as usize] != i as u32 {
+                        stamp[j as usize] = i as u32;
+                        dep_list.push(j);
                     }
                 }
-                d
-            })
-            .collect();
+            }
+            dep_start.push(dep_list.len() as u32);
+        }
+        let deps = |i: usize| &dep_list[dep_start[i] as usize..dep_start[i + 1] as usize];
         let mut user_count = vec![0u32; m];
         let mut pending = vec![0u32; m];
-        for (i, d) in deps.iter().enumerate() {
-            pending[i] = d.iter().filter(|&&x| !is_const(x as usize)).count() as u32;
-            for &x in d {
+        for i in 0..m {
+            pending[i] = deps(i).iter().filter(|&&x| !is_const(x as usize)).count() as u32;
+            for &x in deps(i) {
                 user_count[x as usize] += 1;
             }
         }
@@ -1250,54 +1808,41 @@ impl Program {
         }
         let mut users = vec![0u32; user_start[m] as usize];
         let mut fill = user_start.clone();
-        for (i, d) in deps.iter().enumerate() {
-            for &x in d {
+        for i in 0..m {
+            for &x in deps(i) {
                 users[fill[x as usize] as usize] = i as u32;
                 fill[x as usize] += 1;
             }
         }
         let mut remaining = user_count.clone();
         let kills_of = |i: usize, remaining: &[u32]| -> u32 {
-            deps[i]
+            deps(i)
                 .iter()
                 .filter(|&&d| remaining[d as usize] == 1)
                 .count() as u32
         };
-        let mut heap: std::collections::BinaryHeap<(bool, u32, u64, u32)> =
-            std::collections::BinaryHeap::new();
-        let mut seq: u64 = 0;
+        let mut ready = Ready::default();
         for i in (0..m).rev() {
             if !is_const(i) && pending[i] == 0 {
-                heap.push((self.insts[i].pure, kills_of(i, &remaining), seq, i as u32));
-                seq += 1;
+                ready.push(self.insts[i].pure, kills_of(i, &remaining), i as u32);
             }
         }
         let mut order: Vec<u32> = Vec::with_capacity(m);
         let mut placed = vec![false; m];
         let mut last: Option<usize> = None;
-        while let Some(top) = heap.pop() {
-            let (pure, kills, _, iu) = top;
+        while let Some((pure, kills, iu)) = ready.pop() {
             let mut i = iu as usize;
-            if placed[i] {
-                continue;
-            }
             // Interleave two chains when an equally good candidate does not
             // read the instruction just placed, so the CPU overlaps them.
-            if let (Some(lo), Some(&(p2, k2, _, iu2))) = (last, heap.peek()) {
+            if let (Some(lo), Some(iu2)) = (last, ready.peek_same(pure, kills)) {
                 let i2 = iu2 as usize;
-                if p2 == pure
-                    && k2 == kills
-                    && !placed[i2]
-                    && deps[i].contains(&(lo as u32))
-                    && !deps[i2].contains(&(lo as u32))
-                {
-                    heap.pop();
-                    heap.push(top);
+                if deps(i).contains(&(lo as u32)) && !deps(i2).contains(&(lo as u32)) {
+                    ready.swap_top(pure, kills, iu);
                     i = i2;
                 }
             }
             last = Some(i);
-            for &d in &deps[i] {
+            for &d in deps(i) {
                 let d = d as usize;
                 if is_const(d) && !placed[d] {
                     placed[d] = true;
@@ -1306,15 +1851,14 @@ impl Program {
             }
             placed[i] = true;
             order.push(i as u32);
-            for &d in &deps[i] {
+            for &d in deps(i) {
                 remaining[d as usize] -= 1;
             }
             for k in user_start[i]..user_start[i + 1] {
                 let u = users[k as usize] as usize;
                 pending[u] -= 1;
                 if pending[u] == 0 {
-                    heap.push((self.insts[u].pure, kills_of(u, &remaining), seq, u as u32));
-                    seq += 1;
+                    ready.push(self.insts[u].pure, kills_of(u, &remaining), u as u32);
                 }
             }
         }
@@ -1348,7 +1892,8 @@ impl Program {
 
         // Last use of each instruction's block (the highest position that
         // reads any of its values); roots and, under a split, prolog values
-        // read by the main phase are pinned.
+        // read by the main phase are pinned (not the kernels' placeholder
+        // accumulator, which nothing reads).
         let mut last = vec![0usize; m];
         let mut pinned = vec![false; m];
         for (k, &i) in order.iter().enumerate() {
@@ -1366,7 +1911,10 @@ impl Program {
         }
         if split {
             for i in 0..m {
-                if pos[i] < prolog_ops && last[i] >= prolog_ops {
+                if pos[i] < prolog_ops
+                    && last[i] >= prolog_ops
+                    && self.placeholder != Some(i as u32)
+                {
                     pinned[i] = true;
                     last[i] = usize::MAX;
                 }
@@ -1379,8 +1927,20 @@ impl Program {
         // entry by entry is read in place. First come first served in
         // schedule order; a value already placed for one kernel keeps its
         // slot. Reserved slots are never reused.
-        let mut reserved = vec![u32::MAX; m];
+        // The state: every value the prolog computes and something after it
+        // reads (the main phase, or the outputs), in one block at the start
+        // of the work array, so an instance's prolog result is `work[..state]`
+        // whatever else the buffer holds, the same in every backend.
+        let mut state_base = vec![u32::MAX; m];
         let mut next: u32 = 0;
+        for &i in &order[..prolog_ops] {
+            if pinned[i as usize] {
+                state_base[i as usize] = next;
+                next += self.insts[i as usize].n_out;
+            }
+        }
+        let state_len = next as usize;
+        let mut reserved = vec![u32::MAX; m];
         for &i in order {
             let inst = &self.insts[i as usize];
             let runs: Vec<usize> = match inst.kind {
@@ -1421,7 +1981,9 @@ impl Program {
                 while s < operand.len() {
                     let placeable = |r: &Ref| match *r {
                         Ref::Value(j, 0) => {
-                            self.insts[j as usize].n_out == 1 && reserved[j as usize] == u32::MAX
+                            self.insts[j as usize].n_out == 1
+                                && reserved[j as usize] == u32::MAX
+                                && state_base[j as usize] == u32::MAX
                         }
                         _ => false,
                     };
@@ -1461,31 +2023,35 @@ impl Program {
                 Ref::Input(k) => k | INPUT,
             }
         };
+        // Per-instruction scratch, reused across the stream.
+        let mut operands: Vec<u32> = Vec::new();
+        let mut dying: Vec<u32> = Vec::new();
         for (k, &i) in order.iter().enumerate() {
             let inst = &self.insts[i as usize];
             // The operands, before any slot of this step is freed.
             let ins = self.ins(i as usize);
-            let operands: Vec<u32> = ins.iter().map(|&r| slot_of(r, &base)).collect();
-            let mut dying: Vec<u32> = ins
-                .iter()
-                .filter_map(|r| match *r {
-                    Ref::Value(j, _)
-                        if last[j as usize] == k
-                            && !pinned[j as usize]
-                            && reserved[j as usize] == u32::MAX =>
-                    {
-                        Some(j)
-                    }
-                    _ => None,
-                })
-                .collect();
+            operands.clear();
+            operands.extend(ins.iter().map(|&r| slot_of(r, &base)));
+            dying.clear();
+            dying.extend(ins.iter().filter_map(|r| match *r {
+                Ref::Value(j, _)
+                    if last[j as usize] == k
+                        && !pinned[j as usize]
+                        && reserved[j as usize] == u32::MAX =>
+                {
+                    Some(j)
+                }
+                _ => None,
+            }));
             dying.sort_unstable();
             dying.dedup();
-            for j in dying {
+            for &j in &dying {
                 let b = base[j as usize];
                 free.extend(b..b + self.insts[j as usize].n_out);
             }
-            let d = if inst.n_out == 1 && reserved[i as usize] != u32::MAX {
+            let d = if state_base[i as usize] != u32::MAX {
+                state_base[i as usize]
+            } else if inst.n_out == 1 && reserved[i as usize] != u32::MAX {
                 reserved[i as usize]
             } else if inst.n_out == 1 {
                 free.pop().unwrap_or_else(|| {
@@ -1543,27 +2109,46 @@ impl Program {
                     let start = gather(&mut arg_pool, &mut max_args, o);
                     Op::Dot(start, n)
                 }
-                Kind::Call { bundle } => {
-                    let start = gather(&mut arg_pool, &mut max_args, o);
+                Kind::Call { bundle, stateful } => {
+                    // A stateful call's last operand is its state block.
+                    let (args, state) = split_state(o, stateful);
+                    let start = gather(&mut arg_pool, &mut max_args, args);
                     Op::Call {
                         bundle,
                         start,
-                        n_args: o.len() as u32,
+                        n_args: args.len() as u32,
                         n_out: inst.n_out,
+                        state,
                     }
                 }
                 Kind::CallBatch {
                     bundle,
                     n_groups,
                     n_args,
+                    stateful,
                 } => {
-                    let start = gather(&mut arg_pool, &mut max_args, o);
+                    let (args, state) = split_state(o, stateful);
+                    let start = gather(&mut arg_pool, &mut max_args, args);
                     Op::CallBatch {
                         bundle,
                         start,
                         n_groups,
                         n_args,
                         n_out: inst.n_out / n_groups,
+                        state,
+                    }
+                }
+                Kind::CallProlog {
+                    bundle,
+                    n_groups,
+                    n_pure,
+                } => {
+                    let start = gather(&mut arg_pool, &mut max_args, o);
+                    Op::CallProlog {
+                        bundle,
+                        start,
+                        n_groups,
+                        n_pure,
                     }
                 }
                 Kind::Gemv {
@@ -1639,7 +2224,9 @@ impl Program {
             dst.push(d);
         }
         let outputs: Vec<u32> = self.roots.iter().map(|&r| slot_of(r, &base)).collect();
+        let bundle_work = self.bundles.iter().map(|b| b.work_len()).max().unwrap_or(0);
         Tape {
+            bundle_work,
             ops,
             dst,
             n_selects,
@@ -1649,6 +2236,75 @@ impl Program {
             max_args,
             bundles: self.bundles.clone(),
             prolog_ops,
+            state_len,
+            n_inputs: 0,
         }
+    }
+}
+
+/// The ready instructions of the list scheduler, best first: pure before
+/// impure, more kills before fewer, and among equals the most recently
+/// enabled. A stack per `(pure, kills)` bucket gives that order without a
+/// heap: pushes come in enabling order, so a bucket's top is its most
+/// recent entry, and the best bucket is the highest non-empty one.
+#[derive(Default)]
+struct Ready {
+    /// `buckets[pure][kills]`.
+    buckets: [Vec<Vec<u32>>; 2],
+    /// Per level, no bucket above this one holds anything.
+    hi: [usize; 2],
+    len: usize,
+}
+
+impl Ready {
+    fn push(&mut self, pure: bool, kills: u32, i: u32) {
+        let (p, k) = (pure as usize, kills as usize);
+        let level = &mut self.buckets[p];
+        if level.len() <= k {
+            level.resize_with(k + 1, Vec::new);
+        }
+        level[k].push(i);
+        self.hi[p] = self.hi[p].max(k);
+        self.len += 1;
+    }
+
+    /// The best bucket, `(pure, kills)`, if any holds anything.
+    fn best(&mut self) -> Option<(usize, usize)> {
+        if self.len == 0 {
+            return None;
+        }
+        for p in [1, 0] {
+            let level = &self.buckets[p];
+            while self.hi[p] > 0 && level.get(self.hi[p]).is_none_or(Vec::is_empty) {
+                self.hi[p] -= 1;
+            }
+            if level.get(self.hi[p]).is_some_and(|b| !b.is_empty()) {
+                return Some((p, self.hi[p]));
+            }
+        }
+        None
+    }
+
+    fn pop(&mut self) -> Option<(bool, u32, u32)> {
+        let (p, k) = self.best()?;
+        let i = self.buckets[p][k].pop()?;
+        self.len -= 1;
+        Some((p == 1, k as u32, i))
+    }
+
+    /// The next best entry when it is in the bucket `(pure, kills)`.
+    fn peek_same(&self, pure: bool, kills: u32) -> Option<u32> {
+        self.buckets[pure as usize]
+            .get(kills as usize)?
+            .last()
+            .copied()
+    }
+
+    /// Take the top of bucket `(pure, kills)` in place of `i`, which goes
+    /// back on top: it was that bucket's most recent entry and stays so.
+    fn swap_top(&mut self, pure: bool, kills: u32, i: u32) {
+        let b = &mut self.buckets[pure as usize][kills as usize];
+        let top = b.len() - 1;
+        b[top] = i;
     }
 }

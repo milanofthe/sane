@@ -163,7 +163,7 @@ fn compat_report_flags_ignored_directives_and_unknown_params() {
 fn device_terminal_current(p: &crate::ParsedCircuit, di: usize, bias: &[f64]) -> f64 {
     use num_complex::Complex64;
     use std::collections::HashMap as Map;
-    let mut ctx = rsdag::Graph::new();
+    let mut ctx = sane_core::Graph::new();
     let n = p.devices[di].model.n_terminals();
     let term_v: Vec<_> = (0..n).map(|k| ctx.sym(&format!("tv{k}"))).collect();
     let term_vdot: Vec<_> = (0..n).map(|k| ctx.sym(&format!("tvd{k}"))).collect();
@@ -465,7 +465,7 @@ fn global_nodes_pass_through_subckts() {
         .map(|e| e.name.clone())
         .collect();
     assert!(names.iter().any(|n| n.contains("R1")), "{names:?}");
-    let mut ctx = rsdag::Graph::new();
+    let mut ctx = sane_core::Graph::new();
     let dae = sane_dae::assemble_dae(&mut ctx, &p.circuit, &p.devices);
     assert!(
         dae.unknowns.iter().any(|u| u == "vvdd" || u == "v1"),

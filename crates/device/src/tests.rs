@@ -1,6 +1,7 @@
 use super::*;
 use num_complex::Complex64;
-use rsdag::{eval, Graph, Node, SymbolId};
+use rsdag::{eval, Node, SymbolId};
+use sane_core::Graph;
 use std::collections::HashMap;
 
 fn env_of(ctx: &mut Graph, vals: &[(&str, f64)]) -> HashMap<SymbolId, Complex64> {

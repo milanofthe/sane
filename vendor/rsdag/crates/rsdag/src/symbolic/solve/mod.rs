@@ -44,10 +44,12 @@ pub mod block;
 pub mod btf;
 pub mod num;
 pub mod predict;
+pub mod program;
 pub mod supernodal;
 
 pub use block::{block_pattern, solve_block_planned, solve_block_planned_sizes, Block, BlockRows};
 pub use num::{Cx, Num};
+pub use program::{LuProgram, Panels};
 pub use supernodal::{solve_supernodal_planned, supernodes, Supernodes};
 
 use rustc_hash::FxHashMap as HashMap;
@@ -678,15 +680,18 @@ pub fn solve_guarded<K: Field, N: Num>(
 /// specializes, compiles and batches like the model it came from, and a
 /// consumer that wants damping or a line search composes it from the same
 /// pieces ([`lu_static`], [`StaticLu::solve_static`]).
+///
+/// `None` when the Jacobian is structurally singular: no pivot order
+/// exists, whatever the values.
 pub fn newton_step<K: Field>(
     g: &mut Graph<K>,
     f: &[ExprId],
     x: &[crate::node::SymbolId],
-) -> NewtonStep {
+) -> Option<NewtonStep> {
     let jac = crate::autodiff::sparse_jacobian(g, f, x);
     let pattern = pattern_of(&jac);
-    let plan = plan(&pattern).expect("a structurally nonsingular Jacobian");
-    newton_step_planned(g, f, x, &jac, &plan)
+    let plan = plan(&pattern)?;
+    Some(newton_step_planned(g, f, x, &jac, &plan))
 }
 
 /// [`newton_step`] over a given Jacobian and plan: what a consumer calls

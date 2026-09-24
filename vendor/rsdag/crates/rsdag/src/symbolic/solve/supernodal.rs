@@ -42,6 +42,9 @@ pub struct Supernodes {
     /// Block `b` of the block triangular form spans panels
     /// `blocks[b]..blocks[b + 1]`.
     blocks: Vec<usize>,
+    /// The entries of step `s`'s column in the factor below the diagonal:
+    /// the step's update costs about their square.
+    below: Vec<usize>,
 }
 
 impl Supernodes {
@@ -56,6 +59,25 @@ impl Supernodes {
 
     pub fn max_width(&self) -> usize {
         self.widths().into_iter().max().unwrap_or(0)
+    }
+
+    /// The share of the factorization's update flops in panels at least
+    /// `min_width` wide: what kernels of that width would carry.
+    pub fn flop_share(&self, min_width: usize) -> f64 {
+        let cost = |r: std::ops::Range<usize>| -> f64 {
+            self.below[r].iter().map(|&c| (c * c) as f64).sum()
+        };
+        let total = cost(0..self.below.len());
+        if total == 0.0 {
+            return 0.0;
+        }
+        let wide: f64 = self
+            .bounds
+            .windows(2)
+            .filter(|w| w[1] - w[0] >= min_width)
+            .map(|w| cost(w[0]..w[1]))
+            .sum();
+        wide / total
     }
 
     /// The share of unknowns in panels wider than one: what the kernels
@@ -239,6 +261,7 @@ pub fn supernodes(pattern: &Pattern, plan: &Plan) -> Supernodes {
     let mut col_of = vec![0usize; n];
     let mut bounds = vec![0usize];
     let mut blocks = vec![0usize];
+    let mut below = vec![0usize; n];
     for b in 0..btf.n_blocks() {
         let range = btf.block(b);
         let (lo, m) = (range.start, range.len());
@@ -279,6 +302,9 @@ pub fn supernodes(pattern: &Pattern, plan: &Plan) -> Supernodes {
             .map(|&(r, c)| (new_of[r], new_of[c]))
             .collect();
         let (colstruct, _) = symbolic(m, &entries);
+        for k in 0..m {
+            below[lo + k] = colstruct[k].len();
+        }
         // Panels along the postorder: step k + 1 joins the panel ending at
         // k when it is the parent of the panel's rows (the panel's L
         // structure reaches it) and the explicit zeros of the merged panel's
@@ -328,6 +354,7 @@ pub fn supernodes(pattern: &Pattern, plan: &Plan) -> Supernodes {
         col_of,
         bounds,
         blocks,
+        below,
     }
 }
 

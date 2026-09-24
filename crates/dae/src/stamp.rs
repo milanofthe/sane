@@ -23,7 +23,8 @@
 
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
-use rsdag::{differentiate, ExprId, Graph, Node, ReduceOp, SymbolId};
+use rsdag::{differentiate, ExprId, Node, ReduceOp, SymbolId};
+use sane_core::Graph;
 
 /// One element contribution to the DAE: `expr` is summed into residual `row`.
 /// Ports (the unknown symbols it depends on) and parameters are auto-detected.

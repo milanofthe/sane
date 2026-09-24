@@ -15,7 +15,8 @@
 use std::collections::{HashMap, HashSet};
 
 use rsdag::determinant;
-use rsdag::{differentiate, sparse_jacobian, Crossing, ExprId, Graph, Node, SymbolId};
+use rsdag::{differentiate, sparse_jacobian, Crossing, ExprId, Node, SymbolId};
+use sane_core::Graph;
 use sane_mna::SourceFn;
 
 // Assembly of the symbolic DAE from a parsed circuit.
@@ -164,14 +165,6 @@ impl Dae {
     /// is, so a consumer (SANE's own solver, an exporter, another backend)
     /// reads the structure off the graph instead of off SANE-side metadata.
     pub fn register_function(&self, ctx: &mut Graph, name: &str) -> rsdag::FuncId {
-        // Idempotent: a DAE compiled twice (an AC run after a DC one, a
-        // transform that recompiles) states its signature once.
-        if let Some(f) = (0..ctx.n_funcs())
-            .map(|i| rsdag::FuncId(i as u32))
-            .find(|&f| ctx.func(f).name == name)
-        {
-            return f;
-        }
         let mut params: Vec<SymbolId> = Vec::with_capacity(self.x.len() * 2 + 1);
         let mut roles: Vec<rsdag::ParamRole> = Vec::with_capacity(params.capacity());
         for (i, &s) in self.x.iter().enumerate() {
@@ -184,11 +177,18 @@ impl Dae {
                 roles.push(rsdag::ParamRole::StateDot { id: i as u32 });
             }
         }
-        params.push(self.t);
-        roles.push(rsdag::ParamRole::Time);
-        for &s in self.param_defaults.keys() {
+        // The parameter vector's order (`params`), then time and the delay
+        // histories: the signature the solver's programs take their inputs
+        // in (`rsdag::Signature`).
+        for s in self.params(ctx) {
             params.push(s);
             roles.push(rsdag::ParamRole::Param);
+        }
+        params.push(self.t);
+        roles.push(rsdag::ParamRole::Time);
+        for (k, dl) in self.delays.iter().enumerate() {
+            params.push(dl.hist);
+            roles.push(rsdag::ParamRole::History { id: k as u32 });
         }
 
         let mut outputs: Vec<ExprId> = self.residuals.clone();
@@ -203,6 +203,27 @@ impl Dae {
             });
         }
 
+        // Idempotent per system, not per name: a DAE compiled twice (an AC
+        // run after a DC one) states its signature once, while a derived
+        // DAE in the same graph (folded parameters, a linearization) is
+        // another system and gets its own function.
+        let same = |f: &rsdag::Function| {
+            f.name == name
+                && f.params == params
+                && f.param_roles == roles
+                && f.output_roles == out_roles
+                && f.outputs.len() == outputs.len()
+                && f.outputs
+                    .iter()
+                    .zip(&outputs)
+                    .all(|(o, &e)| matches!(*o, rsdag::Output::Expr(x) if x == e))
+        };
+        if let Some(f) = (0..ctx.n_funcs())
+            .map(|i| rsdag::FuncId(i as u32))
+            .find(|&f| same(ctx.func(f)))
+        {
+            return f;
+        }
         let f = ctx.define_func(name, params, outputs);
         for (i, r) in roles.into_iter().enumerate() {
             ctx.set_param_role(f, i as u32, r);

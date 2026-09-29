@@ -404,7 +404,7 @@ impl<'a> CompiledHb<'a> {
             row_idx: row_idx.clone(),
             values: vec![Complex64::new(1.0, 0.0); row_idx.len()],
         };
-        let sym = KluSymbolic::analyze(&skeleton).ok()?;
+        let sym = KluSymbolic::analyze(&skeleton, &KluSettings::default()).ok()?;
         Some(CompiledHb {
             cdc,
             n,

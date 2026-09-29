@@ -212,7 +212,7 @@ impl SymbolicAc {
             row_idx: row_idx.clone(),
             values: vec![Complex64::new(1.0, 0.0); row_idx.len()],
         };
-        let sym = KluSymbolic::analyze(&pattern).ok()?;
+        let sym = KluSymbolic::analyze(&pattern, &KluSettings::default()).ok()?;
         let (slot_g, slot_c, slot_d) = (
             slot[..ng].to_vec(),
             slot[ng..ng + nc].to_vec(),
@@ -291,6 +291,7 @@ impl AcSweepSolver<'_> {
         for (k, &dv) in sys.d_v.iter().enumerate() {
             self.csc.values[sys.slot_d[k]] += dv * Complex64::from_polar(1.0, -w * sys.d_tau[k]);
         }
+        sane_solve::dump_system(&self.csc, b);
         if let Some(s) = self.solver.as_mut() {
             if s.refactor(&self.csc).is_ok() {
                 return s.solve(b).ok();

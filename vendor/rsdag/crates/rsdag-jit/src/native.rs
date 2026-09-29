@@ -8,10 +8,10 @@
 //! to its slot in the work array only when it has to be: on eviction, at a
 //! host call (which clobbers the caller-saved part of the cache) and at the
 //! chunk's end, and then only if some later op still reads it, which the
-//! last-use table knows. A value that dies inside the chunk never touches
+//! liveness knows. A value that dies inside the chunk never touches
 //! memory; nothing is ever spilled anywhere but where the interpreter keeps
-//! it anyway. Compile time is linear in the op count, around 40 ns per op;
-//! chunks are emitted in parallel.
+//! it anyway. Compile time is linear in the op count, and the chunks are
+//! emitted in parallel into one executable mapping.
 //!
 //! A large program is executed once per evaluation, straight through, so
 //! its cost is instruction fetch: the bytes per op. That is why nothing is
@@ -35,7 +35,7 @@ use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
 use crate::host::{self, Bundles};
-use crate::ir::{Dense, ROp, Recorder};
+use crate::ir::{Dense, Kernel, KernelKind, Liveness, ROp};
 use crate::isa::{Arg, Arith, Base, IArg, Isa, Round};
 use crate::{Batch, JitError, Options};
 
@@ -44,14 +44,21 @@ type Arch = crate::aarch64::A64;
 #[cfg(target_arch = "x86_64")]
 type Arch = crate::x86_64::X64;
 
-type ChunkFn = extern "C" fn(*mut f64, *const f64, *const Bundles);
+/// An emitted chunk: `(work, inputs, bundles)`. Unsafe to call: the code
+/// trusts the work array to have the layout's length and the inputs the
+/// ones it reads, which [`NativeTape::run`] checks.
+type ChunkFn = unsafe extern "C" fn(*mut f64, *const f64, *const Bundles);
 
 /// A tape compiled to native code. Evaluation mirrors [`Tape`]: a
 /// caller-owned work buffer, inputs padded with NaN, and the prolog/main
 /// split of a specialized tape.
 pub struct NativeTape {
-    chunks: Vec<Code>,
+    /// Every chunk's code in one mapping, and each chunk's entry in it.
+    code: Mapping,
+    chunks: Vec<ChunkFn>,
     prolog_chunks: usize,
+    /// The call and kernel descriptors the code holds the addresses of.
+    _descs: Vec<(Vec<host::CallDesc>, Vec<host::KernelDesc>)>,
     bundles: Bundles,
     /// The fold code tables of the accumulating kernels; the code holds
     /// their addresses.
@@ -220,18 +227,18 @@ struct Layout {
     total: usize,
 }
 
-/// One executable chunk.
-struct Code {
-    /// Kept alive for the code it holds; `func` points into it.
-    _map: Mapping,
-    func: ChunkFn,
-    /// The call descriptors the code holds the addresses of.
-    _descs: Vec<host::CallDesc>,
+/// One chunk as emitted: its machine code and the call descriptors the
+/// code holds the addresses of.
+struct Emitted {
+    bytes: Vec<u8>,
+    calls: Vec<host::CallDesc>,
+    kernels: Vec<host::KernelDesc>,
 }
+
 // The mapping is immutable after `Mapping::new`, so calling the code from
-// any thread is sound and the chunks can be built on a rayon pool.
-unsafe impl Send for Code {}
-unsafe impl Sync for Code {}
+// any thread is sound.
+unsafe impl Send for Mapping {}
+unsafe impl Sync for Mapping {}
 
 impl NativeTape {
     pub fn compile(tape: &Tape) -> Result<NativeTape, JitError> {
@@ -257,11 +264,10 @@ impl NativeTape {
         if !cfg!(any(target_arch = "aarch64", target_arch = "x86_64")) {
             return Err(JitError::Unsupported);
         }
-        let mut rec = Recorder::default();
-        tape.lower(&mut rec);
+        let mut ops = crate::ir::record(tape);
         // Function bodies that are tapes become native bodies of their own.
-        let bundles: Result<Bundles, JitError> = rec
-            .bundles
+        let bundles: Result<Bundles, JitError> = tape
+            .bundles()
             .iter()
             .map(|b| match b.body() {
                 Some(body) => Ok(Arc::new(NativeBody {
@@ -273,19 +279,15 @@ impl NativeTape {
                 None => Ok(b.clone()),
             })
             .collect();
-        rec.bundles = bundles?;
+        let bundles = bundles?;
         // The fold code tables, boxed so their addresses hold for the
         // tape's life; the ops carry the addresses.
         let mut tables: Vec<Box<[u32]>> = Vec::new();
-        for op in rec.ops.iter_mut() {
-            if let ROp::Gemv {
-                acc: Some((_, codes, table)),
+        for op in ops.iter_mut() {
+            if let ROp::Kernel(Kernel {
+                codes: Some((codes, table)),
                 ..
-            }
-            | ROp::Gemm {
-                acc: Some((_, codes, table)),
-                ..
-            } = op
+            }) = op
             {
                 let b: Box<[u32]> = codes.clone().into_boxed_slice();
                 *table = b.as_ptr() as usize;
@@ -294,7 +296,7 @@ impl NativeTape {
         }
         // Inputs the code reads: tagged operands, dense runs, outputs.
         let mut n_inputs = 0usize;
-        for op in &rec.ops {
+        for op in &ops {
             let mut top = 0usize;
             op.for_each_operand(|k| {
                 if let Some(i) = input_index(k) {
@@ -302,32 +304,11 @@ impl NativeTape {
                 }
             });
             n_inputs = n_inputs.max(top);
-            let runs: Vec<(&Dense, u32)> = match op {
-                ROp::Gemv {
-                    a, x, m, n, acc, ..
-                } => {
-                    let mut v = vec![(a, m * n), (x, *n)];
-                    if let Some((Some(c), _, _)) = acc {
-                        v.push((c, *m));
+            if let ROp::Kernel(k) = op {
+                for (d, len) in &k.operands {
+                    if let Dense::Inputs(i) = d {
+                        n_inputs = n_inputs.max((i + len) as usize);
                     }
-                    v
-                }
-                ROp::Gemm {
-                    a, b, m, k, n, acc, ..
-                } => {
-                    let mut v = vec![(a, m * k), (b, n * k)];
-                    if let Some((Some(c), _, _)) = acc {
-                        v.push((c, m * n));
-                    }
-                    v
-                }
-                ROp::Solve { a, b, n, .. } => vec![(a, n * n), (b, *n)],
-                ROp::SolveMany { a, b, n, k, .. } => vec![(a, n * n), (b, n * k)],
-                _ => Vec::new(),
-            };
-            for (d, len) in runs {
-                if let Dense::Inputs(k) = d {
-                    n_inputs = n_inputs.max(*k as usize + len as usize);
                 }
             }
         }
@@ -336,19 +317,24 @@ impl NativeTape {
                 n_inputs = n_inputs.max(i as usize + 1);
             }
         }
-        let gather_len = rec.ops.iter().map(ROp::gather_len).max().unwrap_or(0);
+        let gather_len = ops.iter().map(ROp::gather_len).max().unwrap_or(0);
         let n_work = tape.n_slots();
-        // The last op reading each slot; outputs are read after the program.
-        let mut last_use = vec![0u32; n_work.max(1)];
-        for (i, op) in rec.ops.iter().enumerate() {
-            op.for_each_read(|s| last_use[s as usize] = i as u32);
-        }
-        for &o in tape.outputs().iter().chain(live) {
-            if input_index(o).is_none() {
-                last_use[o as usize] = u32::MAX;
-            }
-        }
-        let scratch_len = rec.bundles.iter().map(|b| b.work_len()).max().unwrap_or(0);
+        // When each value dies; the outputs are read after the program.
+        let liveness = Liveness::new(&ops, n_work, tape.outputs().iter().chain(live).copied());
+        // The scratch lent to a called bundle, or to a dense solve.
+        let solves = ops.iter().map(|op| match op {
+            ROp::Kernel(Kernel {
+                kind: KernelKind::Solve { n, k },
+                ..
+            }) => rsdag::semantics::solve_scratch_len(*n as usize, *k as usize),
+            _ => 0,
+        });
+        let scratch_len = bundles
+            .iter()
+            .map(|b| b.work_len())
+            .chain(solves)
+            .max()
+            .unwrap_or(0);
         let layout = Layout {
             gather: n_work,
             scratch: n_work + gather_len,
@@ -358,8 +344,8 @@ impl NativeTape {
         // Chunk the prolog and main phases separately so no chunk straddles
         // the split; the recorded stream is 1:1 with the tape's ops.
         let chunk_ops = chunk_ops.max(1);
-        let split = tape.prolog_len().min(rec.ops.len());
-        let (pro, main) = rec.ops.split_at(split);
+        let split = tape.prolog_len().min(ops.len());
+        let (pro, main) = ops.split_at(split);
         let jobs: Vec<&[ROp]> = pro
             .chunks(chunk_ops)
             .chain(main.chunks(chunk_ops))
@@ -373,15 +359,37 @@ impl NativeTape {
                 Some(s)
             })
             .collect();
-        let chunks: Result<Vec<Code>, JitError> = jobs
+        let emitted: Vec<Emitted> = jobs
             .par_iter()
             .zip(&starts)
-            .map(|(ops, &start)| emit_chunk(ops, start, layout, &last_use))
+            .map(|(ops, &start)| emit_chunk(ops, start, layout, &liveness))
+            .collect();
+        // One mapping for all of them: a chunk is position independent (it
+        // reaches host routines, descriptors and tables by absolute
+        // address), so it runs from wherever it lands, 16-byte aligned.
+        let size = emitted.iter().map(|e| e.bytes.len() + 15).sum();
+        let mut bytes: Vec<u8> = Vec::with_capacity(size);
+        let mut offsets = Vec::with_capacity(emitted.len());
+        let mut descs = Vec::with_capacity(emitted.len());
+        for e in emitted {
+            bytes.resize(bytes.len().next_multiple_of(16), 0);
+            offsets.push(bytes.len());
+            bytes.extend_from_slice(&e.bytes);
+            descs.push((e.calls, e.kernels));
+        }
+        let code = Mapping::new(&bytes)?;
+        let chunks = offsets
+            .iter()
+            // SAFETY: each offset is the entry of a function emitted for the
+            // `ChunkFn` convention, inside the mapping, which the tape keeps.
+            .map(|&o| unsafe { std::mem::transmute::<*mut u8, ChunkFn>(code.ptr.add(o)) })
             .collect();
         Ok(NativeTape {
-            chunks: chunks?,
+            code,
+            chunks,
+            _descs: descs,
             prolog_chunks,
-            bundles: rec.bundles,
+            bundles,
             _tables: tables,
             outputs: tape.outputs().to_vec(),
             layout,
@@ -394,6 +402,11 @@ impl NativeTape {
     /// Number of emitted functions (diagnostics).
     pub fn n_chunks(&self) -> usize {
         self.chunks.len()
+    }
+
+    /// Bytes of machine code (diagnostics).
+    pub fn code_len(&self) -> usize {
+        self.code.len
     }
 
     fn padded<'a>(&self, inputs: &'a [f64], buf: &'a mut Vec<f64>) -> &'a [f64] {
@@ -420,7 +433,9 @@ impl NativeTape {
             &self.bundles as *const Bundles,
         );
         for c in &self.chunks[range] {
-            (c.func)(wp, ip, bp);
+            // SAFETY: the buffers were checked above, the code and the
+            // tables it addresses live as long as `self`.
+            unsafe { c(wp, ip, bp) };
             host::resume_panic();
         }
     }
@@ -529,8 +544,8 @@ impl NativeTape {
 struct Emitter<'a, I: Isa> {
     isa: I,
     layout: Layout,
-    /// Global index of the last op reading each slot.
-    last_use: &'a [u32],
+    /// When each value dies.
+    live: &'a Liveness,
     /// Global index of the op being emitted.
     pos: u32,
     /// Global index of the next op that calls a host routine (`u32::MAX`
@@ -540,6 +555,8 @@ struct Emitter<'a, I: Isa> {
     held: Vec<Option<u32>>,
     /// Whether the register's value is newer than the slot in memory.
     dirty: Vec<bool>,
+    /// The last op reading the register's value (see [`Liveness::death`]).
+    death: Vec<u32>,
     /// Cache index holding each slot.
     at: FxHashMap<u32, usize>,
     /// Cache index of each register number.
@@ -547,14 +564,14 @@ struct Emitter<'a, I: Isa> {
     /// Round-robin victim pointers of the callee-saved and caller-saved pools.
     next: [usize; 2],
     pinned: Vec<bool>,
-    /// The chunk's call descriptors, allocated for all of them before the
+    /// The chunk's call and kernel descriptors, allocated for all of them before the
     /// first is emitted (their addresses go into the code).
     descs: Vec<host::CallDesc>,
-    descs_cap: usize,
+    kernels: Vec<host::KernelDesc>,
 }
 
 impl<'a, I: Isa> Emitter<'a, I> {
-    fn new(layout: Layout, last_use: &'a [u32], hot: &[*const ()]) -> Emitter<'a, I> {
+    fn new(layout: Layout, live: &'a Liveness, hot: &[*const ()]) -> Emitter<'a, I> {
         let mut index = [0u8; 32];
         for (i, &r) in I::CACHE.iter().enumerate() {
             index[r as usize] = i as u8;
@@ -562,17 +579,18 @@ impl<'a, I: Isa> Emitter<'a, I> {
         Emitter {
             isa: I::new(hot),
             layout,
-            last_use,
+            live,
             pos: 0,
             next_call: u32::MAX,
             held: vec![None; I::CACHE.len()],
             dirty: vec![false; I::CACHE.len()],
+            death: vec![0; I::CACHE.len()],
             at: Default::default(),
             index,
             next: [0, 0],
             pinned: vec![false; I::CACHE.len()],
             descs: Vec::new(),
-            descs_cap: 0,
+            kernels: Vec::new(),
         }
     }
 
@@ -582,7 +600,7 @@ impl<'a, I: Isa> Emitter<'a, I> {
     /// to make room for another.
     fn drop_index(&mut self, i: usize) {
         if let Some(s) = self.held[i].take() {
-            if self.dirty[i] && self.last_use[s as usize] >= self.pos {
+            if self.dirty[i] && self.death[i] >= self.pos {
                 self.isa.store(I::CACHE[i], Base::Work, s as usize * 8);
             }
             self.dirty[i] = false;
@@ -600,11 +618,15 @@ impl<'a, I: Isa> Emitter<'a, I> {
     fn fresh(&mut self) -> u8 {
         self.fresh_in(I::SAVED..I::CACHE.len())
     }
-    /// A register for the value of `slot`: preferably callee-saved when a
-    /// host call comes before the value's last use, so the call does not
-    /// cost it a store and a reload; preferably caller-saved otherwise.
+    /// A register for the value op `pos` writes to `slot`.
     fn fresh_for(&mut self, slot: u32) -> u8 {
-        let keep = I::SAVED > 0 && self.next_call <= self.last_use[slot as usize];
+        self.fresh_until(self.live.death(slot, self.pos, true))
+    }
+    /// A register for a value that dies at `death`: preferably callee-saved
+    /// when a host call comes before, so the call does not cost it a store
+    /// and a reload; preferably caller-saved otherwise.
+    fn fresh_until(&mut self, death: u32) -> u8 {
+        let keep = I::SAVED > 0 && self.next_call <= death;
         if keep {
             self.fresh_in(0..I::SAVED)
         } else {
@@ -628,7 +650,7 @@ impl<'a, I: Isa> Emitter<'a, I> {
                 None => true,
                 Some(s) => match input_index(s) {
                     Some(_) => true, // an input reloads from the inputs
-                    None => self.last_use[s as usize] < self.pos,
+                    None => self.death[i] < self.pos,
                 },
             };
             if !self.pinned[i] && dead {
@@ -669,13 +691,14 @@ impl<'a, I: Isa> Emitter<'a, I> {
                 // An input: read in place, cached, never written back.
                 let r = self.fresh();
                 self.isa.load(r, Base::Inputs, k as usize * 8);
-                self.bind(r, slot);
+                self.bind(r, slot, 0);
                 r
             }
             None => {
-                let r = self.fresh_for(slot);
+                let death = self.live.death(slot, self.pos, false);
+                let r = self.fresh_until(death);
                 self.isa.load(r, Base::Work, slot as usize * 8);
-                self.bind(r, slot);
+                self.bind(r, slot, death);
                 r
             }
         }
@@ -690,7 +713,7 @@ impl<'a, I: Isa> Emitter<'a, I> {
             }
         }
     }
-    fn bind(&mut self, r: u8, slot: u32) {
+    fn bind(&mut self, r: u8, slot: u32, death: u32) {
         // A slot rebound to a new value: the old one is dead by the tape's
         // construction, so it is dropped without a write-back.
         if let Some(i) = self.at.remove(&slot) {
@@ -700,11 +723,13 @@ impl<'a, I: Isa> Emitter<'a, I> {
         let i = self.index[r as usize] as usize;
         self.drop_index(i);
         self.held[i] = Some(slot);
+        self.death[i] = death;
         self.at.insert(slot, i);
     }
     /// `r` is the value of `slot` now; memory will get it when it must.
     fn put(&mut self, slot: u32, r: u8) {
-        self.bind(r, slot);
+        let death = self.live.death(slot, self.pos, true);
+        self.bind(r, slot, death);
         self.dirty[self.index[r as usize] as usize] = true;
     }
     fn fconst(&mut self, v: f64) -> u8 {
@@ -743,35 +768,24 @@ impl<'a, I: Isa> Emitter<'a, I> {
         base
     }
 
-    /// A kernel's two dense operands as host arguments: an input run is
-    /// its address, gathered slots are packed into the gather area in
-    /// order, so the area holds exactly the slots the ops gather
-    /// ([`ROp::gather_len`]).
-    fn dense_args(&mut self, a: &Dense, b: &Dense) -> (IArg, IArg) {
-        let mut at = 0usize;
-        let a = self.dense_arg(a, &mut at);
-        let b = self.dense_arg(b, &mut at);
-        (a, b)
-    }
-
     /// A dense operand's address: in place (inputs, a consecutive run of
-    /// work slots), or gathered into the gather area from `*at`.
+    /// work slots), or gathered into the gather area from `*at`, so the
+    /// area holds exactly the slots a kernel gathers
+    /// ([`ROp::gather_len`]).
     fn dense_arg(&mut self, d: &Dense, at: &mut usize) -> IArg {
         let mut arg = |this: &mut Self, d: &Dense| match d {
             Dense::Inputs(k) => IArg::InputAddr(*k as usize * 8),
-            Dense::Slots(s) => {
-                let consecutive =
-                    !s.is_empty() && s.iter().enumerate().all(|(j, &x)| x == s[0] + j as u32);
-                if consecutive {
-                    // Read in place: whatever of the run the register cache
-                    // still owes to memory is written back first.
-                    for &slot in s {
-                        if let Some(&i) = this.at.get(&slot) {
-                            this.drop_index(i);
-                        }
+            Dense::Run(s, len) => {
+                // Read in place: whatever of the run the register cache
+                // still owes to memory is written back first.
+                for slot in *s..s + len {
+                    if let Some(&i) = this.at.get(&slot) {
+                        this.drop_index(i);
                     }
-                    return IArg::WorkAddr(s[0] as usize * 8);
                 }
+                IArg::WorkAddr(*s as usize * 8)
+            }
+            Dense::Slots(s) => {
                 let p = IArg::WorkAddr(this.gather_at(s, *at));
                 *at += s.len();
                 p
@@ -796,12 +810,11 @@ impl<'a, I: Isa> Emitter<'a, I> {
             ROp::Mul(dst, a, b) => self.bin2(Arith::Mul, dst, a, b),
             ROp::MulAdd(dst, a, b, c) => {
                 // Two roundings, like the interpreter.
-                let (x, y) = (self.get(a), self.get(b));
+                let x = self.get(a);
                 let m = self.fresh();
-                self.isa.arith(Arith::Mul, m, x, y);
-                let z = self.get(c);
+                self.arith_rm(Arith::Mul, m, x, b);
                 let r = self.fresh_for(dst);
-                self.isa.arith(Arith::Add, r, m, z);
+                self.arith_rm(Arith::Add, r, m, c);
                 self.put(dst, r);
             }
             ROp::Neg(dst, a) => {
@@ -895,7 +908,7 @@ impl<'a, I: Isa> Emitter<'a, I> {
                 let at = self.gather(&c.args);
                 let d = self.descs.len();
                 assert!(
-                    d < self.descs_cap,
+                    d < self.descs.capacity(),
                     "call descriptors counted before emission"
                 );
                 let desc = host::CallDesc {
@@ -924,176 +937,134 @@ impl<'a, I: Isa> Emitter<'a, I> {
                 self.call(host::h_call as *const (), &args);
                 self.invalidate(c.dst, c.n_groups * c.n_out);
             }
-            ROp::Gemv {
-                dst,
-                ref a,
-                ref x,
-                m,
-                n,
-                ref acc,
-            } => {
+            ROp::Kernel(ref kn) => {
                 let mut at = 0usize;
-                let a_arg = self.dense_arg(a, &mut at);
-                let x_arg = self.dense_arg(x, &mut at);
-                match acc {
-                    None => {
-                        let args = [
-                            Arg::I(a_arg),
-                            Arg::I(x_arg),
-                            Arg::I(IArg::Imm(m as u64)),
-                            Arg::I(IArg::Imm(n as u64)),
-                            Arg::I(IArg::WorkAddr(dst as usize * 8)),
-                        ];
-                        self.call(host::h_gemv as *const (), &args);
-                    }
-                    Some((c, _, table)) => {
-                        let c_arg = match c {
-                            Some(c) => self.dense_arg(c, &mut at),
-                            None => IArg::Imm(0),
-                        };
-                        let args = [
-                            Arg::I(a_arg),
-                            Arg::I(x_arg),
-                            Arg::I(c_arg),
-                            Arg::I(IArg::Imm(*table as u64)),
-                            Arg::I(IArg::Imm(m as u64)),
-                            Arg::I(IArg::Imm(n as u64)),
-                            Arg::I(IArg::WorkAddr(dst as usize * 8)),
-                        ];
-                        self.call(host::h_gemv_acc as *const (), &args);
-                    }
+                let mut operands = [host::Place::NONE; 3];
+                for (p, (d, _)) in operands.iter_mut().zip(&kn.operands) {
+                    *p = match self.dense_arg(d, &mut at) {
+                        IArg::InputAddr(off) => host::Place {
+                            base: host::Place::INPUTS,
+                            off: off as u64,
+                        },
+                        IArg::WorkAddr(off) => host::Place {
+                            base: host::Place::WORK,
+                            off: off as u64,
+                        },
+                        _ => unreachable!("a dense operand is in the work array or the inputs"),
+                    };
                 }
-                self.invalidate(dst, m);
-            }
-            ROp::Gemm {
-                dst,
-                ref a,
-                ref b,
-                m,
-                k,
-                n,
-                ref acc,
-            } => {
-                let mut at = 0usize;
-                let a_arg = self.dense_arg(a, &mut at);
-                let b_arg = self.dense_arg(b, &mut at);
-                match acc {
-                    None => {
-                        let args = [
-                            Arg::I(a_arg),
-                            Arg::I(b_arg),
-                            Arg::I(IArg::Imm(m as u64)),
-                            Arg::I(IArg::Imm(k as u64)),
-                            Arg::I(IArg::Imm(n as u64)),
-                            Arg::I(IArg::WorkAddr(dst as usize * 8)),
-                        ];
-                        self.call(host::h_gemm as *const (), &args);
-                    }
-                    Some((c, _, table)) => {
-                        let c_arg = match c {
-                            Some(c) => self.dense_arg(c, &mut at),
-                            None => IArg::Imm(0),
-                        };
-                        let args = [
-                            Arg::I(a_arg),
-                            Arg::I(b_arg),
-                            Arg::I(c_arg),
-                            Arg::I(IArg::Imm(*table as u64)),
-                            Arg::I(IArg::Imm(m as u64)),
-                            Arg::I(IArg::Imm(k as u64)),
-                            Arg::I(IArg::Imm(n as u64)),
-                            Arg::I(IArg::WorkAddr(dst as usize * 8)),
-                        ];
-                        self.call(host::h_gemm_acc as *const (), &args);
-                    }
-                }
-                self.invalidate(dst, m * n);
-            }
-            ROp::SolveMany {
-                dst,
-                ref a,
-                ref b,
-                n,
-                k,
-            } => {
-                let (a_arg, b_arg) = self.dense_args(a, b);
+                let (kind, m, k, n) = match kn.kind {
+                    KernelKind::Gemv { m, n } => (0, m, 0, n),
+                    KernelKind::Gemm { m, k, n } => (1, m, k, n),
+                    KernelKind::Solve { n, k } => (2, 0, k, n),
+                };
+                let desc = host::KernelDesc {
+                    kind,
+                    m: m as u64,
+                    k: k as u64,
+                    n: n as u64,
+                    operands,
+                    codes: kn.codes.as_ref().map_or(0, |c| c.1 as u64),
+                    out: kn.dst as u64 * 8,
+                    scratch: self.layout.scratch as u64 * 8,
+                    scratch_len: self.layout.scratch_len as u64,
+                };
+                let d = self.kernels.len();
+                assert!(
+                    d < self.kernels.capacity(),
+                    "kernel descriptors counted before emission"
+                );
+                // Sized up front: pushing never moves the table, so the
+                // address baked into the code stays valid.
+                self.kernels.push(desc);
+                let ptr = &self.kernels[d] as *const host::KernelDesc as u64;
                 let args = [
-                    Arg::I(a_arg),
-                    Arg::I(b_arg),
-                    Arg::I(IArg::Imm(n as u64)),
-                    Arg::I(IArg::Imm(k as u64)),
-                    Arg::I(IArg::WorkAddr(dst as usize * 8)),
+                    Arg::I(IArg::WorkAddr(0)),
+                    Arg::I(IArg::InputAddr(0)),
+                    Arg::I(IArg::Imm(ptr)),
                 ];
-                self.call(host::h_solve_many as *const (), &args);
-                self.invalidate(dst, n * k);
-            }
-            ROp::Solve {
-                dst,
-                ref a,
-                ref b,
-                n,
-            } => {
-                let (a_arg, b_arg) = self.dense_args(a, b);
-                let args = [
-                    Arg::I(a_arg),
-                    Arg::I(b_arg),
-                    Arg::I(IArg::Imm(n as u64)),
-                    Arg::I(IArg::WorkAddr(dst as usize * 8)),
-                ];
-                self.call(host::h_solve as *const (), &args);
-                self.invalidate(dst, n);
+                self.call(host::h_kernel as *const (), &args);
+                self.invalidate(kn.dst, kn.width());
             }
         }
     }
 
     fn bin2(&mut self, op: Arith, dst: u32, a: u32, b: u32) {
-        let (x, y) = (self.get(a), self.get(b));
+        let x = self.get(a);
         let r = self.fresh_for(dst);
-        self.isa.arith(op, r, x, y);
+        self.arith_rm(op, r, x, b);
         self.put(dst, r);
+    }
+
+    /// `d = a op slot`: the second operand from memory when the ISA reads
+    /// memory operands and the cache does not hold a value this op reads
+    /// last (a load would take a register and an instruction for nothing),
+    /// else from its register.
+    fn arith_rm(&mut self, op: Arith, d: u8, a: u8, slot: u32) {
+        if I::MEM_OPERANDS
+            && input_index(slot).is_none()
+            && !self.at.contains_key(&slot)
+            && self.live.death(slot, self.pos, false) == self.pos
+        {
+            self.isa.arith_mem(op, d, a, Base::Work, slot as usize * 8);
+            return;
+        }
+        let b = self.get(slot);
+        self.isa.arith(op, d, a, b);
     }
 
     fn unary(&mut self, dst: u32, uop: UnaryOp, a: u32) {
         let x = self.get(a);
-        let r = self.fresh_for(dst);
+        // The result register only for an op done inline: a host call
+        // returns its result in its own.
         let inline = match uop {
             UnaryOp::Sqrt => {
                 // x <= 0 ? 0 : sqrt(x), the reference's guard (NaN stays NaN).
+                let r = self.fresh_for(dst);
                 let zero = self.fconst(0.0);
                 let s = self.fresh();
                 self.isa.sqrt(s, x);
                 self.isa.cmp_select(CmpOp::Le, x, zero, zero, s, r);
-                true
+                Some(r)
             }
-            UnaryOp::Floor => self.isa.round(Round::Floor, r, x),
-            UnaryOp::Ceil => self.isa.round(Round::Ceil, r, x),
-            UnaryOp::Trunc => self.isa.round(Round::Trunc, r, x),
+            UnaryOp::Floor | UnaryOp::Ceil | UnaryOp::Trunc => {
+                let mode = match uop {
+                    UnaryOp::Floor => Round::Floor,
+                    UnaryOp::Ceil => Round::Ceil,
+                    _ => Round::Trunc,
+                };
+                let r = self.fresh_for(dst);
+                self.isa.round(mode, r, x).then_some(r)
+            }
             UnaryOp::Abs => {
+                let r = self.fresh_for(dst);
                 self.isa.abs(r, x);
-                true
+                Some(r)
             }
             UnaryOp::Sign => {
+                let r = self.fresh_for(dst);
                 let zero = self.fconst(0.0);
                 let one = self.fconst(1.0);
                 let minus = self.fconst(-1.0);
                 let t = self.fresh();
                 self.isa.cmp_select(CmpOp::Lt, x, zero, minus, x, t);
                 self.isa.cmp_select(CmpOp::Gt, x, zero, one, t, r);
-                true
+                Some(r)
             }
-            _ => false,
+            _ => None,
         };
-        if inline {
-            self.put(dst, r);
-        } else {
-            let (addr, code) = host::unary_addr(uop);
-            // The coded routine takes the op first: `h_unary_ext(op, x)`.
-            let args: Vec<Arg> = code
-                .into_iter()
-                .map(|c| Arg::I(IArg::Imm(c as u64)))
-                .chain([Arg::F(x)])
-                .collect();
-            self.call_into(dst, addr, &args);
+        match inline {
+            Some(r) => self.put(dst, r),
+            None => {
+                let (addr, code) = host::unary_addr(uop);
+                // The coded routine takes the op first: `h_unary_ext(op, x)`.
+                let args: Vec<Arg> = code
+                    .into_iter()
+                    .map(|c| Arg::I(IArg::Imm(c as u64)))
+                    .chain([Arg::F(x)])
+                    .collect();
+                self.call_into(dst, addr, &args);
+            }
         }
     }
 
@@ -1101,43 +1072,48 @@ impl<'a, I: Isa> Emitter<'a, I> {
     /// accumulators, merged as `(a0 + a1) + (a2 + a3)`, then the tail.
     /// Accumulators stay pinned across the terms; a term's registers are
     /// released once it is folded in, so a long list needs seven registers,
-    /// not one per operand.
+    /// not one per operand. Under four terms the merged accumulators are
+    /// the identity itself (`+0` or `1`, exactly), so the fold starts there.
     fn fold(&mut self, op: Arith, ident: f64, a: &[u32], b: Option<&[u32]>) -> u8 {
         let n = a.len();
-        let acc: [u8; 4] = std::array::from_fn(|_| self.fconst(ident));
         let ch = n / 4;
-        for c in 0..ch {
-            for (k, &ak) in acc.iter().enumerate() {
-                let t = self.term(a, b, 4 * c + k);
-                self.isa.arith(op, ak, ak, t);
-                self.release_except(&acc);
+        let mut s = if ch == 0 {
+            self.fconst(ident)
+        } else {
+            let acc: [u8; 4] = std::array::from_fn(|_| self.fconst(ident));
+            for c in 0..ch {
+                for (k, &ak) in acc.iter().enumerate() {
+                    self.term(op, ak, ak, a, b, 4 * c + k);
+                    self.release_except(&acc);
+                }
             }
-        }
-        let l = self.fresh();
-        self.isa.arith(op, l, acc[0], acc[1]);
-        let r = self.fresh();
-        self.isa.arith(op, r, acc[2], acc[3]);
-        let mut s = self.fresh();
-        self.isa.arith(op, s, l, r);
+            let l = self.fresh();
+            self.isa.arith(op, l, acc[0], acc[1]);
+            let r = self.fresh();
+            self.isa.arith(op, r, acc[2], acc[3]);
+            let s = self.fresh();
+            self.isa.arith(op, s, l, r);
+            s
+        };
         for k in ch * 4..n {
-            let t = self.term(a, b, k);
             let s2 = self.fresh();
-            self.isa.arith(op, s2, s, t);
+            self.term(op, s2, s, a, b, k);
             s = s2;
             self.release_except(&[s]);
         }
         s
     }
 
-    /// Term `k` of a fold: the operand, or the product for a dot.
-    fn term(&mut self, a: &[u32], b: Option<&[u32]>, k: usize) -> u8 {
+    /// `d = acc op term k` of a fold: the term is the operand, or for a dot
+    /// the product.
+    fn term(&mut self, op: Arith, d: u8, acc: u8, a: &[u32], b: Option<&[u32]>, k: usize) {
         match b {
-            None => self.get(a[k]),
+            None => self.arith_rm(op, d, acc, a[k]),
             Some(bb) => {
-                let (x, y) = (self.get(a[k]), self.get(bb[k]));
+                let x = self.get(a[k]);
                 let p = self.fresh();
-                self.isa.arith(Arith::Mul, p, x, y);
-                p
+                self.arith_rm(Arith::Mul, p, x, bb[k]);
+                self.isa.arith(op, d, acc, p);
             }
         }
     }
@@ -1160,12 +1136,7 @@ fn hot_routines(ops: &[ROp]) -> Vec<*const ()> {
     count.into_iter().map(|(a, _)| a).collect()
 }
 
-fn emit_chunk(
-    ops: &[ROp],
-    start: usize,
-    layout: Layout,
-    last_use: &[u32],
-) -> Result<Code, JitError> {
+fn emit_chunk(ops: &[ROp], start: usize, layout: Layout, live: &Liveness) -> Emitted {
     let hot = hot_routines(ops);
     // For each op, the next op at or after it that calls out.
     let mut next_call = vec![u32::MAX; ops.len() + 1];
@@ -1176,26 +1147,26 @@ fn emit_chunk(
             next_call[k + 1]
         };
     }
-    let mut e: Emitter<Arch> = Emitter::new(layout, last_use, &hot);
-    let n_calls = ops.iter().filter(|op| matches!(op, ROp::Call(_))).count();
-    e.descs = Vec::with_capacity(n_calls);
-    e.descs_cap = n_calls;
+    let mut e: Emitter<Arch> = Emitter::new(layout, live, &hot);
+    let count = |f: fn(&ROp) -> bool| ops.iter().filter(|op| f(op)).count();
+    e.descs = Vec::with_capacity(count(|op| matches!(op, ROp::Call(_))));
+    e.kernels = Vec::with_capacity(count(|op| matches!(op, ROp::Kernel(_))));
     e.isa.prologue();
     for (k, op) in ops.iter().enumerate() {
         e.pos = (start + k) as u32;
         e.next_call = next_call[k];
         e.op(op);
     }
+    // Past the chunk: what a later chunk reads is written back.
+    e.pos = (start + ops.len()) as u32;
     e.flush();
     e.isa.epilogue();
-    let descs = std::mem::take(&mut e.descs);
-    let map = Mapping::new(&e.isa.finish())?;
-    let func: ChunkFn = unsafe { std::mem::transmute(map.ptr) };
-    Ok(Code {
-        _map: map,
-        func,
-        _descs: descs,
-    })
+    let (calls, kernels) = (std::mem::take(&mut e.descs), std::mem::take(&mut e.kernels));
+    Emitted {
+        bytes: e.isa.finish(),
+        calls,
+        kernels,
+    }
 }
 
 // --- executable memory -----------------------------------------------------------

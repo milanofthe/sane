@@ -87,20 +87,30 @@ fn volt(x: &[f64], idx: Option<usize>) -> f64 {
 /// endpoints, so the limited difference is realized while preserving the common
 /// mode. Returns the limited iterate (a no-op when `limits` is empty).
 pub fn apply(limits: &[Limit], x_old: &[f64], x_new: &[f64]) -> Vec<f64> {
+    let mut x = x_new.to_vec();
+    apply_in_place(limits, x_old, &mut x);
+    x
+}
+
+/// [`apply`] over `x_new` in place.
+pub fn apply_in_place(limits: &[Limit], x_old: &[f64], x_new: &mut [f64]) {
     let alpha = fraction(limits, x_old, x_new);
-    if alpha >= 1.0 {
-        return x_new.to_vec();
+    if alpha < 1.0 {
+        for (n, o) in x_new.iter_mut().zip(x_old) {
+            *n = o + alpha * (*n - o);
+        }
     }
-    x_old
-        .iter()
-        .zip(x_new)
-        .map(|(o, n)| o + alpha * (n - o))
-        .collect()
 }
 
 /// The fraction of the move `x_old -> x_new` every limited junction allows
 /// (`1.0` when nothing limits).
 pub fn fraction(limits: &[Limit], x_old: &[f64], x_new: &[f64]) -> f64 {
+    fraction_by(limits, x_old, |i| x_new[i])
+}
+
+/// [`fraction`] with the proposed iterate given entry by entry (`x_new(i)`),
+/// read only at the limited junctions' nodes.
+pub fn fraction_by(limits: &[Limit], x_old: &[f64], x_new: impl Fn(usize) -> f64) -> f64 {
     // The Newton step is shortened as a whole, by the largest fraction that
     // keeps every limited junction within its own curve-aware bound. Moving
     // the endpoints of each junction separately (the SPICE-style node
@@ -113,7 +123,7 @@ pub fn fraction(limits: &[Limit], x_old: &[f64], x_new: &[f64]) -> f64 {
     let mut alpha = 1.0f64;
     for lim in limits {
         let v_old = volt(x_old, lim.hi) - volt(x_old, lim.lo);
-        let v_new = volt(x_new, lim.hi) - volt(x_new, lim.lo);
+        let v_new = lim.hi.map_or(0.0, &x_new) - lim.lo.map_or(0.0, &x_new);
         let v_lim = match lim.kind {
             LimitKind::PnJunction => pnjlim(v_new, v_old),
             LimitKind::Fet => fetlim(v_new, v_old),

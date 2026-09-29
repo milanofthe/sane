@@ -23,13 +23,11 @@
 //! # let _ = &mut back;
 //! ```
 
-use rustc_hash::FxHashMap as HashMap;
-
 use crate::field::Field;
 use std::sync::Arc;
 
 use crate::extern_fn::ExternBundle;
-use crate::func::{FuncId, FunctionBody, Output, OutputId};
+use crate::func::{FuncId, Function, Output};
 use crate::graph::Graph;
 use crate::node::{ExprId, Node, SymbolId};
 use crate::role::{OutputRole, ParamRole};
@@ -125,6 +123,20 @@ impl<K> Module<K> {
             });
         }
         let n_nodes = self.nodes.len();
+        // The node of each symbol: `sym` interns one when it creates the
+        // symbol, so every parameter has one.
+        let mut sym_node = vec![usize::MAX; self.symbols.len()];
+        for (i, node) in self.nodes.iter().enumerate() {
+            if let Node::Symbol(s) = *node {
+                if let Some(slot) = sym_node.get_mut(s.0 as usize) {
+                    *slot = (*slot).min(i);
+                }
+            }
+        }
+        // `ready[f]`: the first node at which function `f` and every one
+        // before it can be defined (their parameters exist).
+        let mut ready = Vec::with_capacity(self.funcs.len());
+        let mut at = 0;
         for (fi, f) in self.funcs.iter().enumerate() {
             let bad = |what| Err(ModuleError::Function { func: fi, what });
             if f.params.iter().any(|s| s.0 as usize >= self.symbols.len()) {
@@ -140,6 +152,13 @@ impl<K> Module<K> {
             if f.param_roles.len() > f.params.len() || f.output_roles.len() > f.outputs.len() {
                 return bad("more roles than slots");
             }
+            for s in &f.params {
+                match sym_node[s.0 as usize] {
+                    usize::MAX => return bad("parameter symbol without a node"),
+                    i => at = at.max(i + 1),
+                }
+            }
+            ready.push(at);
         }
         for &(f, k) in &self.call_outputs {
             match self.funcs.get(f.0 as usize) {
@@ -197,14 +216,20 @@ impl<K> Module<K> {
                             }
                         }
                         Node::Call(o, _) => {
-                            let Some(&(f, _)) = self.call_outputs.get(o.0 as usize) else {
+                            let Some(&(f, k)) = self.call_outputs.get(o.0 as usize) else {
                                 return dangling("call output");
                             };
                             let data = &self.funcs[f.0 as usize];
                             if data.params.len() != n {
                                 return shape("call with another argument count than its function");
                             }
-                            let late = data.outputs.iter().any(|o| match o {
+                            // The loader defines the callee here with the
+                            // outputs up to the called one; later outputs
+                            // (derivatives demanded after the call) follow.
+                            if ready[f.0 as usize] > i {
+                                return dangling("callee parameter after its call");
+                            }
+                            let late = data.outputs[..=k as usize].iter().any(|o| match o {
                                 Output::Expr(e) => !before(e),
                                 _ => false,
                             });
@@ -250,15 +275,12 @@ impl<K: Field> Graph<K> {
                 .funcs_slice()
                 .iter()
                 .map(|f| FunctionData {
-                    name: f.name.clone(),
-                    params: f.params.clone(),
-                    param_roles: f.param_roles.clone(),
-                    outputs: f.outputs.clone(),
-                    output_roles: f.output_roles.clone(),
-                    extern_body: match &f.body {
-                        FunctionBody::Symbolic => None,
-                        FunctionBody::Extern(_) => Some(f.name.clone()),
-                    },
+                    name: f.name().to_string(),
+                    params: f.params().to_vec(),
+                    param_roles: f.param_roles().to_vec(),
+                    outputs: f.outputs().to_vec(),
+                    output_roles: f.output_roles().to_vec(),
+                    extern_body: f.is_extern().then(|| f.name().to_string()),
                 })
                 .collect(),
             call_outputs: self.call_outputs_slice().to_vec(),
@@ -333,57 +355,35 @@ impl<K: Field> Graph<K> {
             symbols: vec![SymbolId(u32::MAX); module.symbols.len()],
             funcs: vec![None; module.funcs.len()],
         };
-        // Output ids are interned on demand by `call`, so the `Call` nodes
-        // are remapped through the module's own table.
-        let mut out_map: HashMap<OutputId, (FuncId, u32)> = HashMap::default();
-        for (i, &(f, k)) in module.call_outputs.iter().enumerate() {
-            out_map.insert(OutputId(i as u32), (f, k));
-        }
-        for (i, node) in module.nodes.iter().enumerate() {
-            match node {
+        let mut ops: Vec<ExprId> = Vec::new();
+        for node in &module.nodes {
+            ops.clear();
+            ops.extend(
+                node.operands(&module.arg_pool)
+                    .iter()
+                    .map(|x| map.exprs[x.0 as usize]),
+            );
+            let e = match *node {
+                Node::Const(c) => self.konst(module.consts[c.0 as usize].clone()),
                 Node::Symbol(s) => {
                     let e = self.sym(&module.symbols[s.0 as usize]);
-                    map.symbols[s.0 as usize] = match self.node(e) {
-                        Node::Symbol(t) => *t,
-                        _ => unreachable!("sym returns a symbol node"),
+                    let Node::Symbol(t) = *self.node(e) else {
+                        unreachable!("sym returns a symbol node")
                     };
-                    map.exprs.push(e);
-                    continue;
+                    map.symbols[s.0 as usize] = t;
+                    e
                 }
                 Node::Call(o, _) => {
-                    let (f, _) = out_map[o];
-                    self.define_loaded(module, f, &mut map, &bodies);
+                    let (f, k) = module.call_outputs[o.0 as usize];
+                    let id = self.sync_loaded(module, f, &mut map, &bodies);
+                    self.call(id, k, &ops)
                 }
-                _ => {}
-            }
-            let pool = &module.arg_pool;
-            let e = self.intern_node(
-                node,
-                |n| match *n {
-                    Node::Const(c) => module.consts[c.0 as usize].clone(),
-                    _ => unreachable!("only a constant asks for its value"),
-                },
-                |s| map.symbols[s.0 as usize],
-                |x| map.exprs[x.0 as usize],
-                |l| {
-                    pool[l.start as usize..(l.start + l.len) as usize]
-                        .iter()
-                        .map(|&x| map.exprs[x.0 as usize])
-                        .collect()
-                },
-                |o| {
-                    let (f, k) = out_map[&o];
-                    (
-                        map.funcs[f.0 as usize].expect("callee defined before its call"),
-                        k,
-                    )
-                },
-            );
-            debug_assert_eq!(map.exprs.len(), i);
+                _ => self.intern_over(*node, &ops),
+            };
             map.exprs.push(e);
         }
-        for f in 0..module.funcs.len() {
-            self.define_loaded(module, FuncId(f as u32), &mut map, &bodies);
+        if let Some(last) = module.funcs.len().checked_sub(1) {
+            self.sync_loaded(module, FuncId(last as u32), &mut map, &bodies);
         }
         Ok(IdMap {
             exprs: map.exprs,
@@ -396,60 +396,50 @@ impl<K: Field> Graph<K> {
         })
     }
 
-    /// Define function `f` of a module being loaded, once.
-    fn define_loaded(
+    /// Bring function `f` of a module being loaded up to the sweep: it and
+    /// every function before it defined (so the ids keep their order), and
+    /// holding each of its outputs, in order, whose node the sweep has met.
+    /// Outputs appended to a function after a call to it (derivatives
+    /// demanded later) are appended here as late as they were there.
+    fn sync_loaded(
         &mut self,
         module: &Module<K>,
         f: FuncId,
         map: &mut LoadMap,
         bodies: &[Option<Arc<dyn ExternBundle>>],
-    ) {
-        if map.funcs[f.0 as usize].is_some() {
-            return;
-        }
-        let data = &module.funcs[f.0 as usize];
-        let params: Vec<SymbolId> = data
-            .params
-            .iter()
-            .map(|s| map.symbols[s.0 as usize])
-            .collect();
-        let outputs: Vec<Output> = data
-            .outputs
-            .iter()
-            .map(|o| match *o {
-                Output::Expr(e) => Output::Expr(map.exprs[e.0 as usize]),
-                other => other,
-            })
-            .collect();
-        let id = match &bodies[f.0 as usize] {
-            Some(body) => {
-                self.define_extern_func_with_params(&data.name, params, body.clone(), outputs)
-            }
-            None => {
-                let exprs: Vec<ExprId> = outputs
+    ) -> FuncId {
+        for g in 0..=f.0 as usize {
+            let data = &module.funcs[g];
+            let id = *map.funcs[g].get_or_insert_with(|| {
+                let params = data
+                    .params
                     .iter()
-                    .map(|o| match o {
-                        Output::Expr(e) => *e,
-                        _ => self.zero(),
-                    })
+                    .map(|s| map.symbols[s.0 as usize])
                     .collect();
-                let id = self.define_func(&data.name, params, exprs);
-                // A zero output stays a zero output.
-                for (k, o) in outputs.iter().enumerate() {
-                    if matches!(o, Output::Zero) {
-                        self.func_mut(id).outputs[k] = Output::Zero;
-                    }
+                let mut func = Function::new(&data.name, params, bodies[g].clone());
+                for (k, &r) in data.param_roles.iter().enumerate() {
+                    func.set_param_role(k as u32, r);
                 }
-                id
+                self.push_function(func)
+            });
+            let func = self.func(id);
+            for k in func.outputs().len()..data.outputs.len() {
+                let o = match data.outputs[k] {
+                    Output::Expr(e) => match map.exprs.get(e.0 as usize) {
+                        Some(&e) => Output::Expr(e),
+                        None => break,
+                    },
+                    other => other,
+                };
+                let role = data
+                    .output_roles
+                    .get(k)
+                    .copied()
+                    .unwrap_or(OutputRole::Plain);
+                self.push_output(id, o, role);
             }
-        };
-        for (k, r) in data.param_roles.iter().enumerate() {
-            self.set_param_role(id, k as u32, *r);
         }
-        for (k, r) in data.output_roles.iter().enumerate() {
-            self.set_output_role(id, k as u32, *r);
-        }
-        map.funcs[f.0 as usize] = Some(id);
+        map.funcs[f.0 as usize].expect("defined above")
     }
 }
 

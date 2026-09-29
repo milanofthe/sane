@@ -63,6 +63,34 @@ fn hessian_off_the_solved_point() {
     assert!(h[0][0].is_finite());
 }
 
+/// A Hessian over several parameters solves its sensitivities as one
+/// multi-right-hand-side block; its diagonal matches the single-parameter
+/// Hessians.
+#[test]
+fn hessian_over_several_parameters() {
+    let sim = Model::from_netlist(
+        "V1 in 0 0.72
+R1 in mid 1k
+R2 mid out 500
+D1 out 0 dm
+.model dm D(Is=1e-14 N=1 Vt=0.025852)
+.end",
+    )
+    .unwrap();
+    let op = sim.operating_point(&[]).unwrap();
+    let h = op.hessian("out", &["R1", "R2"]).unwrap();
+    assert_eq!((h.len(), h[0].len()), (2, 2));
+    for (k, name) in ["R1", "R2"].iter().enumerate() {
+        let single = op.hessian("out", &[name]).unwrap()[0][0];
+        assert!(
+            (h[k][k] - single).abs() <= 1e-9 * single.abs().max(1e-30),
+            "{name}: {} vs {single}",
+            h[k][k]
+        );
+    }
+    assert!((h[0][1] - h[1][0]).abs() <= 1e-9 * h[0][1].abs().max(1e-30));
+}
+
 #[test]
 fn transient_and_noise() {
     let sim = Model::from_netlist("V1 in 0 1\nR1 in out 1k\nC1 out 0 1u\n.end").unwrap();

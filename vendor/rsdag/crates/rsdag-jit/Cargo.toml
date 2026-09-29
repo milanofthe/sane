@@ -16,7 +16,9 @@ rayon.workspace = true
 libc = "0.2"
 
 [dev-dependencies]
-rsdag = { workspace = true, features = ["synth"] }
+rsdag = { workspace = true, features = ["synth", "serde"] }
+# examples/modules: module JSON.
+serde_json = "1"
 
 [lints]
 workspace = true

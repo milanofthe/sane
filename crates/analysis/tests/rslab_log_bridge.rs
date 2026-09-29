@@ -23,16 +23,12 @@ D1 mid 0 DMOD
 .model DMOD D(Is=1e-14)
 .end
 ";
-    // The graph solve carries the Newton systems; the library runs only on
-    // request, which is what this test is about.
-    sane_core::update_config(|c| c.graph_solve = false);
     log::set_sink(Some(capture));
     log::set_level(LogLevel::Debug);
     let model = Model::from_netlist(deck).expect("model");
     let _ = model.operating_point(&[]).expect("op");
     log::set_level(LogLevel::Disabled);
     log::set_sink(None);
-    sane_core::update_config(|c| c.graph_solve = true);
     let lines = LINES.lock().unwrap().clone();
     let rslab: Vec<&(LogLevel, String)> =
         lines.iter().filter(|(_, m)| m.contains("rslab:")).collect();

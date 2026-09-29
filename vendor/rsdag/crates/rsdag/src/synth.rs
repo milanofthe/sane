@@ -182,16 +182,66 @@ pub fn inputs(rng: &mut Rng, n: usize) -> Vec<f64> {
     (0..n).map(|_| rng.val()).collect()
 }
 
-/// Ring forms (see [`ring_op`]): smooth prefix, then comparisons, selects
+/// One form a program may draw besides the lists and the guarded selects.
+#[derive(Clone, Copy)]
+enum Form {
+    /// Ring form `k` (see [`ring_op`]).
+    Ring(usize),
+    Unary(UnaryOp),
+    Binary(BinOp),
+}
+
+/// Ring forms (see [`ring_op`]): the smooth ones, then comparisons, selects
 /// and the ordered reductions.
 const RING_SMOOTH: usize = 8;
-const RING_ROUGH: usize = 4;
-/// Elementary forms (see [`elementary_op`]), `floor` and `abs` last.
-const ELEM_SMOOTH: usize = 10;
-const ELEM_ROUGH: usize = 2;
-/// Extension forms (see [`extended_op`]), smooth ones first.
-const EXT_SMOOTH: usize = 16;
-const EXT_ROUGH: usize = 7;
+const RING_ALL: usize = 12;
+
+/// The unary functions of [`Vocabulary::Elementary`].
+const ELEMENTARY: &[UnaryOp] = &[
+    UnaryOp::Exp,
+    UnaryOp::Ln,
+    UnaryOp::Sqrt,
+    UnaryOp::Sin,
+    UnaryOp::Cos,
+    UnaryOp::Sinh,
+    UnaryOp::Cosh,
+    UnaryOp::Tanh,
+    UnaryOp::Atan,
+    UnaryOp::Floor,
+    UnaryOp::Abs,
+];
+
+/// Every form `vocab` allows, only the differentiable ones when `smooth`:
+/// the vocabulary tables themselves, so an op added to them is drawn.
+fn forms(vocab: Vocabulary, smooth: bool) -> Vec<Form> {
+    let ring = if smooth { RING_SMOOTH } else { RING_ALL };
+    let mut forms: Vec<Form> = (0..ring).map(Form::Ring).collect();
+    let keep = |op: UnaryOp| !smooth || op.is_smooth();
+    match vocab {
+        Vocabulary::Ring => {}
+        Vocabulary::Elementary => forms.extend(
+            ELEMENTARY
+                .iter()
+                .filter(|&&op| keep(op))
+                .map(|&op| Form::Unary(op)),
+        ),
+        Vocabulary::Full => {
+            forms.extend(
+                crate::node::UNARY_OPS
+                    .iter()
+                    .filter(|s| keep(s.op))
+                    .map(|s| Form::Unary(s.op)),
+            );
+            forms.extend(
+                crate::node::BINARY_OPS
+                    .iter()
+                    .filter(|s| !smooth || s.smooth)
+                    .map(|s| Form::Binary(s.op)),
+            );
+        }
+    }
+    forms
+}
 
 /// Build one program: `n_outputs` root expressions over `n_params` free
 /// symbols. Returns the roots and the symbols in input order.
@@ -214,6 +264,7 @@ pub fn build_over<K: Field>(g: &mut Graph<K>, spec: &mut Spec, syms: &[ExprId]) 
 
 /// The draw loop shared by both entry points.
 fn build_roots<K: Field>(g: &mut Graph<K>, spec: &mut Spec, syms: &[ExprId]) -> Vec<ExprId> {
+    let forms = forms(spec.vocab, spec.smooth);
     let mut pool = syms.to_vec();
     for _ in 0..2 {
         let v = spec.rng.val();
@@ -229,7 +280,7 @@ fn build_roots<K: Field>(g: &mut Graph<K>, spec: &mut Spec, syms: &[ExprId]) -> 
             per_root
         };
         for _ in 0..steps {
-            let e = draw(g, spec, &pool, syms);
+            let e = draw(g, spec, &forms, &pool);
             pool.push(e);
         }
         roots.push(*pool.last().unwrap());
@@ -264,8 +315,18 @@ fn pick(rng: &mut Rng, pool: &[ExprId], width: usize) -> ExprId {
     }
 }
 
+/// Every comparison.
+const CMPS: [CmpOp; 6] = [
+    CmpOp::Gt,
+    CmpOp::Ge,
+    CmpOp::Lt,
+    CmpOp::Le,
+    CmpOp::Eq,
+    CmpOp::Ne,
+];
+
 /// Draw and build one node over the current pool.
-fn draw<K: Field>(g: &mut Graph<K>, spec: &mut Spec, pool: &[ExprId], syms: &[ExprId]) -> ExprId {
+fn draw<K: Field>(g: &mut Graph<K>, spec: &mut Spec, forms: &[Form], pool: &[ExprId]) -> ExprId {
     let spec_width = spec.width;
     let rng = &mut spec.rng;
     let a = pick(rng, pool, spec_width);
@@ -299,39 +360,11 @@ fn draw<K: Field>(g: &mut Graph<K>, spec: &mut Spec, pool: &[ExprId], syms: &[Ex
             _ => g.reduce(ReduceOp::Max, list),
         };
     }
-    // Index space: the ring forms, then the elementary ones, then the
-    // extension forms, each block split into its smooth prefix and its
-    // rough suffix so `smooth` is a prefix restriction at every level.
-    let (ring, elem) = (
-        if spec.smooth {
-            RING_SMOOTH
-        } else {
-            RING_SMOOTH + RING_ROUGH
-        },
-        if spec.smooth {
-            ELEM_SMOOTH
-        } else {
-            ELEM_SMOOTH + ELEM_ROUGH
-        },
-    );
-    let ext = match spec.vocab {
-        Vocabulary::Full if spec.smooth => EXT_SMOOTH,
-        Vocabulary::Full => EXT_SMOOTH + EXT_ROUGH,
-        _ => 0,
-    };
-    let elem = if spec.vocab == Vocabulary::Ring {
-        0
-    } else {
-        elem
-    };
-    let i = rng.below(ring + elem + ext);
-    if i >= ring + elem {
-        return extended_op(g, i - ring - elem, a, b);
+    match forms[rng.below(forms.len())] {
+        Form::Ring(k) => ring_op(g, rng, k, a, b, c),
+        Form::Unary(op) => unary_form(g, op, a),
+        Form::Binary(op) => binary_form(g, op, a, b),
     }
-    if i >= ring {
-        return elementary_op(g, i - ring, a, b, syms);
-    }
-    ring_op(g, rng, i, a, b, c)
 }
 
 /// The ring forms: what every backend, generated C included, reproduces bit
@@ -344,8 +377,8 @@ fn ring_op<K: Field>(
     b: ExprId,
     c: ExprId,
 ) -> ExprId {
-    let pow = rng.below(6) as i64 - 2;
-    let cmp = [CmpOp::Gt, CmpOp::Le, CmpOp::Lt][rng.below(3)];
+    let pow = rng.below(9) as i64 - 4;
+    let cmp = CMPS[rng.below(CMPS.len())];
     match k {
         0 => g.add(a, b),
         1 => g.sub(a, b),
@@ -371,88 +404,52 @@ fn ring_op<K: Field>(
     }
 }
 
-/// The elementary functions, smooth ones first. `ln` and `sqrt` of a
-/// structural zero would differentiate to `1/0`, so those arguments are
-/// steered to a symbol.
-fn elementary_op<K: Field>(
-    g: &mut Graph<K>,
-    k: usize,
-    a: ExprId,
-    b: ExprId,
-    syms: &[ExprId],
-) -> ExprId {
-    match k {
-        0 => g.exp(a),
-        1 => {
-            let arg = if g.is_zero(a) { syms[0] } else { a };
-            g.ln(arg)
+/// `op` of `a`, the argument moved into the function's domain so the value
+/// stays finite over the inputs [`inputs`] draws: at least 1 for the
+/// logarithms, the roots and the gamma family, of magnitude at most 1/2 for
+/// the inverse sines and `atanh`, at least 2 for `acosh`, off the poles for
+/// `tan`.
+fn unary_form<K: Field>(g: &mut Graph<K>, op: UnaryOp, a: ExprId) -> ExprId {
+    use UnaryOp::*;
+    let arg = match op {
+        Ln | Sqrt | Log10 | Log2 | Cbrt | Lgamma | Tgamma | Digamma | Trigamma => {
+            let a2 = g.mul(a, a);
+            let one = g.one();
+            g.add(a2, one)
         }
-        2 => {
-            let arg = if g.is_zero(a) { syms[0] } else { a };
-            g.sqrt(arg)
-        }
-        3 => g.sin(a),
-        4 => g.cos(a),
-        5 => g.sinh(a),
-        6 => g.cosh(a),
-        7 => g.tanh(a),
-        8 => g.unary(UnaryOp::Atan, a),
-        9 => {
+        Log1p => g.mul(a, a),
+        Asin | Acos | Atanh => {
             let s = g.sin(a);
-            g.mul(s, b)
+            let half = g.ratio(1, 2);
+            g.mul(half, s)
         }
-        10 => g.floor(a),
-        _ => g.unary(UnaryOp::Abs, a),
-    }
+        Acosh => {
+            let a2 = g.mul(a, a);
+            let two = g.konst_int(2);
+            g.add(a2, two)
+        }
+        Tan => g.tanh(a),
+        _ => a,
+    };
+    g.unary(op, arg)
 }
 
-/// Extension form `k` over `a` and `b`, each argument shifted or bounded
-/// into the function's domain so the value stays finite; the smooth forms
-/// come first so a derivative check can draw from the prefix alone.
-fn extended_op<K: Field>(g: &mut Graph<K>, k: usize, a: ExprId, b: ExprId) -> ExprId {
-    let one = g.one();
+/// `op` of `a` and `b`, moved into its domain as [`unary_form`] does.
+fn binary_form<K: Field>(g: &mut Graph<K>, op: BinOp, a: ExprId, b: ExprId) -> ExprId {
     let a2 = g.mul(a, a);
+    let one = g.one();
     let pos = g.add(a2, one); // >= 1
-    let half = g.ratio(1, 2);
-    let s = g.sin(a);
-    let bounded = g.mul(half, s); // |.| <= 1/2
-    match k {
-        0 => {
-            let t = g.tanh(a);
-            g.unary(UnaryOp::Tan, t)
-        }
-        1 => g.unary(UnaryOp::Asinh, a),
-        2 => g.unary(UnaryOp::Expm1, a),
-        3 => g.unary(UnaryOp::Log1p, a2),
-        4 => g.unary(UnaryOp::Erf, a),
-        5 => g.unary(UnaryOp::Erfc, a),
-        6 => g.binary(BinOp::Atan2, a, pos),
-        7 => g.binary(BinOp::Hypot, pos, b),
-        8 => {
+    match op {
+        BinOp::Atan2 => g.binary(op, a, pos),
+        BinOp::Hypot => g.binary(op, pos, b),
+        BinOp::Powf => {
             let t = g.tanh(b);
-            g.binary(BinOp::Powf, pos, t)
+            g.binary(op, pos, t)
         }
-        9 => g.unary(UnaryOp::Cbrt, pos),
-        10 => g.unary(UnaryOp::Lgamma, pos),
-        11 => g.unary(UnaryOp::Digamma, pos),
-        12 => g.unary(UnaryOp::Asin, bounded),
-        13 => g.unary(UnaryOp::Atanh, bounded),
-        14 => g.unary(UnaryOp::Log10, pos),
-        15 => {
-            let two = g.konst_int(2);
-            let p2 = g.add(a2, two);
-            g.unary(UnaryOp::Acosh, p2)
-        }
-        16 => g.unary(UnaryOp::Abs, a),
-        17 => g.unary(UnaryOp::Sign, a),
-        18 => g.unary(UnaryOp::Ceil, a),
-        19 => g.unary(UnaryOp::Round, a),
-        20 => g.unary(UnaryOp::Trunc, a),
-        21 => {
+        BinOp::Mod => {
             let m = g.ratio(3, 2);
-            g.binary(BinOp::Mod, a, m)
+            g.binary(op, a, m)
         }
-        _ => g.unary(UnaryOp::RandUniform, a),
     }
 }
 

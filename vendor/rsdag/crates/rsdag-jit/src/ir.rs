@@ -1,16 +1,12 @@
-//! The op stream: the tape lowered through [`TapeVisitor`] into a flat
-//! vector the emitter walks. Recording decouples the chunk partitioning and
-//! the parallel per-chunk codegen from the visitor callback structure.
-//! Bundle bodies are interned by `Arc` identity into a table the compiled
-//! code indexes through the pointer every chunk receives. Operands are the
+//! The op stream: the tape's ops as a flat vector the emitter walks,
+//! their lists resolved, so the chunk partitioning and the parallel
+//! per-chunk codegen work on owned data. Bundles are indexed as the tape
+//! indexes them, through the table every chunk receives. Operands are the
 //! tape's: slots, or inputs when tagged (see [`rsdag::tape::INPUT`]).
 
-use rsdag::extern_fn::ExternBundle;
 use rsdag::node::{BinOp, CmpOp, ReduceOp, UnaryOp};
-use rsdag::tape::{input_index, Operand};
-use rsdag::TapeVisitor;
-use rustc_hash::FxHashMap;
-use std::sync::Arc;
+use rsdag::tape::{input_index, Accum, Op, Operand, Src, NO_STATE};
+use rsdag::Tape;
 
 pub(crate) enum ROp {
     Const(u32, f64),
@@ -28,40 +24,40 @@ pub(crate) enum ROp {
     Dot(u32, Vec<u32>, Vec<u32>),
     /// A bundle call of any form (see [`CallSite`]).
     Call(CallSite),
-    Gemv {
-        dst: u32,
-        a: Dense,
-        x: Dense,
-        m: u32,
-        n: u32,
-        /// The accumulator operand, the fold codes and, once compiled,
-        /// the address of the codes' table.
-        acc: Option<(Option<Dense>, Vec<u32>, usize)>,
-    },
-    Gemm {
-        dst: u32,
-        a: Dense,
-        b: Dense,
-        m: u32,
-        k: u32,
-        n: u32,
-        /// The accumulator operand, the fold codes and, once compiled,
-        /// the address of the codes' table.
-        acc: Option<(Option<Dense>, Vec<u32>, usize)>,
-    },
-    Solve {
-        dst: u32,
-        a: Dense,
-        b: Dense,
-        n: u32,
-    },
-    SolveMany {
-        dst: u32,
-        a: Dense,
-        b: Dense,
-        n: u32,
-        k: u32,
-    },
+    /// A dense kernel (see [`Kernel`]).
+    Kernel(Kernel),
+}
+
+/// What a dense kernel computes: the product kernels and the dense solve
+/// of `rsdag::tape::Op`, by the code the host routine dispatches on.
+#[derive(Clone, Copy)]
+pub(crate) enum KernelKind {
+    Gemv { m: u32, n: u32 },
+    Gemm { m: u32, k: u32, n: u32 },
+    Solve { n: u32, k: u32 },
+}
+
+/// A dense kernel: its operands in order (`a`, then `x` or `b`, then the
+/// accumulator when a fold reads one), each with its length, its outputs
+/// the block from `dst`.
+pub(crate) struct Kernel {
+    pub(crate) dst: u32,
+    pub(crate) kind: KernelKind,
+    pub(crate) operands: Vec<(Dense, u32)>,
+    /// The fold codes of a product kernel that folds, and once compiled the
+    /// address of their table.
+    pub(crate) codes: Option<(Vec<u32>, usize)>,
+}
+
+impl Kernel {
+    /// How many values it writes from `dst`.
+    pub(crate) fn width(&self) -> u32 {
+        match self.kind {
+            KernelKind::Gemv { m, .. } => m,
+            KernelKind::Gemm { m, n, .. } => m * n,
+            KernelKind::Solve { n, k } => n * k,
+        }
+    }
 }
 
 /// What a call computes.
@@ -96,29 +92,43 @@ pub(crate) struct CallSite {
     pub(crate) batch: bool,
 }
 
-/// A dense operand: a run of inputs read in place, or slots gathered.
+/// A dense operand: a run of inputs or of work slots read in place, or
+/// slots gathered.
 pub(crate) enum Dense {
     Inputs(u32),
+    /// `len` work slots from `s`.
+    Run(u32, u32),
     Slots(Vec<u32>),
 }
 
 impl Dense {
-    pub(crate) fn slots(&self) -> &[u32] {
-        match self {
-            Dense::Inputs(_) => &[],
-            Dense::Slots(v) => v,
+    /// Every work slot the operand reads.
+    pub(crate) fn for_each_slot(&self, mut f: impl FnMut(u32)) {
+        match *self {
+            Dense::Inputs(_) => {}
+            Dense::Run(s, len) => (s..s + len).for_each(f),
+            Dense::Slots(ref v) => v.iter().for_each(|&k| f(k)),
         }
     }
-    fn of(o: Operand<'_>) -> Dense {
+    /// How many values it gathers.
+    fn gathered(&self) -> usize {
+        match self {
+            Dense::Slots(v) => v.len(),
+            _ => 0,
+        }
+    }
+    fn of(o: Operand<'_>, len: u32) -> Dense {
         match o {
             Operand::Inputs(k) => Dense::Inputs(k),
+            Operand::Run(s) => Dense::Run(s, len),
             Operand::Slots(s) => Dense::Slots(s.to_vec()),
         }
     }
 }
 
 impl ROp {
-    /// Every operand the op reads, slots and tagged inputs alike.
+    /// Every operand the op reads: slots, and the tagged inputs a scalar
+    /// op or a list names (a kernel's input run is read by address).
     pub(crate) fn for_each_operand(&self, mut f: impl FnMut(u32)) {
         match self {
             ROp::Const(..) => {}
@@ -139,29 +149,7 @@ impl ROp {
             ROp::Reduce(_, _, args) => args.iter().copied().for_each(f),
             ROp::Call(c) => c.args.iter().copied().for_each(f),
             ROp::Dot(_, a, b) => a.iter().chain(b).copied().for_each(f),
-            ROp::Gemv { a, x, acc, .. } => a
-                .slots()
-                .iter()
-                .chain(x.slots())
-                .chain(
-                    acc.iter()
-                        .flat_map(|(c, _, _)| c.as_ref().map_or(&[][..], |c| c.slots())),
-                )
-                .copied()
-                .for_each(f),
-            ROp::Gemm { a, b, acc, .. } => a
-                .slots()
-                .iter()
-                .chain(b.slots())
-                .chain(
-                    acc.iter()
-                        .flat_map(|(c, _, _)| c.as_ref().map_or(&[][..], |c| c.slots())),
-                )
-                .copied()
-                .for_each(f),
-            ROp::Solve { a, b, .. } | ROp::SolveMany { a, b, .. } => {
-                a.slots().iter().chain(b.slots()).copied().for_each(f)
-            }
+            ROp::Kernel(k) => k.operands.iter().for_each(|(d, _)| d.for_each_slot(&mut f)),
         }
     }
     /// Every work slot the op reads.
@@ -171,6 +159,27 @@ impl ROp {
                 f(k)
             }
         });
+    }
+    /// The slots the op writes: its destination, a kernel's block from it.
+    pub(crate) fn writes(&self) -> std::ops::Range<u32> {
+        let (dst, n) = match *self {
+            ROp::Const(d, _)
+            | ROp::Add(d, ..)
+            | ROp::Mul(d, ..)
+            | ROp::MulAdd(d, ..)
+            | ROp::Sub(d, ..)
+            | ROp::Neg(d, _)
+            | ROp::Powi(d, ..)
+            | ROp::Unary(d, ..)
+            | ROp::Binary(d, ..)
+            | ROp::Cmp(d, ..)
+            | ROp::Select(d, ..)
+            | ROp::Reduce(d, ..)
+            | ROp::Dot(d, ..) => (d, 1),
+            ROp::Call(ref c) => (c.dst, c.n_groups * c.n_out),
+            ROp::Kernel(ref k) => (k.dst, k.width()),
+        };
+        dst..dst + n
     }
     /// The host routine the op calls, if any.
     pub(crate) fn host(&self) -> Option<*const ()> {
@@ -188,12 +197,7 @@ impl ROp {
             ROp::Powi(_, _, n) if *n != -1 && *n != 2 => crate::host::h_powi as *const (),
             ROp::Reduce(_, ReduceOp::Min | ReduceOp::Max, _) => crate::host::h_reduce as *const (),
             ROp::Call(..) => crate::host::h_call as *const (),
-            ROp::Gemv { acc: None, .. } => crate::host::h_gemv as *const (),
-            ROp::Gemv { .. } => crate::host::h_gemv_acc as *const (),
-            ROp::Gemm { acc: None, .. } => crate::host::h_gemm as *const (),
-            ROp::Gemm { .. } => crate::host::h_gemm_acc as *const (),
-            ROp::Solve { .. } => crate::host::h_solve as *const (),
-            ROp::SolveMany { .. } => crate::host::h_solve_many as *const (),
+            ROp::Kernel(..) => crate::host::h_kernel as *const (),
             _ => return None,
         })
     }
@@ -203,208 +207,190 @@ impl ROp {
         match self {
             ROp::Reduce(_, ReduceOp::Min | ReduceOp::Max, args) => args.len(),
             ROp::Call(c) => c.args.len(),
-            ROp::Gemv { a, x, acc, .. } => {
-                a.slots().len()
-                    + x.slots().len()
-                    + acc
-                        .as_ref()
-                        .map_or(0, |(c, _, _)| c.as_ref().map_or(0, |c| c.slots().len()))
-            }
-            ROp::Gemm { a, b, acc, .. } => {
-                a.slots().len()
-                    + b.slots().len()
-                    + acc
-                        .as_ref()
-                        .map_or(0, |(c, _, _)| c.as_ref().map_or(0, |c| c.slots().len()))
-            }
-            ROp::Solve { a, b, .. } | ROp::SolveMany { a, b, .. } => {
-                a.slots().len() + b.slots().len()
-            }
+            ROp::Kernel(k) => k.operands.iter().map(|(d, _)| d.gathered()).sum(),
             _ => 0,
         }
     }
 }
 
-#[derive(Default)]
-pub(crate) struct Recorder {
-    pub(crate) ops: Vec<ROp>,
-    pub(crate) bundles: Vec<Arc<dyn ExternBundle>>,
-    bundle_idx: FxHashMap<usize, u32>,
-}
-
-impl Recorder {
-    fn intern(&mut self, b: &Arc<dyn ExternBundle>) -> u32 {
-        let key = Arc::as_ptr(b) as *const () as usize;
-        *self.bundle_idx.entry(key).or_insert_with(|| {
-            self.bundles.push(b.clone());
-            (self.bundles.len() - 1) as u32
+/// The op stream of a tape, its bundles indexed as the tape indexes them.
+pub(crate) fn record(tape: &Tape) -> Vec<ROp> {
+    // A kernel over the dense operands `srcs`, with the folds of `acc`
+    // over its `width` outputs.
+    let kernel = |dst: u32, kind: KernelKind, srcs: &[(Src, u32)], acc: Option<Accum>| {
+        let mut k = Kernel {
+            dst,
+            kind,
+            operands: Vec::new(),
+            codes: None,
+        };
+        let width = k.width();
+        let c = acc.and_then(|a| a.c).map(|c| (c, width));
+        k.operands = srcs
+            .iter()
+            .chain(&c)
+            .map(|&(s, len)| (Dense::of(tape.operand(s, len), len), len))
+            .collect();
+        k.codes = acc.map(|a| (tape.pool(a.codes, width).to_vec(), 0));
+        ROp::Kernel(k)
+    };
+    (0..tape.ops().len())
+        .map(|i| {
+            let dst = tape.dst(i);
+            match tape.ops()[i] {
+                Op::Const(v) => ROp::Const(dst, v),
+                Op::Add(a, b) => ROp::Add(dst, a, b),
+                Op::Mul(a, b) => ROp::Mul(dst, a, b),
+                Op::MulAdd(a, b, c) => ROp::MulAdd(dst, a, b, c),
+                Op::Sub(a, b) => ROp::Sub(dst, a, b),
+                Op::Neg(a) => ROp::Neg(dst, a),
+                Op::Powi(a, n) => ROp::Powi(dst, a, n),
+                Op::Unary(op, a) => ROp::Unary(dst, op, a),
+                Op::Binary(op, a, b) => ROp::Binary(dst, op, a, b),
+                Op::Cmp(op, a, b) => ROp::Cmp(dst, op, a, b),
+                Op::Select(c, t, e) => ROp::Select(dst, c, t, e),
+                Op::Reduce(op, s, l) => ROp::Reduce(dst, op, tape.pool(s, l).to_vec()),
+                Op::Dot(s, l) => {
+                    ROp::Dot(dst, tape.pool(s, l).to_vec(), tape.pool(s + l, l).to_vec())
+                }
+                Op::Call {
+                    bundle,
+                    start,
+                    n_groups,
+                    n_args,
+                    n_out,
+                    state,
+                } => ROp::Call(CallSite {
+                    dst,
+                    bundle,
+                    args: tape.pool(start, n_groups * n_args).to_vec(),
+                    n_groups,
+                    n_args,
+                    n_out,
+                    kind: if state == NO_STATE {
+                        CallKind::Whole
+                    } else {
+                        CallKind::Main
+                    },
+                    state: if state == NO_STATE { 0 } else { state },
+                    state_len: tape.bundles()[bundle as usize].state_len() as u32,
+                    batch: n_groups > 1,
+                }),
+                Op::CallProlog {
+                    bundle,
+                    start,
+                    n_groups,
+                    n_pure,
+                } => {
+                    let state_len = tape.bundles()[bundle as usize].state_len() as u32;
+                    ROp::Call(CallSite {
+                        dst,
+                        bundle,
+                        args: tape.pool(start, n_groups * n_pure).to_vec(),
+                        n_groups,
+                        n_args: n_pure,
+                        n_out: state_len,
+                        kind: CallKind::Prolog,
+                        state: dst,
+                        state_len,
+                        batch: n_groups > 1,
+                    })
+                }
+                Op::Gemv { a, x, m, n, acc } => {
+                    kernel(dst, KernelKind::Gemv { m, n }, &[(a, m * n), (x, n)], acc)
+                }
+                Op::Gemm { a, b, m, k, n, acc } => kernel(
+                    dst,
+                    KernelKind::Gemm { m, k, n },
+                    &[(a, m * k), (b, n * k)],
+                    acc,
+                ),
+                Op::Solve { a, b, n, k } => kernel(
+                    dst,
+                    KernelKind::Solve { n, k },
+                    &[(a, n * n), (b, n * k)],
+                    None,
+                ),
+            }
         })
-    }
+        .collect()
 }
 
-impl TapeVisitor for Recorder {
-    fn constant(&mut self, dst: u32, v: f64) {
-        self.ops.push(ROp::Const(dst, v));
-    }
-    fn add(&mut self, dst: u32, a: u32, b: u32) {
-        self.ops.push(ROp::Add(dst, a, b));
-    }
-    fn mul(&mut self, dst: u32, a: u32, b: u32) {
-        self.ops.push(ROp::Mul(dst, a, b));
-    }
-    fn mul_add(&mut self, dst: u32, a: u32, b: u32, c: u32) {
-        self.ops.push(ROp::MulAdd(dst, a, b, c));
-    }
-    fn sub(&mut self, dst: u32, a: u32, b: u32) {
-        self.ops.push(ROp::Sub(dst, a, b));
-    }
-    fn neg(&mut self, dst: u32, a: u32) {
-        self.ops.push(ROp::Neg(dst, a));
-    }
-    fn powi(&mut self, dst: u32, a: u32, n: i32) {
-        self.ops.push(ROp::Powi(dst, a, n));
-    }
-    fn unary(&mut self, dst: u32, op: UnaryOp, a: u32) {
-        self.ops.push(ROp::Unary(dst, op, a));
-    }
-    fn binary(&mut self, dst: u32, op: BinOp, a: u32, b: u32) {
-        self.ops.push(ROp::Binary(dst, op, a, b));
-    }
-    fn cmp(&mut self, dst: u32, op: CmpOp, a: u32, b: u32) {
-        self.ops.push(ROp::Cmp(dst, op, a, b));
-    }
-    fn select(&mut self, dst: u32, c: u32, t: u32, e: u32) {
-        self.ops.push(ROp::Select(dst, c, t, e));
-    }
-    fn reduce(&mut self, dst: u32, op: ReduceOp, args: &[u32]) {
-        self.ops.push(ROp::Reduce(dst, op, args.to_vec()));
-    }
-    fn dot(&mut self, dst: u32, a: &[u32], b: &[u32]) {
-        self.ops.push(ROp::Dot(dst, a.to_vec(), b.to_vec()));
-    }
-    fn call(
-        &mut self,
-        dst: u32,
-        b: &Arc<dyn ExternBundle>,
-        args: &[u32],
-        n_out: u32,
-        state: Option<u32>,
-    ) {
-        let bundle = self.intern(b);
-        self.ops.push(ROp::Call(CallSite {
-            dst,
-            bundle,
-            args: args.to_vec(),
-            n_groups: 1,
-            n_args: args.len() as u32,
-            n_out,
-            kind: if state.is_some() {
-                CallKind::Main
-            } else {
-                CallKind::Whole
-            },
-            state: state.unwrap_or(0),
-            state_len: b.state_len() as u32,
-            batch: false,
-        }));
-    }
-    fn call_batch(
-        &mut self,
-        dst: u32,
-        b: &Arc<dyn ExternBundle>,
-        args: &[u32],
-        n_groups: u32,
-        n_args: u32,
-        n_out: u32,
-        state: Option<u32>,
-    ) {
-        let bundle = self.intern(b);
-        self.ops.push(ROp::Call(CallSite {
-            dst,
-            bundle,
-            args: args.to_vec(),
-            n_groups,
-            n_args,
-            n_out,
-            kind: if state.is_some() {
-                CallKind::Main
-            } else {
-                CallKind::Whole
-            },
-            state: state.unwrap_or(0),
-            state_len: b.state_len() as u32,
-            batch: true,
-        }));
-    }
-    fn call_prolog(&mut self, dst: u32, b: &Arc<dyn ExternBundle>, pure: &[u32], n_groups: u32) {
-        let bundle = self.intern(b);
-        let state_len = b.state_len() as u32;
-        self.ops.push(ROp::Call(CallSite {
-            dst,
-            bundle,
-            args: pure.to_vec(),
-            n_groups,
-            n_args: pure.len() as u32 / n_groups.max(1),
-            n_out: state_len,
-            kind: CallKind::Prolog,
-            state: dst,
-            state_len,
-            batch: n_groups > 1,
-        }));
-    }
-    fn gemv(
-        &mut self,
-        dst: u32,
-        a: Operand<'_>,
-        x: Operand<'_>,
-        m: u32,
-        n: u32,
-        acc: Option<(Option<Operand<'_>>, &[u32])>,
-    ) {
-        self.ops.push(ROp::Gemv {
-            dst,
-            a: Dense::of(a),
-            x: Dense::of(x),
-            m,
-            n,
-            acc: acc.map(|(c, codes)| (c.map(Dense::of), codes.to_vec(), 0)),
+/// When each value dies: per slot, the ops that read it and the ops that
+/// write it, in stream order, the outputs read after the program. Slots
+/// are reused, so a slot holds many values in turn; the one it holds at an
+/// op dies at its last read before the slot's next write (an op reads its
+/// operands before it writes). The register cache asks this when it takes
+/// a value, so a value is written back only if a later op reads it and
+/// counts as dead as soon as nothing will.
+pub(crate) struct Liveness {
+    reads: Vec<u32>,
+    read_start: Vec<u32>,
+    writes: Vec<u32>,
+    write_start: Vec<u32>,
+}
+
+impl Liveness {
+    /// Over `ops` with `n_work` slots, the slots `outputs` read at the end.
+    pub(crate) fn new(ops: &[ROp], n_work: usize, outputs: impl Iterator<Item = u32>) -> Liveness {
+        let outputs: Vec<u32> = outputs.filter(|&s| input_index(s).is_none()).collect();
+        // Two passes each, counting then filling, in stream order so the
+        // positions of a slot come out sorted.
+        let csr = |each: &dyn Fn(&mut dyn FnMut(u32, u32))| -> (Vec<u32>, Vec<u32>) {
+            let mut start = vec![0u32; n_work + 1];
+            each(&mut |s, _| start[s as usize + 1] += 1);
+            for s in 0..n_work {
+                start[s + 1] += start[s];
+            }
+            let mut fill = start.clone();
+            let mut at = vec![0u32; start[n_work] as usize];
+            each(&mut |s, pos| {
+                at[fill[s as usize] as usize] = pos;
+                fill[s as usize] += 1;
+            });
+            (at, start)
+        };
+        let (reads, read_start) = csr(&|f| {
+            for (i, op) in ops.iter().enumerate() {
+                op.for_each_read(|s| f(s, i as u32));
+            }
+            for &s in &outputs {
+                f(s, u32::MAX);
+            }
         });
-    }
-    fn gemm(
-        &mut self,
-        dst: u32,
-        a: Operand<'_>,
-        b: Operand<'_>,
-        m: u32,
-        k: u32,
-        n: u32,
-        acc: Option<(Option<Operand<'_>>, &[u32])>,
-    ) {
-        self.ops.push(ROp::Gemm {
-            dst,
-            a: Dense::of(a),
-            b: Dense::of(b),
-            m,
-            k,
-            n,
-            acc: acc.map(|(c, codes)| (c.map(Dense::of), codes.to_vec(), 0)),
+        let (writes, write_start) = csr(&|f| {
+            for (i, op) in ops.iter().enumerate() {
+                op.writes().for_each(|s| f(s, i as u32));
+            }
         });
+        Liveness {
+            reads,
+            read_start,
+            writes,
+            write_start,
+        }
     }
-    fn solve_many(&mut self, dst: u32, a: Operand<'_>, b: Operand<'_>, n: u32, k: u32) {
-        self.ops.push(ROp::SolveMany {
-            dst,
-            a: Dense::of(a),
-            b: Dense::of(b),
-            n,
-            k,
-        });
-    }
-    fn solve(&mut self, dst: u32, a: Operand<'_>, b: Operand<'_>, n: u32) {
-        self.ops.push(ROp::Solve {
-            dst,
-            a: Dense::of(a),
-            b: Dense::of(b),
-            n,
-        });
+
+    /// The last op reading the value slot `s` holds when op `pos` writes it
+    /// (`def`) or reads it; `pos` when nothing reads it after, `u32::MAX`
+    /// when the program's outputs do.
+    pub(crate) fn death(&self, s: u32, pos: u32, def: bool) -> u32 {
+        let s = s as usize;
+        let reads = &self.reads[self.read_start[s] as usize..self.read_start[s + 1] as usize];
+        let writes = &self.writes[self.write_start[s] as usize..self.write_start[s + 1] as usize];
+        // The value lives from `lo` to the next write, whose op still reads
+        // it.
+        let lo = if def { pos + 1 } else { pos };
+        let end = writes
+            .get(writes.partition_point(|&w| w < lo))
+            .copied()
+            .unwrap_or(u32::MAX);
+        let from = reads.partition_point(|&r| r < lo);
+        let to = reads.partition_point(|&r| r <= end);
+        if to > from {
+            reads[to - 1]
+        } else {
+            pos
+        }
     }
 }

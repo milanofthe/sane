@@ -26,11 +26,6 @@ pub struct Config {
     /// Choice-specialise the circuit-level tapes after a solve settles
     /// (`SANE_TAPE_SPEC`, `0` disables).
     pub tape_specialization: bool,
-    /// Solve the Newton systems with rsdag's graph solve, the static LU as
-    /// one program over the Jacobian entries, with the sparse LU library as
-    /// the fallback for patterns beyond its range (`SANE_GRAPH_SOLVE`, `0`
-    /// selects the library for every system: the A/B reference).
-    pub graph_solve: bool,
     /// Lower the instances of a multiply-instantiated Verilog-A module as
     /// calls into one shared compiled body (`SANE_NO_DEVBUNDLE` disables: every
     /// instance becomes its own graph clone -- the differential reference).
@@ -74,7 +69,6 @@ impl Default for Config {
         Config {
             jit: true,
             tape_specialization: true,
-            graph_solve: true,
             device_bundles: true,
             device_templates: true,
             node_collapse: true,
@@ -106,9 +100,6 @@ impl Config {
         }
         if off("SANE_TAPE_SPEC") {
             c.tape_specialization = false;
-        }
-        if off("SANE_GRAPH_SOLVE") {
-            c.graph_solve = false;
         }
         if set("SANE_NO_DEVBUNDLE") {
             c.device_bundles = false;

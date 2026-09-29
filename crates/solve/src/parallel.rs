@@ -10,7 +10,7 @@
 //! (both must take effect before the pool is first used).
 //!
 //! Sweep parallelism is *outer*: each task solves its systems sequentially
-//! (the graph solve's programs are sequential by construction), so the sweep
+//! (rslab's KLU is sequential), so the sweep
 //! never nests with another pool and oversubscribes the machine.
 
 use std::sync::OnceLock;

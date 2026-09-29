@@ -13,7 +13,7 @@ use crate::node::{BinOp, CmpOp, ExprId, Node, ReduceOp, SymbolId, UnaryOp};
 /// Derivative of `expr` with respect to the symbol `wrt`.
 pub fn differentiate<K: Field>(ctx: &mut Graph<K>, expr: ExprId, wrt: SymbolId) -> ExprId {
     let mut memo = ctx.take_memo();
-    let d = diff(ctx, expr, wrt, &mut memo);
+    let d = forward(ctx, &[expr], wrt, &mut memo)[0];
     ctx.put_memo(memo);
     d
 }
@@ -202,31 +202,46 @@ fn unary_factor<K: Field>(ctx: &mut Graph<K>, op: UnaryOp, a: ExprId) -> ExprId 
     }
 }
 
-/// Partial derivatives `(d/da, d/db)` of a binary function.
+/// Partial derivatives `[d/da, d/db]` of a binary function, each built only
+/// if `want` asks for it (zero otherwise).
 fn binary_partials<K: Field>(
     ctx: &mut Graph<K>,
     op: BinOp,
     a: ExprId,
     b: ExprId,
-) -> (ExprId, ExprId) {
+    want: [bool; 2],
+) -> [ExprId; 2] {
+    let zero = ctx.zero();
     match op {
         BinOp::Powf => {
             // d/da = b a^(b-1), d/db = a^b ln a
-            let one = ctx.one();
-            let bm1 = ctx.sub(b, one);
-            let p = ctx.binary(BinOp::Powf, a, bm1);
-            let da = ctx.mul(b, p);
-            let ab = ctx.binary(BinOp::Powf, a, b);
-            let ln = ctx.ln(a);
-            let db = ctx.mul(ab, ln);
-            (da, db)
+            let da = if want[0] {
+                let one = ctx.one();
+                let bm1 = ctx.sub(b, one);
+                let p = ctx.binary(BinOp::Powf, a, bm1);
+                ctx.mul(b, p)
+            } else {
+                zero
+            };
+            let db = if want[1] {
+                let ab = ctx.binary(BinOp::Powf, a, b);
+                let ln = ctx.ln(a);
+                ctx.mul(ab, ln)
+            } else {
+                zero
+            };
+            [da, db]
         }
         BinOp::Mod => {
             // fmod(a, b) = a - b trunc(a/b): d/da = 1, d/db = -trunc(a/b)
-            let q = ctx.div(a, b);
-            let t = ctx.unary(UnaryOp::Trunc, q);
-            let one = ctx.one();
-            (one, ctx.neg(t))
+            let db = if want[1] {
+                let q = ctx.div(a, b);
+                let t = ctx.unary(UnaryOp::Trunc, q);
+                ctx.neg(t)
+            } else {
+                zero
+            };
+            [ctx.one(), db]
         }
         BinOp::Atan2 => {
             // d/da = b/(a^2+b^2), d/db = -a/(a^2+b^2)
@@ -234,104 +249,175 @@ fn binary_partials<K: Field>(
             let b2 = ctx.mul(b, b);
             let s = ctx.add(a2, b2);
             let r = ctx.recip(s);
-            let da = ctx.mul(b, r);
-            let ar = ctx.mul(a, r);
-            (da, ctx.neg(ar))
+            let da = if want[0] { ctx.mul(b, r) } else { zero };
+            let db = if want[1] {
+                let ar = ctx.mul(a, r);
+                ctx.neg(ar)
+            } else {
+                zero
+            };
+            [da, db]
         }
         BinOp::Hypot => {
             let h = ctx.binary(BinOp::Hypot, a, b);
             let r = ctx.recip(h);
-            (ctx.mul(a, r), ctx.mul(b, r))
+            let da = if want[0] { ctx.mul(a, r) } else { zero };
+            let db = if want[1] { ctx.mul(b, r) } else { zero };
+            [da, db]
         }
     }
 }
 
-fn diff<K: Field>(ctx: &mut Graph<K>, expr: ExprId, wrt: SymbolId, memo: &mut Memo) -> ExprId {
-    if let Some(d) = memo.get(expr) {
-        return d;
+/// For each factor of a product `args` that `want` asks for, the product of
+/// the others, from prefix and suffix products: linear in the factors.
+fn cofactors<K: Field>(
+    ctx: &mut Graph<K>,
+    args: &[ExprId],
+    want: impl Fn(usize) -> bool,
+) -> Vec<Option<ExprId>> {
+    let mut prefix = Vec::with_capacity(args.len());
+    let mut acc = ctx.one();
+    for &x in args {
+        prefix.push(acc);
+        acc = ctx.mul(acc, x);
     }
-    // Copy the node (16 bytes) so we can mutate the context while building the
-    // derivative; variadic operand lists are copied out of the pool below.
-    let node = *ctx.node(expr);
-    let d = match node {
-        Node::Const(_) => ctx.zero(),
-        Node::Symbol(s) => {
-            if s == wrt {
-                ctx.one()
-            } else {
-                ctx.zero()
-            }
+    let mut out = vec![None; args.len()];
+    let mut suffix = ctx.one();
+    for i in (0..args.len()).rev() {
+        if want(i) {
+            out[i] = Some(ctx.mul(prefix[i], suffix));
         }
-        Node::Add(a, b) => {
-            let da = diff(ctx, a, wrt, memo);
-            let db = diff(ctx, b, wrt, memo);
-            ctx.add(da, db)
+        suffix = ctx.mul(suffix, args[i]);
+    }
+    out
+}
+
+/// How many leading operands of `node` carry no derivative: both of a
+/// comparison's (piecewise constant), a select's condition.
+fn inert(node: &Node) -> usize {
+    match node {
+        Node::Cmp(..) => 2,
+        Node::Select(..) => 1,
+        _ => 0,
+    }
+}
+
+/// The nodes under `root` through operands that carry a derivative, marked
+/// in `seen`, in ascending id order: a topological one, a hash-consed node
+/// having a larger id than its operands.
+fn cone<K: Field>(ctx: &Graph<K>, root: ExprId, seen: &mut Memo) -> Vec<ExprId> {
+    let mut out = Vec::new();
+    let mut stack = vec![root];
+    while let Some(e) = stack.pop() {
+        if seen.get(e).is_none() {
+            seen.set(e, e);
+            out.push(e);
+            stack.extend_from_slice(&ctx.operands(e)[inert(ctx.node(e))..]);
         }
+    }
+    out.sort_unstable();
+    out
+}
+
+/// One forward sweep: `d root / d wrt` for every root. The derivative of
+/// every node below is kept in `memo`, so a subexpression shared by the
+/// roots (or by the roots of a later sweep over the same `wrt` and memo)
+/// is differentiated once. Operands first, in order, on an explicit stack
+/// (the order a recursive walk takes), so a deep chain does not overflow
+/// the call stack.
+fn forward<K: Field>(
+    ctx: &mut Graph<K>,
+    roots: &[ExprId],
+    wrt: SymbolId,
+    memo: &mut Memo,
+) -> Vec<ExprId> {
+    let mut stack: Vec<(ExprId, bool)> = Vec::with_capacity(64);
+    stack.extend(roots.iter().rev().map(|&r| (r, false)));
+    while let Some((e, expanded)) = stack.pop() {
+        // Done already: shared, or a solve component set by a sibling.
+        if memo.get(e).is_some() {
+            continue;
+        }
+        if expanded {
+            let d = tangent(ctx, e, wrt, memo);
+            memo.set(e, d);
+        } else {
+            stack.push((e, true));
+            let ops = ctx.operands(e);
+            let pending = ops[inert(ctx.node(e))..]
+                .iter()
+                .rev()
+                .filter(|&&c| memo.get(c).is_none());
+            stack.extend(pending.map(|&c| (c, false)));
+        }
+    }
+    roots
+        .iter()
+        .map(|&r| memo.get(r).expect("root differentiated"))
+        .collect()
+}
+
+/// The derivative of node `e` with respect to `wrt`, its operands' already
+/// in `memo`. A node none of whose operands moves is zero: an inactive
+/// subgraph builds nothing.
+fn tangent<K: Field>(ctx: &mut Graph<K>, e: ExprId, wrt: SymbolId, memo: &mut Memo) -> ExprId {
+    let zero = ctx.zero();
+    let node = *ctx.node(e);
+    if let Node::Symbol(s) = node {
+        return if s == wrt { ctx.one() } else { zero };
+    }
+    let d = |c: ExprId| memo.get(c).expect("operand differentiated");
+    if ctx.operands(e)[inert(&node)..]
+        .iter()
+        .all(|&c| d(c) == zero)
+    {
+        return zero;
+    }
+    match node {
+        Node::Const(_) | Node::Symbol(_) | Node::Cmp(..) => unreachable!("no moving operand"),
+        Node::Add(a, b) => ctx.add(d(a), d(b)),
         Node::Mul(a, b) => {
             // product rule: da*b + a*db
-            let da = diff(ctx, a, wrt, memo);
-            let db = diff(ctx, b, wrt, memo);
-            let t1 = ctx.mul(da, b);
-            let t2 = ctx.mul(a, db);
+            let t1 = ctx.mul(d(a), b);
+            let t2 = ctx.mul(a, d(b));
             ctx.add(t1, t2)
         }
-        Node::Neg(a) => {
-            let da = diff(ctx, a, wrt, memo);
-            ctx.neg(da)
-        }
+        Node::Neg(a) => ctx.neg(d(a)),
         Node::Pow(a, n) => {
             // power rule (integer exponent): n * a^(n-1) * da
-            let da = diff(ctx, a, wrt, memo);
             let coeff = ctx.konst_int(n);
             let p = ctx.pow_i(a, n - 1);
             let cp = ctx.mul(coeff, p);
-            ctx.mul(cp, da)
+            ctx.mul(cp, d(a))
         }
         Node::Unary(op, a) => {
-            let da = diff(ctx, a, wrt, memo);
             let factor = unary_factor(ctx, op, a);
-            ctx.mul(factor, da)
+            ctx.mul(factor, d(a))
         }
-        // Comparisons are piecewise-constant: derivative is zero a.e.
         Node::Binary(op, a, b) => {
-            let da = diff(ctx, a, wrt, memo);
-            let db = diff(ctx, b, wrt, memo);
-            let (pa, pb) = binary_partials(ctx, op, a, b);
+            let (da, db) = (d(a), d(b));
+            let [pa, pb] = binary_partials(ctx, op, a, b, [da != zero, db != zero]);
             let t1 = ctx.mul(pa, da);
             let t2 = ctx.mul(pb, db);
             ctx.add(t1, t2)
         }
-        Node::Cmp(..) => ctx.zero(),
         // Subgradient: differentiate through both branches, keep the condition.
-        Node::Select(c, t, e) => {
-            let dt = diff(ctx, t, wrt, memo);
-            let de = diff(ctx, e, wrt, memo);
-            ctx.select(c, dt, de)
-        }
+        Node::Select(c, t, f) => ctx.select(c, d(t), d(f)),
         Node::Reduce(op, l) => match op {
             // d(Σ aᵢ) = Σ daᵢ
             ReduceOp::Sum => {
-                let args = ctx.args(l).to_vec();
-                let dargs: Vec<ExprId> = args.iter().map(|&a| diff(ctx, a, wrt, memo)).collect();
+                let dargs: Vec<ExprId> = ctx.args(l).iter().map(|&a| d(a)).collect();
                 ctx.reduce(ReduceOp::Sum, dargs)
             }
             // d(Π aᵢ) = Σᵢ daᵢ · Πⱼ≠ᵢ aⱼ  (generalized product rule)
             ReduceOp::Product => {
                 let args = ctx.args(l).to_vec();
+                let others = cofactors(ctx, &args, |i| d(args[i]) != zero);
                 let mut terms = Vec::with_capacity(args.len());
-                for i in 0..args.len() {
-                    let dai = diff(ctx, args[i], wrt, memo);
-                    if ctx.is_zero(dai) {
-                        continue;
+                for (&a, other) in args.iter().zip(others) {
+                    if let Some(other) = other {
+                        terms.push(ctx.mul(d(a), other));
                     }
-                    let others: Vec<ExprId> = args
-                        .iter()
-                        .enumerate()
-                        .filter(|&(j, _)| j != i)
-                        .map(|(_, &a)| a)
-                        .collect();
-                    let prod = ctx.reduce(ReduceOp::Product, others);
-                    terms.push(ctx.mul(dai, prod));
                 }
                 ctx.reduce(ReduceOp::Sum, terms)
             }
@@ -344,11 +430,10 @@ fn diff<K: Field>(ctx: &mut Graph<K>, expr: ExprId, wrt: SymbolId, memo: &mut Me
                     CmpOp::Lt
                 };
                 let mut m = args[0];
-                let mut dm = diff(ctx, args[0], wrt, memo);
+                let mut dm = d(args[0]);
                 for &a in &args[1..] {
-                    let da = diff(ctx, a, wrt, memo);
                     let cond = ctx.cmp(cmp, a, m);
-                    dm = ctx.select(cond, da, dm);
+                    dm = ctx.select(cond, d(a), dm);
                     m = ctx.reduce(op, vec![m, a]);
                 }
                 dm
@@ -360,54 +445,51 @@ fn diff<K: Field>(ctx: &mut Graph<K>, expr: ExprId, wrt: SymbolId, memo: &mut Me
             let (a, b) = (a.to_vec(), b.to_vec());
             let mut terms = Vec::with_capacity(a.len());
             for (&ai, &bi) in a.iter().zip(b.iter()) {
-                let dai = diff(ctx, ai, wrt, memo);
-                let dbi = diff(ctx, bi, wrt, memo);
-                let t1 = ctx.mul(dai, bi);
-                let t2 = ctx.mul(ai, dbi);
+                let t1 = ctx.mul(d(ai), bi);
+                let t2 = ctx.mul(ai, d(bi));
                 terms.push(ctx.add(t1, t2));
             }
             ctx.reduce(ReduceOp::Sum, terms)
         }
         // x = A^-1 b: dx = A^-1 (db - dA x), another solve over the same
-        // matrix, with the solution's components as they are.
+        // matrix, with the solution's components as they are; built once
+        // for the system and memoized for every component.
         Node::Solve(l, i) => {
             let (n, a, b) = ctx.solve_args(l);
             let (a, b) = (a.to_vec(), b.to_vec());
             let x = ctx.solve_dense(a.clone(), b.clone());
             let mut rhs = Vec::with_capacity(n);
             for r in 0..n {
-                let db = diff(ctx, b[r], wrt, memo);
-                let da: Vec<ExprId> = (0..n).map(|j| diff(ctx, a[r * n + j], wrt, memo)).collect();
+                let da: Vec<ExprId> = a[r * n..(r + 1) * n].iter().map(|&c| d(c)).collect();
                 let dax = ctx.dot(da, x.clone());
-                rhs.push(ctx.sub(db, dax));
+                rhs.push(ctx.sub(d(b[r]), dax));
             }
-            if rhs.iter().all(|&e| ctx.is_zero(e)) {
-                ctx.zero()
-            } else {
-                ctx.solve_dense(a, rhs)[i as usize]
+            let dx = ctx.solve_dense(a, rhs);
+            for (&xk, &dk) in x.iter().zip(&dx) {
+                memo.set(xk, dk);
             }
+            dx[i as usize]
         }
         // Chain rule through a call: d/dx f_out(a) = Σ_i (∂f_out/∂p_i)(a) · da_i,
         // each partial a call into the function's derivative output.
         Node::Call(o, l) => {
             let args = ctx.args(l).to_vec();
             let (f, out) = ctx.output(o);
-            let mut acc = ctx.zero();
-            for (i, &arg) in args.iter().enumerate() {
-                let dai = diff(ctx, arg, wrt, memo);
-                if ctx.is_zero(dai) {
-                    continue;
-                }
-                let k = ctx.derivative_output(f, out, i as u32);
+            let moving: Vec<(u32, ExprId)> = (0..args.len() as u32)
+                .map(|i| (i, d(args[i as usize])))
+                .filter(|&(_, da)| da != zero)
+                .collect();
+            let params: Vec<u32> = moving.iter().map(|&(i, _)| i).collect();
+            let ks = ctx.derivative_outputs(f, out, &params);
+            let mut acc = zero;
+            for (&(_, dai), k) in moving.iter().zip(ks) {
                 let partial = ctx.call(f, k, &args);
                 let term = ctx.mul(partial, dai);
                 acc = ctx.add(acc, term);
             }
             acc
         }
-    };
-    memo.set(expr, d);
-    d
+    }
 }
 
 /// A sparse matrix of expressions: for each row, the `(column, entry)`
@@ -470,8 +552,9 @@ pub fn sparse_jacobian<K: Field>(
             continue;
         }
         memo.begin(ctx.len());
-        for &i in members {
-            let d = diff(ctx, residuals[i], wrt[j], &mut memo);
+        let roots: Vec<ExprId> = members.iter().map(|&i| residuals[i]).collect();
+        let col = forward(ctx, &roots, wrt[j], &mut memo);
+        for (&i, d) in members.iter().zip(col) {
             rows[i].push((j, d));
         }
     }
@@ -491,50 +574,74 @@ pub fn sparse_jacobian<K: Field>(
 /// differs. The result is an ordinary expression in the same context, so it can
 /// be differentiated again (see [`hessian`]).
 pub fn gradient<K: Field>(ctx: &mut Graph<K>, f: ExprId, wrt: &[SymbolId]) -> Vec<ExprId> {
-    // Reachable sub-DAG of f. Ascending ExprId is a topological order (a
-    // hash-consed node has a larger id than its children), so iterating the
-    // sorted set in REVERSE visits every node after all of its parents.
-    let mut reach: std::collections::BTreeSet<ExprId> = std::collections::BTreeSet::new();
-    let mut stack = vec![f];
-    while let Some(e) = stack.pop() {
-        if !reach.insert(e) {
-            continue;
-        }
-        stack.extend_from_slice(&ctx.operands(e));
+    // The cone of f, ascending: walked backwards, every node comes after
+    // all of its consumers. `pos` is a node's place in it.
+    let mut pos = ctx.take_memo();
+    let nodes = cone(ctx, f, &mut pos);
+    for (k, &e) in nodes.iter().enumerate() {
+        pos.set(e, ExprId(k as u32));
     }
+    let at = |e: ExprId| pos.get(e).expect("in the cone").0 as usize;
+    // Activity: a node is active if it depends on a symbol of `wrt`. Only
+    // active operands receive an adjoint, so a subgraph over other symbols
+    // (the parameters not asked for, a call's constant arguments) builds
+    // nothing.
+    let wanted: rustc_hash::FxHashSet<SymbolId> = wrt.iter().copied().collect();
+    let mut active = vec![false; nodes.len()];
+    for (k, &e) in nodes.iter().enumerate() {
+        let node = ctx.node(e);
+        active[k] = match *node {
+            Node::Symbol(s) => wanted.contains(&s),
+            _ => ctx.operands(e)[inert(node)..]
+                .iter()
+                .any(|&c| active[at(c)]),
+        };
+    }
+    let act = |e: ExprId| active[at(e)];
 
     // Adjoint accumulation: per node a term list, folded into one fused
-    // Reduce(Sum) when the node is visited (all parents seen by then).
-    let mut adj: HashMap<ExprId, Vec<ExprId>> = HashMap::default();
-    let one = ctx.one();
-    adj.insert(f, vec![one]);
-    let push = |adj: &mut HashMap<ExprId, Vec<ExprId>>, child: ExprId, term: ExprId| {
-        adj.entry(child).or_default().push(term);
+    // Reduce(Sum) when the node is visited (all consumers seen by then).
+    let mut adj: Vec<Vec<ExprId>> = vec![Vec::new(); nodes.len()];
+    if act(f) {
+        adj[at(f)].push(ctx.one());
+    }
+    let push = |adj: &mut Vec<Vec<ExprId>>, child: ExprId, term: ExprId| {
+        adj[at(child)].push(term);
     };
+    let zero = ctx.zero();
     let mut sym_adj: HashMap<SymbolId, ExprId> = HashMap::default();
-    for &e in reach.iter().rev() {
-        let terms = match adj.remove(&e) {
-            Some(t) => t,
-            None => continue, // unreachable from f's value path (e.g. below a Cmp)
-        };
+    for k in (0..nodes.len()).rev() {
+        if adj[k].is_empty() {
+            continue; // no adjoint: inactive, or no value path from f
+        }
+        let e = nodes[k];
+        let terms = std::mem::take(&mut adj[k]);
         let a_bar = ctx.reduce(ReduceOp::Sum, terms);
-        if ctx.is_zero(a_bar) {
+        if a_bar == zero {
             continue;
         }
         match *ctx.node(e) {
-            Node::Const(_) => {}
+            // Piecewise-constant or constant: never active.
+            Node::Const(_) | Node::Cmp(..) => {}
             Node::Symbol(s) => {
                 sym_adj.insert(s, a_bar);
             }
             Node::Add(x, y) => {
-                push(&mut adj, x, a_bar);
-                push(&mut adj, y, a_bar);
+                for c in [x, y] {
+                    if act(c) {
+                        push(&mut adj, c, a_bar);
+                    }
+                }
             }
             Node::Mul(x, y) => {
-                let tx = ctx.mul(a_bar, y);
-                let ty = ctx.mul(a_bar, x);
-                push(&mut adj, x, tx);
-                push(&mut adj, y, ty);
+                if act(x) {
+                    let t = ctx.mul(a_bar, y);
+                    push(&mut adj, x, t);
+                }
+                if act(y) {
+                    let t = ctx.mul(a_bar, x);
+                    push(&mut adj, y, t);
+                }
             }
             Node::Neg(x) => {
                 let t = ctx.neg(a_bar);
@@ -554,45 +661,43 @@ pub fn gradient<K: Field>(ctx: &mut Graph<K>, f: ExprId, wrt: &[SymbolId]) -> Ve
                 push(&mut adj, x, t);
             }
             Node::Binary(op, x, y) => {
-                let (px, py) = binary_partials(ctx, op, x, y);
-                let tx = ctx.mul(a_bar, px);
-                let ty = ctx.mul(a_bar, py);
-                push(&mut adj, x, tx);
-                push(&mut adj, y, ty);
+                let p = binary_partials(ctx, op, x, y, [act(x), act(y)]);
+                for (c, p) in [(x, p[0]), (y, p[1])] {
+                    if act(c) {
+                        let t = ctx.mul(a_bar, p);
+                        push(&mut adj, c, t);
+                    }
+                }
             }
-            // Piecewise-constant: no value path into the operands.
-            Node::Cmp(..) => {}
             // Subgradient: the adjoint flows into the taken branch only
             // (matching the forward rule d = select(c, dt, de)).
             Node::Select(c, t, e2) => {
-                let zero = ctx.zero();
-                let tt = ctx.select(c, a_bar, zero);
-                let te = ctx.select(c, zero, a_bar);
-                push(&mut adj, t, tt);
-                push(&mut adj, e2, te);
+                if act(t) {
+                    let tt = ctx.select(c, a_bar, zero);
+                    push(&mut adj, t, tt);
+                }
+                if act(e2) {
+                    let te = ctx.select(c, zero, a_bar);
+                    push(&mut adj, e2, te);
+                }
             }
             Node::Reduce(op, l) => match op {
                 ReduceOp::Sum => {
                     for &x in ctx.args(l) {
-                        push(&mut adj, x, a_bar);
+                        if act(x) {
+                            push(&mut adj, x, a_bar);
+                        }
                     }
                 }
                 // d(Π aᵢ)/daᵢ = Πⱼ≠ᵢ aⱼ, via prefix/suffix products (O(k) nodes).
                 ReduceOp::Product => {
                     let args = ctx.args(l).to_vec();
-                    let k = args.len();
-                    let mut prefix = Vec::with_capacity(k);
-                    let mut acc = ctx.one();
-                    for &x in &args {
-                        prefix.push(acc);
-                        acc = ctx.mul(acc, x);
-                    }
-                    let mut suffix = ctx.one();
-                    for i in (0..k).rev() {
-                        let others = ctx.mul(prefix[i], suffix);
-                        let t = ctx.mul(a_bar, others);
-                        push(&mut adj, args[i], t);
-                        suffix = ctx.mul(suffix, args[i]);
+                    let others = cofactors(ctx, &args, |i| act(args[i]));
+                    for (&a, other) in args.iter().zip(others) {
+                        if let Some(other) = other {
+                            let t = ctx.mul(a_bar, other);
+                            push(&mut adj, a, t);
+                        }
                     }
                 }
                 // Subgradient of the (first) extremal argument, exactly the
@@ -617,10 +722,12 @@ pub fn gradient<K: Field>(ctx: &mut Graph<K>, f: ExprId, wrt: &[SymbolId]) -> Ve
                     let one = ctx.one();
                     let mut tail = one;
                     for i in (0..n).rev() {
-                        let c_i = if i == 0 { one } else { conds[i - 1] };
-                        let coef = ctx.mul(c_i, tail);
-                        let t = ctx.mul(a_bar, coef);
-                        push(&mut adj, args[i], t);
+                        if act(args[i]) {
+                            let c_i = if i == 0 { one } else { conds[i - 1] };
+                            let coef = ctx.mul(c_i, tail);
+                            let t = ctx.mul(a_bar, coef);
+                            push(&mut adj, args[i], t);
+                        }
                         if i > 0 {
                             let not_c = ctx.sub(one, conds[i - 1]);
                             tail = ctx.mul(tail, not_c);
@@ -632,10 +739,14 @@ pub fn gradient<K: Field>(ctx: &mut Graph<K>, f: ExprId, wrt: &[SymbolId]) -> Ve
                 let (xs, ys) = ctx.dot_args(l);
                 let (xs, ys) = (xs.to_vec(), ys.to_vec());
                 for (&x, &y) in xs.iter().zip(ys.iter()) {
-                    let tx = ctx.mul(a_bar, y);
-                    let ty = ctx.mul(a_bar, x);
-                    push(&mut adj, x, tx);
-                    push(&mut adj, y, ty);
+                    if act(x) {
+                        let t = ctx.mul(a_bar, y);
+                        push(&mut adj, x, t);
+                    }
+                    if act(y) {
+                        let t = ctx.mul(a_bar, x);
+                        push(&mut adj, y, t);
+                    }
                 }
             }
             // The whole system at once: the components of one solve have
@@ -647,55 +758,79 @@ pub fn gradient<K: Field>(ctx: &mut Graph<K>, f: ExprId, wrt: &[SymbolId]) -> Ve
                 let (n, a, b) = ctx.solve_args(l);
                 let (a, b) = (a.to_vec(), b.to_vec());
                 let x = ctx.solve_dense(a.clone(), b.clone());
-                let mut x_bar = vec![ctx.zero(); n];
+                let mut x_bar = vec![zero; n];
                 for (k, &xk) in x.iter().enumerate() {
                     x_bar[k] = if xk == e {
                         a_bar
                     } else {
-                        match adj.remove(&xk) {
-                            Some(t) => ctx.reduce(ReduceOp::Sum, t),
-                            None => ctx.zero(),
+                        match pos.get(xk) {
+                            Some(p) => {
+                                let t = std::mem::take(&mut adj[p.0 as usize]);
+                                ctx.reduce(ReduceOp::Sum, t)
+                            }
+                            None => zero,
                         }
                     };
                 }
-                let at: Vec<ExprId> = (0..n * n).map(|k| a[(k % n) * n + k / n]).collect();
-                let b_bar = ctx.solve_dense(at, x_bar);
+                let a_t: Vec<ExprId> = (0..n * n).map(|k| a[(k % n) * n + k / n]).collect();
+                let b_bar = ctx.solve_dense(a_t, x_bar);
                 for r in 0..n {
-                    push(&mut adj, b[r], b_bar[r]);
+                    if act(b[r]) {
+                        push(&mut adj, b[r], b_bar[r]);
+                    }
                     for j in 0..n {
-                        let t = ctx.mul(b_bar[r], x[j]);
-                        let nt = ctx.neg(t);
-                        push(&mut adj, a[r * n + j], nt);
+                        if act(a[r * n + j]) {
+                            let t = ctx.mul(b_bar[r], x[j]);
+                            let nt = ctx.neg(t);
+                            push(&mut adj, a[r * n + j], nt);
+                        }
                     }
                 }
             }
             // Chain rule through a call: the same derivative outputs as the
-            // forward mode.
+            // forward mode, for the arguments that move.
             Node::Call(o, l) => {
                 let args = ctx.args(l).to_vec();
-                let (f, out) = ctx.output(o);
-                for (i, &arg) in args.iter().enumerate() {
-                    let k = ctx.derivative_output(f, out, i as u32);
-                    let partial = ctx.call(f, k, &args);
+                let (func, out) = ctx.output(o);
+                let moving: Vec<u32> = (0..args.len() as u32)
+                    .filter(|&i| act(args[i as usize]))
+                    .collect();
+                let ks = ctx.derivative_outputs(func, out, &moving);
+                for (&i, k) in moving.iter().zip(ks) {
+                    let partial = ctx.call(func, k, &args);
                     let t = ctx.mul(a_bar, partial);
-                    push(&mut adj, arg, t);
+                    push(&mut adj, args[i as usize], t);
                 }
             }
         }
     }
-
+    ctx.put_memo(pos);
     wrt.iter()
-        .map(|s| sym_adj.get(s).copied().unwrap_or_else(|| ctx.zero()))
+        .map(|s| sym_adj.get(s).copied().unwrap_or(zero))
         .collect()
 }
 
 /// Symbolic Hessian `hess[i][j] = d²f / d(wrt[i]) d(wrt[j])`, built
 /// forward-over-reverse: one reverse sweep for the gradient, then one forward
-/// sweep per column. Like every derivative here it is an ordinary expression,
-/// so third and higher orders are just repeated application.
+/// sweep per column over the gradient entries up to the diagonal, the
+/// lower triangle the mirror of the upper, so the result is exactly
+/// symmetric. Like every derivative here it is an ordinary expression, so
+/// third and higher orders are just repeated application.
 pub fn hessian<K: Field>(ctx: &mut Graph<K>, f: ExprId, wrt: &[SymbolId]) -> Vec<Vec<ExprId>> {
     let grad = gradient(ctx, f, wrt);
-    grad.iter()
-        .map(|&g| wrt.iter().map(|&s| differentiate(ctx, g, s)).collect())
-        .collect()
+    let n = wrt.len();
+    let mut hess = vec![vec![ctx.zero(); n]; n];
+    let mut memo = ctx.take_memo();
+    for j in 0..n {
+        memo.begin(ctx.len());
+        for (i, d) in forward(ctx, &grad[..=j], wrt[j], &mut memo)
+            .into_iter()
+            .enumerate()
+        {
+            hess[i][j] = d;
+            hess[j][i] = d;
+        }
+    }
+    ctx.put_memo(memo);
+    hess
 }

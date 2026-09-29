@@ -95,7 +95,7 @@ pub fn latex_expr(ctx: &Graph, id: ExprId) -> String {
             let (f, k) = ctx.output(*o);
             format!(
                 "{}_{{{k}}}\\left({}\\right)",
-                latex_name(&ctx.func(f).name),
+                latex_name(ctx.func(f).name()),
                 inner.join(",\\, ")
             )
         }

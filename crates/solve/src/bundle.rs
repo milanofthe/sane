@@ -24,7 +24,7 @@
 
 use std::sync::Arc;
 
-use rsdag::{func::Body, ExprId, ExternBundle, FuncId, Output, Program, SymbolId, Tape};
+use rsdag::{func::Body, ExprId, ExternBundle, FuncId, Output, ParamRole, Program, Tape};
 use sane_core::Graph;
 
 /// A compiled function body: the tape's roots are the function's outputs (in
@@ -114,29 +114,27 @@ impl ExternBundle for TapeBundle {
 /// Compile and register the body of every symbolic function whose outputs
 /// `roots` call, covering exactly the outputs referenced (plus the ones an
 /// earlier body already carried, so every tape compiled before keeps
-/// working). `pure_syms` names the solve-constant symbols (the parameter
-/// vector): parameters bound to them feed the body's prolog phase. Idempotent
-/// and cheap when nothing new is referenced; call it before compiling tapes
-/// whose roots may contain calls (residuals, Jacobians, parameter Jacobians,
-/// Hessian blocks).
-pub(crate) fn ensure_function_bodies(ctx: &mut Graph, roots: &[ExprId], pure_syms: &[SymbolId]) {
+/// working). The body splits over the parameters with the `Param` role: their
+/// work is its prolog phase. Idempotent and cheap when nothing new is
+/// referenced; call it before compiling tapes whose roots may contain calls
+/// (residuals, Jacobians, parameter Jacobians, Hessian blocks).
+pub(crate) fn ensure_function_bodies(ctx: &mut Graph, roots: &[ExprId]) {
     use std::collections::{BTreeMap, BTreeSet};
     let mut needed: BTreeMap<FuncId, BTreeSet<u32>> = BTreeMap::new();
     for o in ctx.free_calls_in(roots) {
         let (f, out) = ctx.output(o);
         let func = ctx.func(f);
-        if func.is_extern() || matches!(func.outputs[out as usize], Output::Zero) {
+        if func.is_extern() || matches!(func.outputs()[out as usize], Output::Zero) {
             continue;
         }
         needed.entry(f).or_default().insert(out);
     }
-    let pure: std::collections::HashSet<SymbolId> = pure_syms.iter().copied().collect();
     for (f, outs) in needed {
         // The outputs some registered body carries (a function keeps every
         // body registered for it; a program takes the smallest covering one).
         let have: BTreeSet<u32> = ctx
             .func(f)
-            .compiled
+            .compiled()
             .iter()
             .flat_map(|c| {
                 c.slot_of
@@ -153,8 +151,13 @@ pub(crate) fn ensure_function_bodies(ctx: &mut Graph, roots: &[ExprId], pure_sym
             .iter()
             .map(|&k| ctx.output_expr(f, k).expect("symbolic output"))
             .collect();
-        let params = ctx.func(f).params.clone();
-        let pure_mask: Vec<bool> = params.iter().map(|s| pure.contains(s)).collect();
+        let params = ctx.func(f).params().to_vec();
+        let pure_mask: Vec<bool> = ctx
+            .func(f)
+            .param_roles()
+            .iter()
+            .map(|r| *r == ParamRole::Param)
+            .collect();
         let tape = Arc::new(Tape::compile_split(ctx, &exprs, &params, &pure_mask));
         let n_out = all.len();
         let n_pure = pure_mask.iter().filter(|&&p| p).count();
@@ -192,13 +195,13 @@ pub(crate) fn ensure_function_bodies(ctx: &mut Graph, roots: &[ExprId], pure_sym
                 let _ = body.native.set(None);
             }
         }
-        let mut slot_of = vec![None; ctx.func(f).outputs.len()];
+        let mut slot_of = vec![None; ctx.func(f).outputs().len()];
         for (i, &k) in all.iter().enumerate() {
             slot_of[k as usize] = Some(i as u32);
         }
         sane_core::log::debug(&format!(
             "function body '{}': {} outputs ({} parameters, {} pure)",
-            ctx.func(f).name,
+            ctx.func(f).name(),
             n_out,
             params.len(),
             n_pure

@@ -241,7 +241,10 @@ impl Field for F64 {
         if self.0 == 0.0 && n < 0 {
             return None;
         }
-        Some(F64::new(self.0.powi(i32::try_from(n).ok()?)))
+        Some(F64::new(crate::semantics::powi_f64(
+            self.0,
+            i32::try_from(n).ok()?,
+        )))
     }
     fn is_zero(&self) -> bool {
         self.0 == 0.0

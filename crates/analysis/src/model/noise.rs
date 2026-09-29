@@ -88,12 +88,12 @@ impl Model {
         let mut nval = 0.0;
         let mut r = vec![Complex64::new(0.0, 0.0); n]; // r = sum_q 2 conj(T_q) S_q u_q
         let mut psd_terms: Vec<(f64, ExprId)> = Vec::new(); // (|T_q|^2 fac, psd_expr)
-        for ns in &self.dae().noise_sources {
-            if !ns.table.is_empty() {
-                continue; // tabular sources: not yet in the gradient
-            }
-            let v = rsdag::eval(c, &[ns.psd, ns.flicker_exp], &env);
-            let (sp, fexp) = (v[0], v[1]);
+        let levels = self.dae().noise_levels(c, &env);
+        for (ns, level) in self.dae().noise_sources.iter().zip(levels) {
+            // Tabular sources: not yet in the gradient.
+            let Some((sp, fexp)) = level else {
+                continue;
+            };
             if !sp.is_finite() || sp <= 0.0 || !fexp.is_finite() {
                 continue;
             }

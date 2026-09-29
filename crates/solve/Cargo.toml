@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Numeric DC/Newton solver for SANE DAEs (sparse Jacobian, rsdag graph solve, rslab as the fallback LU)"
+description = "Numeric DC/Newton solver for SANE DAEs (sparse Jacobian, rslab sparse LU)"
 
 [dependencies]
 rsdag.workspace = true

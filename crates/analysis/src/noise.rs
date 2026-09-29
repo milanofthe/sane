@@ -106,7 +106,8 @@ pub fn noise_on_dae(
     // sources carry a (frequency, psd) table interpolated per frequency.
     let mut srcs: Vec<(Vec<f64>, f64, f64)> = Vec::new();
     let mut tab_srcs: Vec<NoiseTab> = Vec::new();
-    for ns in &dae.noise_sources {
+    let levels = dae.noise_levels(ctx, &env);
+    for (ns, level) in dae.noise_sources.iter().zip(levels) {
         let mut u = vec![0.0; n];
         if let Some(s) = ns.hi {
             if let Some(i) = idx_of(s) {
@@ -118,13 +119,12 @@ pub fn noise_on_dae(
                 u[i] -= 1.0;
             }
         }
-        if !ns.table.is_empty() {
-            tab_srcs.push((u, ns.table.clone()));
-        } else {
-            let v = rsdag::eval(ctx, &[ns.psd, ns.flicker_exp], &env);
-            let (psd, fexp) = (v[0], v[1]);
-            if psd.is_finite() && psd > 0.0 && fexp.is_finite() {
-                srcs.push((u, psd, fexp));
+        match level {
+            None => tab_srcs.push((u, ns.table.clone())),
+            Some((psd, fexp)) => {
+                if psd.is_finite() && psd > 0.0 && fexp.is_finite() {
+                    srcs.push((u, psd, fexp));
+                }
             }
         }
     }

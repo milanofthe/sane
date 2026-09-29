@@ -5,7 +5,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet};
 use crate::field::{Field, F64};
 
 use crate::extern_fn::ExternBundle;
-use crate::func::{FuncId, Function, FunctionBody, Output, OutputId};
+use crate::func::{FuncId, Function, Output, OutputId};
 use crate::node::{
     ArgList, BinOp, CmpOp, ConstId, ExprId, Node, Operands, ReduceOp, SymbolId, UnaryOp,
 };
@@ -24,7 +24,7 @@ use crate::semantics::{binary_f64, unary_f64};
 /// operand pool that every variadic node windows into by [`ArgList`]. A node
 /// is interned by hashing 16 bytes; a constant is hashed once when it is first
 /// seen; an operand list is interned by content so equal lists share one
-/// window (which is what makes `Reduce`/`Dot`/`Opaque` hash-cons structurally).
+/// window (which is what makes `Reduce`/`Dot`/`Solve`/`Call` hash-cons structurally).
 pub struct Graph<K: Field = F64> {
     nodes: Vec<Node>,
     /// The structural fingerprint of each node (see
@@ -49,9 +49,10 @@ pub struct Graph<K: Field = F64> {
     funcs: Vec<Function>,
     outputs: Vec<(FuncId, u32)>,
     output_dedup: HashMap<(FuncId, u32), OutputId>,
-    /// Reusable per-node memo for the graph traversals (differentiation,
-    /// substitution); see [`Memo`].
-    memo: Option<Box<Memo>>,
+    /// Reusable per-node memos for the graph traversals (differentiation,
+    /// substitution), a stack so a traversal nested in another reuses one
+    /// too; see [`Memo`].
+    memos: Vec<Memo>,
 }
 
 /// A per-node memo table over the arena, cleared in O(1) by bumping an epoch:
@@ -64,7 +65,7 @@ pub struct Graph<K: Field = F64> {
 /// length at `begin`), so nodes created during the traversal never alias a
 /// key.
 #[derive(Default)]
-pub struct Memo {
+pub(crate) struct Memo {
     epoch: Vec<u32>,
     val: Vec<ExprId>,
     cur: u32,
@@ -72,7 +73,7 @@ pub struct Memo {
 
 impl Memo {
     /// Start a fresh traversal over an arena of `n` nodes.
-    pub fn begin(&mut self, n: usize) {
+    pub(crate) fn begin(&mut self, n: usize) {
         self.cur = self.cur.wrapping_add(1);
         if self.cur == 0 {
             // epoch wrapped: invalidate everything explicitly
@@ -85,7 +86,7 @@ impl Memo {
         }
     }
     #[inline]
-    pub fn get(&self, e: ExprId) -> Option<ExprId> {
+    pub(crate) fn get(&self, e: ExprId) -> Option<ExprId> {
         let k = e.0 as usize;
         if k < self.epoch.len() && self.epoch[k] == self.cur {
             Some(self.val[k])
@@ -94,7 +95,7 @@ impl Memo {
         }
     }
     #[inline]
-    pub fn set(&mut self, e: ExprId, v: ExprId) {
+    pub(crate) fn set(&mut self, e: ExprId, v: ExprId) {
         let k = e.0 as usize;
         if k < self.epoch.len() {
             self.epoch[k] = self.cur;
@@ -129,24 +130,24 @@ impl<K: Field> Graph<K> {
             funcs: Vec::new(),
             outputs: Vec::new(),
             output_dedup: HashMap::default(),
-            memo: None,
+            memos: Vec::new(),
         };
         ctx.zero = ctx.konst(K::zero());
         ctx.one = ctx.konst(K::one());
         ctx
     }
 
-    /// Take the reusable traversal memo (a fresh one if it is in use by an
-    /// enclosing traversal), already begun over the current arena.
-    pub fn take_memo(&mut self) -> Box<Memo> {
-        let mut m = self.memo.take().unwrap_or_default();
+    /// Take a reusable traversal memo (a fresh one if every one is in use
+    /// by an enclosing traversal), already begun over the current arena.
+    pub(crate) fn take_memo(&mut self) -> Memo {
+        let mut m = self.memos.pop().unwrap_or_default();
         m.begin(self.nodes.len());
         m
     }
 
     /// Return a memo taken with [`take_memo`](Self::take_memo).
-    pub fn put_memo(&mut self, m: Box<Memo>) {
-        self.memo = Some(m);
+    pub(crate) fn put_memo(&mut self, m: Memo) {
+        self.memos.push(m);
     }
 
     /// Number of distinct nodes currently interned (useful for sharing checks).
@@ -190,27 +191,7 @@ impl<K: Field> Graph<K> {
     /// The operands a node reads, without allocation (leaves have none).
     #[inline]
     pub fn operands(&self, id: ExprId) -> Operands<'_> {
-        let z = ExprId(0);
-        match *self.node(id) {
-            Node::Const(_) | Node::Symbol(_) => Operands::Inline { buf: [z; 3], n: 0 },
-            Node::Add(a, b) | Node::Mul(a, b) | Node::Cmp(_, a, b) | Node::Binary(_, a, b) => {
-                Operands::Inline {
-                    buf: [a, b, z],
-                    n: 2,
-                }
-            }
-            Node::Neg(a) | Node::Pow(a, _) | Node::Unary(_, a) => Operands::Inline {
-                buf: [a, z, z],
-                n: 1,
-            },
-            Node::Select(c, t, e) => Operands::Inline {
-                buf: [c, t, e],
-                n: 3,
-            },
-            Node::Reduce(_, l) | Node::Dot(l) | Node::Call(_, l) | Node::Solve(l, _) => {
-                Operands::Slice(self.args(l))
-            }
-        }
+        self.node(id).operands(&self.arg_pool)
     }
 
     /// Intern a node, reusing an existing id if structurally identical.
@@ -275,7 +256,7 @@ impl<K: Field> Graph<K> {
             Node::Solve(l, k) => list(Tag::Solve, k as u64, l),
             Node::Call(o, l) => {
                 let (func, k) = self.output(o);
-                let callee = of_hash(self.func(func).name.as_str());
+                let callee = of_hash(self.func(func).name());
                 list(Tag::Call, mix(callee, k as u64), l)
             }
         }
@@ -761,7 +742,7 @@ impl<K: Field> Graph<K> {
     }
 
     /// Component `i` of a solve over the list `all`, rebuilt.
-    pub(crate) fn solve_component(&mut self, all: Vec<ExprId>, i: u32) -> ExprId {
+    fn solve_component(&mut self, all: &[ExprId], i: u32) -> ExprId {
         let n = Self::solve_n(all.len());
         let (a, b) = all.split_at(n * n);
         self.solve_dense(a.to_vec(), b.to_vec())[i as usize]
@@ -785,96 +766,42 @@ impl<K: Field> Graph<K> {
         &self.outputs
     }
 
-    /// Build a node of another graph (or of this one, before a transform)
-    /// here, through the smart constructors: folding and canonical operand
-    /// order run again, so identities that only became visible after a
-    /// transform collapse. `konst`, `sym`, `operand`, `args_of` and
-    /// `call_of` map the node's parts into this graph.
-    pub(crate) fn rebuild_node(
-        &mut self,
-        node: &Node,
-        konst: impl Fn(&Node) -> K,
-        sym: impl Fn(SymbolId) -> SymbolId,
-        operand: impl Fn(ExprId) -> ExprId,
-        args_of: impl Fn(ArgList) -> Vec<ExprId>,
-        call_of: impl Fn(OutputId) -> (FuncId, u32),
-    ) -> ExprId {
-        let e = &operand;
-        match *node {
-            Node::Const(_) => self.konst(konst(node)),
-            Node::Symbol(s) => self.symbol_expr(sym(s)),
-            Node::Call(o, l) => {
-                let args = args_of(l);
-                let (f, k) = call_of(o);
-                self.call(f, k, &args)
-            }
-            Node::Add(a, b) => self.add(e(a), e(b)),
-            Node::Mul(a, b) => self.mul(e(a), e(b)),
-            Node::Neg(a) => self.neg(e(a)),
-            Node::Pow(a, n) => self.pow_i(e(a), n),
-            Node::Unary(op, a) => self.unary(op, e(a)),
-            Node::Binary(op, a, b) => self.binary(op, e(a), e(b)),
-            Node::Cmp(op, a, b) => self.cmp(op, e(a), e(b)),
-            Node::Select(c, t, f) => self.select(e(c), e(t), e(f)),
-            Node::Reduce(op, l) => {
-                let args = args_of(l);
-                self.reduce(op, args)
-            }
-            Node::Dot(l) => {
-                let all = args_of(l);
-                let (a, b) = all.split_at(all.len() / 2);
+    /// `node` over the operands `ops` (ids of this graph, in
+    /// [`operands`](Self::operands) order), through the smart constructors:
+    /// folding and canonical operand order run again, so identities that
+    /// only became visible after a transform collapse. A leaf or a call must
+    /// already name a constant, symbol or output of this graph.
+    pub(crate) fn build(&mut self, node: Node, ops: &[ExprId]) -> ExprId {
+        match node {
+            Node::Const(_) | Node::Symbol(_) => self.intern(node),
+            Node::Add(..) => self.add(ops[0], ops[1]),
+            Node::Mul(..) => self.mul(ops[0], ops[1]),
+            Node::Neg(_) => self.neg(ops[0]),
+            Node::Pow(_, n) => self.pow_i(ops[0], n),
+            Node::Unary(op, _) => self.unary(op, ops[0]),
+            Node::Binary(op, ..) => self.binary(op, ops[0], ops[1]),
+            Node::Cmp(op, ..) => self.cmp(op, ops[0], ops[1]),
+            Node::Select(..) => self.select(ops[0], ops[1], ops[2]),
+            Node::Reduce(op, _) => self.reduce(op, ops.to_vec()),
+            Node::Dot(_) => {
+                let (a, b) = ops.split_at(ops.len() / 2);
                 self.dot(a.to_vec(), b.to_vec())
             }
-            Node::Solve(l, i) => {
-                let all = args_of(l);
-                self.solve_component(all, i)
-            }
+            Node::Solve(_, i) => self.solve_component(ops, i),
+            Node::Call(o, _) => self.call_output(o, ops),
         }
     }
 
-    /// Intern a node of a stored module as it stands, its parts mapped into
-    /// this graph: loading reproduces a graph exactly, it does not rebuild
-    /// it (see [`rebuild_node`](Self::rebuild_node) for that).
-    pub(crate) fn intern_node(
-        &mut self,
-        node: &Node,
-        konst: impl Fn(&Node) -> K,
-        sym: impl Fn(SymbolId) -> SymbolId,
-        operand: impl Fn(ExprId) -> ExprId,
-        args_of: impl Fn(ArgList) -> Vec<ExprId>,
-        call_of: impl Fn(OutputId) -> (FuncId, u32),
-    ) -> ExprId {
-        let e = &operand;
-        let n = match *node {
-            Node::Const(_) => return self.konst(konst(node)),
-            Node::Symbol(s) => Node::Symbol(sym(s)),
-            Node::Call(o, l) => {
-                let args = args_of(l);
-                let (f, k) = call_of(o);
-                return self.call(f, k, &args);
-            }
-            Node::Add(a, b) => Node::Add(e(a), e(b)),
-            Node::Mul(a, b) => Node::Mul(e(a), e(b)),
-            Node::Neg(a) => Node::Neg(e(a)),
-            Node::Pow(a, k) => Node::Pow(e(a), k),
-            Node::Unary(op, a) => Node::Unary(op, e(a)),
-            Node::Binary(op, a, b) => Node::Binary(op, e(a), e(b)),
-            Node::Cmp(op, a, b) => Node::Cmp(op, e(a), e(b)),
-            Node::Select(c, t, f) => Node::Select(e(c), e(t), e(f)),
-            Node::Reduce(op, l) => {
-                let args = args_of(l);
-                Node::Reduce(op, self.intern_args(&args))
-            }
-            Node::Dot(l) => {
-                let args = args_of(l);
-                Node::Dot(self.intern_args(&args))
-            }
-            Node::Solve(l, i) => {
-                let args = args_of(l);
-                Node::Solve(self.intern_args(&args), i)
-            }
+    /// `node` over the operands `ops` as it stands, without folding: how a
+    /// stored module is reproduced exactly (see [`build`](Self::build) for
+    /// rebuilding).
+    pub(crate) fn intern_over(&mut self, node: Node, ops: &[ExprId]) -> ExprId {
+        let list = if node.is_variadic() {
+            self.intern_args(ops)
+        } else {
+            ArgList { start: 0, len: 0 }
         };
-        self.intern(n)
+        self.intern(node.with_operands(ops, list))
     }
 }
 

@@ -17,8 +17,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::field::Field;
 use crate::graph::Graph;
-use crate::node::{CmpOp, ExprId, Node, ReduceOp, SymbolId};
-use crate::tape::{input_index, Tape};
+use crate::node::{ExprId, Node, ReduceOp, SymbolId};
+use crate::tape::{input_index, Op, Tape};
 
 /// What a node is, which decides its hue and shape.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -99,7 +99,7 @@ pub struct Theme {
 }
 
 const GREY: &str = "#8b8b8b";
-const ACCENT: &str = "#c55a11";
+const ACCENT: &str = "#3b82f6";
 
 impl Default for Theme {
     fn default() -> Self {
@@ -268,7 +268,8 @@ impl Blocks {
         let mut body = theme.header(rankdir);
         // Blocks breathe more than expression nodes, and a column of them
         // lines up at one width.
-        body.push_str("  graph [ranksep=0.55, nodesep=0.3];\n  node [width=1.5];\n");
+        // `newrank` lets a row of blocks line up across group borders.
+        body.push_str("  graph [ranksep=0.55, nodesep=0.3, newrank=true];\n  node [width=1.5];\n");
         Blocks { theme, body }
     }
 
@@ -400,6 +401,13 @@ impl Blocks {
              constraint=false];",
             escape(label)
         );
+        self
+    }
+
+    /// Blocks side by side in one rank: a row in a top-down diagram, a
+    /// column in a left-right one.
+    pub fn row(mut self, ids: &[&str]) -> Self {
+        let _ = writeln!(self.body, "  {{ rank=same; {}; }}", ids.join("; "));
         self
     }
 
@@ -568,14 +576,7 @@ impl<'g, K: Field> GraphView<'g, K> {
             Node::Unary(op, _) => (op.name().into(), Kind::Op),
             Node::Binary(op, ..) => (op.name().into(), Kind::Op),
             Node::Cmp(op, ..) => {
-                let c = match op {
-                    CmpOp::Gt => ">",
-                    CmpOp::Ge => ">=",
-                    CmpOp::Lt => "<",
-                    CmpOp::Le => "<=",
-                    CmpOp::Eq => "==",
-                    CmpOp::Ne => "!=",
-                };
+                let c = op.symbol();
                 let label = if math {
                     format!("(\u{00b7}) {c} (\u{00b7})")
                 } else {
@@ -591,10 +592,7 @@ impl<'g, K: Field> GraphView<'g, K> {
                 match (op, math) {
                     (ReduceOp::Sum, true) => "\u{03a3}",
                     (ReduceOp::Product, true) => "\u{03a0}",
-                    (ReduceOp::Sum, false) => "sum",
-                    (ReduceOp::Product, false) => "prod",
-                    (ReduceOp::Min, _) => "min",
-                    (ReduceOp::Max, _) => "max",
+                    (op, _) => op.name(),
                 }
                 .into(),
                 Kind::Kernel,
@@ -607,10 +605,10 @@ impl<'g, K: Field> GraphView<'g, K> {
             Node::Call(o, _) => {
                 let (f, k) = g.output(o);
                 let func = g.func(f);
-                let name = if func.outputs.len() > 1 {
-                    format!("{}#{k}", func.name)
+                let name = if func.outputs().len() > 1 {
+                    format!("{}#{k}", func.name())
                 } else {
-                    func.name.clone()
+                    func.name().to_string()
                 };
                 (name, Kind::Call)
             }
@@ -672,11 +670,17 @@ impl<'g, K: Field> GraphView<'g, K> {
             if name.is_empty() {
                 continue;
             }
+            let faded = self.faded(*e);
             let _ = writeln!(
                 s,
-                "  out{i} [{}];\n  n{} -> out{i};",
-                t.node(Kind::Output, name, self.faded(*e)),
-                e.0
+                "  out{i} [{}];\n  n{} -> out{i}{};",
+                t.node(Kind::Output, name, faded),
+                e.0,
+                if faded {
+                    format!(" [{}]", t.faded_edge())
+                } else {
+                    String::new()
+                }
             );
         }
         for (a, b, label) in &self.links {
@@ -756,7 +760,7 @@ impl<'t> TapeView<'t> {
         let t = &self.theme;
         let n_ops = tape.n_ops();
         let prolog = tape.prolog_len();
-        let views: Vec<_> = (0..n_ops).map(|i| tape.op_view(i)).collect();
+        let views: Vec<_> = (0..n_ops).map(|i| op_view(tape, i)).collect();
         let mut s = t.header(self.rankdir);
         let input_name = |k: u32| {
             self.inputs
@@ -861,7 +865,7 @@ impl<'t> TapeView<'t> {
                 };
                 let _ = writeln!(s, "  {from} -> o{i}{attrs};");
             }
-            let dst = tape.op_dst(i);
+            let dst = tape.dst(i);
             for slot in dst..dst + v.width {
                 writer.insert(slot, i);
             }
@@ -881,5 +885,55 @@ impl<'t> TapeView<'t> {
         let _ = writeln!(s, "  {{ rank=sink; {}; }}", results.join("; "));
         s.push_str("}\n");
         s
+    }
+}
+
+/// One op of a tape as a diagram draws it: its label and kind, the
+/// operands it reads (slots, or inputs tagged), how many slots it writes
+/// from its destination, and the bundle a call calls.
+struct OpView {
+    label: String,
+    kind: Kind,
+    reads: Vec<u32>,
+    width: u32,
+    bundle: Option<u32>,
+}
+
+/// Op `i` of `tape` as a diagram draws it.
+fn op_view(tape: &Tape, i: usize) -> OpView {
+    let mut reads = Vec::new();
+    tape.for_each_operand(i, |k| reads.push(k));
+    let (label, kind) = match tape.ops()[i] {
+        Op::Const(c) => (number(c), Kind::Const),
+        Op::Add(..) => ("+".into(), Kind::Op),
+        Op::Mul(..) => ("*".into(), Kind::Op),
+        Op::MulAdd(..) => ("*+".into(), Kind::Op),
+        Op::Sub(..) => ("-".into(), Kind::Op),
+        Op::Neg(_) => ("neg".into(), Kind::Op),
+        Op::Powi(_, n) => (format!("^{n}"), Kind::Op),
+        Op::Unary(op, _) => (op.name().into(), Kind::Op),
+        Op::Binary(op, ..) => (op.name().into(), Kind::Op),
+        Op::Cmp(op, ..) => (op.symbol().into(), Kind::Choice),
+        Op::Select(..) => ("select".into(), Kind::Choice),
+        Op::Reduce(op, ..) => (op.name().into(), Kind::Kernel),
+        Op::Dot(_, l) => (format!("dot {l}"), Kind::Kernel),
+        Op::Call { n_groups: 1, .. } => ("call".into(), Kind::Call),
+        Op::Call { n_groups, .. } => (format!("call x{n_groups}"), Kind::Call),
+        Op::CallProlog { n_groups, .. } => (format!("prolog x{n_groups}"), Kind::Call),
+        Op::Gemv { m, n, .. } => (format!("gemv {m}x{n}"), Kind::Kernel),
+        Op::Gemm { m, k, n, .. } => (format!("gemm {m}x{k}x{n}"), Kind::Kernel),
+        Op::Solve { n, k: 1, .. } => (format!("solve {n}"), Kind::Kernel),
+        Op::Solve { n, k, .. } => (format!("solve {n}, {k} rhs"), Kind::Kernel),
+    };
+    let bundle = match tape.ops()[i] {
+        Op::Call { bundle, .. } | Op::CallProlog { bundle, .. } => Some(bundle),
+        _ => None,
+    };
+    OpView {
+        label,
+        kind,
+        reads,
+        width: tape.width(i),
+        bundle,
     }
 }

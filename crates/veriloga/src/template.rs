@@ -31,7 +31,7 @@
 
 use rustc_hash::FxHashMap as HashMap;
 
-use rsdag::{Crossing, ExprId, FuncId, SymbolId};
+use rsdag::{Crossing, ExprId, FuncId, ParamRole, SymbolId};
 use rustc_hash::FxHashMap;
 use sane_core::Graph;
 use sane_device::{
@@ -397,6 +397,16 @@ fn build_template(
     outs.extend(frag.events.iter().map(|e| e.g));
     let leaves: Vec<SymbolId> = ctx.free_symbols_in(&outs).into_iter().collect();
     let func = ctx.define_func(&dev.module.name, leaves.clone(), outs);
+    // The parameters (the instance's, and the temperature) are the body's
+    // pure arguments: a compiled body splits over them, so their work runs
+    // once per parameter binding rather than in every evaluation.
+    let params: std::collections::HashSet<SymbolId> =
+        frag.param_syms.iter().map(|&(_, s)| s).collect();
+    for (k, &s) in leaves.iter().enumerate() {
+        if params.contains(&s) || ctx.symbol_name(s) == sane_core::constants::TEMP_SYMBOL {
+            ctx.set_param_role(func, k as u32, ParamRole::Param);
+        }
+    }
 
     let op_vars = frag
         .op_vars

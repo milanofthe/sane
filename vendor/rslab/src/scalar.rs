@@ -20,8 +20,41 @@ use num_complex::Complex;
 use std::fmt::Debug;
 use std::ops::{Add, Div, Mul, Neg, Sub};
 
-/// A scalar field element supporting the operations the dense and multifrontal
-/// numeric kernels require.
+/// A scalar field element supporting the operations the numeric kernels
+/// require.
+/// A field with a lower-precision twin: `f64` over `f32`, `Complex<f64>`
+/// over `Complex<f32>`. A factor computed in the twin takes half the memory
+/// and preconditions an iteration in this field
+/// ([`MixedPrecision`](crate::MixedPrecision)).
+pub trait Demote: Scalar {
+    /// The lower-precision twin.
+    type Low: Scalar;
+    /// Round to the twin.
+    fn demote(self) -> Self::Low;
+    /// Widen from the twin (exact).
+    fn promote(low: Self::Low) -> Self;
+}
+
+impl Demote for f64 {
+    type Low = f32;
+    fn demote(self) -> f32 {
+        self as f32
+    }
+    fn promote(low: f32) -> f64 {
+        low as f64
+    }
+}
+
+impl Demote for Complex<f64> {
+    type Low = Complex<f32>;
+    fn demote(self) -> Complex<f32> {
+        Complex::new(self.re as f32, self.im as f32)
+    }
+    fn promote(low: Complex<f32>) -> Complex<f64> {
+        Complex::new(low.re as f64, low.im as f64)
+    }
+}
+
 pub trait Scalar:
     'static
     + Copy
@@ -35,11 +68,67 @@ pub trait Scalar:
     + Div<Output = Self>
     + Neg<Output = Self>
 {
+    /// Complex field: its GEMMs may run on split real planes (see
+    /// `dense::gemm_backend`), which the memory plan counts.
+    const COMPLEX: bool = false;
+
     /// The additive identity `0`.
     fn zero() -> Self;
 
     /// The multiplicative identity `1`.
     fn one() -> Self;
+
+    /// The dense product `dst := (read_dst ? alpha * dst : 0) + beta * lhs *
+    /// rhs` of this scalar with the strides of `gemm::gemm` (the one GEMM
+    /// entry of the numeric kernels, see `dense::gemm_backend`).
+    ///
+    /// # Safety
+    /// The pointers and strides must describe valid, non-overlapping
+    /// matrices of the given sizes.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn gemm(
+        m: usize,
+        n: usize,
+        k: usize,
+        dst: *mut Self,
+        dst_cs: isize,
+        dst_rs: isize,
+        read_dst: bool,
+        lhs: *const Self,
+        lhs_cs: isize,
+        lhs_rs: isize,
+        rhs: *const Self,
+        rhs_cs: isize,
+        rhs_rs: isize,
+        alpha: Self,
+        beta: Self,
+        conj_dst: bool,
+        conj_lhs: bool,
+        conj_rhs: bool,
+        mode: crate::dense::gemm_backend::GemmMode,
+    ) {
+        gemm::gemm(
+            m,
+            n,
+            k,
+            dst,
+            dst_cs,
+            dst_rs,
+            read_dst,
+            lhs,
+            lhs_cs,
+            lhs_rs,
+            rhs,
+            rhs_cs,
+            rhs_rs,
+            alpha,
+            beta,
+            conj_dst,
+            conj_lhs,
+            conj_rhs,
+            mode.parallelism,
+        )
+    }
 
     /// Embed a real number into the field (e.g. an `f64` scaling factor).
     fn from_real(r: f64) -> Self;
@@ -62,28 +151,13 @@ pub trait Scalar:
     /// Hermitian path.
     fn conj(self) -> Self;
 
-    /// Low-precision storage partner (`f64 -> f32`, `c64 -> c32`; the
-    /// identity for the already-single types). Powers adaptive-precision
-    /// low-rank storage (issue #19): tail vectors whose contribution is
-    /// below the compression tolerance are stored in `Lo` at half the
-    /// bytes and promoted on read.
-    type Lo: Copy + Send + Sync + std::fmt::Debug + 'static;
-    /// Whether `Lo` actually halves the storage (`false` for the identity).
-    const LO_SHRINKS: bool;
-    /// Unit roundoff of `Lo` (the storage-rounding noise level).
-    const EPS_LO: f64;
-    /// Cast to the low-precision partner.
-    fn demote(self) -> Self::Lo;
-    /// Cast back up.
-    fn promote(lo: Self::Lo) -> Self;
-
     /// The reciprocal `1/z`. The caller must guarantee `self != 0`.
     fn recip(self) -> Self;
 
     /// `self * a + b`, using a fused multiply-add where the hardware offers
     /// one. Do **not** call this directly in hot loops: without the `fma`
     /// target feature it lowers to a slow libm software-fma call; go through
-    /// [`fmadd`] instead, which guards on the build's target features.
+    /// `fmadd` instead, which guards on the build's target features.
     fn mul_add(self, a: Self, b: Self) -> Self;
 
     /// Whether every component is finite (no `NaN`/`inf`) - used by pivot
@@ -114,18 +188,6 @@ pub(crate) fn fmadd<T: Scalar>(a: T, b: T, c: T) -> T {
 }
 
 impl Scalar for f64 {
-    type Lo = f32;
-    const LO_SHRINKS: bool = true;
-    const EPS_LO: f64 = f32::EPSILON as f64;
-    #[inline]
-    fn demote(self) -> f32 {
-        self as f32
-    }
-    #[inline]
-    fn promote(lo: f32) -> f64 {
-        lo as f64
-    }
-
     #[inline]
     fn zero() -> Self {
         0.0
@@ -178,16 +240,33 @@ impl Scalar for f64 {
 }
 
 impl Scalar for Complex<f64> {
-    type Lo = Complex<f32>;
-    const LO_SHRINKS: bool = true;
-    const EPS_LO: f64 = f32::EPSILON as f64;
-    #[inline]
-    fn demote(self) -> Complex<f32> {
-        Complex::new(self.re as f32, self.im as f32)
-    }
-    #[inline]
-    fn promote(lo: Complex<f32>) -> Complex<f64> {
-        Complex::new(lo.re as f64, lo.im as f64)
+    const COMPLEX: bool = true;
+
+    unsafe fn gemm(
+        m: usize,
+        n: usize,
+        k: usize,
+        dst: *mut Self,
+        dst_cs: isize,
+        dst_rs: isize,
+        read_dst: bool,
+        lhs: *const Self,
+        lhs_cs: isize,
+        lhs_rs: isize,
+        rhs: *const Self,
+        rhs_cs: isize,
+        rhs_rs: isize,
+        alpha: Self,
+        beta: Self,
+        conj_dst: bool,
+        conj_lhs: bool,
+        conj_rhs: bool,
+        mode: crate::dense::gemm_backend::GemmMode,
+    ) {
+        crate::dense::gemm_backend::complex_gemm(
+            m, n, k, dst, dst_cs, dst_rs, read_dst, lhs, lhs_cs, lhs_rs, rhs, rhs_cs, rhs_rs,
+            alpha, beta, conj_dst, conj_lhs, conj_rhs, mode,
+        )
     }
 
     #[inline]
@@ -251,18 +330,6 @@ impl Scalar for Complex<f64> {
 }
 
 impl Scalar for f32 {
-    type Lo = f32;
-    const LO_SHRINKS: bool = false;
-    const EPS_LO: f64 = f32::EPSILON as f64;
-    #[inline]
-    fn demote(self) -> f32 {
-        self
-    }
-    #[inline]
-    fn promote(lo: f32) -> f32 {
-        lo
-    }
-
     #[inline]
     fn zero() -> Self {
         0.0
@@ -316,16 +383,33 @@ impl Scalar for f32 {
 }
 
 impl Scalar for Complex<f32> {
-    type Lo = Complex<f32>;
-    const LO_SHRINKS: bool = false;
-    const EPS_LO: f64 = f32::EPSILON as f64;
-    #[inline]
-    fn demote(self) -> Complex<f32> {
-        self
-    }
-    #[inline]
-    fn promote(lo: Complex<f32>) -> Complex<f32> {
-        lo
+    const COMPLEX: bool = true;
+
+    unsafe fn gemm(
+        m: usize,
+        n: usize,
+        k: usize,
+        dst: *mut Self,
+        dst_cs: isize,
+        dst_rs: isize,
+        read_dst: bool,
+        lhs: *const Self,
+        lhs_cs: isize,
+        lhs_rs: isize,
+        rhs: *const Self,
+        rhs_cs: isize,
+        rhs_rs: isize,
+        alpha: Self,
+        beta: Self,
+        conj_dst: bool,
+        conj_lhs: bool,
+        conj_rhs: bool,
+        mode: crate::dense::gemm_backend::GemmMode,
+    ) {
+        crate::dense::gemm_backend::complex_gemm(
+            m, n, k, dst, dst_cs, dst_rs, read_dst, lhs, lhs_cs, lhs_rs, rhs, rhs_cs, rhs_rs,
+            alpha, beta, conj_dst, conj_lhs, conj_rhs, mode,
+        )
     }
 
     #[inline]

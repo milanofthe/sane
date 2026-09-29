@@ -155,6 +155,31 @@ pub struct Dae {
 }
 
 impl Dae {
+    /// Every white/flicker noise source's `(psd, flicker exponent)` over
+    /// `env`, in one arena sweep: the sources share the device subexpressions
+    /// and calls they read. `None` for a tabular source.
+    pub fn noise_levels(
+        &self,
+        ctx: &Graph,
+        env: &HashMap<SymbolId, f64>,
+    ) -> Vec<Option<(f64, f64)>> {
+        let roots: Vec<ExprId> = self
+            .noise_sources
+            .iter()
+            .filter(|ns| ns.table.is_empty())
+            .flat_map(|ns| [ns.psd, ns.flicker_exp])
+            .collect();
+        let vals = rsdag::eval(ctx, &roots, env);
+        let mut pairs = vals.as_chunks::<2>().0.iter();
+        self.noise_sources
+            .iter()
+            .map(|ns| {
+                let &[psd, fexp] = ns.table.is_empty().then(|| pairs.next())??;
+                Some((psd, fexp))
+            })
+            .collect()
+    }
+
     /// Register the system as an rsdag function carrying its roles: the
     /// unknowns as `State`, their derivatives as `StateDot`, time as `Time`,
     /// every parameter as `Param`, the residuals as `Residual` outputs and
@@ -208,12 +233,12 @@ impl Dae {
         // DAE in the same graph (folded parameters, a linearization) is
         // another system and gets its own function.
         let same = |f: &rsdag::Function| {
-            f.name == name
-                && f.params == params
-                && f.param_roles == roles
-                && f.output_roles == out_roles
-                && f.outputs.len() == outputs.len()
-                && f.outputs
+            f.name() == name
+                && f.params() == params.as_slice()
+                && f.param_roles() == roles.as_slice()
+                && f.output_roles() == out_roles.as_slice()
+                && f.outputs().len() == outputs.len()
+                && f.outputs()
                     .iter()
                     .zip(&outputs)
                     .all(|(o, &e)| matches!(*o, rsdag::Output::Expr(x) if x == e))

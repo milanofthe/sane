@@ -1929,7 +1929,7 @@ impl PySens {
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // No thread setting here: the linear solves are sequential by construction
-    // (the graph solve's programs, rslab's KLU) and the parallelism lives in
+    // (rslab's KLU) and the parallelism lives in
     // the outer sweeps, on the worker pool with its own default. `1` used to
     // mean "faer sequential" and would now shrink that pool to one thread.
     m.add_class::<Circuit>()?;

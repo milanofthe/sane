@@ -10,6 +10,17 @@ use super::*;
 impl<K: Field> Graph<K> {
     // --- functions and calls ---------------------------------------------
 
+    /// Append a function; the ids stay in definition order.
+    pub(crate) fn push_function(&mut self, func: Function) -> FuncId {
+        self.funcs.push(func);
+        FuncId(self.funcs.len() as u32 - 1)
+    }
+
+    /// Append an output with its role to `f`; returns its index.
+    pub(crate) fn push_output(&mut self, f: FuncId, output: Output, role: OutputRole) -> u32 {
+        self.funcs[f.0 as usize].push_output(output, role)
+    }
+
     /// Define a symbolic function: `outputs` are expressions over the formal
     /// `params` (free symbols of the outputs not listed in `params` are shared
     /// globals every call sees unchanged).
@@ -19,20 +30,11 @@ impl<K: Field> Graph<K> {
         params: Vec<SymbolId>,
         outputs: Vec<ExprId>,
     ) -> FuncId {
-        let id = FuncId(self.funcs.len() as u32);
-        let n_par = params.len();
-        let n_out = outputs.len();
-        self.funcs.push(Function {
-            name: name.to_string(),
-            params,
-            param_roles: vec![ParamRole::Free; n_par],
-            outputs: outputs.into_iter().map(Output::Expr).collect(),
-            output_roles: vec![OutputRole::Plain; n_out],
-            body: FunctionBody::Symbolic,
-            compiled: Vec::new(),
-            deriv_index: HashMap::default(),
-        });
-        id
+        let f = self.push_function(Function::new(name, params, None));
+        for e in outputs {
+            self.push_output(f, Output::Expr(e), OutputRole::Plain);
+        }
+        f
     }
 
     /// Close an open graph over `outputs` into a function: every free symbol
@@ -45,12 +47,12 @@ impl<K: Field> Graph<K> {
 
     /// Set the role of parameter `param` of function `f`.
     pub fn set_param_role(&mut self, f: FuncId, param: u32, role: ParamRole) {
-        self.funcs[f.0 as usize].param_roles[param as usize] = role;
+        self.funcs[f.0 as usize].set_param_role(param, role);
     }
 
     /// Set the role of output `out` of function `f`.
     pub fn set_output_role(&mut self, f: FuncId, out: u32, role: OutputRole) {
-        self.funcs[f.0 as usize].output_roles[out as usize] = role;
+        self.funcs[f.0 as usize].set_output_role(out, role);
     }
 
     /// Inline every call reachable from `roots`, to the bottom.
@@ -65,65 +67,62 @@ impl<K: Field> Graph<K> {
     /// Calls into an extern body cannot be inlined (there is no expression
     /// to inline) and are left as they are.
     pub fn inline_all(&mut self, roots: &[ExprId]) -> Vec<ExprId> {
-        let mut map: HashMap<ExprId, ExprId> = HashMap::default();
-        roots
-            .iter()
-            .map(|&r| self.inline_rec(r, &mut map))
-            .collect()
+        self.inline_with(roots, &mut HashMap::default())
     }
 
-    fn inline_rec(&mut self, e: ExprId, map: &mut HashMap<ExprId, ExprId>) -> ExprId {
-        if let Some(&done) = map.get(&e) {
-            return done;
-        }
-        let node = *self.node(e);
-        // Operands first, so the rebuild below reads them from `map`.
-        let operands: Vec<ExprId> = self.operands(e).to_vec();
-        for a in operands {
-            self.inline_rec(a, map);
-        }
-        let out = match node {
-            Node::Call(o, l) => {
-                let args: Vec<ExprId> = self.args(l).to_vec().iter().map(|a| map[a]).collect();
-                let (f, k) = self.output(o);
-                match self.funcs[f.0 as usize].outputs[k as usize] {
-                    // An extern body stays a call, over inlined arguments.
-                    Output::Slot(_) => self.call(f, k, &args),
-                    Output::Zero => self.zero,
-                    Output::Expr(_) => {
-                        let body = self.inline_outputs(f, &[k], &args)[0];
-                        // The body may itself contain calls.
-                        self.inline_rec(body, map)
-                    }
+    /// Every call under `roots` that passes constants, redirected to a copy
+    /// of its function specialized to them: the copy's outputs are the
+    /// function's with those parameters replaced by the constants (and
+    /// folded), it takes the other arguments only. The calls that pass the
+    /// same constants in the same places share one copy, so their instances
+    /// still run as one batch, and calls in a copy's body are specialized
+    /// too. A ground terminal, or the derivatives of a DC analysis set to
+    /// zero, take their share of a device body away before it is compiled.
+    ///
+    /// The copy keeps the roles of the parameters it keeps; its outputs are
+    /// `Plain` apart from their non-derivative roles, a derivative of it is
+    /// derived anew. Calls into an extern body are left as they are.
+    pub fn specialize_calls(&mut self, roots: &[ExprId]) -> Vec<ExprId> {
+        specialize_calls_in(self, roots, &mut HashMap::default())
+    }
+
+    /// [`inline_all`](Self::inline_all) with `bodies` holding each output
+    /// already inlined over its function's parameters, so a function is
+    /// inlined once however many calls it has, and the recursion is only as
+    /// deep as the call hierarchy.
+    fn inline_with(
+        &mut self,
+        roots: &[ExprId],
+        bodies: &mut HashMap<OutputId, ExprId>,
+    ) -> Vec<ExprId> {
+        crate::transform::rewrite(self, roots, |g, _, node, args| {
+            let Node::Call(o, _) = node else {
+                return g.build(node, args);
+            };
+            let (f, k) = g.output(o);
+            let e = match g.funcs[f.0 as usize].outputs()[k as usize] {
+                // An extern body stays a call, over inlined arguments.
+                Output::Slot(_) => return g.call(f, k, args),
+                Output::Zero => return g.zero,
+                Output::Expr(e) => e,
+            };
+            let body = match bodies.get(&o) {
+                Some(&b) => b,
+                None => {
+                    let b = g.inline_with(&[e], bodies)[0];
+                    bodies.insert(o, b);
+                    b
                 }
-            }
-            _ => {
-                let konst = match node {
-                    Node::Const(c) => self.consts[c.0 as usize].clone(),
-                    _ => K::zero(),
-                };
-                let args: Vec<ExprId> = match node {
-                    Node::Reduce(_, l) | Node::Dot(l) | Node::Solve(l, _) => {
-                        self.args(l).to_vec().iter().map(|a| map[a]).collect()
-                    }
-                    _ => Vec::new(),
-                };
-                // The call table is copied out first: a closure handed to
-                // `rebuild_node` cannot hold a borrow of the graph it builds
-                // in.
-                let call_table = self.outputs.clone();
-                self.rebuild_node(
-                    &node,
-                    |_| konst.clone(),
-                    |s| s,
-                    |x| map[&x],
-                    |_| args.clone(),
-                    |o| call_table[o.0 as usize],
-                )
-            }
-        };
-        map.insert(e, out);
-        out
+            };
+            let map = g.bind(f, args);
+            crate::transform::substitute(g, &[body], &map)[0]
+        })
+    }
+
+    /// The parameters of `f` bound to the arguments of a call.
+    fn bind(&self, f: FuncId, args: &[ExprId]) -> HashMap<SymbolId, ExprId> {
+        let params = self.funcs[f.0 as usize].params();
+        params.iter().copied().zip(args.iter().copied()).collect()
     }
 
     /// Which outputs of `f` structurally read which of its parameters:
@@ -141,15 +140,15 @@ impl<K: Field> Graph<K> {
     pub fn feedthrough(&self, f: FuncId) -> Vec<Vec<bool>> {
         let func = &self.funcs[f.0 as usize];
         let index: HashMap<SymbolId, usize> = func
-            .params
+            .params()
             .iter()
             .enumerate()
             .map(|(k, &s)| (s, k))
             .collect();
-        func.outputs
+        func.outputs()
             .iter()
             .map(|out| {
-                let mut row = vec![false; func.params.len()];
+                let mut row = vec![false; func.params().len()];
                 match *out {
                     Output::Zero => {}
                     Output::Slot(_) => row.iter_mut().for_each(|r| *r = true),
@@ -179,9 +178,8 @@ impl<K: Field> Graph<K> {
         let pars = self.funcs[f.0 as usize].params_with_role(param_role);
         let mut entries = Vec::new();
         for &o in &outs {
-            for &p in &pars {
-                let k = self.derivative_output(f, o, p);
-                if !matches!(self.funcs[f.0 as usize].outputs[k as usize], Output::Zero) {
+            for (&p, k) in pars.iter().zip(self.derivative_outputs(f, o, &pars)) {
+                if !matches!(self.funcs[f.0 as usize].outputs()[k as usize], Output::Zero) {
                     entries.push((o, p, k));
                 }
             }
@@ -208,33 +206,36 @@ impl<K: Field> Graph<K> {
                 }
             })
             .collect();
-        let id = FuncId(self.funcs.len() as u32);
-        let n_out = outputs.len();
-        self.funcs.push(Function {
-            name: name.to_string(),
-            param_roles: vec![ParamRole::Free; params.len()],
-            params,
-            outputs,
-            output_roles: vec![OutputRole::Plain; n_out],
-            body: FunctionBody::Extern(body),
-            compiled: Vec::new(),
-            deriv_index: HashMap::default(),
-        });
-        id
+        self.define_extern_func_with_params(name, params, body, outputs)
+    }
+
+    /// Define an extern function over the given formal parameters (the
+    /// symbols already exist), see [`define_extern_func`](Self::define_extern_func).
+    pub fn define_extern_func_with_params(
+        &mut self,
+        name: &str,
+        params: Vec<SymbolId>,
+        body: Arc<dyn ExternBundle>,
+        outputs: Vec<Output>,
+    ) -> FuncId {
+        let f = self.push_function(Function::new(name, params, Some(body)));
+        for o in outputs {
+            self.push_output(f, o, OutputRole::Plain);
+        }
+        f
     }
 
     /// Declare `d outputs[out] / d params[param]` of an extern function as
     /// `deriv` (a slot of its body, or zero). Undeclared derivatives are zero.
     pub fn declare_derivative(&mut self, f: FuncId, out: u32, param: u32, deriv: Output) -> u32 {
-        let func = &mut self.funcs[f.0 as usize];
-        let k = func.outputs.len() as u32;
-        func.outputs.push(deriv);
-        func.output_roles.push(OutputRole::Derivative {
-            of: out,
-            wrt: param,
-        });
-        func.deriv_index.insert((out, param), k);
-        k
+        self.push_output(
+            f,
+            deriv,
+            OutputRole::Derivative {
+                of: out,
+                wrt: param,
+            },
+        )
     }
 
     pub fn func(&self, f: FuncId) -> &Function {
@@ -244,11 +245,6 @@ impl<K: Field> Graph<K> {
     /// Number of symbols.
     pub fn n_symbols(&self) -> usize {
         self.symbol_names.len()
-    }
-
-    /// Mutable access to a function (roles, memoised outputs).
-    pub fn func_mut(&mut self, f: FuncId) -> &mut Function {
-        &mut self.funcs[f.0 as usize]
     }
 
     /// Register a body a consumer compiled for the symbolic function `f`:
@@ -262,7 +258,7 @@ impl<K: Field> Graph<K> {
         // Several bodies may serve one function (a residual-only one and
         // one with the partials); a program takes the smallest that covers
         // the outputs it calls.
-        let bodies = &mut self.funcs[f.0 as usize].compiled;
+        let bodies = self.funcs[f.0 as usize].compiled_mut();
         let ptr = Arc::as_ptr(&body.bundle) as *const () as usize;
         if !bodies
             .iter()
@@ -270,30 +266,6 @@ impl<K: Field> Graph<K> {
         {
             bodies.push(body);
         }
-    }
-
-    /// Define an extern function over the given formal parameters (the
-    /// symbols already exist), see [`define_extern_func`](Self::define_extern_func).
-    pub fn define_extern_func_with_params(
-        &mut self,
-        name: &str,
-        params: Vec<SymbolId>,
-        body: Arc<dyn ExternBundle>,
-        outputs: Vec<Output>,
-    ) -> FuncId {
-        let id = FuncId(self.funcs.len() as u32);
-        let n_out = outputs.len();
-        self.funcs.push(Function {
-            name: name.to_string(),
-            param_roles: vec![ParamRole::Free; params.len()],
-            params,
-            outputs,
-            output_roles: vec![OutputRole::Plain; n_out],
-            body: FunctionBody::Extern(body),
-            compiled: Vec::new(),
-            deriv_index: HashMap::default(),
-        });
-        id
     }
 
     pub fn n_funcs(&self) -> usize {
@@ -319,7 +291,7 @@ impl<K: Field> Graph<K> {
 
     /// The expression of a symbolic output, `None` for a slot or zero output.
     pub fn output_expr(&self, f: FuncId, out: u32) -> Option<ExprId> {
-        match self.funcs[f.0 as usize].outputs[out as usize] {
+        match self.funcs[f.0 as usize].outputs()[out as usize] {
             Output::Expr(e) => Some(e),
             _ => None,
         }
@@ -328,12 +300,9 @@ impl<K: Field> Graph<K> {
     /// Output `out` of `f` applied to `args` (one argument per parameter). A
     /// zero output folds to the constant zero.
     pub fn call(&mut self, f: FuncId, out: u32, args: &[ExprId]) -> ExprId {
-        debug_assert_eq!(
-            args.len(),
-            self.funcs[f.0 as usize].params.len(),
-            "call arity"
-        );
-        if matches!(self.funcs[f.0 as usize].outputs[out as usize], Output::Zero) {
+        let func = &self.funcs[f.0 as usize];
+        debug_assert_eq!(args.len(), func.params().len(), "call arity");
+        if matches!(func.outputs()[out as usize], Output::Zero) {
             return self.zero;
         }
         let o = self.output_id(f, out);
@@ -351,12 +320,14 @@ impl<K: Field> Graph<K> {
     /// differentiating the body on first demand (symbolic functions) or
     /// looking up the declared slot (extern functions; zero if undeclared).
     pub fn derivative_output(&mut self, f: FuncId, out: u32, param: u32) -> u32 {
-        if let Some(&k) = self.funcs[f.0 as usize].deriv_index.get(&(out, param)) {
+        let func = &self.funcs[f.0 as usize];
+        if let Some(k) = func.derivative(out, param) {
             return k;
         }
-        let d = match self.funcs[f.0 as usize].outputs[out as usize] {
+        let output = func.outputs()[out as usize];
+        let d = match output {
             Output::Expr(e) => {
-                let wrt = self.funcs[f.0 as usize].params[param as usize];
+                let wrt = func.params()[param as usize];
                 let de = crate::autodiff::differentiate(self, e, wrt);
                 if self.is_zero(de) {
                     Output::Zero
@@ -366,29 +337,55 @@ impl<K: Field> Graph<K> {
             }
             Output::Slot(_) | Output::Zero => Output::Zero,
         };
-        let func = &mut self.funcs[f.0 as usize];
-        let k = func.outputs.len() as u32;
-        func.outputs.push(d);
-        func.output_roles.push(OutputRole::Derivative {
-            of: out,
-            wrt: param,
-        });
-        func.deriv_index.insert((out, param), k);
-        k
+        self.push_output(
+            f,
+            d,
+            OutputRole::Derivative {
+                of: out,
+                wrt: param,
+            },
+        )
+    }
+
+    /// [`derivative_output`](Self::derivative_output) for several parameters
+    /// of one output. The missing derivatives of a symbolic function are
+    /// derived in one reverse sweep over the body when they are
+    /// [`REVERSE_MIN_TOUCHED`](crate::autodiff::REVERSE_MIN_TOUCHED) or more
+    /// (a device's parameters), in one forward sweep each otherwise.
+    pub fn derivative_outputs(&mut self, f: FuncId, out: u32, params: &[u32]) -> Vec<u32> {
+        let func = &self.funcs[f.0 as usize];
+        if let Output::Expr(e) = func.outputs()[out as usize] {
+            let missing: Vec<u32> = params
+                .iter()
+                .copied()
+                .filter(|&p| func.derivative(out, p).is_none())
+                .collect();
+            if missing.len() >= crate::autodiff::REVERSE_MIN_TOUCHED {
+                let wrt: Vec<SymbolId> =
+                    missing.iter().map(|&p| func.params()[p as usize]).collect();
+                let grad = crate::autodiff::gradient(self, e, &wrt);
+                for (&p, d) in missing.iter().zip(grad) {
+                    let d = if self.is_zero(d) {
+                        Output::Zero
+                    } else {
+                        Output::Expr(d)
+                    };
+                    self.push_output(f, d, OutputRole::Derivative { of: out, wrt: p });
+                }
+            }
+        }
+        params
+            .iter()
+            .map(|&p| self.derivative_output(f, out, p))
+            .collect()
     }
 
     /// Inline a call: the output expression with the parameters replaced by
     /// `args`. `None` for an extern (slot) output, which has no body to inline.
     pub fn inline_call(&mut self, f: FuncId, out: u32, args: &[ExprId]) -> Option<ExprId> {
-        match self.funcs[f.0 as usize].outputs[out as usize] {
-            Output::Expr(e) => {
-                let params = self.funcs[f.0 as usize].params.clone();
-                let map: HashMap<SymbolId, ExprId> =
-                    params.iter().copied().zip(args.iter().copied()).collect();
-                Some(crate::transform::substitute(self, &[e], &map)[0])
-            }
-            Output::Zero => Some(self.zero),
+        match self.funcs[f.0 as usize].outputs()[out as usize] {
             Output::Slot(_) => None,
+            _ => Some(self.inline_outputs(f, &[out], args)[0]),
         }
     }
 
@@ -396,12 +393,11 @@ impl<K: Field> Graph<K> {
     /// substitution pass (the outputs of a device template share its core, so
     /// per-output substitution would rebuild that core per output).
     pub fn inline_outputs(&mut self, f: FuncId, outs: &[u32], args: &[ExprId]) -> Vec<ExprId> {
-        let params = self.funcs[f.0 as usize].params.clone();
-        let map: HashMap<SymbolId, ExprId> =
-            params.iter().copied().zip(args.iter().copied()).collect();
+        let map = self.bind(f, args);
+        let func = &self.funcs[f.0 as usize];
         let exprs: Vec<ExprId> = outs
             .iter()
-            .map(|&o| match self.funcs[f.0 as usize].outputs[o as usize] {
+            .map(|&o| match func.outputs()[o as usize] {
                 Output::Expr(e) => e,
                 Output::Zero => self.zero,
                 Output::Slot(_) => panic!("cannot inline an extern function output"),
@@ -460,4 +456,106 @@ impl<K: Field> Graph<K> {
         }
         set
     }
+}
+
+/// The specialized copies made so far: `(function, constant arguments by
+/// position)` to the copy.
+type Specialized = HashMap<(FuncId, Vec<(u32, ExprId)>), FuncId>;
+
+fn specialize_calls_in<K: Field>(
+    g: &mut Graph<K>,
+    roots: &[ExprId],
+    made: &mut Specialized,
+) -> Vec<ExprId> {
+    crate::transform::rewrite(g, roots, |g, _e, node, ops| {
+        let Node::Call(o, _) = node else {
+            return g.build(node, ops);
+        };
+        let (f, out) = g.output(o);
+        let consts: Vec<(u32, ExprId)> = ops
+            .iter()
+            .enumerate()
+            .filter(|(_, &a)| g.const_of(a).is_some())
+            .map(|(k, &a)| (k as u32, a))
+            .collect();
+        if consts.is_empty() || g.func(f).is_extern() {
+            return g.build(node, ops);
+        }
+        let key = (f, consts);
+        let copy = match made.get(&key) {
+            Some(&c) => c,
+            None => {
+                let c = specialize_function(g, f, &key.1, made);
+                made.insert(key.clone(), c);
+                c
+            }
+        };
+        let rest: Vec<ExprId> = ops
+            .iter()
+            .enumerate()
+            .filter(|(k, _)| !key.1.iter().any(|&(p, _)| p as usize == *k))
+            .map(|(_, &a)| a)
+            .collect();
+        g.call(copy, out, &rest)
+    })
+}
+
+/// The copy of `f` with the parameters `consts` names bound to their
+/// constants.
+fn specialize_function<K: Field>(
+    g: &mut Graph<K>,
+    f: FuncId,
+    consts: &[(u32, ExprId)],
+    made: &mut Specialized,
+) -> FuncId {
+    let func = g.func(f);
+    let name = func.name().to_string();
+    let params = func.params().to_vec();
+    let roles = func.param_roles().to_vec();
+    let outputs = func.outputs().to_vec();
+    let out_roles = func.output_roles().to_vec();
+    let bound: HashMap<SymbolId, ExprId> = consts
+        .iter()
+        .map(|&(k, c)| (params[k as usize], c))
+        .collect();
+    let exprs: Vec<ExprId> = outputs
+        .iter()
+        .filter_map(|o| match *o {
+            Output::Expr(e) => Some(e),
+            _ => None,
+        })
+        .collect();
+    let folded = crate::transform::substitute(g, &exprs, &bound);
+    let folded = specialize_calls_in(g, &folded, made);
+    let kept: Vec<usize> = (0..params.len())
+        .filter(|&k| !bound.contains_key(&params[k]))
+        .collect();
+    let copy = g.push_function(Function::new(
+        &name,
+        kept.iter().map(|&k| params[k]).collect(),
+        None,
+    ));
+    for (j, &k) in kept.iter().enumerate() {
+        g.set_param_role(copy, j as u32, roles[k]);
+    }
+    let mut next = folded.into_iter();
+    for (o, role) in outputs.iter().zip(out_roles) {
+        let out = match *o {
+            Output::Expr(_) => {
+                let e = next.next().expect("one folded output per expression");
+                if g.is_zero(e) {
+                    Output::Zero
+                } else {
+                    Output::Expr(e)
+                }
+            }
+            _ => Output::Zero,
+        };
+        let role = match role {
+            OutputRole::Derivative { .. } => OutputRole::Plain,
+            r => r,
+        };
+        g.push_output(copy, out, role);
+    }
+    copy
 }

@@ -70,12 +70,12 @@ pub struct Signature {
 impl Signature {
     /// The signature of `f`'s parameters.
     pub fn of(f: &crate::func::Function) -> Signature {
-        let mut order: Vec<usize> = (0..f.params.len()).collect();
+        let mut order: Vec<usize> = (0..f.params().len()).collect();
         // Stable: parameters of one place keep their declaration order.
-        order.sort_by_key(|&i| f.param_roles[i].place());
+        order.sort_by_key(|&i| f.param_roles()[i].place());
         Signature {
-            syms: order.iter().map(|&i| f.params[i]).collect(),
-            roles: order.iter().map(|&i| f.param_roles[i]).collect(),
+            syms: order.iter().map(|&i| f.params()[i]).collect(),
+            roles: order.iter().map(|&i| f.param_roles()[i]).collect(),
         }
     }
 

@@ -99,7 +99,7 @@ impl CompiledDc {
         time_stage!(
             prof,
             "function_bodies_res",
-            bundle::ensure_function_bodies(ctx, &dae.residuals, &param_syms)
+            bundle::ensure_function_bodies(ctx, &dae.residuals)
         );
         // Tape compilation is the biggest extraction stage on large circuits, and
         // the three passes are independent (`Tape::compile` only reads `&Graph`),
@@ -134,14 +134,14 @@ impl CompiledDc {
             .outputs_with_role(|r| matches!(r, rsdag::OutputRole::Guard { .. }));
         let event_roots: Vec<ExprId> = guards
             .iter()
-            .map(|&o| match ctx.func(sys).outputs[o as usize] {
+            .map(|&o| match ctx.func(sys).outputs()[o as usize] {
                 rsdag::Output::Expr(e) => e,
                 _ => unreachable!("a guard output is an expression"),
             })
             .collect();
         let event_dirs: Vec<Crossing> = guards
             .iter()
-            .map(|&o| match ctx.func(sys).output_roles[o as usize] {
+            .map(|&o| match ctx.func(sys).output_roles()[o as usize] {
                 rsdag::OutputRole::Guard { dir, .. } => dir,
                 _ => unreachable!("selected by role"),
             })
@@ -153,7 +153,7 @@ impl CompiledDc {
             time_stage!(
                 prof,
                 "function_bodies",
-                bundle::ensure_function_bodies(ctx, &broots, &param_syms)
+                bundle::ensure_function_bodies(ctx, &broots)
             );
         }
         let tape_step = time_stage!(
@@ -162,6 +162,47 @@ impl CompiledDc {
             crate::eval::step_eval(Tape::compile_split(
                 ctx,
                 &step_roots,
+                &input_syms,
+                &pure_inputs
+            ))
+        );
+        // The hot loops -- every DC Newton and the transient stages -- run at
+        // x' = 0: their tapes take the derivatives as zero and every call
+        // specialized to that, one pass over the residuals and the Jacobian
+        // entries so each constant pattern gets one copy of its body.
+        let zero = ctx.zero();
+        let at_rest: rustc_hash::FxHashMap<rsdag::SymbolId, ExprId> = input_syms
+            .iter()
+            .zip(&sig.roles)
+            .filter(|(_, r)| matches!(r, rsdag::ParamRole::StateDot { .. }))
+            .map(|(&s, _)| (s, zero))
+            .collect();
+        let step_dc = time_stage!(prof, "specialize_dc", {
+            let rest = rsdag::substitute(ctx, &step_roots, &at_rest);
+            ctx.specialize_calls(&rest)
+        });
+        let res_dc = &step_dc[..dae.residuals.len()];
+        time_stage!(
+            prof,
+            "function_bodies_res_dc",
+            bundle::ensure_function_bodies(ctx, res_dc)
+        );
+        let tape_res_dc = time_stage!(
+            prof,
+            "tape_res_dc",
+            crate::eval::step_eval(Tape::compile_split(ctx, res_dc, &input_syms, &pure_inputs))
+        );
+        time_stage!(
+            prof,
+            "function_bodies_dc",
+            bundle::ensure_function_bodies(ctx, &step_dc)
+        );
+        let tape_step_dc = time_stage!(
+            prof,
+            "tape_step_dc",
+            crate::eval::step_eval(Tape::compile_split(
+                ctx,
+                &step_dc,
                 &input_syms,
                 &pure_inputs
             ))
@@ -339,6 +380,8 @@ impl CompiledDc {
             jxd_cols: xc,
             tape_step,
             tape_res,
+            tape_step_dc,
+            tape_res_dc,
             tape_jxd,
             pjac: std::sync::OnceLock::new(),
             input_x_slots: input_src

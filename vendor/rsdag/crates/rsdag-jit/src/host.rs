@@ -36,7 +36,7 @@ pub(crate) extern "C" fn h_binary(op: u32, x: f64, y: f64) -> f64 {
     binary_f64(BinOp::from_code(op), x, y)
 }
 pub(crate) extern "C" fn h_powi(x: f64, n: i64) -> f64 {
-    x.powi(n as i32)
+    rsdag::semantics::powi_f64(x, n as i32)
 }
 
 pub(crate) fn reduce_code(op: ReduceOp) -> u64 {
@@ -168,83 +168,84 @@ pub(crate) extern "C" fn h_call(bundles: *const Bundles, d: *const CallDesc, wor
     });
 }
 
-pub(crate) extern "C" fn h_solve(a: *const f64, b: *const f64, n: usize, out: *mut f64) {
-    let a = unsafe { std::slice::from_raw_parts(a, n * n) };
-    let b = unsafe { std::slice::from_raw_parts(b, n) };
-    let out = unsafe { std::slice::from_raw_parts_mut(out, n) };
-    rsdag::semantics::solve(a, b, n, out);
+/// Where a kernel operand is: a byte offset into the work array or into
+/// the inputs, or nowhere (an accumulator no fold reads).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct Place {
+    pub(crate) base: u64,
+    pub(crate) off: u64,
 }
 
-pub(crate) extern "C" fn h_solve_many(
-    a: *const f64,
-    b: *const f64,
-    n: usize,
-    k: usize,
-    out: *mut f64,
-) {
-    let a = unsafe { std::slice::from_raw_parts(a, n * n) };
-    let b = unsafe { std::slice::from_raw_parts(b, n * k) };
-    let out = unsafe { std::slice::from_raw_parts_mut(out, n * k) };
-    rsdag::semantics::solve_many(a, b, n, k, out);
+impl Place {
+    pub(crate) const WORK: u64 = 0;
+    pub(crate) const INPUTS: u64 = 1;
+    pub(crate) const NONE: Place = Place { base: 2, off: 0 };
 }
 
-pub(crate) extern "C" fn h_gemm(
-    a: *const f64,
-    b: *const f64,
-    m: usize,
-    k: usize,
-    n: usize,
-    out: *mut f64,
-) {
-    let a = unsafe { std::slice::from_raw_parts(a, m * k) };
-    let b = unsafe { std::slice::from_raw_parts(b, n * k) };
-    let out = unsafe { std::slice::from_raw_parts_mut(out, m * n) };
-    rsdag::semantics::gemm(a, b, m, k, n, out);
+/// A dense kernel as the code hands it over: its kind (0 `Gemv`, 1 `Gemm`,
+/// 2 the solve of `k` right-hand sides), its dimensions, where its
+/// operands are (`a`, then `x` or `b`, then the accumulator), the address
+/// of its fold codes (0 without), the byte offset of its outputs, and
+/// the scratch a solve works in (the layout's, apart from slots and gather).
+#[repr(C)]
+pub(crate) struct KernelDesc {
+    pub(crate) kind: u64,
+    pub(crate) m: u64,
+    pub(crate) k: u64,
+    pub(crate) n: u64,
+    pub(crate) operands: [Place; 3],
+    pub(crate) codes: u64,
+    pub(crate) out: u64,
+    /// The byte offset and the length of the scratch a solve works in.
+    pub(crate) scratch: u64,
+    pub(crate) scratch_len: u64,
 }
 
-/// `A x` folded per the codes at `codes` (see `rsdag::tape::Fold`)
-/// against `c` (null when no code reads it).
-#[allow(clippy::too_many_arguments)]
-pub(crate) extern "C" fn h_gemv_acc(
-    a: *const f64,
-    x: *const f64,
-    c: *const f64,
-    codes: *const u32,
-    m: usize,
-    n: usize,
-    out: *mut f64,
-) {
-    let a = unsafe { std::slice::from_raw_parts(a, m * n) };
-    let x = unsafe { std::slice::from_raw_parts(x, n) };
-    let c = (!c.is_null()).then(|| unsafe { std::slice::from_raw_parts(c, m) });
-    let codes = unsafe { std::slice::from_raw_parts(codes, m) };
-    let out = unsafe { std::slice::from_raw_parts_mut(out, m) };
-    rsdag::semantics::gemv_fold(a, x, m, n, c, codes, out);
-}
-
-/// `A B` folded per the codes, as [`h_gemv_acc`].
-#[allow(clippy::too_many_arguments)]
-pub(crate) extern "C" fn h_gemm_acc(
-    a: *const f64,
-    b: *const f64,
-    c: *const f64,
-    codes: *const u32,
-    m: usize,
-    k: usize,
-    n: usize,
-    out: *mut f64,
-) {
-    let a = unsafe { std::slice::from_raw_parts(a, m * k) };
-    let b = unsafe { std::slice::from_raw_parts(b, n * k) };
-    let c = (!c.is_null()).then(|| unsafe { std::slice::from_raw_parts(c, m * n) });
-    let codes = unsafe { std::slice::from_raw_parts(codes, m * n) };
-    let out = unsafe { std::slice::from_raw_parts_mut(out, m * n) };
-    rsdag::semantics::gemm_fold(a, b, m, k, n, c, codes, out);
-}
-
-pub(crate) extern "C" fn h_gemv(a: *const f64, x: *const f64, m: usize, n: usize, out: *mut f64) {
-    let a = unsafe { std::slice::from_raw_parts(a, m * n) };
-    let x = unsafe { std::slice::from_raw_parts(x, n) };
-    let out = unsafe { std::slice::from_raw_parts_mut(out, m) };
-    rsdag::semantics::gemv(a, x, m, n, out);
+/// Run a dense kernel through the reference kernels of `rsdag::semantics`.
+pub(crate) extern "C" fn h_kernel(work: *mut f64, inputs: *const f64, d: *const KernelDesc) {
+    use rsdag::semantics as s;
+    let d = unsafe { &*d };
+    let (m, k, n) = (d.m as usize, d.k as usize, d.n as usize);
+    // SAFETY: the code placed every operand, in the work array or the
+    // inputs, and the output block apart from all of them (a kernel's
+    // outputs are fresh slots); the lengths are the kernel's.
+    let operand = |i: usize, len: usize| -> Option<&[f64]> {
+        let p = d.operands[i];
+        let base = match p.base {
+            Place::WORK => work as *const f64,
+            Place::INPUTS => inputs,
+            _ => return None,
+        };
+        Some(unsafe { std::slice::from_raw_parts(base.byte_add(p.off as usize), len) })
+    };
+    let len_out = match d.kind {
+        0 => m,
+        1 => m * n,
+        _ => n * k,
+    };
+    let out = unsafe { std::slice::from_raw_parts_mut(work.byte_add(d.out as usize), len_out) };
+    let codes = (d.codes != 0)
+        .then(|| unsafe { std::slice::from_raw_parts(d.codes as *const u32, len_out) });
+    let (a, b) = match d.kind {
+        0 => (operand(0, m * n), operand(1, n)),
+        1 => (operand(0, m * k), operand(1, n * k)),
+        _ => (operand(0, n * n), operand(1, n * k)),
+    };
+    let (a, b) = (a.expect("a kernel's first operand"), b.expect("its second"));
+    match (d.kind, codes) {
+        (0, None) => s::gemv(a, b, m, n, out),
+        (0, Some(codes)) => s::gemv_fold(a, b, m, n, operand(2, m), codes, out),
+        (1, None) => s::gemm(a, b, m, k, n, out),
+        (1, Some(codes)) => s::gemm_fold(a, b, m, k, n, operand(2, m * n), codes, out),
+        _ => {
+            let scratch = unsafe {
+                std::slice::from_raw_parts_mut(
+                    work.byte_add(d.scratch as usize),
+                    d.scratch_len as usize,
+                )
+            };
+            s::solve_many_into(a, b, n, k, out, scratch)
+        }
+    }
 }

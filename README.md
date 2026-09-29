@@ -444,7 +444,6 @@ benchmarking and debugging; the log level (`SANE_LOG`) and the test-corpus locat
 |---|---|
 | `SANE_THREADS` | worker threads of the parallel sweeps, default 4 (see also `set_parallelism`); the linear solves themselves are sequential |
 | `SANE_JIT` | `0` disables the native compilation of hot tapes (default on; build must have the `jit` feature) |
-| `SANE_GRAPH_SOLVE` | `0` solves every Newton system with the sparse LU library instead of rsdag's graph solve (the A/B reference; default on) |
 | `SANE_TAPE_SPEC` | `0` disables choice specialization of the circuit-level tapes |
 | `SANE_NO_DEVBUNDLE` | set to inline every Verilog-A instance as its own graph clone instead of calls into one shared function body |
 | `SANE_TRAN_FIXED` | force a fixed transient step instead of adaptive |
@@ -494,16 +493,12 @@ code by rsdag, see `vendor/rsdag`) is the `jit` build feature, on by default;
 numeric results are identical to the interpreter. `SANE_JIT=0` disables it at
 runtime.
 
-The Newton systems of every analysis (operating point, transient stages,
-sensitivities and adjoints) are solved by rsdag's graph solve: the static LU
-of the Jacobian's pattern as one program over the entry values, with the
-factorization as its parameter-pure prolog and the substitution as its main
-pass, pivot rows guarded and repivoted on the values when a guard fails. The
-sparse LU library (KLU, vendored rslab) keeps what the program does not cover:
-the complex small-signal systems of AC, noise and their adjoints, the
-block-dense harmonic-balance Jacobian, and any pattern beyond the program's
-range by the cost predictor. `SANE_GRAPH_SOLVE=0` selects the library
-everywhere for comparison.
+The linear systems are solved by the vendored rslab (`vendor/rslab`): KLU for
+circuit-shaped patterns, supernodal LDLT for large systems whose values are
+symmetric, supernodal LU for large unsymmetric ones. A Newton loop analyzes
+its pattern once, refactors each iteration into the previous factor and solves
+in scratch it keeps; KLU's numeric-only refactor replays the pivot sequence of
+the first factorization and pivots afresh when a pivot vanishes.
 
 ## License
 

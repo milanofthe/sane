@@ -1,7 +1,8 @@
 //! The background compiler: one thread that takes compile jobs in order,
 //! and the thread pool the jobs (and a consumer's own compiles) run on.
 //!
-//! Compiling is long, unsplittable work (tens of milliseconds per chunk).
+//! Compiling is long work (a large program takes tens to hundreds of
+//! milliseconds).
 //! On the global rayon pool it would starve the latency-bound work that
 //! runs there: a worker waiting in a `join` steals a compile chunk and
 //! holds the caller's critical path for its duration. Compiles therefore

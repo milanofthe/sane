@@ -103,7 +103,7 @@ impl CompiledDc {
             d_const[j * nv + j] += gmin;
         }
 
-        let lu_a = sparse::factor_triplets_both(nl, &a_r, &a_c, &a_v)?;
+        let lu_a = sparse::factor_triplets(nl, &a_r, &a_c, &a_v)?;
 
         // M = C A^{-1} B, column by column (no |L| x |V| dense intermediate).
         let mut s_base = d_const;

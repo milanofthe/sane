@@ -86,10 +86,17 @@ pub trait Scalar: Copy + Send + Sync + std::fmt::Debug + 'static {
     ) {
         crate::semantics::gemv_fold_t(a, x, m, n, c, codes, out)
     }
-    /// The dense solve of `k` right-hand sides
-    /// ([`crate::semantics::solve_many_t`]); `f64` runs its vector twin.
-    fn solve_many(a: &[Self], b: &[Self], n: usize, k: usize, out: &mut [Self]) {
-        crate::semantics::solve_many_generic(a, b, n, k, out)
+    /// The dense solve of `k` right-hand sides over `scratch` (see
+    /// [`crate::semantics::solve_many_into`]); `f64` runs its vector twin.
+    fn solve_many(
+        a: &[Self],
+        b: &[Self],
+        n: usize,
+        k: usize,
+        out: &mut [Self],
+        scratch: &mut [Self],
+    ) {
+        crate::semantics::solve_generic_into(a, b, n, k, out, scratch)
     }
     /// Call a bundle on arguments in `Self`, its outputs back in `Self`.
     /// A bundle computes in `f64`, so a scalar that is not `f64` converts
@@ -223,8 +230,15 @@ impl Scalar for f64 {
         crate::simd::gemv(a, x, m, n, out);
         crate::semantics::fold_in_place(codes, c, out);
     }
-    fn solve_many(a: &[Self], b: &[Self], n: usize, k: usize, out: &mut [Self]) {
-        crate::simd::solve_many(a, b, n, k, out)
+    fn solve_many(
+        a: &[Self],
+        b: &[Self],
+        n: usize,
+        k: usize,
+        out: &mut [Self],
+        scratch: &mut [Self],
+    ) {
+        crate::simd::solve_many(a, b, n, k, out, scratch)
     }
     fn magnitude(self) -> f64 {
         self.abs()
@@ -294,7 +308,7 @@ impl Scalar for f64 {
         -self
     }
     fn powi(self, n: i32) -> Self {
-        f64::powi(self, n)
+        crate::semantics::powi_t(self, n)
     }
     fn unary(op: UnaryOp, x: Self) -> Self {
         unary_f64(op, x)
@@ -355,7 +369,7 @@ impl Scalar for f32 {
         -self
     }
     fn powi(self, n: i32) -> Self {
-        f32::powi(self, n)
+        crate::semantics::powi_t(self, n)
     }
     /// Single precision goes through the double reference and rounds once:
     /// the same guards, one rounding, no second set of algorithms.
@@ -420,7 +434,7 @@ impl Scalar for Complex64 {
         -self
     }
     fn powi(self, n: i32) -> Self {
-        Complex64::powi(&self, n)
+        crate::semantics::powi_t(self, n)
     }
     fn unary(op: UnaryOp, x: Self) -> Self {
         match op {

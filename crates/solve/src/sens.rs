@@ -94,7 +94,7 @@ impl CompiledDc {
                 dae.jacobian_p_coo_templated(ctx, &self.param_syms)
             }
         );
-        bundle::ensure_function_bodies(ctx, &pe, &self.param_syms);
+        bundle::ensure_function_bodies(ctx, &pe);
         let tape = log_stage!(
             "sens/param_jac_tape",
             crate::eval::step_eval(Tape::compile(ctx, &pe, &self.base_inputs))
@@ -132,7 +132,7 @@ impl CompiledDc {
         h_roots.extend(hs.xdxd.2.iter().copied());
         h_roots.extend(hs.xxd.2.iter().copied());
         h_roots.extend(hs.xdp.2.iter().copied());
-        bundle::ensure_function_bodies(ctx, &h_roots, &self.param_syms);
+        bundle::ensure_function_bodies(ctx, &h_roots);
         let ch = CompiledHessian {
             np: self.param_syms.len(),
             nxx: hs.xx.2.len(),
@@ -221,7 +221,7 @@ impl CompiledDc {
             jc.push(i);
             jv.push(GMIN_DC);
         }
-        sparse::factor_triplets_both(n, &jr, &jc, &jv)
+        sparse::factor_triplets(n, &jr, &jc, &jv)
     }
 
     /// State sensitivity `s_k = dx/dp_k` solving `(dF/dx) s_k = -dF/dp_k` at the
@@ -349,23 +349,21 @@ impl CompiledDc {
             Some(l) => l,
             None => return Vec::new(),
         };
-        // Forward: assemble the n x |subset| RHS = -dF/dp[:, subset] (row-major
-        // for KLU's batched multi-RHS solve), one solve.
+        // Forward: assemble the n x |subset| RHS = -dF/dp[:, subset]
+        // (column-major for the batched multi-RHS solve), one solve.
         let (pr, pc, pv) = self.jacobian_p_sparse(x, &zeros, p, t);
         let mut rhs = vec![0.0; n * kk];
         for k in 0..pv.len() {
             let b = loc[pc[k]];
             if b != usize::MAX {
-                rhs[pr[k] * kk + b] -= pv[k]; // column b == subset position of parameter pc[k]
+                rhs[b * n + pr[k]] -= pv[k]; // column b == subset position of parameter pc[k]
             }
         }
         let s_mat = match lu.solve_many(&rhs, kk) {
             Some(s) => s,
             None => return Vec::new(),
         };
-        let s: Vec<Vec<f64>> = (0..kk)
-            .map(|a| (0..n).map(|i| s_mat[i * kk + a]).collect())
-            .collect();
+        let s: Vec<Vec<f64>> = s_mat.chunks(n.max(1)).map(<[f64]>::to_vec).collect();
 
         // Evaluate the Hessian-block tape: base inputs (xdot = 0) ++ multipliers.
         let mut inputs = Vec::new();

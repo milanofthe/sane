@@ -87,6 +87,7 @@ mod schur;
 // Adjoint sensitivities and the second-order-adjoint Hessian.
 mod sens;
 pub(crate) mod sparse;
+pub use sparse::{dump_system, DumpValue};
 #[cfg(test)]
 mod tests;
 mod transient;
@@ -349,6 +350,12 @@ pub struct CompiledDc {
     tape_step: StepEval,
     /// residuals only (cheap line-search evaluations).
     tape_res: StepEval,
+    /// `tape_step` and `tape_res` at `x' = 0`, every device call specialized
+    /// to it: the DC residual, which the transient stages evaluate too (their
+    /// derivative term enters through the mass matrix). The hot loops run
+    /// these, and the charge model drops out of the bodies they call.
+    tape_step_dc: StepEval,
+    tape_res_dc: StepEval,
     /// jacobian-x' nonzeros.
     tape_jxd: StepEval,
     /// Compiled `dF/dp` (parameter Jacobian) for exact adjoint sensitivity, built

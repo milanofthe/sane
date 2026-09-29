@@ -129,8 +129,7 @@ pub(crate) fn limit_step(limits: &[Limit], x: &[f64], step: &mut [f64]) -> f64 {
     if limits.is_empty() {
         return 1.0;
     }
-    let x_new: Vec<f64> = x.iter().zip(step.iter()).map(|(xi, s)| xi - s).collect();
-    let alpha = limiting::fraction(limits, x, &x_new);
+    let alpha = limiting::fraction_by(limits, x, |i| x[i] - step[i]);
     if alpha < 1.0 {
         for s in step.iter_mut() {
             *s *= alpha;
@@ -143,10 +142,12 @@ pub(crate) fn limit_step(limits: &[Limit], x: &[f64], step: &mut [f64]) -> f64 {
 /// `alpha` (from `1`, halving `tries - 1` times) whose trial residual norm is
 /// below `fnorm`; when every probe fails the last, smallest fraction is taken
 /// anyway (the direction is still a descent direction of the linear model).
-/// Real or complex iterates and steps.
+/// Real or complex iterates and steps; `trial` is the caller's scratch of
+/// `x`'s length.
 pub(crate) fn backtrack<T>(
     x: &mut [T],
     step: &[T],
+    trial: &mut [T],
     fnorm: f64,
     tries: usize,
     mut eval_norm: impl FnMut(&[T]) -> f64,
@@ -155,19 +156,18 @@ where
     T: Copy + std::ops::Sub<Output = T> + std::ops::Mul<f64, Output = T>,
 {
     let n = x.len();
-    let mut trial: Vec<T> = x.to_vec();
     let mut bt = Backtrack::new(tries);
     loop {
         let alpha = bt.alpha();
         for i in 0..n {
             trial[i] = x[i] - step[i] * alpha;
         }
-        if eval_norm(&trial) < fnorm {
-            x.copy_from_slice(&trial);
+        if eval_norm(trial) < fnorm {
+            x.copy_from_slice(trial);
             return alpha;
         }
         if bt.shrink().is_none() {
-            x.copy_from_slice(&trial);
+            x.copy_from_slice(trial);
             return alpha;
         }
     }
@@ -248,9 +248,14 @@ mod tests {
         let x0 = 3.0;
         let step = f(x0) / (3.0 * x0 * x0);
         let mut x = [x0];
-        let alpha = backtrack(&mut x, &[step], f(x0).abs(), LINE_SEARCH_TRIES, |t| {
-            f(t[0]).abs()
-        });
+        let alpha = backtrack(
+            &mut x,
+            &[step],
+            &mut [0.0],
+            f(x0).abs(),
+            LINE_SEARCH_TRIES,
+            |t| f(t[0]).abs(),
+        );
         assert!((0.0..=1.0).contains(&alpha));
         assert!(f(x[0]).abs() < f(x0).abs());
     }

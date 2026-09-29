@@ -45,7 +45,7 @@ impl MassMatrix {
     /// A factorization of `C` for the state-space rate `x' = C⁻¹ slope`,
     /// `None` when `C` is singular (a genuine DAE with algebraic unknowns).
     pub fn factor(&self, n: usize) -> Option<sparse::TripletLu> {
-        sparse::factor_triplets_both(n, &self.rows, &self.cols, &self.vals)
+        sparse::factor_triplets(n, &self.rows, &self.cols, &self.vals)
     }
 }
 
@@ -67,12 +67,16 @@ pub(crate) struct StageWorkspace<'a> {
     pub zc: Vec<f64>,
     pub inputs: Vec<f64>,
     pub work: Vec<f64>,
-    /// Own buffer for `tape_res` (its layout differs; sharing `work` would
-    /// clobber `tape_step`'s prolog slots).
+    /// Own buffer for `tape_res_dc` (its layout differs; sharing `work` would
+    /// clobber `tape_step_dc`'s prolog slots).
     pub res_work: Vec<f64>,
     pub out: Vec<f64>,
     pub valbuf: Vec<f64>,
     pub cdx: Vec<f64>,
+    /// The stage Newton's per-iteration scratch: `x - xn` and the scaled
+    /// right-hand side.
+    pub dxn: Vec<f64>,
+    pub rhs: Vec<f64>,
     /// Stage slopes `fᵢ = −F̃(Xᵢ)`; `slopes[0]` is the rate at the step start
     /// and the last entry the rate at the step end (the dense-output contract
     /// every method honours).
@@ -106,8 +110,8 @@ impl<'a> StageWorkspace<'a> {
         let mut inputs = Vec::new();
         let (mut work, mut res_work) = (Vec::new(), Vec::new());
         cdc.fill_inputs(x0, &zc, p, t0, &mut inputs);
-        let step_tok = cdc.tape_step.eval_prolog(&inputs, &mut work);
-        let res_tok = cdc.tape_res.eval_prolog(&inputs, &mut res_work);
+        let step_tok = cdc.tape_step_dc.eval_prolog(&inputs, &mut work);
+        let res_tok = cdc.tape_res_dc.eval_prolog(&inputs, &mut res_work);
         StageWorkspace {
             step_tok,
             res_tok,
@@ -121,6 +125,8 @@ impl<'a> StageWorkspace<'a> {
             out: Vec::new(),
             valbuf: Vec::new(),
             cdx: vec![0.0; n],
+            dxn: vec![0.0; n],
+            rhs: vec![0.0; n],
             slopes: vec![vec![0.0; n]; ESDIRK32_STAGES],
             psi: vec![0.0; n],
             stats: Stats::default(),
@@ -167,7 +173,7 @@ impl CompiledDc {
         t: f64,
     ) -> Vec<f64> {
         self.patch_inputs(x, &ws.zc, t, &mut ws.inputs);
-        self.tape_res
+        self.tape_res_dc
             .eval_main(&mut ws.res_tok, &ws.inputs, &mut ws.res_work, &mut ws.out);
         (0..self.n).map(|k| -(ws.out[k] + GMIN_DC * x[k])).collect()
     }
@@ -192,7 +198,6 @@ impl CompiledDc {
         let alpha = 1.0 / (h * gamma);
         let hg = h * gamma;
         let mut step = vec![0.0; n];
-        let mut r = vec![0.0; n];
         let mut prev_wn = f64::INFINITY;
         let crit = self.criterion(&ws.tolerances());
         let slope = |out: &[f64], x: &[f64]| -> Vec<f64> {
@@ -201,41 +206,51 @@ impl CompiledDc {
 
         for it in 0..IRK_STAGE_MAX_ITER {
             ws.stats.iters += 1;
-            // Building/refreshing the factorization needs dF/dx (full `tape_step`);
-            // a reused factorization needs only F (the cheaper `tape_res`).
+            // Building/refreshing the factorization needs dF/dx (full `tape_step_dc`);
+            // a reused factorization needs only F (the cheaper `tape_res_dc`).
             let refresh = !ws.fac_fresh;
             self.patch_inputs(&x, &ws.zc, ti, &mut ws.inputs);
             if refresh {
                 ws.stats.refacs += 1;
-                self.tape_step
-                    .eval_main(&mut ws.step_tok, &ws.inputs, &mut ws.work, &mut ws.out);
+                self.tape_step_dc.eval_main(
+                    &mut ws.step_tok,
+                    &ws.inputs,
+                    &mut ws.work,
+                    &mut ws.out,
+                );
                 let (jac, valbuf) = (&ws.out[n..], &mut ws.valbuf);
                 if !self.factorize_stage(&mut ws.fac, jac, &ws.mass.vals, alpha, GMIN_DC, valbuf) {
                     return (x.clone(), slope(&ws.out, &x), false);
                 }
                 ws.fac_fresh = true;
             } else {
-                self.tape_res
-                    .eval_main(&mut ws.res_tok, &ws.inputs, &mut ws.res_work, &mut ws.out);
+                self.tape_res_dc.eval_main(
+                    &mut ws.res_tok,
+                    &ws.inputs,
+                    &mut ws.res_work,
+                    &mut ws.out,
+                );
             }
-            // r = C(x - xn) - psi + hγ·F̃,  F̃ = F + gmin·x  (F = out[..n]).
-            let dxn: Vec<f64> = (0..n).map(|k| x[k] - xn[k]).collect();
-            ws.mass.matvec(&dxn, &mut ws.cdx);
+            // r = C(x - xn) - psi + hγ·F̃,  F̃ = F + gmin·x  (F = out[..n]),
+            // solved for the Newton step against r / hγ.
             for k in 0..n {
-                r[k] = ws.cdx[k] - ws.psi[k] + hg * (ws.out[k] + GMIN_DC * x[k]);
+                ws.dxn[k] = x[k] - xn[k];
             }
-            let rhs: Vec<f64> = (0..n).map(|k| r[k] / hg).collect();
-            let delta = match ws.fac.solve(&rhs) {
-                Some(d) => d,
-                None => return (x.clone(), slope(&ws.out, &x), false),
-            };
+            ws.mass.matvec(&ws.dxn, &mut ws.cdx);
+            for k in 0..n {
+                let r = ws.cdx[k] - ws.psi[k] + hg * (ws.out[k] + GMIN_DC * x[k]);
+                ws.rhs[k] = r / hg;
+            }
+            if !ws.fac.solve_into(&ws.rhs, &mut step) {
+                return (x.clone(), slope(&ws.out, &x), false);
+            }
 
             // Scaled update norm (convergence + stall detection).
-            let (wn, worst) = crit.update_norm(&delta, &x);
+            let (wn, worst) = crit.update_norm(&step, &x);
             if ws.trace {
                 eprintln!(
                     "tran:     stage t={ti:.9e} it={it} wn={wn:.3e} worst=x[{worst}] delta={:.3e} x={:.6e}{}",
-                    delta[worst],
+                    step[worst],
                     x[worst],
                     if refresh { " (refactored)" } else { "" }
                 );
@@ -246,9 +261,12 @@ impl CompiledDc {
             // `h` shrinks, which shortens the move without bending the Newton
             // direction. Device limiting still applies, on the device's own
             // scale.
-            step[..n].copy_from_slice(&delta[..n]);
             if !self.limits.is_empty() {
-                let x_new: Vec<f64> = (0..n).map(|k| x[k] - step[k]).collect();
+                let x_new: Vec<f64> = if ws.trace {
+                    (0..n).map(|k| x[k] - step[k]).collect()
+                } else {
+                    Vec::new()
+                };
                 newton::limit_step(&self.limits, &x, &mut step[..n]);
                 if ws.trace {
                     let x_lim: Vec<f64> = (0..n).map(|k| x[k] - step[k]).collect();
@@ -315,7 +333,7 @@ impl CompiledDc {
         let n = self.n;
         ws.fill_hist(t);
         self.patch_inputs(x, &ws.zc, t, &mut ws.inputs);
-        self.tape_step
+        self.tape_step_dc
             .eval_main(&mut ws.step_tok, &ws.inputs, &mut ws.work, &mut ws.out);
         let (jac, valbuf) = (&ws.out[n..], &mut ws.valbuf);
         let ok = self.factorize_stage(

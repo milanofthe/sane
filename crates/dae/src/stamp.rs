@@ -16,14 +16,16 @@
 //!
 //! This is exact, not an approximation: a symbol renaming `sigma` commutes with
 //! differentiation, so `subst(d/d$p canon, sigma) == d/d(sigma $p) instance`.
-//! The assembled entries are therefore identical (after hash-consing) to
-//! differentiating each contribution directly -- it is purely a build-time win,
-//! and it preserves the exact expression structure (so the numerically robust
-//! `select`/clamp forms are kept, unlike reverse-mode AD).
+//! The assembled entries are therefore those of differentiating each
+//! contribution directly -- it is purely a build-time win. A template is
+//! differentiated per block the way [`rsdag::sparse_jacobian`] treats a row:
+//! forward sweeps for the few ports of dF/dx and dF/dx', one reverse sweep for
+//! the many parameters of dF/dp. Both modes share the local rules (domain
+//! guards, `select`/clamp subgradients) and give the same values.
 
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
-use rsdag::{differentiate, ExprId, Node, ReduceOp, SymbolId};
+use rsdag::{ExprId, Node, ReduceOp, SymbolId};
 use sane_core::Graph;
 
 /// One element contribution to the DAE: `expr` is summed into residual `row`.
@@ -247,6 +249,27 @@ pub fn assemble_jacobians(
     let mut targets: Vec<(usize, usize, usize)> = Vec::new(); // (block, col, dcanon idx)
     for stamp in stamps {
         let c = canonicalize(ctx, stamp.expr, t, is_var, &mut pool);
+        // The template's derivatives this instance needs and the cache lacks,
+        // per block in one call. Only the placeholders that are columns of
+        // SOME block are differentiated, so dF/dx never pays for parameters.
+        for col_of in col_ofs {
+            let missing: Vec<SymbolId> = c
+                .vars
+                .iter()
+                .filter(|&&(cs, is)| col_of(is).is_some() && !cache.contains_key(&(c.canon, cs)))
+                .map(|&(cs, _)| cs)
+                .collect();
+            if missing.is_empty() {
+                continue;
+            }
+            for &cs in &missing {
+                cache.insert((c.canon, cs), None);
+            }
+            let row = rsdag::sparse_jacobian(ctx, &[c.canon], &missing);
+            for &(j, d) in &row[0] {
+                cache.insert((c.canon, missing[j]), Some(d));
+            }
+        }
         dcanons.clear();
         targets.clear();
         for &(canon_sym, inst_sym) in &c.vars {
@@ -254,18 +277,9 @@ pub fn assemble_jacobians(
                 let Some(col) = col_of(inst_sym) else {
                     continue;
                 };
-                // Only the placeholders that are columns of SOME block are
-                // differentiated, so dF/dx never pays for parameter columns.
-                let dcanon = match cache.get(&(c.canon, canon_sym)) {
-                    Some(&d) => d,
-                    None => {
-                        let dd = differentiate(ctx, c.canon, canon_sym);
-                        let d = if ctx.is_zero(dd) { None } else { Some(dd) };
-                        cache.insert((c.canon, canon_sym), d);
-                        d
-                    }
+                let Some(dcanon) = cache[&(c.canon, canon_sym)] else {
+                    continue;
                 };
-                let Some(dcanon) = dcanon else { continue };
                 let k = match dcanons.iter().position(|&d| d == dcanon) {
                     Some(k) => k,
                     None => {

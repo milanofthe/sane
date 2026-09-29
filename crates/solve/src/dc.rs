@@ -37,38 +37,43 @@ impl CompiledDc {
         jac: &[f64],
         gmin: f64,
         rhs: &[f64],
+        dx: &mut [f64],
         valbuf: &mut Vec<f64>,
         fac: &mut Option<sparse::Refactorable<'a>>,
-    ) -> Option<Vec<f64>> {
-        let diag = vec![gmin; self.n];
-        self.solve_with_diag(jac, &diag, rhs, valbuf, fac)
+    ) -> bool {
+        let diag = std::iter::repeat_n(gmin, self.n);
+        self.solve_with_diag(jac, diag, rhs, dx, valbuf, fac)
     }
 
-    /// Solve `(J + diag(d)) dx = rhs` with the Jacobian nonzeros `jac` (in the
-    /// compiled order) and a per-row diagonal shunt `d`: the reused symbolic
-    /// pattern with a numeric-only refactor, or, for a degenerate pattern the
-    /// symbolic analysis rejected, a one-shot triplet factorization.
+    /// Solve `(J + diag(d)) dx = rhs` into `dx` with the Jacobian nonzeros
+    /// `jac` (in the compiled order) and a per-row diagonal shunt `d`: the
+    /// reused symbolic pattern refactored in place, or, for a degenerate
+    /// pattern the symbolic analysis rejected, a one-shot triplet
+    /// factorization. `false` when singular.
     fn solve_with_diag<'a>(
         &'a self,
         jac: &[f64],
-        diag: &[f64],
+        diag: impl IntoIterator<Item = f64>,
         rhs: &[f64],
+        dx: &mut [f64],
         valbuf: &mut Vec<f64>,
         fac: &mut Option<sparse::Refactorable<'a>>,
-    ) -> Option<Vec<f64>> {
+    ) -> bool {
         match &self.symbolic {
             Some(sym) => {
                 // values: jacobian nonzeros, then the full diagonal.
                 valbuf.clear();
                 valbuf.extend_from_slice(jac);
-                valbuf.extend_from_slice(diag);
+                valbuf.extend(diag);
                 let f = fac.get_or_insert_with(|| sym.pattern.factorizer());
-                if !f.factor(valbuf, self.tricks.row_equilibration) {
-                    return None;
-                }
-                f.solve(rhs)
+                f.factor(valbuf, self.tricks.row_equilibration) && f.solve_into(rhs, dx)
             }
-            None => self.solve_triplets(jac, &[], diag, rhs),
+            None => {
+                let diag: Vec<f64> = diag.into_iter().collect();
+                self.solve_triplets(jac, &[], &diag, rhs)
+                    .map(|x| dx.copy_from_slice(&x))
+                    .is_some()
+            }
         }
     }
 
@@ -95,7 +100,7 @@ impl CompiledDc {
             cols.push(i);
             vals.push(d);
         }
-        sparse::factor_triplets_both(n, &rows, &cols, &vals)?.solve(rhs)
+        sparse::factor_triplets(n, &rows, &cols, &vals)?.solve(rhs)
     }
 
     /// Residual half of the convergence test: every row's residual `F_i + gmin*x_i`
@@ -177,7 +182,7 @@ impl CompiledDc {
         tricks: SolverTricks,
     ) -> (Vec<f64>, bool, usize) {
         let n = self.n;
-        let xdot = vec![0.0; n];
+        let xdot: &[f64] = &[];
         let mut x = if x_init.len() == n {
             x_init.to_vec()
         } else {
@@ -189,7 +194,9 @@ impl CompiledDc {
         let mut valbuf = Vec::new();
         // Per-iteration scratch reused across the whole solve (no realloc per step).
         let mut rhs = vec![0.0; n];
+        let mut dx = vec![0.0; n];
         let mut step = vec![0.0; n];
+        let mut trial = vec![0.0; n];
         // KLU factorization cache: full pivoting on the first iteration, frozen
         // pivot replay (numeric-only refactor) on the rest of this Newton loop.
         let mut fac: Option<sparse::Refactorable> = None;
@@ -208,14 +215,14 @@ impl CompiledDc {
         // only the main phase runs per iteration (the prolog reads no state,
         // so the initial `x` in `inputs` is irrelevant to it). The tokens pin
         // each buffer's backend for the episode.
-        self.fill_inputs(&x, &xdot, p, 0.0, &mut inputs);
-        let mut step_tok = self.tape_step.eval_prolog(&inputs, &mut work);
-        let mut res_tok = self.tape_res.eval_prolog(&inputs, &mut wb);
+        self.fill_inputs(&x, xdot, p, 0.0, &mut inputs);
+        let mut step_tok = self.tape_step_dc.eval_prolog(&inputs, &mut work);
+        let mut res_tok = self.tape_res_dc.eval_prolog(&inputs, &mut wb);
         let mut stall = newton::StallGuard::new();
 
         for it in 0..max_iter {
-            self.fill_inputs(&x, &xdot, p, 0.0, &mut inputs);
-            self.tape_step
+            self.fill_inputs(&x, xdot, p, 0.0, &mut inputs);
+            self.tape_step_dc
                 .eval_main(&mut step_tok, &inputs, &mut work, &mut out);
             // Residual of the *homotopy* system F(x) + gmin*x: the diagonal
             // gmin term must enter the norm so the line search measures the
@@ -249,14 +256,13 @@ impl CompiledDc {
             // identity fast path in `sparse::Refactorable`, halves purely
             // linear solves). The residual test above always judges the true
             // tape residual, so acceptance quality is unchanged.
-            if res_ok {
-                if let Some(dxp) = fac.as_mut().and_then(|f| f.solve(&rhs)) {
-                    if self.update_converged(&dxp, &x, conv) {
-                        return (x, true, it);
-                    }
-                }
+            if res_ok
+                && fac.as_mut().is_some_and(|f| f.solve_into(&rhs, &mut dx))
+                && self.update_converged(&dx, &x, conv)
+            {
+                return (x, true, it);
             }
-            let dx: Vec<f64> = if use_partition {
+            let partitioned = use_partition && {
                 let part = self.partition.as_ref().unwrap();
                 if lin_cache.is_none() {
                     lin_cache = self.build_lin_cache(part, &out[n..], gmin);
@@ -264,22 +270,17 @@ impl CompiledDc {
                         use_partition = false; // degenerate: fall back to full LU
                     }
                 }
-                match lin_cache
+                lin_cache
                     .as_ref()
                     .and_then(|cache| self.solve_partitioned(cache, part, &out[n..], &rhs))
-                {
-                    Some(d) => d,
-                    None => match self.solve_step(&out[n..], gmin, &rhs, &mut valbuf, &mut fac) {
-                        Some(d) => d,
-                        None => return (x, res_ok, it),
-                    },
-                }
-            } else {
-                match self.solve_step(&out[n..], gmin, &rhs, &mut valbuf, &mut fac) {
-                    Some(d) => d,
-                    None => return (x, res_ok, it),
-                }
+                    .map(|d| dx.copy_from_slice(&d))
+                    .is_some()
             };
+            if !partitioned
+                && !self.solve_step(&out[n..], gmin, &rhs, &mut dx, &mut valbuf, &mut fac)
+            {
+                return (x, res_ok, it);
+            }
 
             // Converged when both the residual and the proposed update are small.
             // Near the solution the limiting and line search below are inactive, so
@@ -336,9 +337,9 @@ impl CompiledDc {
             } else {
                 1
             };
-            let alpha = newton::backtrack(&mut x, &step, fnorm, tries, |trial| {
-                self.fill_inputs(trial, &xdot, p, 0.0, &mut inb);
-                self.tape_res
+            let alpha = newton::backtrack(&mut x, &step, &mut trial, fnorm, tries, |trial| {
+                self.fill_inputs(trial, xdot, p, 0.0, &mut inb);
+                self.tape_res_dc
                     .eval_main(&mut res_tok, &inb, &mut wb, &mut ob);
                 shunted_norm(&ob, trial, gmin)
             });
@@ -349,8 +350,8 @@ impl CompiledDc {
             if tricks.composite_step && alpha == 1.0 {
                 if let Some(f) = fac.as_mut() {
                     let res_norm = |ob: &[f64], xx: &[f64]| shunted_norm(ob, xx, gmin);
-                    self.fill_inputs(&x, &xdot, p, 0.0, &mut inb);
-                    self.tape_res
+                    self.fill_inputs(&x, xdot, p, 0.0, &mut inb);
+                    self.tape_res_dc
                         .eval_main(&mut res_tok, &inb, &mut wb, &mut ob);
                     let f1 = res_norm(&ob, &x);
                     for i in 0..n {
@@ -359,13 +360,15 @@ impl CompiledDc {
                     // Taken whenever it contracts the residual; gating it on
                     // the contraction regime was measured and declined (see
                     // the constants module).
-                    if let Some(d2) = f.solve(&rhs) {
-                        let mut trial: Vec<f64> = (0..n).map(|i| x[i] - d2[i]).collect();
-                        if tricks.device_limiting && !self.limits.is_empty() {
-                            trial = limiting::apply(&self.limits, &x, &trial);
+                    if f.solve_into(&rhs, &mut dx) {
+                        for i in 0..n {
+                            trial[i] = x[i] - dx[i];
                         }
-                        self.fill_inputs(&trial, &xdot, p, 0.0, &mut inb);
-                        self.tape_res
+                        if tricks.device_limiting && !self.limits.is_empty() {
+                            limiting::apply_in_place(&self.limits, &x, &mut trial);
+                        }
+                        self.fill_inputs(&trial, xdot, p, 0.0, &mut inb);
+                        self.tape_res_dc
                             .eval_main(&mut res_tok, &inb, &mut wb, &mut ob);
                         let f2 = res_norm(&ob, &trial);
                         if trace {
@@ -375,7 +378,7 @@ impl CompiledDc {
                             ));
                         }
                         if f2 < f1 {
-                            x = trial;
+                            std::mem::swap(&mut x, &mut trial);
                         }
                     }
                 }
@@ -401,7 +404,7 @@ impl CompiledDc {
         // Diagonal position of each node within the Jacobian value array, fixed
         // by the sparsity pattern and precomputed once in `CompiledDc`.
         let diag_idx = &self.diag_idx;
-        let xdot = vec![0.0; n];
+        let xdot: &[f64] = &[];
         let mut x = vec![0.0; n];
         let (mut inputs, mut work, mut out) = (Vec::new(), Vec::new(), Vec::new());
         let (mut inb, mut wb, mut ob) = (Vec::new(), Vec::new(), Vec::new());
@@ -409,7 +412,9 @@ impl CompiledDc {
         let mut jacbuf: Vec<f64> = Vec::new();
         // Per-iteration scratch reused across the whole solve (no realloc per step).
         let mut rhs = vec![0.0; n];
+        let mut dx = vec![0.0; n];
         let mut step = vec![0.0; n];
+        let mut trial = vec![0.0; n];
         let mut fac: Option<sparse::Refactorable> = None;
         let (mut iterms, mut iwork) = (Vec::new(), Vec::new());
         let trace = sane_core::config().dc_trace;
@@ -419,12 +424,12 @@ impl CompiledDc {
 
         for _ in 0..ADAPT_MAX_ITER {
             iters += 1;
-            self.fill_inputs(&x, &xdot, p, 0.0, &mut inputs);
-            self.tape_step.eval(&inputs, &mut work, &mut out);
+            self.fill_inputs(&x, xdot, p, 0.0, &mut inputs);
+            self.tape_step_dc.eval(&inputs, &mut work, &mut out);
             let fnorm = shunted_norm(&out[..n], &x, GMIN_DC);
             if fnorm < best_fnorm {
                 best_fnorm = fnorm;
-                best_x = x.clone();
+                best_x.clone_from(&x);
             }
             if trace {
                 sane_core::log::debug(&format!("DCADAPT it={iters} fnorm={fnorm:.3e}"));
@@ -454,18 +459,15 @@ impl CompiledDc {
             }
             // Early acceptance with the previous iteration's factors (see the
             // fast-path Newton): probe the update half before refactoring.
-            if res_ok {
-                if let Some(dxp) = fac.as_mut().and_then(|f| f.solve(&rhs)) {
-                    if self.update_converged(&dxp, &x, conv) {
-                        return (x, true, iters);
-                    }
-                }
-            }
-            let dx: Vec<f64> = match self.solve_step(&jacbuf, GMIN_DC, &rhs, &mut valbuf, &mut fac)
+            if res_ok
+                && fac.as_mut().is_some_and(|f| f.solve_into(&rhs, &mut dx))
+                && self.update_converged(&dx, &x, conv)
             {
-                Some(d) => d,
-                None => return (x, res_ok, iters),
-            };
+                return (x, true, iters);
+            }
+            if !self.solve_step(&jacbuf, GMIN_DC, &rhs, &mut dx, &mut valbuf, &mut fac) {
+                return (x, res_ok, iters);
+            }
             if self.update_converged(&dx, &x, conv) {
                 if res_ok {
                     return (x, true, iters);
@@ -491,11 +493,18 @@ impl CompiledDc {
                 newton::limit_step(&self.limits, &x, &mut step[..n]);
             }
             // Backtracking line search on the (true) residual norm.
-            newton::backtrack(&mut x, &step, fnorm, LINE_SEARCH_TRIES, |trial| {
-                self.fill_inputs(trial, &xdot, p, 0.0, &mut inb);
-                self.tape_res.eval(&inb, &mut wb, &mut ob);
-                shunted_norm(&ob, trial, GMIN_DC)
-            });
+            newton::backtrack(
+                &mut x,
+                &step,
+                &mut trial,
+                fnorm,
+                LINE_SEARCH_TRIES,
+                |trial| {
+                    self.fill_inputs(trial, xdot, p, 0.0, &mut inb);
+                    self.tape_res_dc.eval(&inb, &mut wb, &mut ob);
+                    shunted_norm(&ob, trial, GMIN_DC)
+                },
+            );
         }
         // Not converged to tol: return the best (lowest-residual) iterate, which a
         // late drift after the damping decayed would otherwise have spoiled.
@@ -672,7 +681,11 @@ impl CompiledDc {
         let (_, _, jv) = self.jacobian_x_sparse(x, &zeros, p, 0.0);
         let mut valbuf = Vec::new();
         let mut fac: Option<sparse::Refactorable> = None;
-        let s = self.solve_step(&jv, GMIN_DC, x, &mut valbuf, &mut fac)?; // (J + g*I) s = x  =>  dx/dg = -s
+        // (J + g*I) s = x  =>  dx/dg = -s
+        let mut s = vec![0.0; n];
+        if !self.solve_step(&jv, GMIN_DC, x, &mut s, &mut valbuf, &mut fac) {
+            return None;
+        }
         let mut worst: Option<(usize, f64)> = None;
         for i in (0..n).filter(|&i| self.is_node(i)) {
             let dv = GMIN_DC * s[i].abs();
@@ -1055,7 +1068,7 @@ impl CompiledDc {
         max_iter: usize,
     ) -> (Vec<f64>, bool, usize) {
         let n = self.n;
-        let xdot = vec![0.0; n];
+        let xdot: &[f64] = &[];
         let mut x = if x_init.len() == n {
             x_init.to_vec()
         } else {
@@ -1074,8 +1087,8 @@ impl CompiledDc {
         // Rescale each pinned row's spring to dominate that row's own couplings
         // at the start point (one extra tape evaluation).
         let gpin: Vec<f64> = {
-            self.fill_inputs(&x, &xdot, p, 0.0, &mut inputs);
-            self.tape_step.eval(&inputs, &mut work, &mut out);
+            self.fill_inputs(&x, xdot, p, 0.0, &mut inputs);
+            self.tape_step_dc.eval(&inputs, &mut work, &mut out);
             let jac = &out[n..];
             pin.idx
                 .iter()
@@ -1102,19 +1115,20 @@ impl CompiledDc {
         // pivot replay (numeric-only refactor) afterwards.
         let mut fac: Option<sparse::Refactorable> = None;
         // Pinned residual `F + GMIN_DC*x + g*(x - target)` on the pinned rows.
-        let pin_res = |x: &[f64], res: &[f64]| -> Vec<f64> {
-            let mut h: Vec<f64> = (0..n).map(|i| res[i] + GMIN_DC * x[i]).collect();
+        let pin_res = |x: &[f64], res: &[f64], h: &mut Vec<f64>| {
+            h.clear();
+            h.extend((0..n).map(|i| res[i] + GMIN_DC * x[i]));
             for (k, &i) in pin.idx.iter().enumerate() {
                 h[i] += gpin[k] * (x[i] - pin.target[k]);
             }
-            h
         };
+        let (mut h, mut dx, mut trial) = (Vec::new(), vec![0.0; n], vec![0.0; n]);
 
         let mut stall = newton::StallGuard::new();
         for it in 0..max_iter {
-            self.fill_inputs(&x, &xdot, p, 0.0, &mut inputs);
-            self.tape_step.eval(&inputs, &mut work, &mut out); // residual ++ jac-x
-            let h = pin_res(&x, &out[..n]);
+            self.fill_inputs(&x, xdot, p, 0.0, &mut inputs);
+            self.tape_step_dc.eval(&inputs, &mut work, &mut out); // residual ++ jac-x
+            pin_res(&x, &out[..n], &mut h);
             let fnorm = norm2(&h);
             if stall.stalled(fnorm) {
                 return (x, false, it);
@@ -1126,19 +1140,19 @@ impl CompiledDc {
             let crit = self.criterion(conv).with_row_floor(&row_floor);
             let res_ok = crit.residual_ok(&h, &x, 0.0);
             // J + GMIN_DC*I + g_set on the pinned diagonals (duplicates summed).
-            let dx = match self.solve_with_diag(&out[n..], &diag, &h, &mut valbuf, &mut fac) {
-                Some(d) => d,
-                None => return (x, false, it),
-            };
+            let diag = diag.iter().copied();
+            if !self.solve_with_diag(&out[n..], diag, &h, &mut dx, &mut valbuf, &mut fac) {
+                return (x, false, it);
+            }
             if res_ok && crit.update_ok(&dx, &x) {
                 return (x, true, it);
             }
-            let step: Vec<f64> = dx.clone();
             // Backtracking line search on the pinned residual norm.
-            newton::backtrack(&mut x, &step, fnorm, LINE_SEARCH_TRIES, |trial| {
-                self.fill_inputs(trial, &xdot, p, 0.0, &mut inb);
-                self.tape_res.eval(&inb, &mut wb, &mut ob);
-                norm2(&pin_res(trial, &ob))
+            newton::backtrack(&mut x, &dx, &mut trial, fnorm, LINE_SEARCH_TRIES, |trial| {
+                self.fill_inputs(trial, xdot, p, 0.0, &mut inb);
+                self.tape_res_dc.eval(&inb, &mut wb, &mut ob);
+                pin_res(trial, &ob, &mut h);
+                norm2(&h)
             });
         }
         (x, false, max_iter)
@@ -1184,9 +1198,10 @@ impl CompiledDc {
             return (x, false, iters);
         }
 
-        let xdot = vec![0.0; n];
+        let xdot: &[f64] = &[];
         let (mut inputs, mut work, mut out, mut valbuf) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut tangent = vec![0.0; n];
         // Tangent-solve factorization cache (fixed SOURCE_GMIN along the ramp).
         let mut fac: Option<sparse::Refactorable> = None;
         let mut lambda = 0.0_f64;
@@ -1205,12 +1220,22 @@ impl CompiledDc {
             let neg_b: Vec<f64> = (0..n).map(|i| r_zero[i] - r_full[i]).collect();
             // J = dF/dx at x (independent of source values).
             self.fill_inputs(&x, &xdot, p, 0.0, &mut inputs);
-            self.tape_step.eval(&inputs, &mut work, &mut out);
-            let x_pred: Vec<f64> =
-                match self.solve_step(&out[n..], SOURCE_GMIN, &neg_b, &mut valbuf, &mut fac) {
-                    Some(t) => (0..n).map(|i| x[i] + t[i] * (target - lambda)).collect(),
-                    None => x.clone(),
-                };
+            self.tape_step_dc.eval(&inputs, &mut work, &mut out);
+            let solved = self.solve_step(
+                &out[n..],
+                SOURCE_GMIN,
+                &neg_b,
+                &mut tangent,
+                &mut valbuf,
+                &mut fac,
+            );
+            let x_pred: Vec<f64> = if solved {
+                (0..n)
+                    .map(|i| x[i] + tangent[i] * (target - lambda))
+                    .collect()
+            } else {
+                x.clone()
+            };
 
             let ps = scaled(target);
             let (xc, cc, it) = self.newton(
@@ -1377,20 +1402,11 @@ impl CompiledDc {
     }
 
     /// Companion residual `H = F(x) + (1 - lambda)*G_comp*x` at `(x, lambda)`.
-    fn companion_residual(
-        &self,
-        x: &[f64],
-        p: &[f64],
-        lambda: f64,
-        work: &mut Vec<f64>,
-    ) -> Vec<f64> {
+    fn companion_residual(&self, x: &[f64], p: &[f64], lambda: f64, tb: &mut TapeBufs) {
         let n = self.n;
-        let mut inputs = Vec::new();
-        let xdot = vec![0.0; n];
-        self.fill_inputs(x, &xdot, p, 0.0, &mut inputs);
-        let mut out = Vec::new();
-        self.tape_res.eval(&inputs, work, &mut out);
-        let mut h = out;
+        self.fill_inputs(x, &[], p, 0.0, &mut tb.inputs);
+        self.tape_res_dc.eval(&tb.inputs, &mut tb.work, &mut tb.out);
+        let h = &mut tb.out;
         let s = 1.0 - lambda;
         for &(r, c, g) in &self.companion {
             h[r] += s * g * x[c];
@@ -1402,28 +1418,28 @@ impl CompiledDc {
         for i in (0..n).filter(|&i| self.is_node(i)) {
             h[i] += s * GMIN_START * x[i];
         }
-        h
     }
 
     /// Solve `[J(x) + (1-lambda)*G_comp + GMIN_DC*I] dx = rhs` (the augmented
     /// homotopy Jacobian), evaluating `J` from the step tape at `x`. `fac` is
     /// the caller loop's factorization cache over the companion pattern (KLU
     /// numeric-only refactor after the first iteration).
+    #[allow(clippy::too_many_arguments)]
     fn companion_solve<'a>(
         &'a self,
         x: &[f64],
         p: &[f64],
         lambda: f64,
         rhs: &[f64],
+        dx: &mut [f64],
+        tb: &mut TapeBufs,
         fac: &mut Option<sparse::Refactorable<'a>>,
-    ) -> Option<Vec<f64>> {
+    ) -> bool {
         let n = self.n;
-        let xdot = vec![0.0; n];
-        let mut inputs = Vec::new();
-        self.fill_inputs(x, &xdot, p, 0.0, &mut inputs);
-        let (mut work, mut out) = (Vec::new(), Vec::new());
-        self.tape_step.eval(&inputs, &mut work, &mut out);
-        let jac = &out[n..];
+        self.fill_inputs(x, &[], p, 0.0, &mut tb.inputs);
+        self.tape_step_dc
+            .eval(&tb.inputs, &mut tb.work, &mut tb.out);
+        let jac = &tb.out[n..];
         let s = 1.0 - lambda;
         // Reuse a precomputed symbolic (#52): the pattern (dF/dx nonzeros + companion
         // positions + full diagonal) is fixed across the continuation, so only the
@@ -1431,7 +1447,8 @@ impl CompiledDc {
         // LU per iteration rather than a fresh ordering + symbolic analysis.
         // Value order must match `companion_symbolic`: jac ++ companion ++ diagonal.
         if let Some(sym) = self.companion_symbolic() {
-            let mut valbuf: Vec<f64> = Vec::with_capacity(jac.len() + self.companion.len() + n);
+            let valbuf = &mut tb.vals;
+            valbuf.clear();
             valbuf.extend_from_slice(jac);
             for &(_, _, g) in &self.companion {
                 valbuf.push(s * g);
@@ -1441,10 +1458,7 @@ impl CompiledDc {
                 valbuf.push(base + GMIN_DC);
             }
             let f = fac.get_or_insert_with(|| sym.pattern.factorizer());
-            if !f.factor(&valbuf, self.tricks.row_equilibration) {
-                return None;
-            }
-            return f.solve(rhs);
+            return f.factor(valbuf, self.tricks.row_equilibration) && f.solve_into(rhs, dx);
         }
         // Fallback (degenerate pattern): one-shot triplet factorization.
         let extra: Vec<(usize, usize, f64)> = self
@@ -1456,6 +1470,8 @@ impl CompiledDc {
             .map(|i| if self.is_node(i) { s * GMIN_START } else { 0.0 } + GMIN_DC)
             .collect();
         self.solve_triplets(jac, &extra, &diag, rhs)
+            .map(|x| dx.copy_from_slice(&x))
+            .is_some()
     }
 
     /// Lazily build and cache the reused symbolic for the companion-augmented
@@ -1494,13 +1510,15 @@ impl CompiledDc {
         } else {
             vec![0.0; n]
         };
-        let mut work = Vec::new();
+        let (mut res, mut jac) = (TapeBufs::default(), TapeBufs::default());
+        let (mut step, mut trial) = (vec![0.0; n], vec![0.0; n]);
         // Companion-pattern factorization cache for this lambda's corrector.
         let mut fac: Option<sparse::Refactorable> = None;
         let mut stall = newton::StallGuard::new();
         for it in 0..max_iter {
-            let h = self.companion_residual(&x, p, lambda, &mut work);
-            let fnorm = norm2(&h);
+            self.companion_residual(&x, p, lambda, &mut res);
+            let h = &res.out;
+            let fnorm = norm2(h);
             if stall.stalled(fnorm) {
                 return (x, false, it);
             }
@@ -1513,14 +1531,12 @@ impl CompiledDc {
             // there changed which point the polish started from (measured as
             // termination noise in a finite-difference check); the final
             // polish in `newton` enforces both halves.
-            if self.residual_converged(&h, &x, 0.0, conv) {
+            if self.residual_converged(h, &x, 0.0, conv) {
                 return (x, true, it);
             }
-            let dx = match self.companion_solve(&x, p, lambda, &h, &mut fac) {
-                Some(d) => d,
-                None => return (x, false, it),
-            };
-            let mut step: Vec<f64> = dx.clone();
+            if !self.companion_solve(&x, p, lambda, h, &mut step, &mut jac, &mut fac) {
+                return (x, false, it);
+            }
             // Curve-aware per-device limiting (path-only; see `newton`).
             if tricks.device_limiting && !self.limits.is_empty() {
                 newton::limit_step(&self.limits, &x, &mut step[..n]);
@@ -1531,8 +1547,9 @@ impl CompiledDc {
             } else {
                 1
             };
-            newton::backtrack(&mut x, &step, fnorm, tries, |trial| {
-                norm2(&self.companion_residual(trial, p, lambda, &mut work))
+            newton::backtrack(&mut x, &step, &mut trial, fnorm, tries, |trial| {
+                self.companion_residual(trial, p, lambda, &mut res);
+                norm2(&res.out)
             });
         }
         (x, false, max_iter)
@@ -1567,6 +1584,7 @@ impl CompiledDc {
         let mut steps = 0usize;
         // Tangent-solve factorization cache (pattern fixed along the ramp).
         let mut fac_t: Option<sparse::Refactorable> = None;
+        let (mut tb, mut tangent) = (TapeBufs::default(), vec![0.0; n]);
         while lambda < 1.0 {
             steps += 1;
             if steps > HOMOTOPY_MAX_STEPS {
@@ -1582,9 +1600,12 @@ impl CompiledDc {
                 rhs_t[r] += g * x[c];
             }
             let dl = target - lambda;
-            let x_pred: Vec<f64> = match self.companion_solve(&x, p, lambda, &rhs_t, &mut fac_t) {
-                Some(t) => (0..n).map(|i| x[i] + t[i] * dl).collect(),
-                None => x.clone(),
+            let solved =
+                self.companion_solve(&x, p, lambda, &rhs_t, &mut tangent, &mut tb, &mut fac_t);
+            let x_pred: Vec<f64> = if solved {
+                (0..n).map(|i| x[i] + tangent[i] * dl).collect()
+            } else {
+                x.clone()
             };
             let (xc, cc, it) =
                 self.companion_newton(p, &x_pred, target, conv, GMIN_STEP_MAX_ITER, tricks);
@@ -1608,6 +1629,16 @@ impl CompiledDc {
         let (xf, cc, it) = self.newton(p, &x, GMIN_DC, conv, GMIN_STEP_MAX_ITER, tricks);
         (xf, cc, iters + it)
     }
+}
+
+/// One tape evaluation site's buffers, and the factor values built from its
+/// outputs: kept by a Newton loop across its iterations.
+#[derive(Default)]
+struct TapeBufs {
+    inputs: Vec<f64>,
+    work: Vec<f64>,
+    out: Vec<f64>,
+    vals: Vec<f64>,
 }
 
 fn norm2(v: &[f64]) -> f64 {

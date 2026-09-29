@@ -67,6 +67,11 @@ pub struct Policy {
     /// runs only when this many times shorter (an interpreted op costs
     /// about this many native ones).
     pub spec_interp_cost: usize,
+    /// Choices thrash, and specialization goes off, once at least
+    /// `spec_thrash_flips` flips came at one per fewer than
+    /// `spec_thrash_evals` evaluations.
+    pub spec_thrash_flips: u64,
+    pub spec_thrash_evals: u64,
 }
 
 impl Default for Policy {
@@ -81,6 +86,8 @@ impl Default for Policy {
             spec_compile_after: 16,
             spec_compile_budget: 4,
             spec_interp_cost: 4,
+            spec_thrash_flips: 8,
+            spec_thrash_evals: 8,
         }
     }
 }
@@ -233,12 +240,7 @@ impl Adaptive {
         if let (Some((ver, native)), Some(sp)) = (st.native.clone(), st.spec.clone()) {
             if ver == st.version {
                 run(&*native, inputs, work, out);
-                let ok = out[sp.n_real()..]
-                    .iter()
-                    .zip(sp.expected())
-                    .all(|(&v, &e)| (v != 0.0) == (e != 0));
-                out.truncate(sp.n_real());
-                if ok {
+                if sp.check_outputs(out) {
                     st.stable = st.stable.saturating_add(1);
                     return true;
                 }
@@ -259,15 +261,8 @@ impl Adaptive {
                 self.maybe_compile_spec(st, cache, &sp, ver);
                 return true;
             }
-            // A region flipped: retrace below, unless flips dominate.
-            st.flips += 1;
-            st.stable = 0;
-            st.version += 1;
-            st.cooldown_until = st.evals + self.policy.spec_flip_cooldown;
-            if st.flips >= 8 && st.evals < st.flips * 8 {
-                self.disable(st, "choices thrash");
-                return false;
-            }
+            self.on_flip(st, inputs, work, out);
+            return true;
         }
         if st.spec.is_none() && st.evals < st.cooldown_until {
             return false; // cooling down: the full tape serves
@@ -316,28 +311,21 @@ impl Adaptive {
                     return Some(Kind::SpecNative(native, sp));
                 }
                 // A parameter change flipped a pinned region.
-                self.flipped(st);
-                let mut tmp = Vec::new();
-                self.retrace(st, inputs, work, &mut tmp);
-            } else {
-                st.native = None;
+                self.on_flip(st, inputs, work, &mut Vec::new());
+                return Some(Kind::Full);
             }
+            st.native = None;
         }
-        for _ in 0..2 {
-            let sp = st.spec.clone()?;
-            if self.native().is_some()
-                && sp.n_ops() * self.policy.spec_interp_cost > self.tape.n_ops()
-            {
-                return None;
-            }
-            if sp.eval_prolog_checked(inputs, work) {
-                return Some(Kind::SpecInterp(sp, st.version));
-            }
-            self.flipped(st);
-            let mut tmp = Vec::new();
-            self.retrace(st, inputs, work, &mut tmp);
+        let sp = st.spec.clone()?;
+        if self.native().is_some() && sp.n_ops() * self.policy.spec_interp_cost > self.tape.n_ops()
+        {
+            return None;
         }
-        None
+        if sp.eval_prolog_checked(inputs, work) {
+            return Some(Kind::SpecInterp(sp, st.version));
+        }
+        self.on_flip(st, inputs, work, &mut Vec::new());
+        Some(Kind::Full)
     }
 
     /// The full tape's prolog, natively when compiled; the state is the
@@ -477,19 +465,26 @@ impl Adaptive {
     /// A main-phase flip: learn and respecialize (or disable on thrash),
     /// with this call's result from the full tape.
     fn flip_retrace(&self, inputs: &[f64], work: &mut Vec<f64>, out: &mut Vec<f64>) {
-        if let Some(cache) = &self.spec {
-            if let Ok(mut st) = cache.lock() {
-                self.flipped(&mut st);
-                if st.flips >= 8 && st.evals < st.flips * 8 {
-                    self.disable(&mut st, "choices thrash");
-                    self.tape.eval(inputs, work, out);
-                } else {
-                    self.retrace(&mut st, inputs, work, out);
-                }
-                return;
-            }
+        match self.spec.as_ref().map(|c| c.lock()) {
+            Some(Ok(mut st)) => self.on_flip(&mut st, inputs, work, out),
+            _ => self.tape.eval(inputs, work, out),
         }
-        self.tape.eval(inputs, work, out);
+    }
+
+    /// A region flipped: count it, and learn it by a traced evaluation of
+    /// the full tape, which is this call's result and leaves the full
+    /// tape's state in `work` (an episode continues full); unless flips
+    /// come too often, and specialization goes off for this tape.
+    fn on_flip(&self, st: &mut Spec, inputs: &[f64], work: &mut Vec<f64>, out: &mut Vec<f64>) {
+        self.flipped(st);
+        if st.flips >= self.policy.spec_thrash_flips
+            && st.evals < st.flips * self.policy.spec_thrash_evals
+        {
+            self.disable(st, "choices thrash");
+            self.tape.eval(inputs, work, out);
+        } else {
+            self.retrace(st, inputs, work, out);
+        }
     }
 
     /// Past the probation, hand the current specialization to the

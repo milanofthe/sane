@@ -345,7 +345,7 @@ impl CompiledDc {
                     jc.push(i);
                     jv.push(GMIN_DC);
                 }
-                let lu = sparse::factor_triplets_both(n, &jr, &jc, &jv)
+                let lu = sparse::factor_triplets(n, &jr, &jc, &jv)
                     .ok_or("transient_adjoint: singular DC Jacobian for the IC term")?;
                 let rhs: Vec<f64> = g0.iter().map(|v| -v).collect();
                 let mu = lu
@@ -435,6 +435,6 @@ impl CompiledDc {
             jc.push(i);
             jv.push(GMIN_DC);
         }
-        sparse::factor_triplets_both(n, &jr, &jc, &jv)
+        sparse::factor_triplets(n, &jr, &jc, &jv)
     }
 }

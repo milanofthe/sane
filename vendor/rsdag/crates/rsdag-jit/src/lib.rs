@@ -2,8 +2,8 @@
 //!
 //! The tape is the evaluation IR; [`Tape::eval`](rsdag::Tape::eval) is the
 //! interpreting backend and [`NativeTape`] the native one: the op stream
-//! emitted straight to AArch64 or x86-64 machine code, at around 40 ns per
-//! op, with the interpreter's storage model as the register allocator's
+//! emitted straight to AArch64 or x86-64 machine code (compiled at around
+//! 100 to 200 ns per op), with the interpreter's storage model as the register allocator's
 //! spill model. The op stream is cut into chunks of [`CHUNK_OPS`]
 //! instructions, each its own function, so compile stays linear and the
 //! chunks build in parallel; a value crossing a chunk boundary simply stays

@@ -86,7 +86,7 @@ pub fn reduce_slice(op: ReduceOp, xs: &[f64]) -> f64 {
     reduce_slice_t(op, xs)
 }
 
-/// [`dot_slice_t`] in `f64`: the two-lane vector twin, bit-identical.
+/// [`dot_slice_t`] in `f64`: the vector twin (AVX or two-lane), bit-identical.
 pub fn dot_slice(a: &[f64], b: &[f64]) -> f64 {
     <f64 as Scalar>::dot_slice(a, b)
 }
@@ -180,6 +180,41 @@ pub const EXP_LIMIT: f64 = 80.0;
 /// (`1/LN_FLOOR`) would blow intermediate values up to `~1e30` and wreck
 /// conditioning. In-range arguments are untouched. See [`unary_f64`].
 pub const LN_FLOOR: f64 = 1e-30;
+
+/// `x^n` for an integer `n`, the reference every evaluator takes: square
+/// and multiply over `|n|` from the low bit, then one division for a
+/// negative exponent. `n = 2` is exactly `x * x` and `n = -1` exactly
+/// `1 / x`, the forms native code emits inline. Not the platform's `powi`,
+/// whose rounding is unspecified and differs between targets (a runtime
+/// `x.powi(-1)` is not `1 / x` on every one).
+pub fn powi_t<T: Scalar>(x: T, n: i32) -> T {
+    let mut e = n.unsigned_abs();
+    let mut base = x;
+    let mut acc: Option<T> = None;
+    while e > 0 {
+        if e & 1 == 1 {
+            acc = Some(match acc {
+                None => base,
+                Some(a) => a.mul(base),
+            });
+        }
+        e >>= 1;
+        if e > 0 {
+            base = base.mul(base);
+        }
+    }
+    let r = acc.unwrap_or_else(T::one);
+    if n < 0 {
+        T::one().div(r)
+    } else {
+        r
+    }
+}
+
+/// [`powi_t`] on `f64`.
+pub fn powi_f64(x: f64, n: i32) -> f64 {
+    powi_t(x, n)
+}
 
 /// Evaluate a unary op on a real argument. Single source of truth shared by the
 /// arena evaluator ([`crate::eval`](mod@crate::eval)) and the compiled tape ([`crate::tape`]).
@@ -449,7 +484,7 @@ pub fn fold_in_place<T: Scalar>(codes: &[u32], c: Option<&[T]>, out: &mut [T]) {
     }
 }
 
-/// [`gemm_t`] in `f64`: the two-lane vector twin, bit-identical.
+/// [`gemm_t`] in `f64`: the vector twin (AVX or two-lane), bit-identical.
 pub fn gemm(a: &[f64], b: &[f64], m: usize, k: usize, n: usize, out: &mut [f64]) {
     <f64 as Scalar>::gemm(a, b, m, k, n, out)
 }
@@ -482,7 +517,7 @@ pub fn gemv_fold(
     <f64 as Scalar>::gemv_fold(a, x, m, n, c, codes, out)
 }
 
-/// [`gemv_t`] in `f64`: the two-lane vector twin, bit-identical.
+/// [`gemv_t`] in `f64`: the vector twin (AVX or two-lane), bit-identical.
 pub fn gemv(a: &[f64], x: &[f64], m: usize, n: usize, out: &mut [f64]) {
     <f64 as Scalar>::gemv(a, x, m, n, out)
 }
@@ -512,83 +547,95 @@ pub fn solve_t<T: Scalar>(a: &[T], b: &[T], n: usize, out: &mut [T]) {
 /// factorization serves every right-hand side; each solution is bit-identical
 /// to its own [`solve_t`] (the pivots depend on `a` alone, and every
 /// right-hand side column runs through the same updates in the same order).
+/// Allocates its scratch; [`solve_many_into`] takes it from the caller.
 pub fn solve_many_t<T: Scalar>(a: &[T], b: &[T], n: usize, k: usize, out: &mut [T]) {
-    T::solve_many(a, b, n, k, out)
+    let mut scratch = vec![T::zero(); solve_scratch_len(n, k)];
+    solve_many_into(a, b, n, k, out, &mut scratch)
+}
+
+/// [`solve_many_t`] over a `scratch` of at least [`solve_scratch_len`]
+/// values, allocating nothing.
+pub fn solve_many_into<T: Scalar>(
+    a: &[T],
+    b: &[T],
+    n: usize,
+    k: usize,
+    out: &mut [T],
+    scratch: &mut [T],
+) {
+    T::solve_many(a, b, n, k, out, &mut scratch[..solve_scratch_len(n, k)])
+}
+
+/// The column panel of the elimination of `n` unknowns, 0 unblocked.
+pub(crate) fn lu_panel(n: usize) -> usize {
+    if n <= LU_UNBLOCKED_MAX {
+        0
+    } else if n < LU_PANEL_SWITCH {
+        LU_PANEL_SMALL
+    } else {
+        LU_PANEL_LARGE
+    }
+}
+
+/// The scratch a solve of `n` unknowns and `k` right-hand sides works in:
+/// the augmented matrix, and past [`LU_UNBLOCKED_MAX`] the panel's buffers
+/// for the trailing update.
+pub fn solve_scratch_len(n: usize, k: usize) -> usize {
+    let (w, nb) = (n + k, lu_panel(n));
+    n * w + if nb > 0 { nb * w + 4 * nb + 4 * w } else { 0 }
+}
+
+/// The scratch of a solve cut into its parts: the augmented matrix `[a | b]`
+/// (filled here, rows of `n + k`), and the panel's transposed columns, its
+/// rows and their product for the trailing update.
+pub(crate) fn solve_parts<'s, T: Copy>(
+    scratch: &'s mut [T],
+    a: &[T],
+    b: &[T],
+    n: usize,
+    k: usize,
+) -> [&'s mut [T]; 4] {
+    let (w, nb) = (n + k, lu_panel(n));
+    let (m, rest) = scratch.split_at_mut(n * w);
+    for i in 0..n {
+        m[i * w..i * w + n].copy_from_slice(&a[i * n..(i + 1) * n]);
+        for c in 0..k {
+            m[i * w + n + c] = b[c * n + i];
+        }
+    }
+    let (ut, rest) = rest.split_at_mut(nb * w);
+    let (lrows, prod) = rest.split_at_mut(4 * nb);
+    [m, ut, lrows, prod]
 }
 
 /// [`solve_many_t`] as the generic reference, for any scalar (the `f64`
 /// twin in `simd` mirrors it step for step).
 pub fn solve_many_generic<T: Scalar>(a: &[T], b: &[T], n: usize, k: usize, out: &mut [T]) {
-    if n <= LU_UNBLOCKED_MAX {
-        solve_unblocked(a, b, n, k, out)
-    } else if n < LU_PANEL_SWITCH {
-        solve_blocked::<T, LU_PANEL_SMALL>(a, b, n, k, out)
-    } else {
-        solve_blocked::<T, LU_PANEL_LARGE>(a, b, n, k, out)
-    }
+    let mut scratch = vec![T::zero(); solve_scratch_len(n, k)];
+    solve_generic_into(a, b, n, k, out, &mut scratch)
 }
 
-/// [`solve_many_t`] right-looking without panels (see [`LU_UNBLOCKED_MAX`]).
-fn solve_unblocked<T: Scalar>(a: &[T], b: &[T], n: usize, k: usize, out: &mut [T]) {
+/// [`solve_many_generic`] over the caller's scratch.
+pub(crate) fn solve_generic_into<T: Scalar>(
+    a: &[T],
+    b: &[T],
+    n: usize,
+    k: usize,
+    out: &mut [T],
+    scratch: &mut [T],
+) {
+    let [m, ut, lrows, prod] = solve_parts(scratch, a, b, n, k);
     let w = n + k;
-    let mut m: Vec<T> = Vec::with_capacity(n * w);
-    for i in 0..n {
-        m.extend_from_slice(&a[i * n..(i + 1) * n]);
-        for c in 0..k {
-            m.push(b[c * n + i]);
-        }
-    }
-    for kk in 0..n {
-        let mut p = kk;
-        let mut best = m[kk * w + kk].magnitude();
-        for i in kk + 1..n {
-            let v = m[i * w + kk].magnitude();
-            if v > best {
-                best = v;
-                p = i;
-            }
-        }
-        if p != kk {
-            for j in 0..w {
-                m.swap(kk * w + j, p * w + j);
-            }
-        }
-        let piv = m[kk * w + kk];
-        for i in kk + 1..n {
-            let l = m[i * w + kk].div(piv);
-            m[i * w + kk] = l;
-            for j in kk + 1..w {
-                let t = l.mul(m[kk * w + j]);
-                m[i * w + j] = m[i * w + j].sub(t);
-            }
-        }
-    }
-    for c in 0..k {
-        let x = &mut out[c * n..(c + 1) * n];
-        for i in (0..n).rev() {
-            let mut s = m[i * w + n + c];
-            for j in i + 1..n {
-                let t = m[i * w + j].mul(x[j]);
-                s = s.sub(t);
-            }
-            x[i] = s.div(m[i * w + i]);
-        }
-    }
-}
-
-/// [`solve_many_t`] with column panels of `NB`.
-fn solve_blocked<T: Scalar, const NB: usize>(a: &[T], b: &[T], n: usize, k: usize, out: &mut [T]) {
-    let w = n + k;
-    let mut m: Vec<T> = Vec::with_capacity(n * w);
-    for i in 0..n {
-        m.extend_from_slice(&a[i * n..(i + 1) * n]);
-        for c in 0..k {
-            m.push(b[c * n + i]);
-        }
-    }
+    let nb = match lu_panel(n) {
+        0 => n,
+        nb => nb,
+    };
     let mut k0 = 0;
     while k0 < n {
-        let k1 = (k0 + NB).min(n);
+        // Unblocked, one panel of every column: each pivot updates the
+        // whole trailing matrix and the right-hand sides.
+        let k1 = (k0 + nb).min(n);
+        let upto = if lu_panel(n) == 0 { w } else { k1 };
         // The panel's columns, right-looking within the panel.
         for k in k0..k1 {
             let mut p = k;
@@ -609,11 +656,14 @@ fn solve_blocked<T: Scalar, const NB: usize>(a: &[T], b: &[T], n: usize, k: usiz
             for i in k + 1..n {
                 let l = m[i * w + k].div(piv);
                 m[i * w + k] = l;
-                for j in k + 1..k1 {
+                for j in k + 1..upto {
                     let t = l.mul(m[k * w + j]);
                     m[i * w + j] = m[i * w + j].sub(t);
                 }
             }
+        }
+        if upto == w {
+            break;
         }
         // The panel's unit lower triangle applied to the columns right of
         // the panel, for the panel's own rows.
@@ -631,14 +681,12 @@ fn solve_blocked<T: Scalar, const NB: usize>(a: &[T], b: &[T], n: usize, k: usiz
         if k1 < n {
             let nb = k1 - k0;
             let cols = w - k1;
-            let mut ut: Vec<T> = vec![T::zero(); cols * nb];
+            let ut = &mut ut[..cols * nb];
             for (jj, j) in (k1..w).enumerate() {
                 for (kk, k) in (k0..k1).enumerate() {
                     ut[jj * nb + kk] = m[k * w + j];
                 }
             }
-            let mut lrows: Vec<T> = vec![T::zero(); 4 * nb];
-            let mut prod: Vec<T> = vec![T::zero(); 4 * cols];
             let mut i = k1;
             while i < n {
                 let rows = (n - i).min(4);
@@ -648,7 +696,7 @@ fn solve_blocked<T: Scalar, const NB: usize>(a: &[T], b: &[T], n: usize, k: usiz
                 }
                 T::gemm(
                     &lrows[..rows * nb],
-                    &ut,
+                    ut,
                     rows,
                     nb,
                     cols,

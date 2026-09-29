@@ -56,14 +56,6 @@ pub enum Output {
     Zero,
 }
 
-/// How a function's outputs are computed.
-pub enum FunctionBody {
-    /// Outputs are expressions over the parameters.
-    Symbolic,
-    /// Outputs are slots of a numeric bundle.
-    Extern(Arc<dyn ExternBundle>),
-}
-
 /// A function as something to call: a bundle and which of its slots
 /// carries each output, so a tape or a sweep picks outputs without the
 /// symbolic expressions. An extern function is its bundle; a symbolic one
@@ -76,29 +68,21 @@ pub struct Body {
     pub slot_of: Vec<Option<u32>>,
 }
 
+/// A function of a [`Graph`](crate::graph::Graph), read through its
+/// accessors and changed only through the graph, so the derivative index
+/// always says what the output roles say.
 pub struct Function {
-    pub name: String,
-    /// Formal leaves in argument order.
-    pub params: Vec<SymbolId>,
-    /// One role per parameter (`Free` unless set).
-    pub param_roles: Vec<ParamRole>,
-    pub outputs: Vec<Output>,
-    /// One role per output (`Plain` unless set; derivative outputs are
-    /// tagged `Derivative`).
-    pub output_roles: Vec<OutputRole>,
-    pub body: FunctionBody,
-    /// A body a consumer compiled itself and registered with
-    /// [`Graph::set_func_body`](crate::Graph::set_func_body), used in place
-    /// of the interpreted body of a symbolic function (a consumer's body may
-    /// cache work over its solve-constant arguments, say) by every program
-    /// whose calls it covers ([`Function::body_for`]); a program that calls
-    /// an expression output it lacks (a derivative demanded later) takes the
-    /// interpreted body until the consumer registers one that covers it.
-    /// The symbolic outputs stay: differentiation and printing read them,
-    /// only the evaluation goes through the registered bundle.
-    pub compiled: Vec<Body>,
-    /// Derivative output `d outputs[out] / d params[param]`, by index.
-    pub(crate) deriv_index: HashMap<(u32, u32), u32>,
+    name: String,
+    params: Vec<SymbolId>,
+    param_roles: Vec<ParamRole>,
+    outputs: Vec<Output>,
+    output_roles: Vec<OutputRole>,
+    /// The numeric bundle of an extern function; `None` for a symbolic one.
+    extern_body: Option<Arc<dyn ExternBundle>>,
+    compiled: Vec<Body>,
+    /// Derivative output `d outputs[out] / d params[param]`, by index: the
+    /// outputs whose role is [`OutputRole::Derivative`].
+    deriv_index: HashMap<(u32, u32), u32>,
 }
 
 /// A function body evaluated by the interpreter: the fallback every consumer
@@ -171,6 +155,93 @@ impl ExternBundle for InterpretedBody {
 }
 
 impl Function {
+    /// A function without outputs over `params`, every role `Free`.
+    pub(crate) fn new(
+        name: &str,
+        params: Vec<SymbolId>,
+        extern_body: Option<Arc<dyn ExternBundle>>,
+    ) -> Function {
+        Function {
+            name: name.to_string(),
+            param_roles: vec![ParamRole::Free; params.len()],
+            params,
+            outputs: Vec::new(),
+            output_roles: Vec::new(),
+            extern_body,
+            compiled: Vec::new(),
+            deriv_index: HashMap::default(),
+        }
+    }
+
+    /// Append an output with its role; returns its index.
+    pub(crate) fn push_output(&mut self, output: Output, role: OutputRole) -> u32 {
+        let k = self.outputs.len() as u32;
+        self.outputs.push(output);
+        self.output_roles.push(OutputRole::Plain);
+        self.set_output_role(k, role);
+        k
+    }
+
+    /// Set the role of output `out`, keeping the derivative index.
+    pub(crate) fn set_output_role(&mut self, out: u32, role: OutputRole) {
+        if let OutputRole::Derivative { of, wrt } = self.output_roles[out as usize] {
+            self.deriv_index.remove(&(of, wrt));
+        }
+        if let OutputRole::Derivative { of, wrt } = role {
+            self.deriv_index.insert((of, wrt), out);
+        }
+        self.output_roles[out as usize] = role;
+    }
+
+    pub(crate) fn set_param_role(&mut self, param: u32, role: ParamRole) {
+        self.param_roles[param as usize] = role;
+    }
+
+    /// The derivative output `d outputs[out] / d params[param]`, if there is one.
+    pub fn derivative(&self, out: u32, param: u32) -> Option<u32> {
+        self.deriv_index.get(&(out, param)).copied()
+    }
+
+    pub(crate) fn compiled_mut(&mut self) -> &mut Vec<Body> {
+        &mut self.compiled
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    /// Formal leaves in argument order.
+    pub fn params(&self) -> &[SymbolId] {
+        &self.params
+    }
+    /// One role per parameter (`Free` unless set).
+    pub fn param_roles(&self) -> &[ParamRole] {
+        &self.param_roles
+    }
+    pub fn outputs(&self) -> &[Output] {
+        &self.outputs
+    }
+    /// One role per output (`Plain` unless set; derivative outputs are
+    /// tagged `Derivative`).
+    pub fn output_roles(&self) -> &[OutputRole] {
+        &self.output_roles
+    }
+    /// The numeric bundle of an extern function; `None` for a symbolic one.
+    pub fn extern_body(&self) -> Option<&Arc<dyn ExternBundle>> {
+        self.extern_body.as_ref()
+    }
+    /// The bodies a consumer compiled itself and registered with
+    /// [`Graph::set_func_body`](crate::Graph::set_func_body), used in place
+    /// of the interpreted body of a symbolic function (a consumer's body may
+    /// cache work over its solve-constant arguments, say) by every program
+    /// whose calls it covers ([`Function::body_for`]); a program that calls
+    /// an expression output it lacks (a derivative demanded later) takes the
+    /// interpreted body until the consumer registers one that covers it.
+    /// The symbolic outputs stay: differentiation and printing read them,
+    /// only the evaluation goes through the registered bundle.
+    pub fn compiled(&self) -> &[Body] {
+        &self.compiled
+    }
+
     /// The function as something to call: an extern function is its bundle
     /// with the slot of each output, a symbolic one is its body compiled to
     /// a tape and interpreted (see [`InterpretedBody`]), every expression
@@ -182,8 +253,8 @@ impl Function {
 
     /// [`body`](Self::body) for a program that calls the outputs `needed`:
     /// among the registered bodies that carry each of them that is an
-    /// expression, the one computing the fewest outputs; the interpreted
-    /// body when none covers them.
+    /// expression, the one computing the fewest outputs; else the body of
+    /// exactly those outputs, interpreted.
     pub fn body_for<K: crate::field::Field>(
         &self,
         ctx: &crate::graph::Graph<K>,
@@ -198,7 +269,7 @@ impl Function {
         if let Some(c) = covering.min_by_key(|c| c.bundle.n_outputs()) {
             return c.clone();
         }
-        if let FunctionBody::Extern(b) = &self.body {
+        if let Some(b) = &self.extern_body {
             return Body {
                 bundle: b.clone(),
                 slot_of: self
@@ -212,14 +283,11 @@ impl Function {
             };
         }
         let mut roots = Vec::new();
-        let mut slot_of = Vec::with_capacity(self.outputs.len());
-        for o in &self.outputs {
-            match o {
-                Output::Expr(e) => {
-                    slot_of.push(Some(roots.len() as u32));
-                    roots.push(*e);
-                }
-                _ => slot_of.push(None),
+        let mut slot_of = vec![None; self.outputs.len()];
+        for &k in needed {
+            if let (Output::Expr(e), None) = (self.outputs[k as usize], slot_of[k as usize]) {
+                slot_of[k as usize] = Some(roots.len() as u32);
+                roots.push(e);
             }
         }
         // Split over the parameters the roles call pure, when there are any.
@@ -264,6 +332,6 @@ impl Function {
     }
 
     pub fn is_extern(&self) -> bool {
-        matches!(self.body, FunctionBody::Extern(_))
+        self.extern_body.is_some()
     }
 }

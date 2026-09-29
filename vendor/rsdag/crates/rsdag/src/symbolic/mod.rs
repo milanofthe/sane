@@ -11,15 +11,10 @@ pub mod det;
 #[cfg(feature = "egraph")]
 pub mod egraph;
 pub mod poly;
-pub mod solve;
 
 pub use det::{count_det_terms, determinant};
 #[cfg(feature = "egraph")]
 pub use egraph::simplify_egraph;
 pub use poly::{
     collect, expand_terms, poly_add, poly_mul, poly_to_expr, prune_poly, rational_form,
-};
-pub use solve::{
-    lu_static, newton_step, newton_step_planned, pattern_of, plan, solve_planned, sparse_rows,
-    NewtonStep, Pattern, Plan, Solved, StaticLu,
 };

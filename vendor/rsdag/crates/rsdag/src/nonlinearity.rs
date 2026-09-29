@@ -45,7 +45,7 @@ impl Degree {
     /// Degree of a product: degrees add.
     fn times(self, other: Degree) -> Degree {
         match (self.value(), other.value()) {
-            (Some(a), Some(b)) => Degree::finite(a + b),
+            (Some(a), Some(b)) => a.checked_add(b).map_or(Degree::Unbounded, Degree::finite),
             _ => Degree::Unbounded,
         }
     }
@@ -58,7 +58,7 @@ impl Degree {
     }
     fn power(self, n: u32) -> Degree {
         match self.value() {
-            Some(d) => Degree::finite(d * n),
+            Some(d) => d.checked_mul(n).map_or(Degree::Unbounded, Degree::finite),
             None => Degree::Unbounded,
         }
     }
@@ -68,14 +68,39 @@ impl Degree {
     }
 }
 
+/// A set of unary ops, one bit each.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UnarySet(u64);
+
+const _: () = assert!(crate::node::UNARY_OPS.len() <= 64);
+
+impl UnarySet {
+    pub fn insert(&mut self, op: UnaryOp) {
+        self.0 |= 1 << op.code();
+    }
+    pub fn contains(&self, op: &UnaryOp) -> bool {
+        self.0 & (1 << op.code()) != 0
+    }
+    pub fn is_empty(&self) -> bool {
+        self.0 == 0
+    }
+    /// The ops in the set, in the order of the enum.
+    pub fn iter(&self) -> impl Iterator<Item = UnaryOp> + '_ {
+        crate::node::UNARY_OPS
+            .iter()
+            .map(|s| s.op)
+            .filter(|op| self.contains(op))
+    }
+}
+
 /// The classification of an expression, or of a whole residual system, as
 /// far as a harmonic-balance solve cares.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Nonlinearity {
     pub degree: Degree,
     /// Elementary functions applied to a variable-dependent argument (the
     /// `exp` of a diode, the `tanh` of an EKV model). Empty for a polynomial.
-    pub transcendental: BTreeSet<UnaryOp>,
+    pub transcendental: UnarySet,
     /// A variable appears in a denominator (a negative integer power).
     pub rational: bool,
     /// A comparison, a select or an ordered reduction branches on a
@@ -93,8 +118,7 @@ impl Nonlinearity {
         *self == Nonlinearity::default()
     }
     fn absorb(&mut self, other: &Nonlinearity) {
-        self.transcendental
-            .extend(other.transcendental.iter().copied());
+        self.transcendental.0 |= other.transcendental.0;
         self.rational |= other.rational;
         self.piecewise |= other.piecewise;
         self.opaque |= other.opaque;
@@ -129,8 +153,7 @@ pub fn nonlinearity<K: Field>(
     expr: ExprId,
     vars: &BTreeSet<SymbolId>,
 ) -> Nonlinearity {
-    let mut memo = HashMap::default();
-    classify(g, expr, vars, &mut memo)
+    nonlinearity_of(g, &[expr], vars)
 }
 
 /// Classify a residual system: the worst degree over the residuals and the
@@ -140,61 +163,70 @@ pub fn nonlinearity_of<K: Field>(
     exprs: &[ExprId],
     vars: &BTreeSet<SymbolId>,
 ) -> Nonlinearity {
-    let mut memo = HashMap::default();
+    // One sweep over the nodes the expressions reach, ascending (a node
+    // after its operands), each classified from its operands'.
+    let mut cone: Vec<ExprId> = Vec::new();
+    let mut seen = rustc_hash::FxHashSet::default();
+    let mut stack = exprs.to_vec();
+    while let Some(e) = stack.pop() {
+        if seen.insert(e) {
+            cone.push(e);
+            stack.extend_from_slice(&g.operands(e));
+        }
+    }
+    cone.sort_unstable();
+    let mut memo: HashMap<ExprId, Nonlinearity> = HashMap::default();
+    for &e in &cone {
+        let c = classify(g, e, vars, |a| memo[&a]);
+        memo.insert(e, c);
+    }
     let mut acc = Nonlinearity::constant();
-    for &e in exprs {
-        let c = classify(g, e, vars, &mut memo);
+    for e in exprs {
+        let c = memo[e];
         acc.degree = acc.degree.plus(c.degree);
         acc.absorb(&c);
     }
     acc
 }
 
+/// Node `expr` classified from its operands' classes, `sub`.
 fn classify<K: Field>(
     g: &Graph<K>,
     expr: ExprId,
     vars: &BTreeSet<SymbolId>,
-    memo: &mut HashMap<ExprId, Nonlinearity>,
+    sub: impl Fn(ExprId) -> Nonlinearity,
 ) -> Nonlinearity {
-    if let Some(c) = memo.get(&expr) {
-        return c.clone();
-    }
-    let sub = |e: ExprId, memo: &mut HashMap<ExprId, Nonlinearity>| classify(g, e, vars, memo);
-    let out = match *g.node(expr) {
+    // Every operand's flags, and whether any moves with the variables.
+    let parts = || g.operands(expr).iter().map(|&a| sub(a)).collect::<Vec<_>>();
+    let joined = |parts: &[Nonlinearity], mut out: Nonlinearity| {
+        for c in parts {
+            out.absorb(c);
+        }
+        out
+    };
+    match *g.node(expr) {
         Node::Const(_) => Nonlinearity::constant(),
-        Node::Symbol(s) => {
-            if vars.contains(&s) {
-                Nonlinearity {
-                    degree: Degree::Finite(1),
-                    ..Default::default()
-                }
-            } else {
-                Nonlinearity::constant()
-            }
-        }
-        Node::Neg(a) => sub(a, memo),
-        Node::Add(a, b) => {
-            let (ca, cb) = (sub(a, memo), sub(b, memo));
-            let mut out = Nonlinearity {
-                degree: ca.degree.plus(cb.degree),
+        Node::Symbol(s) => Nonlinearity {
+            degree: Degree::Finite(vars.contains(&s) as u32),
+            ..Default::default()
+        },
+        Node::Neg(a) => sub(a),
+        Node::Add(a, b) => joined(
+            &[sub(a), sub(b)],
+            Nonlinearity {
+                degree: sub(a).degree.plus(sub(b).degree),
                 ..Default::default()
-            };
-            out.absorb(&ca);
-            out.absorb(&cb);
-            out
-        }
-        Node::Mul(a, b) => {
-            let (ca, cb) = (sub(a, memo), sub(b, memo));
-            let mut out = Nonlinearity {
-                degree: ca.degree.times(cb.degree),
+            },
+        ),
+        Node::Mul(a, b) => joined(
+            &[sub(a), sub(b)],
+            Nonlinearity {
+                degree: sub(a).degree.times(sub(b).degree),
                 ..Default::default()
-            };
-            out.absorb(&ca);
-            out.absorb(&cb);
-            out
-        }
+            },
+        ),
         Node::Pow(a, n) => {
-            let ca = sub(a, memo);
+            let ca = sub(a);
             if n == 0 || ca.is_constant() {
                 Nonlinearity::constant()
             } else if n > 0 {
@@ -203,52 +235,42 @@ fn classify<K: Field>(
                     ..ca
                 }
             } else {
-                let mut out = Nonlinearity::unbounded(|o| o.rational = true);
-                out.absorb(&ca);
-                out
+                joined(&[ca], Nonlinearity::unbounded(|o| o.rational = true))
             }
         }
         Node::Unary(op, a) => {
-            let ca = sub(a, memo);
+            let ca = sub(a);
             if ca.is_constant() {
                 Nonlinearity::constant()
             } else {
-                let mut out = Nonlinearity::unbounded(|o| {
-                    o.transcendental.insert(op);
-                });
-                out.absorb(&ca);
-                out
+                joined(
+                    &[ca],
+                    Nonlinearity::unbounded(|o| o.transcendental.insert(op)),
+                )
             }
         }
         // A binary function beyond the ring is transcendental in the same
         // sense as a unary one when either argument moves; there is no
         // unary op to name it by, so the flag is the piecewise-free
         // "unbounded" alone.
-        Node::Binary(_, a, b) => {
-            let (ca, cb) = (sub(a, memo), sub(b, memo));
-            if ca.is_constant() && cb.is_constant() {
-                Nonlinearity::constant()
-            } else {
-                let mut out = Nonlinearity::unbounded(|_| {});
-                out.absorb(&ca);
-                out.absorb(&cb);
-                out
+        Node::Binary(..) | Node::Cmp(..) | Node::Solve(..) | Node::Call(..) => {
+            let parts = parts();
+            if parts.iter().all(Nonlinearity::is_constant) {
+                return Nonlinearity::constant();
             }
-        }
-        Node::Cmp(_, a, b) => {
-            let (ca, cb) = (sub(a, memo), sub(b, memo));
-            if ca.is_constant() && cb.is_constant() {
-                Nonlinearity::constant()
-            } else {
-                let mut out = Nonlinearity::unbounded(|o| o.piecewise = true);
-                out.absorb(&ca);
-                out.absorb(&cb);
-                out
-            }
+            let out = Nonlinearity::unbounded(|o| match g.node(expr) {
+                Node::Cmp(..) => o.piecewise = true,
+                // Rational in the matrix, linear in the right-hand side.
+                Node::Solve(..) => o.rational = true,
+                // A call's body is not classified here.
+                Node::Call(..) => o.opaque = true,
+                _ => {}
+            });
+            joined(&parts, out)
         }
         Node::Select(c, t, e) => {
-            let (cc, ct, ce) = (sub(c, memo), sub(t, memo), sub(e, memo));
-            let mut out = if cc.is_constant() {
+            let (cc, ct, ce) = (sub(c), sub(t), sub(e));
+            let out = if cc.is_constant() {
                 // A fixed branch: the degree of whichever arm is taken.
                 Nonlinearity {
                     degree: ct.degree.plus(ce.degree),
@@ -257,17 +279,11 @@ fn classify<K: Field>(
             } else {
                 Nonlinearity::unbounded(|o| o.piecewise = true)
             };
-            out.absorb(&cc);
-            out.absorb(&ct);
-            out.absorb(&ce);
-            out
+            joined(&[cc, ct, ce], out)
         }
-        Node::Reduce(op, l) => {
-            let parts: Vec<Nonlinearity> = g.args(l).iter().map(|&a| sub(a, memo)).collect();
-            let mut out = Nonlinearity::constant();
-            for c in &parts {
-                out.absorb(c);
-            }
+        Node::Reduce(op, _) => {
+            let parts = parts();
+            let mut out = joined(&parts, Nonlinearity::constant());
             out.degree = match op {
                 ReduceOp::Sum => parts
                     .iter()
@@ -288,43 +304,14 @@ fn classify<K: Field>(
         }
         Node::Dot(l) => {
             let (a, b) = g.dot_args(l);
-            let (a, b) = (a.to_vec(), b.to_vec());
             let mut out = Nonlinearity::constant();
-            for (x, y) in a.iter().zip(&b) {
-                let (cx, cy) = (sub(*x, memo), sub(*y, memo));
+            for (&x, &y) in a.iter().zip(b) {
+                let (cx, cy) = (sub(x), sub(y));
                 out.degree = out.degree.plus(cx.degree.times(cy.degree));
                 out.absorb(&cx);
                 out.absorb(&cy);
             }
             out
         }
-        // Rational in the matrix, linear in the right-hand side: a rational
-        // function of whatever the entries are.
-        Node::Solve(l, _) => {
-            let parts: Vec<Nonlinearity> = g.args(l).iter().map(|&a| sub(a, memo)).collect();
-            if parts.iter().all(Nonlinearity::is_constant) {
-                Nonlinearity::constant()
-            } else {
-                let mut out = Nonlinearity::unbounded(|o| o.rational = true);
-                for c in &parts {
-                    out.absorb(c);
-                }
-                out
-            }
-        }
-        Node::Call(_, l) => {
-            let parts: Vec<Nonlinearity> = g.args(l).iter().map(|&a| sub(a, memo)).collect();
-            if parts.iter().all(Nonlinearity::is_constant) {
-                Nonlinearity::constant()
-            } else {
-                let mut out = Nonlinearity::unbounded(|o| o.opaque = true);
-                for c in &parts {
-                    out.absorb(c);
-                }
-                out
-            }
-        }
-    };
-    memo.insert(expr, out.clone());
-    out
+    }
 }

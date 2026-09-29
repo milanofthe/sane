@@ -83,6 +83,13 @@ pub(crate) trait Isa {
 
     /// `d = a op b`; `d` may alias `a`.
     fn arith(&mut self, op: Arith, d: u8, a: u8, b: u8);
+    /// Whether [`arith_mem`](Self::arith_mem) is available.
+    const MEM_OPERANDS: bool = false;
+    /// `d = a op [base + off]`, the second operand read from memory; `d`
+    /// may alias `a`.
+    fn arith_mem(&mut self, _op: Arith, _d: u8, _a: u8, _base: Base, _off: usize) {
+        unreachable!("no memory operands")
+    }
     fn neg(&mut self, d: u8, a: u8);
     fn abs(&mut self, d: u8, a: u8);
     fn sqrt(&mut self, d: u8, a: u8);

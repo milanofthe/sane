@@ -1,7 +1,7 @@
 //! The tape compiler: the reachable forest lowered to instructions, then
 //! scheduled, then given slots.
 //!
-//! Four passes, each reading only what the ones before it produced:
+//! Five passes, each reading only what the ones before it produced:
 //!
 //! 1. [`Forest::analyze`]: reachability, purity for the prolog split, use
 //!    counts and the dispatch fusions (`MulAdd`, `Sub`).
@@ -12,22 +12,27 @@
 //!    an instruction with several outputs; the nodes it stands for are its
 //!    output values. Leaves are operands, never instructions: an input is
 //!    read where it is used, a constant is an instruction of its own.
-//! 3. [`Forest::schedule`]: register-pressure list scheduling over the
+//! 3. [`Program::fuse_accumulators`]: a product kernel's output whose one
+//!    consumer adds, subtracts or negates it is folded by the kernel.
+//! 4. [`Program::schedule`]: register-pressure list scheduling over the
 //!    instructions, the prolog as a strict first phase.
-//! 4. [`Forest::emit`]: lifetimes, slots (a kernel's outputs a block of
+//! 5. [`Program::emit`]: lifetimes, slots (a kernel's outputs a block of
 //!    consecutive slots), and the instruction stream.
+//!
+//! A compiled tape can be lifted back into its program ([`Tape::lift`]),
+//! which is how a transform of a tape (a specialization) is compiled.
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
-use super::{Fold, Op, Src, Tape, INPUT};
+use super::topo::Topo;
+use super::{input_index, Accum, Fold, Op, Src, Tape, INPUT};
 use crate::extern_fn::ExternBundle;
 use crate::field::Field;
 use crate::func::{Body, FuncId};
 use crate::graph::Graph;
-use crate::node::{ExprId, Node, SymbolId};
+use crate::node::{ArgList, ExprId, Node, SymbolId};
 
 /// Row dots against one vector fuse into a `Gemv` from this many rows on.
 const GEMV_MIN_ROWS: usize = 8;
@@ -39,13 +44,6 @@ fn split_state(o: &[u32], stateful: bool) -> (&[u32], u32) {
         (true, Some((&state, args))) => (args, state),
         _ => (o, super::NO_STATE),
     }
-}
-
-/// Append operands to the pool; their range.
-fn pooled(pool: &mut Vec<Ref>, ins: Vec<Ref>) -> (u32, u32) {
-    let start = pool.len() as u32;
-    pool.extend(ins);
-    (start, pool.len() as u32 - start)
 }
 
 impl Tape {
@@ -191,20 +189,20 @@ struct Forest {
 /// references, or tagged inputs, see [`INPUT`]); `n_out` is the number of
 /// values it produces, one for anything but a kernel. Value `(inst, k)` is
 /// the `k`th output of instruction `inst`.
-pub struct Inst {
-    pub kind: Kind,
+pub(super) struct Inst {
+    pub(super) kind: Kind,
     /// The operands: `pool[start .. start + len]` of the program's pool,
     /// one flat vector for every instruction, so a million instructions
     /// are one allocation and not a million.
-    pub ins: (u32, u32),
-    pub n_out: u32,
+    pub(super) ins: (u32, u32),
+    pub(super) n_out: u32,
     /// Parameter-pure: schedulable into the prolog.
-    pub pure: bool,
+    pub(super) pure: bool,
 }
 
 /// An operand of an instruction.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Ref {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(super) enum Ref {
     /// Output `k` of instruction `inst`.
     Value(u32, u32),
     /// Input `k`, read in place.
@@ -213,7 +211,7 @@ pub enum Ref {
 
 /// What an instruction computes; the operand lists live in `Inst::ins`.
 #[derive(Clone, Debug)]
-pub enum Kind {
+pub(super) enum Kind {
     Const(f64),
     Add,
     Mul,
@@ -228,13 +226,10 @@ pub enum Kind {
     Reduce(crate::node::ReduceOp),
     /// `n` pairs.
     Dot(u32),
-    /// With `stateful`, the last operand is the instance state block (the
-    /// value of a [`Kind::CallProlog`]).
+    /// `n_groups` argument lists of `n_args`, group-major; with `stateful`,
+    /// the last operand is the instances' state block (the value of a
+    /// [`Kind::CallProlog`]).
     Call {
-        bundle: u32,
-        stateful: bool,
-    },
-    CallBatch {
         bundle: u32,
         n_groups: u32,
         n_args: u32,
@@ -260,10 +255,8 @@ pub enum Kind {
         n: u32,
         acc: Option<Vec<u32>>,
     },
+    /// `k` right-hand sides against one matrix.
     Solve {
-        n: u32,
-    },
-    SolveMany {
         n: u32,
         k: u32,
     },
@@ -271,19 +264,19 @@ pub enum Kind {
 
 /// The lowered program: instructions in a dependency order, the bundle
 /// table, and which value each root is.
-struct Program {
-    insts: Vec<Inst>,
+pub(super) struct Program {
+    pub(super) insts: Vec<Inst>,
     /// The operand pool of every instruction (see [`Inst::ins`]).
-    pool: Vec<Ref>,
-    bundles: Vec<Arc<dyn ExternBundle>>,
-    roots: Vec<Ref>,
+    pub(super) pool: Vec<Ref>,
+    pub(super) bundles: Vec<Arc<dyn ExternBundle>>,
+    pub(super) roots: Vec<Ref>,
     /// The accumulator operand of the kernels' plain folds (see
     /// [`Program::fuse_accumulators`]): never read, so never part of the state.
-    placeholder: Option<u32>,
+    pub(super) placeholder: Option<u32>,
 }
 
 impl Program {
-    fn ins(&self, i: usize) -> &[Ref] {
+    pub(super) fn ins(&self, i: usize) -> &[Ref] {
         let (s, l) = self.insts[i].ins;
         &self.pool[s as usize..(s + l) as usize]
     }
@@ -483,7 +476,7 @@ impl Program {
             return;
         }
         // Redirect the consumers' values, then drop them.
-        let resolve = |r: Ref| -> Ref {
+        self.compact(&dead, |r| {
             let mut r = r;
             while let Ref::Value(i, _) = r {
                 match alias.get(&i) {
@@ -492,7 +485,13 @@ impl Program {
                 }
             }
             r
-        };
+        });
+    }
+
+    /// Drop the instructions `dead` marks, every operand and root first
+    /// redirected by `resolve` (to a value that stays), the rest renumbered
+    /// in order.
+    pub(super) fn compact(&mut self, dead: &[bool], resolve: impl Fn(Ref) -> Ref) {
         let mut renumber = vec![u32::MAX; self.insts.len()];
         let mut next = 0u32;
         for (i, &d) in dead.iter().enumerate() {
@@ -507,358 +506,169 @@ impl Program {
                 r => r,
             }
         };
-        for r in self.pool.iter_mut() {
+        for r in self.pool.iter_mut().chain(self.roots.iter_mut()) {
             *r = map(*r);
         }
-        for r in self.roots.iter_mut() {
-            *r = map(*r);
-        }
-        self.placeholder = self.placeholder.map(|i| renumber[i as usize]);
+        self.placeholder = self
+            .placeholder
+            .filter(|&i| !dead[i as usize])
+            .map(|i| renumber[i as usize]);
         let old = std::mem::take(&mut self.insts);
         self.insts = old
             .into_iter()
-            .zip(&dead)
+            .zip(dead)
             .filter(|(_, &d)| !d)
             .map(|(inst, _)| inst)
             .collect();
     }
-}
 
-/// A topological order of a program's instructions that the fold pass
-/// keeps valid as kernels take accumulators, by two-way search (Haeupler,
-/// Kavitha, Mathew, Sen and Tarjan). Whether accumulator `a` depends on
-/// kernel `k` is only a question when `a` comes after `k`; then the
-/// readers of `k` searched forward up to `a`, and what `a` reads searched
-/// backward down to `k`, step in turn. Either finding the other end is a
-/// cycle. The side that runs out first is closed under its direction
-/// between the two and moves, the backward side right before `k` or the
-/// forward side right after `a`, so a question costs the smaller side.
-/// Instructions added after the order was taken (the placeholder) are
-/// constants and take part in no edge.
-struct Topo {
-    order: Order,
-    /// Readers of each instruction (`readers[start[i]..start[i + 1]]`),
-    /// and the ones the pass added.
-    start: Vec<u32>,
-    readers: Vec<u32>,
-    added: HashMap<u32, Vec<u32>>,
-    seen: Vec<u32>,
-    stamp: u32,
-    stack_f: Vec<(u32, u32)>,
-    stack_b: Vec<(u32, u32)>,
-    fwd: Vec<u32>,
-    back: Vec<u32>,
-}
-
-impl Topo {
-    /// The order of `p` with kernel `k` also reading `taken`, the
-    /// accumulators it took before the order was needed.
-    fn new(p: &Program, hints: &[(u32, u32)], k: u32, taken: &[u32]) -> Topo {
-        let m = p.insts.len();
-        // Every edge `(j, i)`, instruction `i` reading `j`, once.
-        let edges = |f: &mut dyn FnMut(u32, u32)| {
-            let mut last = vec![u32::MAX; m];
-            for i in 0..m {
-                for r in p.ins(i) {
-                    if let Ref::Value(j, _) = *r {
-                        if last[j as usize] != i as u32 {
-                            last[j as usize] = i as u32;
-                            f(j, i as u32);
-                        }
-                    }
-                }
+    /// Drop what the roots do not reach.
+    pub(super) fn retain_reachable(&mut self) {
+        let m = self.insts.len();
+        let mut dead = vec![true; m];
+        let mut stack: Vec<u32> = self
+            .roots
+            .iter()
+            .filter_map(|r| match *r {
+                Ref::Value(i, _) => Some(i),
+                Ref::Input(_) => None,
+            })
+            .collect();
+        while let Some(i) = stack.pop() {
+            if !std::mem::replace(&mut dead[i as usize], false) {
+                continue;
             }
-            for &a in taken {
-                if last[a as usize] != k {
-                    last[a as usize] = k;
-                    f(a, k);
+            stack.extend(self.ins(i as usize).iter().filter_map(|r| match *r {
+                Ref::Value(j, _) if dead[j as usize] => Some(j),
+                _ => None,
+            }));
+        }
+        self.compact(&dead, |r| r);
+    }
+}
+
+impl Tape {
+    /// The tape as the program it was emitted from: an instruction per op,
+    /// each operand the value it reads (the op whose block held the slot at
+    /// that point, and the offset in the block), the prolog's ops pure.
+    /// Emitting it again gives this tape back up to slot numbering, so a
+    /// transform of a compiled tape ([`Tape::specialize`]) works on its
+    /// program and is scheduled and allocated like a fresh compilation.
+    pub(super) fn lift(&self) -> Program {
+        let m = self.ops.len();
+        // The op whose block holds each slot, as the stream runs.
+        let mut held = vec![u32::MAX; self.n_work];
+        let value = |k: u32, held: &[u32]| -> Ref {
+            match input_index(k) {
+                Some(j) => Ref::Input(j),
+                None => {
+                    let j = held[k as usize];
+                    Ref::Value(j, k - self.dst[j as usize])
                 }
             }
         };
-        let mut count = vec![0u32; m + 1];
-        edges(&mut |j, _| count[j as usize + 1] += 1);
+        // A fold that reads no operand reads the placeholder, appended
+        // after the stream as instruction `m`.
+        let placeholder = Ref::Value(m as u32, 0);
+        let mut uses_placeholder = false;
+        let mut insts: Vec<Inst> = Vec::with_capacity(m + 1);
+        let mut pool: Vec<Ref> = Vec::with_capacity(self.arg_pool.len() + 2 * m);
         for i in 0..m {
-            count[i + 1] += count[i];
-        }
-        let mut fill = count.clone();
-        let mut readers = vec![0u32; count[m] as usize];
-        edges(&mut |j, i| {
-            readers[fill[j as usize] as usize] = i;
-            fill[j as usize] += 1;
-        });
-        // The starting order: a kernel after the accumulators `hints`
-        // offers it (`(operand, kernel)`, sorted) where the program allows,
-        // and otherwise as late as its readers allow. The lowering places a
-        // kernel with its first consumer, before the accumulators of its
-        // other outputs and before the kernels those depend on, so most
-        // accumulators would otherwise come after their kernel. When
-        // nothing else can go, the kernel with the fewest hints open does
-        // (a hint that depends on its kernel never closes).
-        let kernel = |i: usize| matches!(p.insts[i].kind, Kind::Gemv { .. } | Kind::Gemm { .. });
-        let mut pending = vec![0u32; m];
-        for &r in &readers {
-            pending[r as usize] += 1;
-        }
-        let mut hinted = vec![0u32; m];
-        for &(_, k) in hints {
-            hinted[k as usize] += 1;
-        }
-        let hints_of = |x: u32| {
-            let lo = hints.partition_point(|&(y, _)| y < x);
-            let hi = hints.partition_point(|&(y, _)| y <= x);
-            &hints[lo..hi]
-        };
-        let mut ready: Vec<u32> = Vec::new();
-        let mut ready_kernels: BTreeSet<u32> = BTreeSet::new();
-        // Kernels whose operands are there, by their hints still open.
-        let mut blocked: BTreeSet<(u32, u32)> = BTreeSet::new();
-        let release = |r: u32,
-                       hinted: &[u32],
-                       ready: &mut Vec<u32>,
-                       ready_kernels: &mut BTreeSet<u32>,
-                       blocked: &mut BTreeSet<(u32, u32)>| {
-            if !kernel(r as usize) {
-                ready.push(r);
-            } else if hinted[r as usize] == 0 {
-                ready_kernels.insert(r);
-            } else {
-                blocked.insert((hinted[r as usize], r));
-            }
-        };
-        for i in (0..m as u32).rev() {
-            if pending[i as usize] == 0 {
-                release(i, &hinted, &mut ready, &mut ready_kernels, &mut blocked);
-            }
-        }
-        let mut at: Vec<u32> = Vec::with_capacity(m);
-        while let Some(i) = ready
-            .pop()
-            .or_else(|| ready_kernels.pop_first())
-            .or_else(|| blocked.pop_first().map(|(_, k)| k))
-        {
-            at.push(i);
-            for &(_, k) in hints_of(i) {
-                let h = hinted[k as usize];
-                hinted[k as usize] = h - 1;
-                if blocked.remove(&(h, k)) {
-                    if h == 1 {
-                        ready_kernels.insert(k);
-                    } else {
-                        blocked.insert((h - 1, k));
-                    }
-                }
-            }
-            for &r in &readers[count[i as usize] as usize..count[i as usize + 1] as usize] {
-                pending[r as usize] -= 1;
-                if pending[r as usize] == 0 {
-                    release(r, &hinted, &mut ready, &mut ready_kernels, &mut blocked);
-                }
-            }
-        }
-        debug_assert_eq!(at.len(), m, "the lowered program is acyclic");
-        Topo {
-            order: Order::new(&at),
-            start: count,
-            readers,
-            added: HashMap::default(),
-            seen: vec![0; m],
-            stamp: 0,
-            stack_f: Vec::new(),
-            stack_b: Vec::new(),
-            fwd: Vec::new(),
-            back: Vec::new(),
-        }
-    }
-
-    /// Lets kernel `k` read instruction `a` unless `a` depends on `k`;
-    /// whether it did.
-    fn read(&mut self, p: &Program, k: u32, a: u32) -> bool {
-        let n = self.seen.len() as u32;
-        if a >= n {
-            return true;
-        }
-        let label = &self.order.label;
-        let (lb, ub) = (label[k as usize], label[a as usize]);
-        if ub < lb {
-            self.added.entry(a).or_default().push(k);
-            return true;
-        }
-        // Forward marks are `sf`, backward ones `sb`. The sides take one
-        // edge each in turn (a kernel's readers can be thousands), each a
-        // stack of nodes with the next edge to look at.
-        if self.stamp > u32::MAX - 4 {
-            self.seen.fill(0);
-            self.stamp = 0;
-        }
-        self.stamp += 2;
-        let (sf, sb) = (self.stamp, self.stamp + 1);
-        self.stack_f.clear();
-        self.stack_b.clear();
-        self.fwd.clear();
-        self.back.clear();
-        self.stack_f.push((k, 0));
-        self.fwd.push(k);
-        self.seen[k as usize] = sf;
-        self.stack_b.push((a, 0));
-        self.back.push(a);
-        self.seen[a as usize] = sb;
-        let backward = loop {
-            // One forward edge.
-            let Some(&(w, e)) = self.stack_f.last() else {
-                break false;
+            let start = pool.len();
+            self.for_each_operand(i, |k| pool.push(value(k, &held)));
+            let width = self.width(i);
+            let codes = |acc: Option<Accum>| acc.map(|a| self.pool(a.codes, width).to_vec());
+            let kind = match self.ops[i] {
+                Op::Const(v) => Kind::Const(v),
+                Op::Add(..) => Kind::Add,
+                Op::Mul(..) => Kind::Mul,
+                Op::MulAdd(..) => Kind::MulAdd,
+                Op::Sub(..) => Kind::Sub,
+                Op::Neg(_) => Kind::Neg,
+                Op::Powi(_, n) => Kind::Powi(n),
+                Op::Unary(op, _) => Kind::Unary(op),
+                Op::Binary(op, ..) => Kind::Binary(op),
+                Op::Cmp(op, ..) => Kind::Cmp(op),
+                Op::Select(..) => Kind::Select,
+                Op::Reduce(op, ..) => Kind::Reduce(op),
+                Op::Dot(_, n) => Kind::Dot(n),
+                Op::Call {
+                    bundle,
+                    n_groups,
+                    n_args,
+                    state,
+                    ..
+                } => Kind::Call {
+                    bundle,
+                    n_groups,
+                    n_args,
+                    stateful: state != super::NO_STATE,
+                },
+                Op::CallProlog {
+                    bundle,
+                    n_groups,
+                    n_pure,
+                    ..
+                } => Kind::CallProlog {
+                    bundle,
+                    n_groups,
+                    n_pure,
+                },
+                Op::Gemv {
+                    m: rows, n, acc, ..
+                } => Kind::Gemv {
+                    m: rows,
+                    n,
+                    acc: codes(acc),
+                },
+                Op::Gemm {
+                    m: rows, k, n, acc, ..
+                } => Kind::Gemm {
+                    m: rows,
+                    k,
+                    n,
+                    acc: codes(acc),
+                },
+                Op::Solve { n, k, .. } => Kind::Solve { n, k },
             };
-            let (s0, s1) = (self.start[w as usize], self.start[w as usize + 1]);
-            let deg = s1 - s0;
-            let r = if e < deg {
-                Some(self.readers[(s0 + e) as usize])
-            } else {
-                self.added
-                    .get(&w)
-                    .and_then(|v| v.get((e - deg) as usize))
-                    .copied()
-            };
-            match r {
-                None => {
-                    self.stack_f.pop();
+            // A kernel's accumulator entries, one per output after the
+            // factors: the operand where its fold reads it, else the
+            // placeholder.
+            if let Op::Gemv { acc: Some(a), .. } | Op::Gemm { acc: Some(a), .. } = self.ops[i] {
+                if a.c.is_none() {
+                    pool.extend(std::iter::repeat_n(placeholder, width as usize));
                 }
-                Some(r) => {
-                    self.stack_f.last_mut().unwrap().1 += 1;
-                    if r == a {
-                        return false;
-                    }
-                    if self.seen[r as usize] != sf && label[r as usize] < ub {
-                        self.seen[r as usize] = sf;
-                        self.fwd.push(r);
-                        self.stack_f.push((r, 0));
+                let entries = pool.len() - width as usize;
+                for (j, &code) in self.pool(a.codes, width).iter().enumerate() {
+                    if !Fold(code).reads_operand() {
+                        pool[entries + j] = placeholder;
+                        uses_placeholder = true;
                     }
                 }
             }
-            // One backward edge.
-            let Some(&(w, e)) = self.stack_b.last() else {
-                break true;
-            };
-            match p.ins(w as usize).get(e as usize) {
-                None => {
-                    self.stack_b.pop();
-                }
-                Some(&r) => {
-                    self.stack_b.last_mut().unwrap().1 += 1;
-                    if let Ref::Value(j, _) = r {
-                        if j == k {
-                            return false;
-                        }
-                        if j < n && self.seen[j as usize] != sb && label[j as usize] > lb {
-                            self.seen[j as usize] = sb;
-                            self.back.push(j);
-                            self.stack_b.push((j, 0));
-                        }
-                    }
-                }
-            }
-        };
-        let order = &mut self.order;
-        let set = if backward {
-            &mut self.back
-        } else {
-            &mut self.fwd
-        };
-        set.sort_unstable_by_key(|&w| order.label[w as usize]);
-        for &w in set.iter() {
-            order.unlink(w);
+            insts.push(Inst {
+                kind,
+                ins: (start as u32, (pool.len() - start) as u32),
+                n_out: width,
+                pure: i < self.prolog_ops,
+            });
+            let d = self.dst[i];
+            held[d as usize..(d + width) as usize].fill(i as u32);
         }
-        let mut at = if backward { order.prev[k as usize] } else { a };
-        for &w in set.iter() {
-            order.insert_after(at, w);
-            at = w;
+        if uses_placeholder {
+            insts.push(Inst {
+                kind: Kind::Const(f64::NAN),
+                ins: (pool.len() as u32, 0),
+                n_out: 1,
+                pure: true,
+            });
         }
-        self.added.entry(a).or_default().push(k);
-        true
-    }
-}
-
-/// A list whose order is compared by labels (the order maintenance of
-/// Bender, Cole, Demaine, Farach-Colton and Zito): an element moved in
-/// takes the middle of the gap it lands in, and a gap too narrow relabels
-/// the smallest aligned label range around it that is sparse enough, its
-/// allowance shrinking with its size, amortized O(log n) labels a move.
-struct Order {
-    label: Vec<u64>,
-    prev: Vec<u32>,
-    next: Vec<u32>,
-}
-
-impl Order {
-    /// The elements `0..n` in `order`, between a head (`n`, label 0) and a
-    /// tail (`n + 1`, the largest label).
-    fn new(order: &[u32]) -> Order {
-        let n = order.len();
-        let (head, tail) = (n as u32, n as u32 + 1);
-        let mut label = vec![0u64; n + 2];
-        let mut prev = vec![0u32; n + 2];
-        let mut next = vec![0u32; n + 2];
-        let step = u64::MAX / (n as u64 + 2);
-        let mut last = head;
-        for (q, &w) in order.iter().enumerate() {
-            label[w as usize] = (q as u64 + 1) * step;
-            prev[w as usize] = last;
-            next[last as usize] = w;
-            last = w;
-        }
-        next[last as usize] = tail;
-        prev[tail as usize] = last;
-        label[tail as usize] = u64::MAX;
-        Order { label, prev, next }
-    }
-
-    fn unlink(&mut self, w: u32) {
-        let (p, q) = (self.prev[w as usize], self.next[w as usize]);
-        self.next[p as usize] = q;
-        self.prev[q as usize] = p;
-    }
-
-    /// Links `w` right after `x`.
-    fn insert_after(&mut self, x: u32, w: u32) {
-        let y = self.next[x as usize];
-        self.prev[w as usize] = x;
-        self.next[w as usize] = y;
-        self.next[x as usize] = w;
-        self.prev[y as usize] = w;
-        let (lo, hi) = (self.label[x as usize], self.label[y as usize]);
-        if hi - lo >= 2 {
-            self.label[w as usize] = lo + (hi - lo) / 2;
-            return;
-        }
-        let head = self.label.len() as u32 - 2;
-        let tail = head + 1;
-        for i in 1..=64u32 {
-            let size = 1u128 << i;
-            let base = lo as u128 & !(size - 1);
-            let end = base + size;
-            let mut first = w;
-            let mut c = 1u128;
-            let mut v = x;
-            while v != head && self.label[v as usize] as u128 >= base {
-                first = v;
-                c += 1;
-                v = self.prev[v as usize];
-            }
-            let mut v = y;
-            while v != tail && (self.label[v as usize] as u128) < end {
-                c += 1;
-                v = self.next[v as usize];
-            }
-            // Sparse enough: fewer than (2 / 1.5)^i elements in 2^i labels.
-            if i == 64 || (c as f64) < (4.0f64 / 3.0).powi(i as i32) {
-                let from = base.max(1);
-                let to = end.min(u64::MAX as u128);
-                let gap = (to - from) / (c + 1);
-                let mut v = first;
-                for j in 0..c {
-                    self.label[v as usize] = (from + gap * (j + 1)) as u64;
-                    v = self.next[v as usize];
-                }
-                return;
-            }
+        Program {
+            insts,
+            pool,
+            bundles: self.bundles.clone(),
+            roots: self.outputs.iter().map(|&k| value(k, &held)).collect(),
+            placeholder: uses_placeholder.then_some(m as u32),
         }
     }
 }
@@ -979,20 +789,76 @@ impl Forest {
         }
     }
 
-    /// Pass 2: the instructions.
+    /// Pass 2: the instructions, in three steps: the kernel groups
+    /// ([`Forest::groups`]), an order of units, each a node or a whole group,
+    /// after its operands ([`Forest::unit_order`]), and the instructions in
+    /// that order.
     fn lower<K: Field>(&self, ctx: &Graph<K>, roots: &[ExprId]) -> Program {
-        let base = &self.base;
-        let m = base.len();
-        let mut insts: Vec<Inst> = Vec::with_capacity(m);
-        let mut pool: Vec<Ref> = Vec::with_capacity(2 * m);
-        let mut bundles: Vec<Arc<dyn ExternBundle>> = Vec::new();
-        let mut bundle_idx: HashMap<usize, u32> = HashMap::default();
-        // The outputs each call (function and argument list) is made for:
-        // what a body must cover to serve it. Calls of one function made
-        // for different output sets (a residual alone, the residual with
-        // its partials) take different bodies, so they are keyed by the set.
-        let mut per_call: HashMap<(u32, crate::node::ArgList), Vec<u32>> = HashMap::default();
-        for &id in base {
+        let calls = self.call_sets(ctx);
+        let groups = self.groups(ctx, &calls);
+        let order = self.unit_order(ctx, roots, &groups);
+        let m = self.base.len();
+        let mut lw = Lowering {
+            p: Program {
+                insts: Vec::with_capacity(m),
+                pool: Vec::with_capacity(2 * m),
+                bundles: Vec::new(),
+                roots: Vec::new(),
+                placeholder: None,
+            },
+            value: vec![None; m],
+        };
+        let mut bodies = Bodies::default();
+        // The nodes of one call (same function, same arguments): a single
+        // call is one instruction whichever of its outputs is reached first.
+        let mut call_sites: HashMap<(u32, ArgList), Vec<usize>> = HashMap::default();
+        for (i, &id) in self.base.iter().enumerate() {
+            if let Node::Call(o, l) = *ctx.node(id) {
+                call_sites
+                    .entry((ctx.output(o).0 .0, l))
+                    .or_default()
+                    .push(i);
+            }
+        }
+        let mut lowered = vec![false; groups.groups.len()];
+        for &i in &order {
+            // Materialized inside its consuming Add, or an output of a call
+            // or a kernel lowered earlier.
+            if self.fused_into[i].is_some() || lw.value[i].is_some() {
+                continue;
+            }
+            match (groups.kernel_of[i], *ctx.node(self.base[i])) {
+                (Some(g), _) => {
+                    if !std::mem::replace(&mut lowered[g], true) {
+                        let (key, members) = &groups.groups[g];
+                        self.lower_group(ctx, &mut lw, &mut bodies, &calls, key, members);
+                    }
+                }
+                (None, Node::Call(o, l)) => {
+                    let f = ctx.output(o).0 .0;
+                    let members = &call_sites[&(f, l)];
+                    let set = calls.set_of[&(f, l)];
+                    self.lower_calls(ctx, &mut lw, &mut bodies, &calls, f, set, members);
+                }
+                (None, _) => self.lower_node(ctx, &mut lw, i),
+            }
+        }
+        lw.p.roots = roots.iter().map(|&r| self.val(&lw, r)).collect();
+        lw.p
+    }
+
+    /// The value node `e` was lowered to.
+    fn val(&self, lw: &Lowering, e: ExprId) -> Ref {
+        lw.value[self.pos(e)].expect("an operand precedes its consumer")
+    }
+
+    /// The outputs each call (function and argument list) is made for: what
+    /// a body must cover to serve it. Calls of one function made for
+    /// different output sets (a residual alone, the residual with its
+    /// partials) take different bodies, so they are keyed by the set.
+    fn call_sets<K: Field>(&self, ctx: &Graph<K>) -> CallSets {
+        let mut per_call: HashMap<(u32, ArgList), Vec<u32>> = HashMap::default();
+        for &id in &self.base {
             if let Node::Call(o, l) = *ctx.node(id) {
                 let (f, out) = ctx.output(o);
                 let v = per_call.entry((f.0, l)).or_default();
@@ -1001,40 +867,37 @@ impl Forest {
                 }
             }
         }
-        let mut set_ids: HashMap<(u32, Vec<u32>), u32> = HashMap::default();
-        let mut sets: Vec<Vec<u32>> = Vec::new();
-        let mut set_of: HashMap<(u32, crate::node::ArgList), u32> = HashMap::default();
+        let mut ids: HashMap<(u32, Vec<u32>), u32> = HashMap::default();
+        let mut calls = CallSets::default();
         for ((f, l), mut outs) in per_call {
             outs.sort_unstable();
-            let id = *set_ids.entry((f, outs.clone())).or_insert_with(|| {
-                sets.push(outs);
-                sets.len() as u32 - 1
+            let id = *ids.entry((f, outs.clone())).or_insert_with(|| {
+                calls.sets.push(outs);
+                calls.sets.len() as u32 - 1
             });
-            set_of.insert((f, l), id);
+            calls.set_of.insert((f, l), id);
         }
-        let needed = |f: u32, l: crate::node::ArgList| -> (u32, &Vec<u32>) {
-            let id = set_of[&(f, l)];
-            (id, &sets[id as usize])
-        };
-        let mut bodies: HashMap<(u32, u32), Body> = HashMap::default();
-        // The value each base node is, once lowered.
-        let mut value: Vec<Option<Ref>> = vec![None; m];
+        calls
+    }
 
-        // --- the kernels' groups -----------------------------------------
-        // Calls of one function with distinct argument lists; row dots by
-        // their vector; solve components by their list. Members of one
-        // group share a call depth: a member's depth is one more than the
-        // deepest kernel member among its operands, so equal depth means
-        // no member depends on another's output, and the group's operands
-        // all precede it.
-        let mut lists: HashMap<u32, Vec<Vec<ExprId>>> = HashMap::default();
-        let mut seen: BTreeSet<(u32, Vec<ExprId>)> = BTreeSet::new();
+    /// The kernel groups: calls of one function with distinct argument
+    /// lists, row dots by their vector, solve components by their list.
+    /// Members of one group share a call depth: a member's depth is one more
+    /// than the deepest member among its operands, so equal depth means no
+    /// member depends on another's output, and the group's operands all
+    /// precede it. Gemv groups over the same rows become one Gemm, solves
+    /// over one matrix one solve of several right-hand sides.
+    fn groups<K: Field>(&self, ctx: &Graph<K>, calls: &CallSets) -> Groups {
+        let base = &self.base;
+        let m = base.len();
+        // The functions called with two or more argument lists of one length.
+        let mut lists: HashMap<u32, Vec<ArgList>> = HashMap::default();
+        let mut seen: HashSet<(u32, ArgList)> = HashSet::default();
         for &id in base {
             if let Node::Call(o, l) = *ctx.node(id) {
-                let (f, _) = ctx.output(o);
-                let args = ctx.args(l);
-                if seen.insert((f.0, args.to_vec())) {
-                    lists.entry(f.0).or_default().push(args.to_vec());
+                let f = ctx.output(o).0 .0;
+                if seen.insert((f, l)) {
+                    lists.entry(f).or_default().push(l);
                 }
             }
         }
@@ -1072,23 +935,8 @@ impl Forest {
                 .unwrap_or(0);
             depth[i] = over + u32::from(is_member[i]);
         }
-        // Group keys, by first encounter: (kind, key, depth) -> members.
-        #[derive(PartialEq, Eq, Hash, Clone)]
-        // Every key carries the members' purity: a kernel of pure and impure
-        // members would be impure as a whole and pull the pure work out of
-        // the prolog.
-        enum GroupKey {
-            /// Function, depth, purity, the id of the output set called for.
-            Call(u32, u32, bool, u32),
-            Gemv(Vec<ExprId>, u32, bool),
-            /// The rows (sorted) against every vector: a matrix product.
-            Gemm(Vec<Vec<ExprId>>, Vec<Vec<ExprId>>),
-            Solve(crate::node::ArgList, bool),
-            /// One matrix against several right-hand sides (their lists, in
-            /// first-encounter order).
-            SolveMany(Vec<ExprId>, Vec<crate::node::ArgList>),
-        }
-        let mut group_index: HashMap<GroupKey, usize> = HashMap::default();
+        // Groups by first encounter.
+        let mut index: HashMap<GroupKey, usize> = HashMap::default();
         let mut groups: Vec<(GroupKey, Vec<usize>)> = Vec::new();
         for (i, &id) in base.iter().enumerate() {
             if !is_member[i] {
@@ -1097,37 +945,62 @@ impl Forest {
             let key = match *ctx.node(id) {
                 Node::Call(o, l) => {
                     let f = ctx.output(o).0 .0;
-                    GroupKey::Call(f, depth[i], self.pure[i], needed(f, l).0)
+                    GroupKey::Call(f, depth[i], self.pure[i], calls.set_of[&(f, l)])
                 }
                 Node::Dot(l) => GroupKey::Gemv(ctx.dot_args(l).1.to_vec(), depth[i], self.pure[i]),
                 Node::Solve(l, _) => GroupKey::Solve(l, self.pure[i]),
                 _ => unreachable!("members are calls, rows or components"),
             };
-            let g = *group_index.entry(key.clone()).or_insert_with(|| {
+            let g = *index.entry(key.clone()).or_insert_with(|| {
                 groups.push((key, Vec::new()));
                 groups.len() - 1
             });
             groups[g].1.push(i);
         }
-        // Gemv groups over the same rows at one depth are one Gemm: the
-        // rows against every vector at once. A merged-away group is left
-        // empty; no member points at it.
-        let row_of = |mi: usize| -> Vec<ExprId> {
-            let Node::Dot(l) = *ctx.node(base[mi]) else {
+        self.merge_gemm(ctx, &mut groups);
+        self.merge_solves(ctx, &mut groups, &depth);
+        // A gemv group of too few rows at its depth, or a call group of one
+        // argument list, is no kernel: its members lower on their own.
+        let mut kernel_of: Vec<Option<usize>> = vec![None; m];
+        for (g, (key, members)) in groups.iter().enumerate() {
+            let is_kernel = match key {
+                GroupKey::Gemv(..) => members.len() >= GEMV_MIN_ROWS,
+                GroupKey::Call(..) => {
+                    let mut distinct: HashSet<ArgList> = HashSet::default();
+                    for &i in members {
+                        if let Node::Call(_, l) = *ctx.node(base[i]) {
+                            distinct.insert(l);
+                        }
+                    }
+                    distinct.len() >= 2
+                }
+                GroupKey::Gemm(..) | GroupKey::Solve(..) | GroupKey::SolveMany(..) => true,
+            };
+            if is_kernel {
+                for &i in members {
+                    kernel_of[i] = Some(g);
+                }
+            }
+        }
+        Groups { groups, kernel_of }
+    }
+
+    /// Gemv groups over the same rows at one depth are one Gemm: the rows
+    /// against every vector at once. A merged-away group is left empty; no
+    /// member points at it. Row sets are compared by fingerprint (one hash
+    /// per row, sorted), and the candidate groups' rows verified before they
+    /// merge, so a group of long rows costs one pass over its entries.
+    fn merge_gemm<K: Field>(&self, ctx: &Graph<K>, groups: &mut [(GroupKey, Vec<usize>)]) {
+        let row_of = |mi: usize| -> &[ExprId] {
+            let Node::Dot(l) = *ctx.node(self.base[mi]) else {
                 unreachable!()
             };
-            ctx.dot_args(l).0.to_vec()
+            ctx.dot_args(l).0
         };
-        // Row sets are compared by fingerprint (one hash per row, sorted),
-        // and the candidate groups' rows verified before they merge, so a
-        // group of long rows costs one pass over its entries.
         let row_hash = |mi: usize| -> u64 {
             use std::hash::{Hash, Hasher};
-            let Node::Dot(l) = *ctx.node(base[mi]) else {
-                unreachable!()
-            };
             let mut h = rustc_hash::FxHasher::default();
-            ctx.dot_args(l).0.hash(&mut h);
+            row_of(mi).hash(&mut h);
             h.finish()
         };
         let mut by_rows: HashMap<(Vec<u64>, u32, bool), Vec<usize>> = HashMap::default();
@@ -1147,17 +1020,17 @@ impl Forest {
         let mut merged: Vec<Vec<usize>> =
             by_rows.into_values().filter(|gs| gs.len() >= 2).collect();
         merged.sort();
+        let rows = |g: usize, groups: &[(GroupKey, Vec<usize>)]| -> Vec<Vec<ExprId>> {
+            let mut r: Vec<Vec<ExprId>> =
+                groups[g].1.iter().map(|&mi| row_of(mi).to_vec()).collect();
+            r.sort();
+            r
+        };
         for gs in merged {
-            // The rows of the first group, sorted, and the check that every
-            // other group has exactly them.
-            let mut rows: Vec<Vec<ExprId>> = groups[gs[0]].1.iter().map(|&mi| row_of(mi)).collect();
-            rows.sort();
-            let same_rows = gs[1..].iter().all(|&g| {
-                let mut r: Vec<Vec<ExprId>> = groups[g].1.iter().map(|&mi| row_of(mi)).collect();
-                r.sort();
-                r == rows
-            });
-            if !same_rows {
+            // The rows of the first group, and the check that every other
+            // group has exactly them.
+            let first = rows(gs[0], groups);
+            if gs[1..].iter().any(|&g| rows(g, groups) != first) {
                 continue;
             }
             let xs: Vec<Vec<ExprId>> = gs
@@ -1169,37 +1042,41 @@ impl Forest {
                 .collect();
             let members: Vec<usize> = gs
                 .iter()
-                .flat_map(|&g| groups[g].1.iter().copied())
+                .flat_map(|&g| std::mem::take(&mut groups[g].1))
                 .collect();
-            for &g in &gs[1..] {
-                groups[g].1.clear();
-            }
-            groups[gs[0]] = (GroupKey::Gemm(rows, xs), members);
+            groups[gs[0]] = (GroupKey::Gemm(first, xs), members);
         }
-        // Solve groups over one matrix at one depth are one solve of several
-        // right-hand sides: the factorization once. Equal depth means no
-        // right-hand side depends on another group's solution (a
-        // derivative's solve reads the primal solution over the same
-        // matrix). A merged-away group is left empty.
+    }
+
+    /// Solve groups over one matrix at one depth are one solve of several
+    /// right-hand sides: the factorization once. Equal depth means no
+    /// right-hand side depends on another group's solution (a derivative's
+    /// solve reads the primal solution over the same matrix). A merged-away
+    /// group is left empty.
+    fn merge_solves<K: Field>(
+        &self,
+        ctx: &Graph<K>,
+        groups: &mut [(GroupKey, Vec<usize>)],
+        depth: &[u32],
+    ) {
         let mut by_matrix: HashMap<(Vec<ExprId>, u32, bool), Vec<usize>> = HashMap::default();
         for (g, (key, members)) in groups.iter().enumerate() {
             if let GroupKey::Solve(l, pure) = key {
-                let all = ctx.args(*l);
-                let n = Graph::<K>::solve_n(all.len());
+                let (n, all) = (Graph::<K>::solve_n(l.len()), ctx.args(*l));
                 by_matrix
                     .entry((all[..n * n].to_vec(), depth[members[0]], *pure))
                     .or_default()
                     .push(g);
             }
         }
-        let mut merged_solves: Vec<(Vec<usize>, Vec<ExprId>)> = by_matrix
+        let mut merged: Vec<(Vec<usize>, Vec<ExprId>)> = by_matrix
             .into_iter()
             .filter(|(_, gs)| gs.len() >= 2)
             .map(|((a, _, _), gs)| (gs, a))
             .collect();
-        merged_solves.sort();
-        for (gs, a) in merged_solves {
-            let lists: Vec<crate::node::ArgList> = gs
+        merged.sort();
+        for (gs, a) in merged {
+            let lists: Vec<ArgList> = gs
                 .iter()
                 .map(|&g| match &groups[g].0 {
                     GroupKey::Solve(l, _) => *l,
@@ -1208,57 +1085,25 @@ impl Forest {
                 .collect();
             let members: Vec<usize> = gs
                 .iter()
-                .flat_map(|&g| groups[g].1.iter().copied())
+                .flat_map(|&g| std::mem::take(&mut groups[g].1))
                 .collect();
-            for &g in &gs[1..] {
-                groups[g].1.clear();
-            }
             groups[gs[0]] = (GroupKey::SolveMany(a, lists), members);
         }
-        // A gemv group of too few rows at its depth, or a call group of one
-        // argument list, is no kernel: its members lower on their own.
-        let mut kernel_of: Vec<Option<usize>> = vec![None; m];
-        for (g, (key, members)) in groups.iter().enumerate() {
-            let is_kernel = match key {
-                GroupKey::Gemv(..) => members.len() >= GEMV_MIN_ROWS,
-                GroupKey::Gemm(..) => true,
-                GroupKey::Call(..) => {
-                    let mut distinct: BTreeSet<Vec<ExprId>> = BTreeSet::new();
-                    for &i in members {
-                        if let Node::Call(_, l) = *ctx.node(base[i]) {
-                            distinct.insert(ctx.args(l).to_vec());
-                        }
-                    }
-                    distinct.len() >= 2
-                }
-                GroupKey::Solve(..) => true,
-                GroupKey::SolveMany(..) => true,
-            };
-            if is_kernel {
-                for &i in members {
-                    kernel_of[i] = Some(g);
-                }
-            }
-        }
-        let mut lowered_group = vec![false; groups.len()];
-        // The outputs of one call (same function, same arguments), so a
-        // single call is one instruction whichever output is reached first.
-        let mut call_sites: HashMap<(u32, crate::node::ArgList), Vec<usize>> = HashMap::default();
-        for (i, &id) in base.iter().enumerate() {
-            if let Node::Call(o, l) = *ctx.node(id) {
-                call_sites
-                    .entry((ctx.output(o).0 .0, l))
-                    .or_default()
-                    .push(i);
-            }
-        }
+    }
 
-        // --- the order: every unit after its operands ----------------------
-        // A unit is a node, or the group it belongs to (by its first
-        // member); a group's operands are all its members' operands. A
-        // fused operand is no unit, its consumer reads its operands. A
-        // depth-first walk from the roots, post-order, with an explicit
-        // stack.
+    /// Every unit after its operands: a unit is a node, or the group it
+    /// belongs to (by its first member), whose operands are all its members'
+    /// operands; a fused operand is no unit, its consumer reads its
+    /// operands. A depth-first walk from the roots, post-order, on an
+    /// explicit stack.
+    fn unit_order<K: Field>(
+        &self,
+        ctx: &Graph<K>,
+        roots: &[ExprId],
+        groups: &Groups,
+    ) -> Vec<usize> {
+        let m = self.base.len();
+        let (groups, kernel_of) = (&groups.groups, &groups.kernel_of);
         let first_member: Vec<usize> = groups
             .iter()
             .map(|(_, ms)| ms.first().copied().unwrap_or(0))
@@ -1270,7 +1115,7 @@ impl Forest {
             }
         };
         let deps_of_node = |i: usize, out: &mut Vec<usize>| {
-            for &a in ctx.operands(base[i]).iter() {
+            for &a in ctx.operands(self.base[i]).iter() {
                 let pa = self.pos(a);
                 if self.fused_into[pa] == Some(i) {
                     for &x in ctx.operands(a).iter() {
@@ -1282,11 +1127,11 @@ impl Forest {
             }
         };
         // Distinct dependencies by a stamp per unit, not a sort: a kernel
-        // over thousands of rows names its operands hundreds of thousands
-        // of times.
+        // over thousands of rows names its operands hundreds of thousands of
+        // times. One buffer for every unit's raw operands and one for the
+        // distinct ones, reused: a million units are not two million
+        // allocations.
         let mut stamp: Vec<usize> = vec![usize::MAX; m];
-        // One buffer for every unit's raw operands and one for the distinct
-        // ones, reused: a million units are not two million allocations.
         let mut raw: Vec<usize> = Vec::new();
         let mut deps: Vec<usize> = Vec::new();
         let mut deps_of_unit = |u: usize, deps: &mut Vec<usize>| {
@@ -1330,435 +1175,335 @@ impl Forest {
                 }
             }
         }
+        order
+    }
 
-        // --- the instructions, in that order --------------------------------
-        let leaf = |e: ExprId| -> Option<Ref> {
-            match ctx.node(e) {
-                Node::Symbol(s) => Some(Ref::Input(self.input(*s).unwrap_or(u32::MAX))),
-                _ => None,
+    /// The instruction of a kernel group.
+    fn lower_group<K: Field>(
+        &self,
+        ctx: &Graph<K>,
+        lw: &mut Lowering,
+        bodies: &mut Bodies,
+        calls: &CallSets,
+        key: &GroupKey,
+        members: &[usize],
+    ) {
+        let base = &self.base;
+        let pure = members.iter().all(|&mi| self.pure[mi]);
+        let val = |lw: &Lowering, e: ExprId| self.val(lw, e);
+        match key {
+            GroupKey::Call(f, _, _, set) => {
+                self.lower_calls(ctx, lw, bodies, calls, *f, *set, members)
             }
-        };
-        for &i in &order {
-            let id = base[i];
-            if self.fused_into[i].is_some() {
-                continue; // materialised inside its consuming Add
+            GroupKey::Gemv(x, ..) => {
+                let mut ins: Vec<Ref> = Vec::new();
+                for &mi in members {
+                    let Node::Dot(l) = *ctx.node(base[mi]) else {
+                        unreachable!()
+                    };
+                    ins.extend(ctx.dot_args(l).0.iter().map(|&a| val(lw, a)));
+                }
+                ins.extend(x.iter().map(|&a| val(lw, a)));
+                let kind = Kind::Gemv {
+                    m: members.len() as u32,
+                    n: x.len() as u32,
+                    acc: None,
+                };
+                let inst = lw.push(kind, ins, members.len() as u32, pure);
+                for (r, &mi) in members.iter().enumerate() {
+                    lw.value[mi] = Some(Ref::Value(inst, r as u32));
+                }
             }
-            if value[i].is_some() {
-                continue; // an output of a kernel lowered earlier
+            GroupKey::Gemm(rows, xs) => {
+                let (rm, k, cn) = (rows.len(), xs[0].len(), xs.len());
+                let ins: Vec<Ref> = rows
+                    .iter()
+                    .chain(xs)
+                    .flat_map(|r| r.iter().map(|&a| val(lw, a)))
+                    .collect();
+                fn index(set: &[Vec<ExprId>]) -> HashMap<&[ExprId], usize> {
+                    set.iter()
+                        .enumerate()
+                        .map(|(i, r)| (r.as_slice(), i))
+                        .collect()
+                }
+                let (row_index, col_index) = (index(rows), index(xs));
+                let kind = Kind::Gemm {
+                    m: rm as u32,
+                    k: k as u32,
+                    n: cn as u32,
+                    acc: None,
+                };
+                let inst = lw.push(kind, ins, (rm * cn) as u32, pure);
+                for &mi in members {
+                    let Node::Dot(l) = *ctx.node(base[mi]) else {
+                        unreachable!()
+                    };
+                    let (a, x) = ctx.dot_args(l);
+                    let (r, c) = (row_index[a], col_index[x]);
+                    lw.value[mi] = Some(Ref::Value(inst, (r * cn + c) as u32));
+                }
             }
-            let node = *ctx.node(id);
-            // A leaf: an input is an operand (a symbol without an input is
-            // NaN), a constant an instruction.
-            if let Some(r) = leaf(id) {
-                value[i] = Some(match r {
-                    Ref::Input(u32::MAX) => {
-                        insts.push(Inst {
-                            kind: Kind::Const(f64::NAN),
-                            ins: (pool.len() as u32, 0),
-                            n_out: 1,
-                            pure: true,
-                        });
-                        Ref::Value(insts.len() as u32 - 1, 0)
-                    }
-                    r => r,
-                });
-                continue;
+            GroupKey::SolveMany(a, lists) => {
+                let n = (a.len() as f64).sqrt() as u32;
+                let k = lists.len() as u32;
+                let mut ins: Vec<Ref> = a.iter().map(|&e| val(lw, e)).collect();
+                for &l in lists {
+                    ins.extend(ctx.args(l)[(n * n) as usize..].iter().map(|&e| val(lw, e)));
+                }
+                let col_of: HashMap<ArgList, u32> = lists
+                    .iter()
+                    .enumerate()
+                    .map(|(c, &l)| (l, c as u32))
+                    .collect();
+                let inst = lw.push(Kind::Solve { n, k }, ins, n * k, pure);
+                for &mi in members {
+                    let Node::Solve(l, c) = *ctx.node(base[mi]) else {
+                        unreachable!()
+                    };
+                    lw.value[mi] = Some(Ref::Value(inst, col_of[&l] * n + c));
+                }
             }
-            if let Node::Const(c) = node {
-                insts.push(Inst {
-                    kind: Kind::Const(ctx.const_val(c).to_f64()),
-                    ins: (pool.len() as u32, 0),
-                    n_out: 1,
-                    pure: true,
-                });
-                value[i] = Some(Ref::Value(insts.len() as u32 - 1, 0));
-                continue;
+            GroupKey::Solve(l, _) => {
+                let all = ctx.args(*l);
+                let n = Graph::<K>::solve_n(all.len()) as u32;
+                let ins: Vec<Ref> = all.iter().map(|&a| val(lw, a)).collect();
+                let inst = lw.push(Kind::Solve { n, k: 1 }, ins, n, pure);
+                for &mi in members {
+                    let Node::Solve(_, c) = *ctx.node(base[mi]) else {
+                        unreachable!()
+                    };
+                    lw.value[mi] = Some(Ref::Value(inst, c));
+                }
             }
-            // The operand of a node: its value (every operand precedes its
-            // consumer in base order, and a fused operand's own operands
-            // are read by the consumer).
-            let val = |e: ExprId, value: &[Option<Ref>]| -> Ref {
-                value[self.pos(e)].expect("an operand precedes its consumer")
+        }
+    }
+
+    /// Calls of `f` made for the output set `set`, the nodes `members`: one
+    /// instruction over their distinct argument lists in first-encounter
+    /// order, each member a value of the group its list is, or zero where
+    /// the body does not carry the output. A call that keeps state gets its
+    /// instances' prolog first.
+    #[allow(clippy::too_many_arguments)]
+    fn lower_calls<K: Field>(
+        &self,
+        ctx: &Graph<K>,
+        lw: &mut Lowering,
+        bodies: &mut Bodies,
+        calls: &CallSets,
+        f: u32,
+        set: u32,
+        members: &[usize],
+    ) {
+        let (bundle, body) = bodies.get(ctx, &mut lw.p.bundles, f, set, &calls.sets);
+        let b = body.bundle.clone();
+        let n_out = b.n_outputs() as u32;
+        let mut lists: Vec<ArgList> = Vec::new();
+        let mut group_of: HashMap<ArgList, u32> = HashMap::default();
+        for &mi in members {
+            let Node::Call(_, l) = *ctx.node(self.base[mi]) else {
+                unreachable!()
             };
-            if let Some(g) = kernel_of[i] {
-                if lowered_group[g] {
-                    continue;
-                }
-                lowered_group[g] = true;
-                let (key, members) = &groups[g];
-                match key {
-                    GroupKey::Call(f, _, _, set) => {
-                        let (bundle, n_out) = {
-                            let body = bodies.entry((*f, *set)).or_insert_with(|| {
-                                ctx.func(FuncId(*f)).body_for(ctx, &sets[*set as usize])
-                            });
-                            let ptr = Arc::as_ptr(&body.bundle) as *const () as usize;
-                            let b = *bundle_idx.entry(ptr).or_insert_with(|| {
-                                bundles.push(body.bundle.clone());
-                                bundles.len() as u32 - 1
-                            });
-                            (b, body.bundle.n_outputs() as u32)
-                        };
-                        // Distinct argument lists in first-encounter order,
-                        // and each member's (group, slot) within the block.
-                        let mut arg_lists: Vec<Vec<ExprId>> = Vec::new();
-                        let mut group_of_list: HashMap<Vec<ExprId>, u32> = HashMap::default();
-                        let mut ins: Vec<Ref> = Vec::new();
-                        for &mi in members {
-                            let Node::Call(_, l) = *ctx.node(base[mi]) else {
-                                unreachable!()
-                            };
-                            let args = ctx.args(l).to_vec();
-                            if !group_of_list.contains_key(&args) {
-                                group_of_list.insert(args.clone(), arg_lists.len() as u32);
-                                ins.extend(args.iter().map(|&a| val(a, &value)));
-                                arg_lists.push(args);
-                            }
-                        }
-                        let n_args = arg_lists[0].len() as u32;
-                        let n_groups = arg_lists.len() as u32;
-                        let pure = members.iter().all(|&mi| self.pure[mi]);
-                        let b = bundles[bundle as usize].clone();
-                        let lists: Vec<&[ExprId]> = arg_lists.iter().map(Vec::as_slice).collect();
-                        let stateful = !pure && self.stateful(&*b, &lists);
-                        if stateful {
-                            let mask = b.pure_args();
-                            let ps = pool.len() as u32;
-                            for args in &arg_lists {
-                                pool.extend(
-                                    args.iter()
-                                        .zip(mask)
-                                        .filter(|&(_, &p)| p)
-                                        .map(|(&a, _)| val(a, &value)),
-                                );
-                            }
-                            let n_pure = mask.iter().filter(|&&p| p).count() as u32;
-                            insts.push(Inst {
-                                kind: Kind::CallProlog {
-                                    bundle,
-                                    n_groups,
-                                    n_pure,
-                                },
-                                ins: (ps, pool.len() as u32 - ps),
-                                n_out: n_groups * b.state_len() as u32,
-                                pure: true,
-                            });
-                            ins.push(Ref::Value(insts.len() as u32 - 1, 0));
-                        }
-                        let inst = insts.len() as u32;
-                        insts.push(Inst {
-                            kind: Kind::CallBatch {
-                                bundle,
-                                n_groups,
-                                n_args,
-                                stateful,
-                            },
-                            ins: pooled(&mut pool, ins),
-                            n_out: n_groups * n_out,
-                            pure,
-                        });
-                        let body = &bodies[&(*f, *set)];
-                        for &mi in members {
-                            let Node::Call(o, l) = *ctx.node(base[mi]) else {
-                                unreachable!()
-                            };
-                            let (_, out) = ctx.output(o);
-                            let gi = group_of_list[&ctx.args(l).to_vec()];
-                            value[mi] = Some(match body.slot_of[out as usize] {
-                                Some(slot) => Ref::Value(inst, gi * n_out + slot),
-                                None => {
-                                    // A zero output: a derivative the body
-                                    // does not carry.
-                                    insts.push(Inst {
-                                        kind: Kind::Const(0.0),
-                                        ins: (pool.len() as u32, 0),
-                                        n_out: 1,
-                                        pure: true,
-                                    });
-                                    Ref::Value(insts.len() as u32 - 1, 0)
-                                }
-                            });
-                        }
-                    }
-                    GroupKey::Gemv(x, ..) => {
-                        let mut ins: Vec<Ref> = Vec::new();
-                        for &mi in members {
-                            let Node::Dot(l) = *ctx.node(base[mi]) else {
-                                unreachable!()
-                            };
-                            ins.extend(ctx.dot_args(l).0.iter().map(|&a| val(a, &value)));
-                        }
-                        ins.extend(x.iter().map(|&a| val(a, &value)));
-                        let pure = members.iter().all(|&mi| self.pure[mi]);
-                        let inst = insts.len() as u32;
-                        insts.push(Inst {
-                            kind: Kind::Gemv {
-                                m: members.len() as u32,
-                                n: x.len() as u32,
-                                acc: None,
-                            },
-                            ins: pooled(&mut pool, ins),
-                            n_out: members.len() as u32,
-                            pure,
-                        });
-                        for (r, &mi) in members.iter().enumerate() {
-                            value[mi] = Some(Ref::Value(inst, r as u32));
-                        }
-                    }
-                    GroupKey::Gemm(rows, xs) => {
-                        let (rm, k, cn) = (rows.len(), xs[0].len(), xs.len());
-                        let mut ins: Vec<Ref> = Vec::with_capacity((rm + cn) * k);
-                        for r in rows {
-                            ins.extend(r.iter().map(|&a| val(a, &value)));
-                        }
-                        for x in xs {
-                            ins.extend(x.iter().map(|&a| val(a, &value)));
-                        }
-                        let row_index: HashMap<&[ExprId], usize> = rows
-                            .iter()
-                            .enumerate()
-                            .map(|(i, r)| (r.as_slice(), i))
-                            .collect();
-                        let col_index: HashMap<&[ExprId], usize> = xs
-                            .iter()
-                            .enumerate()
-                            .map(|(j, x)| (x.as_slice(), j))
-                            .collect();
-                        let pure = members.iter().all(|&mi| self.pure[mi]);
-                        let inst = insts.len() as u32;
-                        insts.push(Inst {
-                            kind: Kind::Gemm {
-                                m: rm as u32,
-                                k: k as u32,
-                                n: cn as u32,
-                                acc: None,
-                            },
-                            ins: pooled(&mut pool, ins),
-                            n_out: (rm * cn) as u32,
-                            pure,
-                        });
-                        for &mi in members {
-                            let Node::Dot(l) = *ctx.node(base[mi]) else {
-                                unreachable!()
-                            };
-                            let (a, x) = ctx.dot_args(l);
-                            let (r, c) = (row_index[a], col_index[x]);
-                            value[mi] = Some(Ref::Value(inst, (r * cn + c) as u32));
-                        }
-                    }
-                    GroupKey::SolveMany(a, lists) => {
-                        let n = (a.len() as f64).sqrt() as u32;
-                        let kk = lists.len() as u32;
-                        let mut ins: Vec<Ref> = a.iter().map(|&e| val(e, &value)).collect();
-                        for l in lists {
-                            let all = ctx.args(*l);
-                            ins.extend(all[(n * n) as usize..].iter().map(|&e| val(e, &value)));
-                        }
-                        let col_of: HashMap<crate::node::ArgList, u32> = lists
-                            .iter()
-                            .enumerate()
-                            .map(|(c, &l)| (l, c as u32))
-                            .collect();
-                        let pure = members.iter().all(|&mi| self.pure[mi]);
-                        let inst = insts.len() as u32;
-                        insts.push(Inst {
-                            kind: Kind::SolveMany { n, k: kk },
-                            ins: pooled(&mut pool, ins),
-                            n_out: n * kk,
-                            pure,
-                        });
-                        for &mi in members {
-                            let Node::Solve(l, c) = *ctx.node(base[mi]) else {
-                                unreachable!()
-                            };
-                            value[mi] = Some(Ref::Value(inst, col_of[&l] * n + c));
-                        }
-                    }
-                    GroupKey::Solve(l, _) => {
-                        let all = ctx.args(*l);
-                        let n = Graph::<K>::solve_n(all.len()) as u32;
-                        let ins: Vec<Ref> = all.iter().map(|&a| val(a, &value)).collect();
-                        let pure = members.iter().all(|&mi| self.pure[mi]);
-                        let inst = insts.len() as u32;
-                        insts.push(Inst {
-                            kind: Kind::Solve { n },
-                            ins: pooled(&mut pool, ins),
-                            n_out: n,
-                            pure,
-                        });
-                        for &mi in members {
-                            let Node::Solve(_, c) = *ctx.node(base[mi]) else {
-                                unreachable!()
-                            };
-                            value[mi] = Some(Ref::Value(inst, c));
-                        }
-                    }
-                }
-                continue;
+            group_of.entry(l).or_insert_with(|| {
+                lists.push(l);
+                lists.len() as u32 - 1
+            });
+        }
+        let args: Vec<&[ExprId]> = lists.iter().map(|&l| ctx.args(l)).collect();
+        let (n_groups, n_args) = (lists.len() as u32, args[0].len() as u32);
+        let pure = members.iter().all(|&mi| self.pure[mi]);
+        let stateful = !pure && self.stateful(&*b, &args);
+        let mut ins: Vec<Ref> = args
+            .iter()
+            .flat_map(|a| a.iter())
+            .map(|&a| self.val(lw, a))
+            .collect();
+        if stateful {
+            let mask = b.pure_args();
+            let pure_args: Vec<Ref> = args
+                .iter()
+                .flat_map(|a| a.iter().zip(mask).filter(|&(_, &p)| p))
+                .map(|(&a, _)| self.val(lw, a))
+                .collect();
+            let n_pure = mask.iter().filter(|&&p| p).count() as u32;
+            let kind = Kind::CallProlog {
+                bundle,
+                n_groups,
+                n_pure,
+            };
+            let prolog = lw.push(kind, pure_args, n_groups * b.state_len() as u32, true);
+            ins.push(Ref::Value(prolog, 0));
+        }
+        let kind = Kind::Call {
+            bundle,
+            n_groups,
+            n_args,
+            stateful,
+        };
+        let inst = lw.push(kind, ins, n_groups * n_out, pure);
+        for &mi in members {
+            let Node::Call(o, l) = *ctx.node(self.base[mi]) else {
+                unreachable!()
+            };
+            let slot = body.slot_of[ctx.output(o).1 as usize];
+            lw.value[mi] = Some(match slot {
+                Some(slot) => Ref::Value(inst, group_of[&l] * n_out + slot),
+                // A zero output: a derivative the body does not carry.
+                None => lw.constant(0.0),
+            });
+        }
+    }
+
+    /// The instruction of node `i` that is no kernel member: a leaf (an
+    /// input is an operand, a symbol without one NaN, a constant an
+    /// instruction), or one instruction, an Add with a fused operand reading
+    /// through it.
+    fn lower_node<K: Field>(&self, ctx: &Graph<K>, lw: &mut Lowering, i: usize) {
+        let val = |lw: &Lowering, e: ExprId| self.val(lw, e);
+        let (kind, ins): (Kind, Vec<Ref>) = match *ctx.node(self.base[i]) {
+            Node::Symbol(s) => {
+                lw.value[i] = Some(match self.input(s) {
+                    Some(k) => Ref::Input(k),
+                    None => lw.constant(f64::NAN),
+                });
+                return;
             }
-            // An ordinary node, one instruction; an Add with a fused
-            // operand reads through it.
-            // The operands go straight into the program's pool.
-            let start = pool.len() as u32;
-            let kind = match node {
-                Node::Add(a, b) => {
-                    let (pa, pb) = (self.pos(a), self.pos(b));
-                    if self.fused_into[pa] == Some(i) || self.fused_into[pb] == Some(i) {
-                        let (fused, other) = if self.fused_into[pa] == Some(i) {
-                            (a, b)
-                        } else {
-                            (b, a)
-                        };
-                        match *ctx.node(fused) {
+            Node::Const(c) => {
+                lw.value[i] = Some(lw.constant(ctx.const_val(c).to_f64()));
+                return;
+            }
+            Node::Add(a, b) => {
+                let fused = |x: ExprId| self.fused_into[self.pos(x)] == Some(i);
+                match (fused(a), fused(b)) {
+                    (false, false) => (Kind::Add, vec![val(lw, a), val(lw, b)]),
+                    (fa, _) => {
+                        let (f, other) = if fa { (a, b) } else { (b, a) };
+                        match *ctx.node(f) {
                             Node::Mul(x, y) => {
-                                pool.extend_from_slice(&[
-                                    val(x, &value),
-                                    val(y, &value),
-                                    val(other, &value),
-                                ]);
-                                Kind::MulAdd
+                                (Kind::MulAdd, vec![val(lw, x), val(lw, y), val(lw, other)])
                             }
-                            Node::Neg(x) => {
-                                pool.extend_from_slice(&[val(other, &value), val(x, &value)]);
-                                Kind::Sub
-                            }
+                            Node::Neg(x) => (Kind::Sub, vec![val(lw, other), val(lw, x)]),
                             _ => unreachable!("only a Mul or a Neg fuses"),
                         }
-                    } else {
-                        {
-                            pool.extend_from_slice(&[val(a, &value), val(b, &value)]);
-                            Kind::Add
-                        }
                     }
                 }
-                Node::Mul(a, b) => {
-                    pool.extend_from_slice(&[val(a, &value), val(b, &value)]);
-                    Kind::Mul
-                }
-                Node::Neg(a) => {
-                    pool.extend_from_slice(&[val(a, &value)]);
-                    Kind::Neg
-                }
-                Node::Pow(a, n) => {
-                    pool.extend_from_slice(&[val(a, &value)]);
-                    Kind::Powi(n as i32)
-                }
-                Node::Unary(op, a) => {
-                    pool.extend_from_slice(&[val(a, &value)]);
-                    Kind::Unary(op)
-                }
-                Node::Binary(op, a, b) => {
-                    pool.extend_from_slice(&[val(a, &value), val(b, &value)]);
-                    Kind::Binary(op)
-                }
-                Node::Cmp(op, a, b) => {
-                    pool.extend_from_slice(&[val(a, &value), val(b, &value)]);
-                    Kind::Cmp(op)
-                }
-                Node::Select(c, t, e) => {
-                    pool.extend_from_slice(&[val(c, &value), val(t, &value), val(e, &value)]);
-                    Kind::Select
-                }
-                Node::Reduce(op, l) => {
-                    pool.extend(ctx.args(l).iter().map(|&a| val(a, &value)));
-                    Kind::Reduce(op)
-                }
-                Node::Dot(l) => {
-                    let (a, b) = ctx.dot_args(l);
-                    pool.extend(a.iter().chain(b).map(|&e| val(e, &value)));
-                    Kind::Dot(a.len() as u32)
-                }
-                Node::Call(o, l) => {
-                    // A single call: its outputs a block, this node one of
-                    // them; other outputs of the same call join it.
-                    let (f, _) = ctx.output(o);
-                    let (set, outs) = needed(f.0, l);
-                    let body = bodies
-                        .entry((f.0, set))
-                        .or_insert_with(|| ctx.func(f).body_for(ctx, outs));
-                    let ptr = Arc::as_ptr(&body.bundle) as *const () as usize;
-                    let bundle = *bundle_idx.entry(ptr).or_insert_with(|| {
-                        bundles.push(body.bundle.clone());
-                        bundles.len() as u32 - 1
-                    });
-                    let n_out = body.bundle.n_outputs() as u32;
-                    let args = ctx.args(l);
-                    let stateful = !self.pure[i] && self.stateful(&*body.bundle, &[args]);
-                    let state = stateful.then(|| {
-                        let mask = body.bundle.pure_args();
-                        let ps = pool.len() as u32;
-                        pool.extend(
-                            args.iter()
-                                .zip(mask)
-                                .filter(|&(_, &p)| p)
-                                .map(|(&a, _)| val(a, &value)),
-                        );
-                        insts.push(Inst {
-                            kind: Kind::CallProlog {
-                                bundle,
-                                n_groups: 1,
-                                n_pure: pool.len() as u32 - ps,
-                            },
-                            ins: (ps, pool.len() as u32 - ps),
-                            n_out: body.bundle.state_len() as u32,
-                            pure: true,
-                        });
-                        Ref::Value(insts.len() as u32 - 1, 0)
-                    });
-                    let start = pool.len() as u32;
-                    pool.extend(args.iter().map(|&a| val(a, &value)));
-                    pool.extend(state);
-                    let inst = insts.len() as u32;
-                    insts.push(Inst {
-                        kind: Kind::Call { bundle, stateful },
-                        ins: (start, pool.len() as u32 - start),
-                        n_out,
-                        pure: self.pure[i],
-                    });
-                    // Every reachable output of this very call, this one
-                    // included.
-                    for &j in &call_sites[&(f.0, l)] {
-                        let Node::Call(o2, _) = *ctx.node(base[j]) else {
-                            unreachable!()
-                        };
-                        let (_, out2) = ctx.output(o2);
-                        value[j] = Some(match body.slot_of[out2 as usize] {
-                            Some(slot) => Ref::Value(inst, slot),
-                            None => {
-                                insts.push(Inst {
-                                    kind: Kind::Const(0.0),
-                                    ins: (pool.len() as u32, 0),
-                                    n_out: 1,
-                                    pure: true,
-                                });
-                                Ref::Value(insts.len() as u32 - 1, 0)
-                            }
-                        });
-                    }
-                    continue;
-                }
-                Node::Solve(..) => unreachable!("a solve component is a kernel member"),
-                Node::Const(_) | Node::Symbol(_) => unreachable!("leaves handled above"),
-            };
-            insts.push(Inst {
-                kind,
-                ins: (start, pool.len() as u32 - start),
-                n_out: 1,
-                pure: self.pure[i],
+            }
+            Node::Mul(a, b) => (Kind::Mul, vec![val(lw, a), val(lw, b)]),
+            Node::Neg(a) => (Kind::Neg, vec![val(lw, a)]),
+            Node::Pow(a, n) => (Kind::Powi(n as i32), vec![val(lw, a)]),
+            Node::Unary(op, a) => (Kind::Unary(op), vec![val(lw, a)]),
+            Node::Binary(op, a, b) => (Kind::Binary(op), vec![val(lw, a), val(lw, b)]),
+            Node::Cmp(op, a, b) => (Kind::Cmp(op), vec![val(lw, a), val(lw, b)]),
+            Node::Select(c, t, e) => (Kind::Select, vec![val(lw, c), val(lw, t), val(lw, e)]),
+            Node::Reduce(op, l) => (
+                Kind::Reduce(op),
+                ctx.args(l).iter().map(|&a| val(lw, a)).collect(),
+            ),
+            Node::Dot(l) => (
+                Kind::Dot(l.len() as u32 / 2),
+                ctx.args(l).iter().map(|&a| val(lw, a)).collect(),
+            ),
+            Node::Call(..) | Node::Solve(..) => unreachable!("calls and solves lower as groups"),
+        };
+        let inst = lw.push(kind, ins, 1, self.pure[i]);
+        lw.value[i] = Some(Ref::Value(inst, 0));
+    }
+}
+
+/// The output sets calls are made for (see [`Forest::call_sets`]).
+#[derive(Default)]
+struct CallSets {
+    /// Per function and argument list, the set of outputs called.
+    set_of: HashMap<(u32, ArgList), u32>,
+    sets: Vec<Vec<u32>>,
+}
+
+/// What makes the members of a group one kernel. Every key carries the
+/// members' purity: a kernel of pure and impure members would be impure as
+/// a whole and pull the pure work out of the prolog.
+#[derive(PartialEq, Eq, Hash, Clone)]
+enum GroupKey {
+    /// Function, depth, purity, the output set called for.
+    Call(u32, u32, bool, u32),
+    Gemv(Vec<ExprId>, u32, bool),
+    /// The rows (sorted) against every vector: a matrix product.
+    Gemm(Vec<Vec<ExprId>>, Vec<Vec<ExprId>>),
+    Solve(ArgList, bool),
+    /// One matrix against several right-hand sides (their lists, in
+    /// first-encounter order).
+    SolveMany(Vec<ExprId>, Vec<ArgList>),
+}
+
+/// The kernel groups of a forest (see [`Forest::groups`]): members by base
+/// position, and the group, if a kernel, each position belongs to.
+struct Groups {
+    groups: Vec<(GroupKey, Vec<usize>)>,
+    kernel_of: Vec<Option<usize>>,
+}
+
+/// A program as [`Forest::lower`] builds it, and the value each base node
+/// is once lowered.
+struct Lowering {
+    p: Program,
+    value: Vec<Option<Ref>>,
+}
+
+impl Lowering {
+    /// Append an instruction over the operands `ins`; its index.
+    fn push(
+        &mut self,
+        kind: Kind,
+        ins: impl IntoIterator<Item = Ref>,
+        n_out: u32,
+        pure: bool,
+    ) -> u32 {
+        let start = self.p.pool.len() as u32;
+        self.p.pool.extend(ins);
+        self.p.insts.push(Inst {
+            kind,
+            ins: (start, self.p.pool.len() as u32 - start),
+            n_out,
+            pure,
+        });
+        self.p.insts.len() as u32 - 1
+    }
+
+    /// A constant instruction's value.
+    fn constant(&mut self, v: f64) -> Ref {
+        Ref::Value(self.push(Kind::Const(v), [], 1, true), 0)
+    }
+}
+
+/// The bodies serving the calls, by function and output set, with their
+/// bundles' indices in the program.
+#[derive(Default)]
+struct Bodies {
+    of: HashMap<(u32, u32), (u32, Body)>,
+    bundle_idx: HashMap<usize, u32>,
+}
+
+impl Bodies {
+    /// The body of `f` for the output set `set`, compiled on first demand,
+    /// its bundle interned into `bundles`.
+    fn get<K: Field>(
+        &mut self,
+        ctx: &Graph<K>,
+        bundles: &mut Vec<Arc<dyn ExternBundle>>,
+        f: u32,
+        set: u32,
+        sets: &[Vec<u32>],
+    ) -> (u32, &Body) {
+        let bundle_idx = &mut self.bundle_idx;
+        let (b, body) = self.of.entry((f, set)).or_insert_with(|| {
+            let body = ctx.func(FuncId(f)).body_for(ctx, &sets[set as usize]);
+            let ptr = Arc::as_ptr(&body.bundle) as *const () as usize;
+            let b = *bundle_idx.entry(ptr).or_insert_with(|| {
+                bundles.push(body.bundle.clone());
+                bundles.len() as u32 - 1
             });
-            value[i] = Some(Ref::Value(insts.len() as u32 - 1, 0));
-        }
-        let roots: Vec<Ref> = roots
-            .iter()
-            .map(|r| value[self.pos(*r)].expect("a root is lowered"))
-            .collect();
-        Program {
-            insts,
-            pool,
-            bundles,
-            roots,
-            placeholder: None,
-        }
+            (b, body)
+        });
+        (*b, body)
     }
 }
 
@@ -1772,7 +1517,7 @@ impl Program {
     /// pure instruction precedes every impure one. Constants are placed
     /// right before their first consumer, so a multiply-used one is live
     /// from its first use, not from the start.
-    fn schedule(&self) -> Vec<u32> {
+    pub(super) fn schedule(&self) -> Vec<u32> {
         let m = self.insts.len();
         let is_const = |i: usize| matches!(self.insts[i].kind, Kind::Const(_));
         // Distinct value dependencies of each instruction, as instruction
@@ -1874,7 +1619,7 @@ impl Program {
     }
 
     /// Pass 4: lifetimes, slots and the instruction stream.
-    fn emit(&self, order: &[u32], split: bool) -> Tape {
+    pub(super) fn emit(&self, order: &[u32], split: bool) -> Tape {
         let m = self.insts.len();
         let mut pos = vec![0usize; m];
         for (k, &i) in order.iter().enumerate() {
@@ -1967,8 +1712,7 @@ impl Program {
                     }
                     r
                 }
-                Kind::Solve { n } => vec![(n * n) as usize, n as usize],
-                Kind::SolveMany { n, k } => vec![(n * n) as usize, (n * k) as usize],
+                Kind::Solve { n, k } => vec![(n * n) as usize, (n * k) as usize],
                 _ => continue,
             };
             let ins = self.ins(i as usize);
@@ -2071,18 +1815,14 @@ impl Program {
                 *max_args = (*max_args).max(ops.len());
                 start
             };
-            // A dense operand: a run of consecutive inputs is read in place.
+            // A dense operand: a run of consecutive inputs or of consecutive
+            // work slots is read in place, anything else gathered.
             let dense = |arg_pool: &mut Vec<u32>, max_args: &mut usize, ops: &[u32]| -> Src {
-                let run = ops.first().and_then(|&k0| {
-                    let k0 = super::input_index(k0)?;
-                    ops.iter()
-                        .enumerate()
-                        .all(|(j, &k)| super::input_index(k) == Some(k0 + j as u32))
-                        .then_some(k0)
-                });
-                match run {
-                    Some(k0) => Src::Inputs(k0),
-                    None => Src::Pool(gather(arg_pool, max_args, ops)),
+                let run = |k0: u32| ops.iter().enumerate().all(|(j, &k)| k == k0 + j as u32);
+                match ops.first() {
+                    Some(&k0) if run(k0) && input_index(k0).is_some() => Src::Inputs(k0 & !INPUT),
+                    Some(&k0) if run(k0) => Src::Slots(k0),
+                    _ => Src::Pool(gather(arg_pool, max_args, ops)),
                 }
             };
             let o = &operands;
@@ -2109,27 +1849,16 @@ impl Program {
                     let start = gather(&mut arg_pool, &mut max_args, o);
                     Op::Dot(start, n)
                 }
-                Kind::Call { bundle, stateful } => {
-                    // A stateful call's last operand is its state block.
-                    let (args, state) = split_state(o, stateful);
-                    let start = gather(&mut arg_pool, &mut max_args, args);
-                    Op::Call {
-                        bundle,
-                        start,
-                        n_args: args.len() as u32,
-                        n_out: inst.n_out,
-                        state,
-                    }
-                }
-                Kind::CallBatch {
+                Kind::Call {
                     bundle,
                     n_groups,
                     n_args,
                     stateful,
                 } => {
+                    // A stateful call's last operand is its state block.
                     let (args, state) = split_state(o, stateful);
                     let start = gather(&mut arg_pool, &mut max_args, args);
-                    Op::CallBatch {
+                    Op::Call {
                         bundle,
                         start,
                         n_groups,
@@ -2205,28 +1934,33 @@ impl Program {
                         acc,
                     }
                 }
-                Kind::Solve { n } => {
-                    let (a, b) = o.split_at((n * n) as usize);
-                    let a = dense(&mut arg_pool, &mut max_args, a);
-                    let b = dense(&mut arg_pool, &mut max_args, b);
-                    max_args = max_args.max((n * n + n) as usize);
-                    Op::Solve { a, b, n }
-                }
-                Kind::SolveMany { n, k } => {
+                Kind::Solve { n, k } => {
                     let (a, b) = o.split_at((n * n) as usize);
                     let a = dense(&mut arg_pool, &mut max_args, a);
                     let b = dense(&mut arg_pool, &mut max_args, b);
                     max_args = max_args.max((n * n + n * k) as usize);
-                    Op::SolveMany { a, b, n, k }
+                    Op::Solve { a, b, n, k }
                 }
             };
             ops.push(op);
             dst.push(d);
         }
         let outputs: Vec<u32> = self.roots.iter().map(|&r| slot_of(r, &base)).collect();
-        let bundle_work = self.bundles.iter().map(|b| b.work_len()).max().unwrap_or(0);
+        // What the tail of the work buffer lends: a bundle's scratch, or a
+        // solve's, never both at once.
+        let solves = ops.iter().map(|op| match *op {
+            Op::Solve { n, k, .. } => crate::semantics::solve_scratch_len(n as usize, k as usize),
+            _ => 0,
+        });
+        let lent = self
+            .bundles
+            .iter()
+            .map(|b| b.work_len())
+            .chain(solves)
+            .max()
+            .unwrap_or(0);
         Tape {
-            bundle_work,
+            lent,
             ops,
             dst,
             n_selects,

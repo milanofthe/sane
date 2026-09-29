@@ -4,84 +4,108 @@
 
 use std::collections::HashMap;
 
+use rustc_hash::FxHashMap;
+
 use crate::eval::eval;
 use crate::field::Field;
 use crate::graph::Graph;
 use crate::node::{ExprId, Node, ReduceOp, SymbolId};
 
+/// `e` folded bottom-up over the nodes that depend on `s`: `free(g, c)` is
+/// the value of an operand free of `s`, `node(g, n, vals)` the value of a
+/// node from its operands' values (in operand order), `None` when the node
+/// is outside the algebra. One ascending sweep, each node once however
+/// often it is shared.
+fn fold_in<K: Field, T: Clone>(
+    g: &mut Graph<K>,
+    e: ExprId,
+    s: SymbolId,
+    free: impl Fn(&mut Graph<K>, ExprId) -> T,
+    mut node: impl FnMut(&mut Graph<K>, Node, &[T]) -> Option<T>,
+) -> Option<T> {
+    let mut cone = Vec::new();
+    let mut seen = rustc_hash::FxHashSet::default();
+    let mut stack = vec![e];
+    while let Some(x) = stack.pop() {
+        if seen.insert(x) {
+            cone.push(x);
+            stack.extend_from_slice(&g.operands(x));
+        }
+    }
+    cone.sort_unstable();
+    // The values of the nodes that depend on `s`; `None` marks one outside
+    // the algebra, which every node above it inherits.
+    let mut vals: FxHashMap<ExprId, Option<T>> = FxHashMap::default();
+    let mut args: Vec<T> = Vec::new();
+    for &x in &cone {
+        let n = *g.node(x);
+        let depends = match n {
+            Node::Symbol(t) => t == s,
+            _ => g.operands(x).iter().any(|c| vals.contains_key(c)),
+        };
+        if !depends {
+            continue;
+        }
+        let ops = g.operands(x).to_vec();
+        args.clear();
+        let mut ok = true;
+        for c in ops {
+            match vals.get(&c) {
+                Some(Some(v)) => args.push(v.clone()),
+                Some(None) => ok = false,
+                None => args.push(free(g, c)),
+            }
+        }
+        let v = if ok { node(g, n, &args) } else { None };
+        vals.insert(x, v);
+    }
+    match vals.remove(&e) {
+        Some(v) => v,
+        None => Some(free(g, e)),
+    }
+}
+
 /// `e` as a polynomial in `s`: coefficients by ascending power, each an
 /// expression free of `s`. `None` if `s` appears under a non-polynomial op
 /// (a transcendental, a comparison, a call, a negative power).
 pub fn collect<K: Field>(g: &mut Graph<K>, e: ExprId, s: SymbolId) -> Option<Vec<ExprId>> {
-    if !g.free_symbols(e).contains(&s) {
-        return Some(vec![e]);
-    }
-    match *g.node(e) {
-        Node::Symbol(_) => {
-            let z = g.zero();
-            let o = g.one();
-            Some(vec![z, o])
-        }
-        Node::Add(a, b) => {
-            let pa = collect(g, a, s)?;
-            let pb = collect(g, b, s)?;
-            Some(poly_add(g, pa, pb))
-        }
-        Node::Neg(a) => {
-            let mut p = collect(g, a, s)?;
-            for c in p.iter_mut() {
-                *c = g.neg(*c);
+    fold_in(
+        g,
+        e,
+        s,
+        |_, c| vec![c],
+        |g, n, p| match n {
+            Node::Symbol(_) => Some(vec![g.zero(), g.one()]),
+            Node::Add(..) => Some(poly_add(g, p[0].clone(), p[1].clone())),
+            Node::Neg(_) => Some(p[0].iter().map(|&c| g.neg(c)).collect()),
+            Node::Mul(..) => Some(poly_mul(g, &p[0], &p[1])),
+            Node::Pow(_, k) if k >= 0 => {
+                let mut acc = vec![g.one()];
+                for _ in 0..k {
+                    acc = poly_mul(g, &acc, &p[0]);
+                }
+                Some(acc)
             }
-            Some(p)
-        }
-        Node::Mul(a, b) => {
-            let pa = collect(g, a, s)?;
-            let pb = collect(g, b, s)?;
-            Some(poly_mul(g, &pa, &pb))
-        }
-        Node::Pow(a, n) => {
-            if n < 0 {
-                return None;
+            Node::Reduce(ReduceOp::Sum, _) => {
+                let z = vec![g.zero()];
+                Some(p.iter().fold(z, |acc, q| poly_add(g, acc, q.clone())))
             }
-            let pa = collect(g, a, s)?;
-            let mut acc = vec![g.one()];
-            for _ in 0..n {
-                acc = poly_mul(g, &acc, &pa);
+            Node::Reduce(ReduceOp::Product, _) => {
+                let o = vec![g.one()];
+                Some(p.iter().fold(o, |acc, q| poly_mul(g, &acc, q)))
             }
-            Some(acc)
-        }
-        Node::Reduce(ReduceOp::Sum, l) => {
-            let list = g.args(l).to_vec();
-            let mut acc = vec![g.zero()];
-            for it in list {
-                let p = collect(g, it, s)?;
-                acc = poly_add(g, acc, p);
+            Node::Dot(_) => {
+                let (a, b) = p.split_at(p.len() / 2);
+                let mut acc = vec![g.zero()];
+                for (pa, pb) in a.iter().zip(b) {
+                    let prod = poly_mul(g, pa, pb);
+                    acc = poly_add(g, acc, prod);
+                }
+                Some(acc)
             }
-            Some(acc)
-        }
-        Node::Reduce(ReduceOp::Product, l) => {
-            let list = g.args(l).to_vec();
-            let mut acc = vec![g.one()];
-            for it in list {
-                let p = collect(g, it, s)?;
-                acc = poly_mul(g, &acc, &p);
-            }
-            Some(acc)
-        }
-        Node::Dot(l) => {
-            let (al, bl) = g.dot_args(l);
-            let (al, bl) = (al.to_vec(), bl.to_vec());
-            let mut acc = vec![g.zero()];
-            for (a, b) in al.iter().zip(bl.iter()) {
-                let pa = collect(g, *a, s)?;
-                let pb = collect(g, *b, s)?;
-                let prod = poly_mul(g, &pa, &pb);
-                acc = poly_add(g, acc, prod);
-            }
-            Some(acc)
-        }
-        _ => None,
-    }
+            _ => None,
+        },
+    )
 }
 
 /// `e` as a rational function `N(s) / D(s)` with polynomial numerator and
@@ -92,89 +116,65 @@ pub fn rational_form<K: Field>(
     e: ExprId,
     s: SymbolId,
 ) -> Option<(Vec<ExprId>, Vec<ExprId>)> {
-    if !g.free_symbols(e).contains(&s) {
-        return Some((vec![e], vec![g.one()]));
+    type Ratio = (Vec<ExprId>, Vec<ExprId>);
+    // `n1/d1 + n2/d2 = (n1 d2 + n2 d1) / (d1 d2)`.
+    fn add<K: Field>(g: &mut Graph<K>, (na, da): &Ratio, (nb, db): &Ratio) -> Ratio {
+        let t1 = poly_mul(g, na, db);
+        let t2 = poly_mul(g, nb, da);
+        (poly_add(g, t1, t2), poly_mul(g, da, db))
     }
-    match *g.node(e) {
-        Node::Add(a, b) => {
-            let (na, da) = rational_form(g, a, s)?;
-            let (nb, db) = rational_form(g, b, s)?;
-            // na/da + nb/db = (na db + nb da) / (da db)
-            let t1 = poly_mul(g, &na, &db);
-            let t2 = poly_mul(g, &nb, &da);
-            Some((poly_add(g, t1, t2), poly_mul(g, &da, &db)))
-        }
-        Node::Neg(a) => {
-            let (mut n, d) = rational_form(g, a, s)?;
-            for c in n.iter_mut() {
-                *c = g.neg(*c);
-            }
-            Some((n, d))
-        }
-        Node::Mul(a, b) => {
-            let (na, da) = rational_form(g, a, s)?;
-            let (nb, db) = rational_form(g, b, s)?;
-            Some((poly_mul(g, &na, &nb), poly_mul(g, &da, &db)))
-        }
-        Node::Pow(a, n) => {
-            let (na, da) = rational_form(g, a, s)?;
-            let (base_n, base_d) = if n < 0 { (da, na) } else { (na, da) };
-            let mut num = vec![g.one()];
-            let mut den = vec![g.one()];
-            for _ in 0..n.unsigned_abs() {
-                num = poly_mul(g, &num, &base_n);
-                den = poly_mul(g, &den, &base_d);
-            }
-            Some((num, den))
-        }
-        Node::Reduce(ReduceOp::Sum, l) => {
-            let list = g.args(l).to_vec();
-            let mut num = vec![g.zero()];
-            let mut den = vec![g.one()];
-            for it in list {
-                let (ni, di) = rational_form(g, it, s)?;
-                let t1 = poly_mul(g, &num, &di);
-                let t2 = poly_mul(g, &ni, &den);
-                num = poly_add(g, t1, t2);
-                den = poly_mul(g, &den, &di);
-            }
-            Some((num, den))
-        }
-        Node::Reduce(ReduceOp::Product, l) => {
-            let list = g.args(l).to_vec();
-            let mut num = vec![g.one()];
-            let mut den = vec![g.one()];
-            for it in list {
-                let (ni, di) = rational_form(g, it, s)?;
-                num = poly_mul(g, &num, &ni);
-                den = poly_mul(g, &den, &di);
-            }
-            Some((num, den))
-        }
-        Node::Dot(l) => {
-            let (al, bl) = g.dot_args(l);
-            let (al, bl) = (al.to_vec(), bl.to_vec());
-            let mut num = vec![g.zero()];
-            let mut den = vec![g.one()];
-            for (a, b) in al.iter().zip(bl.iter()) {
-                let (na, da) = rational_form(g, *a, s)?;
-                let (nb, db) = rational_form(g, *b, s)?;
-                let ni = poly_mul(g, &na, &nb);
-                let di = poly_mul(g, &da, &db);
-                let t1 = poly_mul(g, &num, &di);
-                let t2 = poly_mul(g, &ni, &den);
-                num = poly_add(g, t1, t2);
-                den = poly_mul(g, &den, &di);
-            }
-            Some((num, den))
-        }
-        Node::Symbol(_) => {
-            let z = g.zero();
-            let o = g.one();
-            Some((vec![z, o], vec![o]))
-        }
-        _ => None,
+    fn mul<K: Field>(g: &mut Graph<K>, (na, da): &Ratio, (nb, db): &Ratio) -> Ratio {
+        (poly_mul(g, na, nb), poly_mul(g, da, db))
     }
+    let one = |g: &mut Graph<K>| -> Ratio { (vec![g.one()], vec![g.one()]) };
+    fold_in(
+        g,
+        e,
+        s,
+        |g, c| (vec![c], vec![g.one()]),
+        |g, n, p| match n {
+            Node::Symbol(_) => Some((vec![g.zero(), g.one()], vec![g.one()])),
+            Node::Add(..) => Some(add(g, &p[0], &p[1])),
+            Node::Neg(_) => Some((p[0].0.iter().map(|&c| g.neg(c)).collect(), p[0].1.clone())),
+            Node::Mul(..) => Some(mul(g, &p[0], &p[1])),
+            Node::Pow(_, k) => {
+                let base = if k < 0 {
+                    (p[0].1.clone(), p[0].0.clone())
+                } else {
+                    p[0].clone()
+                };
+                let mut acc = one(g);
+                for _ in 0..k.unsigned_abs() {
+                    acc = mul(g, &acc, &base);
+                }
+                Some(acc)
+            }
+            Node::Reduce(ReduceOp::Sum, _) => {
+                let mut acc = (vec![g.zero()], vec![g.one()]);
+                for q in p {
+                    acc = add(g, &acc, q);
+                }
+                Some(acc)
+            }
+            Node::Reduce(ReduceOp::Product, _) => {
+                let mut acc = one(g);
+                for q in p {
+                    acc = mul(g, &acc, q);
+                }
+                Some(acc)
+            }
+            Node::Dot(_) => {
+                let (a, b) = p.split_at(p.len() / 2);
+                let mut acc = (vec![g.zero()], vec![g.one()]);
+                for (pa, pb) in a.iter().zip(b) {
+                    let prod = mul(g, pa, pb);
+                    acc = add(g, &acc, &prod);
+                }
+                Some(acc)
+            }
+            _ => None,
+        },
+    )
 }
 
 /// Coefficient-wise sum.
@@ -290,10 +290,12 @@ pub fn prune_poly<K: Field>(
 ) -> (Vec<ExprId>, usize, usize) {
     let mut terms: Vec<(usize, ExprId, f64)> = Vec::new();
     for (k, &coeff) in poly.iter().enumerate() {
-        for t in expand_terms(g, coeff) {
-            let v = eval(g, &[t], env)[0];
-            terms.push((k, t, v.abs() * w0.powi(k as i32)));
-        }
+        terms.extend(expand_terms(g, coeff).into_iter().map(|t| (k, t, 0.0)));
+    }
+    // Every term's value in one sweep over the graph.
+    let roots: Vec<ExprId> = terms.iter().map(|&(_, t, _)| t).collect();
+    for ((k, _, c), v) in terms.iter_mut().zip(eval(g, &roots, env)) {
+        *c = v.abs() * w0.powi(*k as i32);
     }
     let maxc = terms
         .iter()

@@ -26,7 +26,7 @@ fn node_value<T: Scalar, K: Field>(
     mut get: impl FnMut(ExprId) -> T,
     sym: &mut impl FnMut(SymbolId) -> T,
     call: &mut impl FnMut(FuncId, u32, ArgList, &[T]) -> T,
-    solve: &mut impl FnMut(ArgList, &[T]) -> Vec<T>,
+    solve: &mut impl FnMut(ArgList, &[T], u32) -> T,
 ) -> T {
     match *node {
         Node::Const(c) => T::from_f64(ctx.const_val(c).to_f64()),
@@ -62,7 +62,7 @@ fn node_value<T: Scalar, K: Field>(
         }
         Node::Solve(l, i) => {
             let vals: Vec<T> = ctx.args(l).iter().map(|&a| get(a)).collect();
-            solve(l, &vals)[i as usize]
+            solve(l, &vals, i)
         }
     }
 }
@@ -104,16 +104,13 @@ pub fn eval<T: Scalar, K: Field>(
         let mut sym = |s: SymbolId| env.get(&s).copied().unwrap_or(T::nan());
         let mut call =
             |f: FuncId, out: u32, l: ArgList, args: &[T]| fe.output(ctx, f, out, l, args);
-        let mut solve = |l: ArgList, vals: &[T]| -> Vec<T> {
-            solved
-                .entry(l)
-                .or_insert_with(|| {
-                    let n = Graph::<K>::solve_n(vals.len());
-                    let mut out = vec![T::zero(); n];
-                    crate::semantics::solve_t(&vals[..n * n], &vals[n * n..], n, &mut out);
-                    out
-                })
-                .clone()
+        let mut solve = |l: ArgList, vals: &[T], i: u32| -> T {
+            solved.entry(l).or_insert_with(|| {
+                let n = Graph::<K>::solve_n(vals.len());
+                let mut out = vec![T::zero(); n];
+                crate::semantics::solve_t(&vals[..n * n], &vals[n * n..], n, &mut out);
+                out
+            })[i as usize]
         };
         w[i] = node_value(
             ctx,
@@ -185,14 +182,17 @@ impl<T: Scalar> FuncEval<T> {
         args: &[T],
     ) -> T {
         let func = ctx.func(f);
-        if matches!(func.outputs[out as usize], Output::Zero) {
+        if matches!(func.outputs()[out as usize], Output::Zero) {
             return T::zero();
         }
-        let needed = self.needed.get(&f).cloned().unwrap_or_else(|| vec![out]);
+        let needed = &self.needed;
         let body = self
             .bodies
             .entry(f)
-            .or_insert_with(|| func.body_for(ctx, &needed));
+            .or_insert_with(|| match needed.get(&f) {
+                Some(needed) => func.body_for(ctx, needed),
+                None => func.body_for(ctx, &[out]),
+            });
         let Some(slot) = body.slot_of.get(out as usize).copied().flatten() else {
             // The cached body predates this output (a derivative demanded
             // later): rebuild it over every output.

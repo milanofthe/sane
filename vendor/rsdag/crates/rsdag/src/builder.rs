@@ -5,7 +5,12 @@
 //! plain `f64`, through [`Numeric`], the hot path when nothing symbolic is
 //! wanted -- or *records* it into a [`Graph`], where it can be
 //! differentiated, specialized and compiled. One body, no drift between the
-//! numeric model and its symbolic twin.
+//! numeric model and its symbolic twin beyond one order: the graph folds
+//! the terms of a sum or a product in a canonical order (so equal
+//! expressions compile alike however they were built) where [`Numeric`]
+//! folds them as given; and two identities the graph applies as it builds, `0 * x`
+//! as `0` (whatever `x`, an infinity included) and `(a^m)^n` as `a^(m n)`.
+//! Everything else is the same IEEE operation sequence, bit for bit.
 //!
 //! The trait is the op vocabulary: the required methods are one per node
 //! kind, and the named functions (`sin`, `atan2`, `min`, ...) are provided
@@ -65,11 +70,10 @@ pub trait Builder {
     fn dot(&mut self, a: &[Self::N], b: &[Self::N]) -> Self::N;
     /// `x` with `A x = b`, for a square `a` given by rows.
     ///
-    /// The implicit step a block writes in the same code as its model: the
-    /// numeric builder solves with a pivoted dense LU, the recording builder
-    /// builds a static-pivot LU in a fill-reducing order as graph ops (see
-    /// [`crate::symbolic::solve`]), so the recorded twin carries the solve
-    /// and differentiates through it.
+    /// The implicit step a block writes in the same code as its model: both
+    /// builders solve with the same pivoted dense LU, the recording one as a
+    /// solve node, so the recorded twin carries the solve and differentiates
+    /// through it.
     fn solve(&mut self, a: &[Vec<Self::N>], b: &[Self::N]) -> Vec<Self::N>;
 
     // --- the ring, spelled the way a model reads ---------------------------
@@ -252,7 +256,7 @@ impl Builder for Numeric {
         -a
     }
     fn powi(&mut self, a: f64, n: i64) -> f64 {
-        a.powi(n as i32)
+        crate::semantics::powi_f64(a, n as i32)
     }
     fn unary(&mut self, op: UnaryOp, a: f64) -> f64 {
         unary_f64(op, a)
@@ -330,19 +334,6 @@ impl<K: Field> Builder for Graph<K> {
         Graph::dot(self, a.to_vec(), b.to_vec())
     }
     fn solve(&mut self, a: &[Vec<ExprId>], b: &[ExprId]) -> Vec<ExprId> {
-        // A dense matrix is one pivoting kernel; a sparse one is the
-        // structural solve, its static LU as ops.
-        use crate::symbolic::solve::{pattern_of, plan, solve_planned, sparse_rows};
-        let rows = sparse_rows(self, a);
-        let n = b.len();
-        let nnz: usize = rows.iter().map(Vec::len).sum();
-        // A structurally singular system has no static LU; it goes to the
-        // dense kernel too, which is exactly what the numeric builder runs
-        // on it, so both paths still agree to the bit.
-        let plan = (nnz < n * n).then(|| plan(&pattern_of(&rows))).flatten();
-        match plan {
-            Some(plan) => solve_planned(self, &rows, &plan, b).x,
-            None => Graph::solve_dense(self, a.iter().flatten().copied().collect(), b.to_vec()),
-        }
+        Graph::solve_dense(self, a.iter().flatten().copied().collect(), b.to_vec())
     }
 }

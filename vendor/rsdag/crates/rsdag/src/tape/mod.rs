@@ -26,7 +26,7 @@
 //!   [`crate::semantics::dot_slice_t`] fold with four accumulators merged as
 //!   `(a0 + a1) + (a2 + a3)`, then the tail in order; a kernel is those
 //!   folds row by row.
-//! - **No contraction.** [`TapeVisitor::mul_add`] is a fused *dispatch*, not
+//! - **No contraction.** [`Op::MulAdd`] is a fused *dispatch*, not
 //!   a fused rounding: it rounds the product and the sum separately.
 
 use std::sync::Arc;
@@ -72,20 +72,12 @@ pub enum Op {
     /// Inner product of `arg_pool[start .. start+len]` and the `len` that
     /// follow.
     Dot(u32, u32),
-    /// `bundles[b]` on `arg_pool[start .. start+n_args]`, its outputs to
-    /// `dst .. dst+n_out`; with a `state` slot (not [`NO_STATE`]), the
-    /// bundle's main phase over the instance state there.
+    /// `bundles[b]` on `n_groups` argument groups of `n_args`, laid
+    /// group-major at `arg_pool[start ..]`, group `g`'s `n_out` outputs to
+    /// `dst + g*n_out ..`; with a `state` slot (not [`NO_STATE`]), the
+    /// bundle's main phase over group `g`'s instance state at
+    /// `state + g*state_len`.
     Call {
-        bundle: u32,
-        start: u32,
-        n_args: u32,
-        n_out: u32,
-        state: u32,
-    },
-    /// `bundles[b]` on `n_groups` argument groups laid group-major in the
-    /// pool, group `g`'s outputs to `dst + g*n_out ..`; with a `state`
-    /// slot, group `g`'s state at `state + g*state_len`.
-    CallBatch {
         bundle: u32,
         start: u32,
         n_groups: u32,
@@ -124,17 +116,10 @@ pub enum Op {
         n: u32,
         acc: Option<Accum>,
     },
-    /// The dense solve `A x = b`, `a` `n` by `n` and `b` of `n`, `x` to
-    /// `dst .. dst+n` (see [`crate::semantics::solve_t`]).
-    Solve {
-        a: Src,
-        b: Src,
-        n: u32,
-    },
     /// The dense solve of `k` right-hand sides against one `n` by `n` `a`:
     /// `b` holds `k` vectors of `n` back to back, the `k` solutions go to
     /// `dst .. dst + n*k` the same way (see [`crate::semantics::solve_many_t`]).
-    SolveMany {
+    Solve {
         a: Src,
         b: Src,
         n: u32,
@@ -209,30 +194,25 @@ pub enum Src {
     Inputs(u32),
     /// Operands listed in the arg pool from `start`, gathered.
     Pool(u32),
-}
-
-/// One op as a diagram draws it: its label and kind, the operands it
-/// reads (slots, or inputs tagged with [`INPUT`]), how many slots it writes
-/// from its destination, and the bundle a call calls.
-pub(crate) struct OpView {
-    pub label: String,
-    pub kind: crate::dot::Kind,
-    pub reads: Vec<u32>,
-    pub width: u32,
-    pub bundle: Option<u32>,
+    /// Consecutive work slots from `s`, read in place.
+    Slots(u32),
 }
 
 /// A dense operand as a backend sees it.
 #[derive(Clone, Copy, Debug)]
 pub enum Operand<'a> {
+    /// Consecutive inputs from `k`.
     Inputs(u32),
+    /// Consecutive work slots from `s`.
+    Run(u32),
+    /// Slots to gather.
     Slots(&'a [u32]),
 }
 
 mod compile;
 mod specialize;
+mod topo;
 
-pub use compile::Inst;
 pub use specialize::SpecializedTape;
 
 /// A compiled evaluator for a set of expression roots.
@@ -247,9 +227,10 @@ pub struct Tape {
     n_work: usize,
     /// Widest gather any variadic op or kernel needs.
     max_args: usize,
-    /// The widest scratch a called bundle asks for ([`ExternBundle::work_len`]),
-    /// lent to it from the tail of the work buffer.
-    bundle_work: usize,
+    /// The widest scratch a called bundle ([`ExternBundle::work_len`]) or a
+    /// dense solve ([`crate::semantics::solve_scratch_len`]) works in, lent
+    /// from the tail of the work buffer, after the gather.
+    lent: usize,
     bundles: Vec<Arc<dyn ExternBundle>>,
     /// Instruction count of the parameter-pure prolog prefix (0 = no split;
     /// see [`compile_split`](Self::compile_split)).
@@ -323,94 +304,6 @@ impl Program for Tape {
     }
 }
 
-/// A backend that lowers a [`Tape`]'s instruction stream: the seam every
-/// code generator sits on.
-///
-/// The tape is the evaluation IR. [`Tape::eval`] is the interpreting
-/// backend, [`Tape::lower`] drives any other one: a printer, another
-/// evaluator, or a generator emitting C, Verilog or a GPU kernel. Each method
-/// receives the destination slot `dst` and the operands the op reads, slots
-/// or tagged inputs (see [`INPUT`]); a backend keeps its own slot-to-value
-/// map. A slot is never reused while a value it holds is still needed, so
-/// reading the current occupant is always the intended value. A program
-/// with a parameter-pure prefix (see [`Tape::compile_split`]) exposes it as
-/// the first [`Tape::prolog_len`] ops.
-pub trait TapeVisitor {
-    fn constant(&mut self, dst: u32, v: f64);
-    fn add(&mut self, dst: u32, a: u32, b: u32);
-    fn mul(&mut self, dst: u32, a: u32, b: u32);
-    /// `a*b + c` as one dispatch, two roundings (see `Op::MulAdd`).
-    fn mul_add(&mut self, dst: u32, a: u32, b: u32, c: u32);
-    fn sub(&mut self, dst: u32, a: u32, b: u32);
-    fn neg(&mut self, dst: u32, a: u32);
-    fn powi(&mut self, dst: u32, a: u32, n: i32);
-    fn unary(&mut self, dst: u32, op: UnaryOp, a: u32);
-    fn binary(&mut self, dst: u32, op: BinOp, a: u32, b: u32);
-    fn cmp(&mut self, dst: u32, op: CmpOp, a: u32, b: u32);
-    fn select(&mut self, dst: u32, c: u32, t: u32, e: u32);
-    fn reduce(&mut self, dst: u32, op: ReduceOp, args: &[u32]);
-    fn dot(&mut self, dst: u32, a: &[u32], b: &[u32]);
-    /// Call `b` on `args`, its `n_out` outputs to `dst ..`; with `state`,
-    /// its main phase over the instance state at that slot.
-    fn call(
-        &mut self,
-        dst: u32,
-        b: &Arc<dyn ExternBundle>,
-        args: &[u32],
-        n_out: u32,
-        state: Option<u32>,
-    );
-    /// Call `b` on `n_groups` argument groups (group-major `args`), group
-    /// `g`'s outputs to `dst + g*n_out ..`; with `state`, group `g`'s state
-    /// at `state + g * b.state_len()`.
-    #[allow(clippy::too_many_arguments)]
-    fn call_batch(
-        &mut self,
-        dst: u32,
-        b: &Arc<dyn ExternBundle>,
-        args: &[u32],
-        n_groups: u32,
-        n_args: u32,
-        n_out: u32,
-        state: Option<u32>,
-    );
-    /// The prolog of `b` for `n_groups` instances (their pure arguments
-    /// group-major in `pure`), instance `g`'s state to
-    /// `dst + g * b.state_len() ..`.
-    fn call_prolog(&mut self, dst: u32, b: &Arc<dyn ExternBundle>, pure: &[u32], n_groups: u32);
-    /// `m` rows of `n` in `a` against `x`, to `dst .. dst+m`, each row the
-    /// fold of [`dot`](Self::dot) (see [`crate::semantics::gemv_t`]).
-    fn gemv(
-        &mut self,
-        dst: u32,
-        a: Operand<'_>,
-        x: Operand<'_>,
-        m: u32,
-        n: u32,
-        acc: Option<(Option<Operand<'_>>, &[u32])>,
-    );
-    /// The product of `m` rows of `k` in `a` with `n` rows of `k` in `b`,
-    /// entry `(i, j)` to `dst + i*n + j` (see [`crate::semantics::gemm_t`]).
-    #[allow(clippy::too_many_arguments)]
-    fn gemm(
-        &mut self,
-        dst: u32,
-        a: Operand<'_>,
-        b: Operand<'_>,
-        m: u32,
-        k: u32,
-        n: u32,
-        acc: Option<(Option<Operand<'_>>, &[u32])>,
-    );
-    /// The dense solve of `a` (`n` by `n`) against `b`, to `dst .. dst+n`
-    /// (see [`crate::semantics::solve_t`]).
-    fn solve(&mut self, dst: u32, a: Operand<'_>, b: Operand<'_>, n: u32);
-    /// The dense solve of `k` right-hand sides (`b`: `k` vectors of `n`
-    /// back to back) against `a`, the solutions to `dst .. dst + n*k`
-    /// (see [`crate::semantics::solve_many_t`]).
-    fn solve_many(&mut self, dst: u32, a: Operand<'_>, b: Operand<'_>, n: u32, k: u32);
-}
-
 /// Observer of `Select` decisions during evaluation: [`NoTrace`] costs
 /// nothing, a `Vec<u8>` records one byte per `Select` in op order (`1` =
 /// then-arm taken), the trace [`Tape::specialize`] takes.
@@ -445,164 +338,19 @@ impl Tape {
     /// Human-readable instruction listing (diagnostics): one line per op
     /// with its destination slot, the prolog boundary marked; an operand
     /// `i7` is input 7.
-    /// Op `i` as a diagram draws it (see [`crate::dot`]).
-    pub(crate) fn op_view(&self, i: usize) -> OpView {
-        use crate::dot::Kind;
-        let pool = |start: u32, len: u32| -> Vec<u32> {
-            self.arg_pool[start as usize..(start + len) as usize].to_vec()
-        };
-        let src = |s: Src, len: u32| -> Vec<u32> {
-            match s {
-                Src::Inputs(k) => (k..k + len).map(|j| j | INPUT).collect(),
-                Src::Pool(start) => pool(start, len),
-            }
-        };
-        let acc = |a: Option<Accum>, len: u32| -> Vec<u32> {
-            match a {
-                Some(Accum { c: Some(c), .. }) => src(c, len),
-                _ => Vec::new(),
-            }
-        };
-        let state = |b: u32, at: u32, n: u32| -> Vec<u32> {
-            if at == NO_STATE {
-                return Vec::new();
-            }
-            let len = self.bundles[b as usize].state_len() as u32 * n;
-            (at..at + len).collect()
-        };
-        let cmp = |op: CmpOp| match op {
-            CmpOp::Gt => ">",
-            CmpOp::Ge => ">=",
-            CmpOp::Lt => "<",
-            CmpOp::Le => "<=",
-            CmpOp::Eq => "==",
-            CmpOp::Ne => "!=",
-        };
-        let reduce = |op: ReduceOp| match op {
-            ReduceOp::Sum => "sum",
-            ReduceOp::Product => "prod",
-            ReduceOp::Min => "min",
-            ReduceOp::Max => "max",
-        };
-        let v = |label: String, kind: Kind, reads: Vec<u32>, width: u32| OpView {
-            label,
-            kind,
-            reads,
-            width,
-            bundle: None,
-        };
-        match self.ops[i] {
-            Op::Const(c) => v(crate::dot::number(c), Kind::Const, Vec::new(), 1),
-            Op::Add(a, b) => v("+".into(), Kind::Op, vec![a, b], 1),
-            Op::Mul(a, b) => v("*".into(), Kind::Op, vec![a, b], 1),
-            Op::MulAdd(a, b, c) => v("*+".into(), Kind::Op, vec![a, b, c], 1),
-            Op::Sub(a, b) => v("-".into(), Kind::Op, vec![a, b], 1),
-            Op::Neg(a) => v("neg".into(), Kind::Op, vec![a], 1),
-            Op::Powi(a, n) => v(format!("^{n}"), Kind::Op, vec![a], 1),
-            Op::Unary(op, a) => v(op.name().into(), Kind::Op, vec![a], 1),
-            Op::Binary(op, a, b) => v(op.name().into(), Kind::Op, vec![a, b], 1),
-            Op::Cmp(op, a, b) => v(cmp(op).into(), Kind::Choice, vec![a, b], 1),
-            Op::Select(c, t, e) => v("select".into(), Kind::Choice, vec![c, t, e], 1),
-            Op::Reduce(op, s, l) => v(reduce(op).into(), Kind::Kernel, pool(s, l), 1),
-            Op::Dot(s, l) => v(format!("dot {l}"), Kind::Kernel, pool(s, 2 * l), 1),
-            Op::Call {
-                bundle,
-                start,
-                n_args,
-                n_out,
-                state: at,
-            } => {
-                let mut r = pool(start, n_args);
-                r.extend(state(bundle, at, 1));
-                OpView {
-                    bundle: Some(bundle),
-                    ..v("call".into(), Kind::Call, r, n_out)
-                }
-            }
-            Op::CallBatch {
-                bundle,
-                start,
-                n_groups,
-                n_args,
-                n_out,
-                state: at,
-            } => {
-                let mut r = pool(start, n_groups * n_args);
-                r.extend(state(bundle, at, n_groups));
-                OpView {
-                    bundle: Some(bundle),
-                    ..v(format!("call x{n_groups}"), Kind::Call, r, n_groups * n_out)
-                }
-            }
-            Op::CallProlog {
-                bundle,
-                start,
-                n_groups,
-                n_pure,
-            } => {
-                let w = self.bundles[bundle as usize].state_len() as u32 * n_groups;
-                OpView {
-                    bundle: Some(bundle),
-                    ..v(
-                        format!("prolog x{n_groups}"),
-                        Kind::Call,
-                        pool(start, n_groups * n_pure),
-                        w,
-                    )
-                }
-            }
-            Op::Gemv { a, x, m, n, acc: c } => {
-                let mut r = src(a, m * n);
-                r.extend(src(x, n));
-                r.extend(acc(c, m));
-                v(format!("gemv {m}x{n}"), Kind::Kernel, r, m)
-            }
-            Op::Gemm {
-                a,
-                b,
-                m,
-                k,
-                n,
-                acc: c,
-            } => {
-                let mut r = src(a, m * k);
-                r.extend(src(b, n * k));
-                r.extend(acc(c, m * n));
-                v(format!("gemm {m}x{k}x{n}"), Kind::Kernel, r, m * n)
-            }
-            Op::Solve { a, b, n } => {
-                let mut r = src(a, n * n);
-                r.extend(src(b, n));
-                v(format!("solve {n}"), Kind::Kernel, r, n)
-            }
-            Op::SolveMany { a, b, n, k } => {
-                let mut r = src(a, n * n);
-                r.extend(src(b, n * k));
-                v(format!("solve {n}, {k} rhs"), Kind::Kernel, r, n * k)
-            }
-        }
-    }
-
-    /// The instruction count and destinations a diagram walks.
-    pub(crate) fn op_dst(&self, i: usize) -> u32 {
-        self.dst[i]
-    }
-
     pub fn dump(&self) -> String {
         let name = |k: u32| match input_index(k) {
             Some(i) => format!("i{i}"),
             None => format!("s{k}"),
         };
         let list = |start: u32, len: u32| -> String {
-            self.arg_pool[start as usize..(start + len) as usize]
-                .iter()
-                .map(|&k| name(k))
-                .collect::<Vec<_>>()
-                .join(", ")
+            let names: Vec<String> = self.pool(start, len).iter().map(|&k| name(k)).collect();
+            names.join(", ")
         };
         let src = |s: Src, len: u32| match s {
             Src::Inputs(k) => format!("i{k}..i{}", k + len),
             Src::Pool(start) => format!("[{}]", list(start, len)),
+            Src::Slots(s) => format!("s{s}..s{}", s + len),
         };
         let mut out = String::new();
         for (i, op) in self.ops.iter().enumerate() {
@@ -626,6 +374,7 @@ impl Tape {
                 Op::Call {
                     bundle,
                     start,
+                    n_groups: 1,
                     n_args,
                     n_out,
                     state,
@@ -634,7 +383,7 @@ impl Tape {
                     list(start, n_args),
                     state_text(state)
                 ),
-                Op::CallBatch {
+                Op::Call {
                     bundle,
                     start,
                     n_groups,
@@ -673,10 +422,10 @@ impl Tape {
                         m * n
                     )
                 }
-                Op::Solve { a, b, n } => {
+                Op::Solve { a, b, n, k: 1 } => {
                     format!("Solve({n}x{n} {}, {}) -> {n}", src(a, n * n), src(b, n))
                 }
-                Op::SolveMany { a, b, n, k } => {
+                Op::Solve { a, b, n, k } => {
                     format!(
                         "SolveMany({n}x{n} {}, {k} rhs {}) -> {}",
                         src(a, n * n),
@@ -762,9 +511,9 @@ impl Tape {
         self.collect(inputs, work, out);
     }
 
-    /// The work buffer: the slots, then the gather scratch.
+    /// The work buffer: the slots, the gather, then what is lent.
     fn buffer_len(&self) -> usize {
-        self.n_work + self.max_args + self.bundle_work
+        self.n_work + self.max_args + self.lent
     }
 
     fn collect<T: Scalar>(&self, inputs: &[T], work: &[T], out: &mut Vec<T>) {
@@ -842,7 +591,7 @@ impl Tape {
         hi: usize,
         sink: &mut S,
     ) {
-        use crate::semantics::{reduce_slice_t, solve_many_t, solve_t};
+        use crate::semantics::{reduce_slice_t, solve_many_into};
         // The gather scratch at the tail of `work`, so nothing is allocated
         // per call.
         let (work, scratch) = work.split_at_mut(self.n_work);
@@ -890,57 +639,21 @@ impl Tape {
                 Op::Call {
                     bundle,
                     start,
-                    n_args,
-                    n_out,
-                    state,
-                } => {
-                    for (j, &k) in pool(start, n_args).iter().enumerate() {
-                        scratch[j] = g(k);
-                    }
-                    let b = &*self.bundles[bundle as usize];
-                    let n_args = n_args as usize;
-                    if state == NO_STATE {
-                        let (args, bwork) = scratch.split_at_mut(self.max_args);
-                        T::call_bundle_whole(
-                            b,
-                            &args[..n_args],
-                            bwork,
-                            &mut work[d..d + n_out as usize],
-                        );
-                    } else {
-                        let (args, bwork) = scratch.split_at_mut(self.max_args);
-                        let (st, out) =
-                            state_and_out(work, state as usize, b.state_len(), d, n_out as usize);
-                        T::call_bundle_main(b, &args[..n_args], st, bwork, out);
-                    }
-                    continue;
-                }
-                Op::CallBatch {
-                    bundle,
-                    start,
                     n_groups,
                     n_args,
                     n_out,
                     state,
                 } => {
-                    let flat = (n_groups * n_args) as usize;
                     for (j, &k) in pool(start, n_groups * n_args).iter().enumerate() {
                         scratch[j] = g(k);
                     }
                     let b = &*self.bundles[bundle as usize];
-                    let (n_args, n_out) = (n_args as usize, n_out as usize);
-                    if state == NO_STATE {
-                        T::call_bundle_batch(
-                            b,
-                            &scratch[..flat],
-                            n_groups as usize,
-                            n_args,
-                            &mut work[d..d + n_groups as usize * n_out],
-                        );
-                    } else {
-                        let (args, bwork) = scratch.split_at_mut(self.max_args);
+                    let (n_groups, n_args, n_out) =
+                        (n_groups as usize, n_args as usize, n_out as usize);
+                    let (args, bwork) = scratch.split_at_mut(self.max_args);
+                    if state != NO_STATE {
                         let sl = b.state_len();
-                        for gi in 0..n_groups as usize {
+                        for gi in 0..n_groups {
                             let (st, out) = state_and_out(
                                 work,
                                 state as usize + gi * sl,
@@ -951,6 +664,16 @@ impl Tape {
                             let a = &args[gi * n_args..(gi + 1) * n_args];
                             T::call_bundle_main(b, a, st, bwork, out);
                         }
+                    } else if n_groups == 1 {
+                        T::call_bundle_whole(b, &args[..n_args], bwork, &mut work[d..d + n_out]);
+                    } else {
+                        T::call_bundle_batch(
+                            b,
+                            &args[..n_groups * n_args],
+                            n_groups,
+                            n_args,
+                            &mut work[d..d + n_groups * n_out],
+                        );
                     }
                     continue;
                 }
@@ -1037,8 +760,11 @@ impl Tape {
                     }
                     continue;
                 }
-                Op::SolveMany { a, b, n, k } => {
+                Op::Solve { a, b, n, k } => {
                     let (n, k) = (n as usize, k as usize);
+                    // The operands gathered at the front of the scratch, the
+                    // solve working behind them.
+                    let (scratch, lent) = scratch.split_at_mut(self.max_args);
                     let (ra, rb) =
                         dense_operands(inputs, work, scratch, &self.arg_pool, a, n * n, b, n * k);
                     let base = work.as_mut_ptr();
@@ -1046,19 +772,7 @@ impl Tape {
                     let bv: &[T] = dense_slice(inputs, base, scratch, rb, n * k);
                     let reads = [Some((ra, n * n)), Some((rb, n * k)), None];
                     let out = unsafe { out_block(base, work.len(), d, n * k, &reads) };
-                    solve_many_t(av, bv, n, k, out);
-                    continue;
-                }
-                Op::Solve { a, b, n } => {
-                    let n = n as usize;
-                    let (ra, rb) =
-                        dense_operands(inputs, work, scratch, &self.arg_pool, a, n * n, b, n);
-                    let base = work.as_mut_ptr();
-                    let av: &[T] = dense_slice(inputs, base, scratch, ra, n * n);
-                    let bv: &[T] = dense_slice(inputs, base, scratch, rb, n);
-                    let reads = [Some((ra, n * n)), Some((rb, n)), None];
-                    let out = unsafe { out_block(base, work.len(), d, n, &reads) };
-                    solve_t(av, bv, n, out);
+                    solve_many_into(av, bv, n, k, out, lent);
                     continue;
                 }
             };
@@ -1071,91 +785,129 @@ impl Tape {
         &self.outputs
     }
 
-    /// Drive a backend over the instruction stream.
-    pub fn lower(&self, v: &mut dyn TapeVisitor) {
-        let pool = |start: u32, len: u32| &self.arg_pool[start as usize..(start + len) as usize];
-        let operand = |src: Src, len: u32| match src {
+    /// The instruction stream, for a backend that lowers it (the native
+    /// code, a printer, a code generator): op `i` writes from slot
+    /// [`dst`](Self::dst)`(i)`, its lists are windows of [`pool`](Self::pool)
+    /// and its bundle an index into [`bundles`](Self::bundles). A slot is
+    /// never reused while a value it holds is still needed, so the current
+    /// occupant of a slot is the value an operand means. The first
+    /// [`prolog_len`](Self::prolog_len) ops are the prolog.
+    pub fn ops(&self) -> &[Op] {
+        &self.ops
+    }
+
+    /// The destination slot of op `i` (the first of a kernel's block).
+    pub fn dst(&self, i: usize) -> u32 {
+        self.dst[i]
+    }
+
+    /// The operand list `start .. start + len` of the pool.
+    pub fn pool(&self, start: u32, len: u32) -> &[u32] {
+        &self.arg_pool[start as usize..(start + len) as usize]
+    }
+
+    /// The bundles the calls call, by index.
+    pub fn bundles(&self) -> &[Arc<dyn ExternBundle>] {
+        &self.bundles
+    }
+
+    /// A kernel's dense operand of `len` values.
+    pub fn operand(&self, src: Src, len: u32) -> Operand<'_> {
+        match src {
             Src::Inputs(k) => Operand::Inputs(k),
-            Src::Pool(start) => Operand::Slots(pool(start, len)),
+            Src::Pool(start) => Operand::Slots(self.pool(start, len)),
+            Src::Slots(s) => Operand::Run(s),
+        }
+    }
+
+    /// Every operand op `i` reads, in read order: slots, or inputs tagged
+    /// with [`INPUT`] (a kernel's run of inputs one by one), and last the
+    /// state block of a call that keeps one, by its first slot.
+    pub fn for_each_operand(&self, i: usize, mut f: impl FnMut(u32)) {
+        let f = &mut f as &mut dyn FnMut(u32);
+        let dense = |src: Src, len: u32, f: &mut dyn FnMut(u32)| match src {
+            Src::Inputs(k) => (k..k + len).for_each(|j| f(j | INPUT)),
+            Src::Pool(start) => self.pool(start, len).iter().for_each(|&k| f(k)),
+            Src::Slots(s) => (s..s + len).for_each(f),
         };
-        for i in 0..self.ops.len() {
-            let dst = self.dst[i];
-            match self.ops[i] {
-                Op::Const(c) => v.constant(dst, c),
-                Op::Add(a, b) => v.add(dst, a, b),
-                Op::Mul(a, b) => v.mul(dst, a, b),
-                Op::MulAdd(a, b, c) => v.mul_add(dst, a, b, c),
-                Op::Sub(a, b) => v.sub(dst, a, b),
-                Op::Neg(a) => v.neg(dst, a),
-                Op::Powi(a, n) => v.powi(dst, a, n),
-                Op::Unary(op, a) => v.unary(dst, op, a),
-                Op::Binary(op, a, b) => v.binary(dst, op, a, b),
-                Op::Cmp(op, a, b) => v.cmp(dst, op, a, b),
-                Op::Select(c, t, e) => v.select(dst, c, t, e),
-                Op::Reduce(op, s, l) => v.reduce(dst, op, pool(s, l)),
-                Op::Dot(s, l) => v.dot(dst, pool(s, l), pool(s + l, l)),
-                Op::Call {
-                    bundle,
-                    start,
-                    n_args,
-                    n_out,
-                    state,
-                } => v.call(
-                    dst,
-                    &self.bundles[bundle as usize],
-                    pool(start, n_args),
-                    n_out,
-                    (state != NO_STATE).then_some(state),
-                ),
-                Op::CallBatch {
-                    bundle,
-                    start,
-                    n_groups,
-                    n_args,
-                    n_out,
-                    state,
-                } => v.call_batch(
-                    dst,
-                    &self.bundles[bundle as usize],
-                    pool(start, n_groups * n_args),
-                    n_groups,
-                    n_args,
-                    n_out,
-                    (state != NO_STATE).then_some(state),
-                ),
-                Op::CallProlog {
-                    bundle,
-                    start,
-                    n_groups,
-                    n_pure,
-                } => v.call_prolog(
-                    dst,
-                    &self.bundles[bundle as usize],
-                    pool(start, n_groups * n_pure),
-                    n_groups,
-                ),
-                Op::Gemv { a, x, m, n, acc } => v.gemv(
-                    dst,
-                    operand(a, m * n),
-                    operand(x, n),
-                    m,
-                    n,
-                    acc.map(|f| (f.c.map(|c| operand(c, m)), pool(f.codes, m))),
-                ),
-                Op::Gemm { a, b, m, k, n, acc } => v.gemm(
-                    dst,
-                    operand(a, m * k),
-                    operand(b, n * k),
-                    m,
-                    k,
-                    n,
-                    acc.map(|f| (f.c.map(|c| operand(c, m * n)), pool(f.codes, m * n))),
-                ),
-                Op::Solve { a, b, n } => v.solve(dst, operand(a, n * n), operand(b, n), n),
-                Op::SolveMany { a, b, n, k } => {
-                    v.solve_many(dst, operand(a, n * n), operand(b, n * k), n, k)
+        let acc = |acc: Option<Accum>, len: u32, f: &mut dyn FnMut(u32)| {
+            if let Some(Accum { c: Some(c), .. }) = acc {
+                dense(c, len, f);
+            }
+        };
+        match self.ops[i] {
+            Op::Const(_) => {}
+            Op::Neg(a) | Op::Powi(a, _) | Op::Unary(_, a) => f(a),
+            Op::Add(a, b)
+            | Op::Mul(a, b)
+            | Op::Sub(a, b)
+            | Op::Cmp(_, a, b)
+            | Op::Binary(_, a, b) => {
+                f(a);
+                f(b);
+            }
+            Op::MulAdd(a, b, c) | Op::Select(a, b, c) => {
+                f(a);
+                f(b);
+                f(c);
+            }
+            Op::Reduce(_, start, len) => dense(Src::Pool(start), len, f),
+            Op::Dot(start, len) => dense(Src::Pool(start), 2 * len, f),
+            Op::Call {
+                start,
+                n_groups,
+                n_args,
+                state,
+                ..
+            } => {
+                dense(Src::Pool(start), n_groups * n_args, f);
+                if state != NO_STATE {
+                    f(state);
                 }
             }
+            Op::CallProlog {
+                start,
+                n_groups,
+                n_pure,
+                ..
+            } => dense(Src::Pool(start), n_groups * n_pure, f),
+            Op::Gemv { a, x, m, n, acc: c } => {
+                dense(a, m * n, f);
+                dense(x, n, f);
+                acc(c, m, f);
+            }
+            Op::Gemm {
+                a,
+                b,
+                m,
+                k,
+                n,
+                acc: c,
+            } => {
+                dense(a, m * k, f);
+                dense(b, n * k, f);
+                acc(c, m * n, f);
+            }
+            Op::Solve { a, b, n, k } => {
+                dense(a, n * n, f);
+                dense(b, n * k, f);
+            }
+        }
+    }
+
+    /// How many slots op `i` writes from its destination.
+    pub fn width(&self, i: usize) -> u32 {
+        match self.ops[i] {
+            Op::Call {
+                n_groups, n_out, ..
+            } => n_groups * n_out,
+            Op::CallProlog {
+                bundle, n_groups, ..
+            } => n_groups * self.bundles[bundle as usize].state_len() as u32,
+            Op::Gemv { m, .. } => m,
+            Op::Gemm { m, n, .. } => m * n,
+            Op::Solve { n, k, .. } => n * k,
+            _ => 1,
         }
     }
 
@@ -1276,13 +1028,9 @@ unsafe fn out_block<'a, T>(
     std::slice::from_raw_parts_mut(work.add(d), len)
 }
 
-/// Resolve a kernel's two dense operands: an input run that the inputs
-/// reach and a run of consecutive work slots are read in place; anything
-/// else is gathered into the scratch, `a` first, then `b`.
-#[allow(clippy::too_many_arguments)]
-/// Where a dense operand is read from: in place (inputs, or a consecutive
-/// run of work slots), or gathered into `scratch` from `*at` on, which
-/// advances past it.
+/// Where a dense operand is read from: in place (a run of inputs the inputs
+/// reach, a run of work slots), or gathered into `scratch` from `*at` on,
+/// which advances past it.
 fn place_operand<T: Scalar>(
     inputs: &[T],
     work: &[T],
@@ -1301,14 +1049,9 @@ fn place_operand<T: Scalar>(
             *at += len;
             Dense::Scratch(*at - len)
         }
+        Src::Slots(s) => Dense::Work(s as usize),
         Src::Pool(start) => {
             let run = &pool[start as usize..start as usize + len];
-            let consecutive = len > 0
-                && input_index(run[0]).is_none()
-                && run.iter().enumerate().all(|(j, &s)| s == run[0] + j as u32);
-            if consecutive {
-                return Dense::Work(run[0] as usize);
-            }
             for j in 0..len {
                 scratch[*at + j] = read(inputs, work, run[j]);
             }
@@ -1318,6 +1061,8 @@ fn place_operand<T: Scalar>(
     }
 }
 
+/// Resolve a kernel's two dense operands, `a` first, then `b` (see
+/// [`place_operand`]).
 #[allow(clippy::too_many_arguments)]
 fn dense_operands<T: Scalar>(
     inputs: &[T],
@@ -1385,6 +1130,7 @@ fn acc_text(pool: &[u32], acc: Option<Accum>, len: u32) -> String {
                 match c {
                     Some(Src::Inputs(k)) => format!("i{k}..i{}", k + len),
                     Some(Src::Pool(start)) => format!("pool{start}[{len}]"),
+                    Some(Src::Slots(s)) => format!("s{s}..s{}", s + len),
                     None => "-".to_string(),
                 },
                 text.join(",")

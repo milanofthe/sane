@@ -5,8 +5,12 @@
 //! cache is `xmm2` to `xmm15`. Under System V every vector register is
 //! caller-saved, so nothing survives a host call; under Windows `xmm6` to
 //! `xmm15` are callee-saved, so the chunk preserves them and they come
-//! first in the cache. Baseline SSE2, with `roundsd` when SSE4.1 is present
-//!.
+//! first in the cache. Baseline SSE2, with `roundsd` where there is SSE4.1
+//! and three-operand VEX forms and `vblendvpd` where there is AVX (the same
+//! IEEE operations, fewer bytes); `RSDAG_SSE2` set in the environment
+//! keeps to the baseline (as it keeps rsdag's dense kernels to SSE2), so
+//! both paths can be tested on one machine.
+//! Constants are read rip-relative from a pool at the end of the chunk.
 
 use crate::isa::*;
 use rsdag::node::{CmpOp, ReduceOp};
@@ -32,8 +36,14 @@ const WIN_SHADOW: i32 = 32;
 pub(crate) struct X64 {
     code: Vec<u8>,
     sse41: bool,
+    /// Three-operand VEX forms and `vblendvpd`.
+    avx: bool,
     /// Host routines held in `r12` and `r15`.
     hot: Vec<*const ()>,
+    /// The chunk's constants, and where their displacements go: the byte
+    /// offset of each `disp32` and the constant it addresses.
+    pool: Vec<u64>,
+    fixups: Vec<(usize, usize)>,
 }
 
 const HOT_REGS: [u8; 2] = [12, 15];
@@ -145,24 +155,87 @@ impl X64 {
             }
         }
     }
-    /// `movq xmm, rax`.
-    fn movq_from_rax(&mut self, xmm: u8) {
-        self.b(0x66);
-        self.rex(true, xmm, 0);
-        self.bytes(&[0x0F, 0x6E]);
-        self.modrm_reg(xmm, 0);
+    /// A VEX.128 prefix for map `map` (1 `0F`, 3 `0F3A`) and the legacy
+    /// prefix `pp` (0 none, 1 `66`, 2 `F3`, 3 `F2`): `reg` the ModRM reg
+    /// field, `v` the extra source, `rm` the ModRM rm field. The two-byte
+    /// form where it can encode them.
+    fn vex(&mut self, pp: u8, map: u8, reg: u8, v: u8, rm: u8) {
+        let r = (!reg >> 3) & 1;
+        let b = (!rm >> 3) & 1;
+        let v = !v & 0xF;
+        if map == 1 && b == 1 {
+            self.bytes(&[0xC5, (r << 7) | (v << 3) | pp]);
+        } else {
+            self.bytes(&[0xC4, (r << 7) | (1 << 6) | (b << 5) | map, (v << 3) | pp]);
+        }
     }
-    /// A bit mask into `xmm1`.
-    fn mask1(&mut self, bits: u64) {
-        self.mov_imm(0, bits);
-        self.movq_from_rax(1);
+    /// `op d, a, rm`: a VEX.128 register instruction of map `0F`.
+    fn vex_rr(&mut self, pp: u8, op: u8, d: u8, a: u8, rm: u8) {
+        self.vex(pp, 1, d, a, rm);
+        self.b(op);
+        self.modrm_reg(d, rm);
+    }
+    /// ModRM for `[rip + disp32]` addressing the constant `bits` of the
+    /// chunk's pool; `finish` writes the displacement.
+    fn modrm_const(&mut self, reg: u8, bits: u64) {
+        self.b(((reg & 7) << 3) | 5);
+        let k = match self.pool.iter().position(|&c| c == bits) {
+            Some(k) => k,
+            None => {
+                self.pool.push(bits);
+                self.pool.len() - 1
+            }
+        };
+        self.fixups.push((self.code.len(), k));
+        self.bytes(&[0; 4]);
+    }
+    /// `d = a op [constant]`: VEX where there is AVX, else a copy and the
+    /// legacy two-operand form (`prefix 0F op`).
+    fn op_const(&mut self, prefix: u8, pp: u8, op: u8, d: u8, a: u8, bits: u64) {
+        if self.avx {
+            self.vex(pp, 1, d, a, 0);
+        } else {
+            self.mov(d, a);
+            self.b(prefix);
+            self.rex(false, d, 0);
+            self.b(0x0F);
+        }
+        self.b(op);
+        self.modrm_const(d, bits);
     }
     /// `d = mask ? t : e` with the mask in `xmm0`; clobbers `xmm0`.
     fn blend(&mut self, t: u8, e: u8, d: u8) {
+        if self.avx {
+            // vblendvpd d, e, t, xmm0
+            self.vex(1, 3, d, e, t);
+            self.b(0x4B);
+            self.modrm_reg(d, t);
+            self.b(0x00);
+            return;
+        }
         self.mov(d, t);
         self.sse(0x66, 0x54, d, 0); // andpd d, xmm0
         self.sse(0x66, 0x55, 0, e); // andnpd xmm0, e
         self.sse(0x66, 0x56, d, 0); // orpd d, xmm0
+    }
+    /// `xmm0 = (x pred y) ? all ones : 0`, `cmpsd`.
+    fn cmp_mask(&mut self, x: u8, y: u8, pred: u8) {
+        if self.avx {
+            self.vex_rr(3, 0xC2, 0, x, y);
+        } else {
+            self.mov(0, x);
+            self.sse(0xF2, 0xC2, 0, y);
+        }
+        self.b(pred);
+    }
+    /// The scalar opcode (`F2 0F op`) of an arithmetic op.
+    fn arith_op(op: Arith) -> u8 {
+        match op {
+            Arith::Add => 0x58,
+            Arith::Mul => 0x59,
+            Arith::Sub => 0x5C,
+            Arith::Div => 0x5E,
+        }
     }
     fn base(b: Base) -> u8 {
         match b {
@@ -182,17 +255,41 @@ impl Isa for X64 {
     const RESULT: u8 = 0;
 
     fn new(hot: &[*const ()]) -> X64 {
+        static BASELINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let baseline = *BASELINE.get_or_init(|| std::env::var_os("RSDAG_SSE2").is_some());
         #[cfg(target_arch = "x86_64")]
-        let sse41 = is_x86_feature_detected!("sse4.1");
+        let (sse41, avx) = (
+            !baseline && is_x86_feature_detected!("sse4.1"),
+            !baseline && is_x86_feature_detected!("avx"),
+        );
         #[cfg(not(target_arch = "x86_64"))]
-        let sse41 = true;
+        let (sse41, avx) = (!baseline, false);
         X64 {
             code: Vec::with_capacity(8192),
             sse41,
+            avx,
             hot: hot.iter().copied().take(HOT_REGS.len()).collect(),
+            pool: Vec::new(),
+            fixups: Vec::new(),
         }
     }
-    fn finish(self) -> Vec<u8> {
+    fn finish(mut self) -> Vec<u8> {
+        // The constant pool after the code, each use rip-relative. An entry
+        // is 16 bytes, 16-byte aligned (a chunk is placed so): a legacy
+        // `andpd` or `xorpd` reads 16 aligned bytes from memory.
+        if !self.pool.is_empty() {
+            self.code.resize(self.code.len().next_multiple_of(16), 0xCC);
+            let base = self.code.len();
+            for c in &self.pool {
+                self.code.extend_from_slice(&c.to_le_bytes());
+                self.code.extend_from_slice(&[0; 8]);
+            }
+            for &(at, k) in &self.fixups {
+                let disp = (base + 16 * k) as i64 - (at + 4) as i64;
+                let disp = i32::try_from(disp).expect("a chunk is smaller than 2 GB");
+                self.code[at..at + 4].copy_from_slice(&disp.to_le_bytes());
+            }
+        }
         self.code
     }
 
@@ -245,8 +342,11 @@ impl Isa for X64 {
         if v.to_bits() == 0 {
             self.sse(0x66, 0x57, r, r); // xorpd r, r
         } else {
-            self.mov_imm(0, v.to_bits());
-            self.movq_from_rax(r);
+            // movsd r, [rip + constant]
+            self.b(0xF2);
+            self.rex(false, r, 0);
+            self.bytes(&[0x0F, 0x10]);
+            self.modrm_const(r, v.to_bits());
         }
     }
     fn mov(&mut self, d: u8, a: u8) {
@@ -256,13 +356,10 @@ impl Isa for X64 {
     }
 
     fn arith(&mut self, op: Arith, d: u8, a: u8, b: u8) {
-        let opc = match op {
-            Arith::Add => 0x58,
-            Arith::Mul => 0x59,
-            Arith::Sub => 0x5C,
-            Arith::Div => 0x5E,
-        };
-        if d == b && d != a {
+        let opc = Self::arith_op(op);
+        if self.avx {
+            self.vex_rr(3, opc, d, a, b);
+        } else if d == b && d != a {
             if matches!(op, Arith::Add | Arith::Mul) {
                 self.sse(0xF2, opc, d, a);
             } else {
@@ -275,6 +372,20 @@ impl Isa for X64 {
             self.sse(0xF2, opc, d, b);
         }
     }
+    const MEM_OPERANDS: bool = true;
+    fn arith_mem(&mut self, op: Arith, d: u8, a: u8, base: Base, off: usize) {
+        let base = Self::base(base);
+        if self.avx {
+            self.vex(3, 1, d, a, base);
+        } else {
+            self.mov(d, a);
+            self.b(0xF2);
+            self.rex(false, d, base);
+            self.b(0x0F);
+        }
+        self.b(Self::arith_op(op));
+        self.modrm_mem(d, base, off);
+    }
     const MINMAX: bool = false;
     fn minmax(&mut self, _op: ReduceOp, _d: u8, _a: u8, _b: u8) {
         // minsd / maxsd return the second operand on a NaN or a tie of
@@ -282,14 +393,10 @@ impl Isa for X64 {
         unreachable!("no min/max instruction with the reference's NaN rule")
     }
     fn neg(&mut self, d: u8, a: u8) {
-        self.mask1(0x8000_0000_0000_0000);
-        self.mov(d, a);
-        self.sse(0x66, 0x57, d, 1); // xorpd
+        self.op_const(0x66, 1, 0x57, d, a, 0x8000_0000_0000_0000); // xorpd
     }
     fn abs(&mut self, d: u8, a: u8) {
-        self.mask1(0x7FFF_FFFF_FFFF_FFFF);
-        self.mov(d, a);
-        self.sse(0x66, 0x54, d, 1); // andpd
+        self.op_const(0x66, 1, 0x54, d, a, 0x7FFF_FFFF_FFFF_FFFF); // andpd
     }
     fn sqrt(&mut self, d: u8, a: u8) {
         self.sse(0xF2, 0x51, d, a);
@@ -321,16 +428,12 @@ impl Isa for X64 {
             CmpOp::Eq => (a, b, 0),
             CmpOp::Ne => (a, b, 4),
         };
-        self.mov(0, x);
-        self.sse(0xF2, 0xC2, 0, y);
-        self.b(pred);
+        self.cmp_mask(x, y, pred);
         self.blend(t, e, d);
     }
     fn select_nz(&mut self, c: u8, t: u8, e: u8, d: u8) {
         self.sse(0x66, 0x57, 1, 1); // xorpd xmm1, xmm1
-        self.mov(0, c);
-        self.sse(0xF2, 0xC2, 0, 1);
-        self.b(4); // cmpneqsd: true when c != 0 or c is NaN
+        self.cmp_mask(c, 1, 4); // cmpneqsd: true when c != 0 or c is NaN
         self.blend(t, e, d);
     }
 

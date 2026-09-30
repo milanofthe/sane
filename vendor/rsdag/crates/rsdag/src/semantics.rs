@@ -566,6 +566,40 @@ pub fn solve_many_into<T: Scalar>(
     T::solve_many(a, b, n, k, out, &mut scratch[..solve_scratch_len(n, k)])
 }
 
+/// Systems of at most this many unknowns and right-hand sides solve side
+/// by side in a batch, four to a vector ([`solve_batch_into`] in `f64`);
+/// the tape batches solves of these shapes only, larger ones gain nothing
+/// from it.
+pub const SOLVE_BATCH_MAX_N: usize = 16;
+/// See [`SOLVE_BATCH_MAX_N`].
+pub const SOLVE_BATCH_MAX_K: usize = 4;
+
+/// `count` independent systems of one shape: `a` holds their `n` by `n`
+/// matrices back to back, `b` their `k` right-hand sides each (as
+/// [`solve_many_t`] takes them), `out` their solutions the same way. Each
+/// solution is bit-identical to its system's own [`solve_many_into`]; the
+/// systems share the `scratch` of one.
+#[allow(clippy::too_many_arguments)]
+pub fn solve_batch_into<T: Scalar>(
+    a: &[T],
+    b: &[T],
+    n: usize,
+    k: usize,
+    count: usize,
+    out: &mut [T],
+    scratch: &mut [T],
+) {
+    T::solve_batch(
+        a,
+        b,
+        n,
+        k,
+        count,
+        out,
+        &mut scratch[..solve_scratch_len(n, k)],
+    )
+}
+
 /// The column panel of the elimination of `n` unknowns, 0 unblocked.
 pub(crate) fn lu_panel(n: usize) -> usize {
     if n <= LU_UNBLOCKED_MAX {

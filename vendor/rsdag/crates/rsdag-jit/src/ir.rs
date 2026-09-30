@@ -5,7 +5,7 @@
 //! tape's: slots, or inputs when tagged (see [`rsdag::tape::INPUT`]).
 
 use rsdag::node::{BinOp, CmpOp, ReduceOp, UnaryOp};
-use rsdag::tape::{input_index, Accum, Op, Operand, Src, NO_STATE};
+use rsdag::tape::{input_index, Accum, Fold, Op, Operand, Src, INPUT, NO_STATE};
 use rsdag::Tape;
 
 pub(crate) enum ROp {
@@ -34,7 +34,7 @@ pub(crate) enum ROp {
 pub(crate) enum KernelKind {
     Gemv { m: u32, n: u32 },
     Gemm { m: u32, k: u32, n: u32 },
-    Solve { n: u32, k: u32 },
+    Solve { n: u32, k: u32, count: u32 },
 }
 
 /// A dense kernel: its operands in order (`a`, then `x` or `b`, then the
@@ -55,7 +55,7 @@ impl Kernel {
         match self.kind {
             KernelKind::Gemv { m, .. } => m,
             KernelKind::Gemm { m, n, .. } => m * n,
-            KernelKind::Solve { n, k } => n * k,
+            KernelKind::Solve { n, k, count } => count * n * k,
         }
     }
 }
@@ -213,8 +213,69 @@ impl ROp {
     }
 }
 
-/// The op stream of a tape, its bundles indexed as the tape indexes them.
-pub(crate) fn record(tape: &Tape) -> Vec<ROp> {
+/// A product kernel of fewer rows than this runs as its entries' dots,
+/// inline in the code: there the host call costs more than the arithmetic
+/// (measured: a six by six product inline in two thirds of the host's
+/// time, an eight by eight one on the host in two thirds of the inline).
+const INLINE_ROWS: u32 = 8;
+
+/// A small product kernel as the ops it stands for: every entry the dot
+/// of its row and its column (the kernel's own fold, see
+/// [`rsdag::semantics::gemm_t`]), then the entries that fold, in entry
+/// order, against their accumulator operand or another entry's product.
+fn inline_product(
+    tape: &Tape,
+    dst: u32,
+    kind: KernelKind,
+    a: Src,
+    b: Src,
+    acc: Option<Accum>,
+    out: &mut Vec<ROp>,
+) {
+    let (m, k, n) = match kind {
+        KernelKind::Gemv { m, n } => (m, n, 1),
+        KernelKind::Gemm { m, k, n } => (m, k, n),
+        KernelKind::Solve { .. } => unreachable!("a solve is no product"),
+    };
+    // Element `e` of a dense operand of `len` values.
+    let elem = |src: Src, len: u32, e: u32| -> u32 {
+        match src {
+            Src::Inputs(i) => (i + e) | INPUT,
+            Src::Pool(start) => tape.pool(start, len)[e as usize],
+            Src::Slots(s) => s + e,
+        }
+    };
+    let (la, lb) = (m * k, n * k);
+    let width = m * n;
+    for e in 0..width {
+        let (i, j) = (e / n, e % n);
+        let row = (0..k).map(|l| elem(a, la, i * k + l)).collect();
+        let col = (0..k).map(|l| elem(b, lb, j * k + l)).collect();
+        out.push(ROp::Dot(dst + e, row, col));
+    }
+    let Some(acc) = acc else { return };
+    let codes = tape.pool(acc.codes, width);
+    for e in 0..width {
+        let f = Fold(codes[e as usize]);
+        let d = dst + e;
+        let c = if f.is_self() {
+            dst + f.self_index() as u32
+        } else {
+            acc.c.map_or(d, |c| elem(c, width, e))
+        };
+        match f.0 & 3 {
+            0 => {}
+            1 => out.push(ROp::Sub(d, c, d)),
+            2 => out.push(ROp::Add(d, c, d)),
+            _ => out.push(ROp::Neg(d, d)),
+        }
+    }
+}
+
+/// The op stream of a tape, its bundles indexed as the tape indexes them,
+/// and where its prolog ends in it (a small product kernel is recorded as
+/// its dots, so the stream is longer than the tape).
+pub(crate) fn record(tape: &Tape) -> (Vec<ROp>, usize) {
     // A kernel over the dense operands `srcs`, with the folds of `acc`
     // over its `width` outputs.
     let kernel = |dst: u32, kind: KernelKind, srcs: &[(Src, u32)], acc: Option<Accum>| {
@@ -234,86 +295,100 @@ pub(crate) fn record(tape: &Tape) -> Vec<ROp> {
         k.codes = acc.map(|a| (tape.pool(a.codes, width).to_vec(), 0));
         ROp::Kernel(k)
     };
-    (0..tape.ops().len())
-        .map(|i| {
-            let dst = tape.dst(i);
-            match tape.ops()[i] {
-                Op::Const(v) => ROp::Const(dst, v),
-                Op::Add(a, b) => ROp::Add(dst, a, b),
-                Op::Mul(a, b) => ROp::Mul(dst, a, b),
-                Op::MulAdd(a, b, c) => ROp::MulAdd(dst, a, b, c),
-                Op::Sub(a, b) => ROp::Sub(dst, a, b),
-                Op::Neg(a) => ROp::Neg(dst, a),
-                Op::Powi(a, n) => ROp::Powi(dst, a, n),
-                Op::Unary(op, a) => ROp::Unary(dst, op, a),
-                Op::Binary(op, a, b) => ROp::Binary(dst, op, a, b),
-                Op::Cmp(op, a, b) => ROp::Cmp(dst, op, a, b),
-                Op::Select(c, t, e) => ROp::Select(dst, c, t, e),
-                Op::Reduce(op, s, l) => ROp::Reduce(dst, op, tape.pool(s, l).to_vec()),
-                Op::Dot(s, l) => {
-                    ROp::Dot(dst, tape.pool(s, l).to_vec(), tape.pool(s + l, l).to_vec())
-                }
-                Op::Call {
-                    bundle,
-                    start,
-                    n_groups,
-                    n_args,
-                    n_out,
-                    state,
-                } => ROp::Call(CallSite {
+    let mut ops = Vec::with_capacity(tape.n_ops());
+    let mut split = 0;
+    for i in 0..tape.n_ops() {
+        if i == tape.prolog_len() {
+            split = ops.len();
+        }
+        let dst = tape.dst(i);
+        let op = match tape.ops()[i] {
+            Op::Const(v) => ROp::Const(dst, v),
+            Op::Add(a, b) => ROp::Add(dst, a, b),
+            Op::Mul(a, b) => ROp::Mul(dst, a, b),
+            Op::MulAdd(a, b, c) => ROp::MulAdd(dst, a, b, c),
+            Op::Sub(a, b) => ROp::Sub(dst, a, b),
+            Op::Neg(a) => ROp::Neg(dst, a),
+            Op::Powi(a, n) => ROp::Powi(dst, a, n),
+            Op::Unary(op, a) => ROp::Unary(dst, op, a),
+            Op::Binary(op, a, b) => ROp::Binary(dst, op, a, b),
+            Op::Cmp(op, a, b) => ROp::Cmp(dst, op, a, b),
+            Op::Select(c, t, e) => ROp::Select(dst, c, t, e),
+            Op::Reduce(op, s, l) => ROp::Reduce(dst, op, tape.pool(s, l).to_vec()),
+            Op::Dot(s, l) => ROp::Dot(dst, tape.pool(s, l).to_vec(), tape.pool(s + l, l).to_vec()),
+            Op::Call {
+                bundle,
+                start,
+                n_groups,
+                n_args,
+                n_out,
+                state,
+            } => ROp::Call(CallSite {
+                dst,
+                bundle,
+                args: tape.pool(start, n_groups * n_args).to_vec(),
+                n_groups,
+                n_args,
+                n_out,
+                kind: if state == NO_STATE {
+                    CallKind::Whole
+                } else {
+                    CallKind::Main
+                },
+                state: if state == NO_STATE { 0 } else { state },
+                state_len: tape.bundles()[bundle as usize].state_len() as u32,
+                batch: n_groups > 1,
+            }),
+            Op::CallProlog {
+                bundle,
+                start,
+                n_groups,
+                n_pure,
+            } => {
+                let state_len = tape.bundles()[bundle as usize].state_len() as u32;
+                ROp::Call(CallSite {
                     dst,
                     bundle,
-                    args: tape.pool(start, n_groups * n_args).to_vec(),
+                    args: tape.pool(start, n_groups * n_pure).to_vec(),
                     n_groups,
-                    n_args,
-                    n_out,
-                    kind: if state == NO_STATE {
-                        CallKind::Whole
-                    } else {
-                        CallKind::Main
-                    },
-                    state: if state == NO_STATE { 0 } else { state },
-                    state_len: tape.bundles()[bundle as usize].state_len() as u32,
+                    n_args: n_pure,
+                    n_out: state_len,
+                    kind: CallKind::Prolog,
+                    state: dst,
+                    state_len,
                     batch: n_groups > 1,
-                }),
-                Op::CallProlog {
-                    bundle,
-                    start,
-                    n_groups,
-                    n_pure,
-                } => {
-                    let state_len = tape.bundles()[bundle as usize].state_len() as u32;
-                    ROp::Call(CallSite {
-                        dst,
-                        bundle,
-                        args: tape.pool(start, n_groups * n_pure).to_vec(),
-                        n_groups,
-                        n_args: n_pure,
-                        n_out: state_len,
-                        kind: CallKind::Prolog,
-                        state: dst,
-                        state_len,
-                        batch: n_groups > 1,
-                    })
-                }
-                Op::Gemv { a, x, m, n, acc } => {
-                    kernel(dst, KernelKind::Gemv { m, n }, &[(a, m * n), (x, n)], acc)
-                }
-                Op::Gemm { a, b, m, k, n, acc } => kernel(
-                    dst,
-                    KernelKind::Gemm { m, k, n },
-                    &[(a, m * k), (b, n * k)],
-                    acc,
-                ),
-                Op::Solve { a, b, n, k } => kernel(
-                    dst,
-                    KernelKind::Solve { n, k },
-                    &[(a, n * n), (b, n * k)],
-                    None,
-                ),
+                })
             }
-        })
-        .collect()
+            Op::Gemv { a, x, m, n, acc } if m < INLINE_ROWS => {
+                inline_product(tape, dst, KernelKind::Gemv { m, n }, a, x, acc, &mut ops);
+                continue;
+            }
+            Op::Gemm { a, b, m, k, n, acc } if m < INLINE_ROWS => {
+                inline_product(tape, dst, KernelKind::Gemm { m, k, n }, a, b, acc, &mut ops);
+                continue;
+            }
+            Op::Gemv { a, x, m, n, acc } => {
+                kernel(dst, KernelKind::Gemv { m, n }, &[(a, m * n), (x, n)], acc)
+            }
+            Op::Gemm { a, b, m, k, n, acc } => kernel(
+                dst,
+                KernelKind::Gemm { m, k, n },
+                &[(a, m * k), (b, n * k)],
+                acc,
+            ),
+            Op::Solve { a, b, n, k, count } => kernel(
+                dst,
+                KernelKind::Solve { n, k, count },
+                &[(a, count * n * n), (b, count * n * k)],
+                None,
+            ),
+        };
+        ops.push(op);
+    }
+    if tape.prolog_len() >= tape.n_ops() {
+        split = ops.len();
+    }
+    (ops, split)
 }
 
 /// When each value dies: per slot, the ops that read it and the ops that

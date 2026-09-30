@@ -184,7 +184,7 @@ impl Place {
 }
 
 /// A dense kernel as the code hands it over: its kind (0 `Gemv`, 1 `Gemm`,
-/// 2 the solve of `k` right-hand sides), its dimensions, where its
+/// 2 the solves of `k` right-hand sides, `m` systems of them), its dimensions, where its
 /// operands are (`a`, then `x` or `b`, then the accumulator), the address
 /// of its fold codes (0 without), the byte offset of its outputs, and
 /// the scratch a solve works in (the layout's, apart from slots and gather).
@@ -222,7 +222,7 @@ pub(crate) extern "C" fn h_kernel(work: *mut f64, inputs: *const f64, d: *const 
     let len_out = match d.kind {
         0 => m,
         1 => m * n,
-        _ => n * k,
+        _ => m * n * k,
     };
     let out = unsafe { std::slice::from_raw_parts_mut(work.byte_add(d.out as usize), len_out) };
     let codes = (d.codes != 0)
@@ -230,7 +230,7 @@ pub(crate) extern "C" fn h_kernel(work: *mut f64, inputs: *const f64, d: *const 
     let (a, b) = match d.kind {
         0 => (operand(0, m * n), operand(1, n)),
         1 => (operand(0, m * k), operand(1, n * k)),
-        _ => (operand(0, n * n), operand(1, n * k)),
+        _ => (operand(0, m * n * n), operand(1, m * n * k)),
     };
     let (a, b) = (a.expect("a kernel's first operand"), b.expect("its second"));
     match (d.kind, codes) {
@@ -245,7 +245,7 @@ pub(crate) extern "C" fn h_kernel(work: *mut f64, inputs: *const f64, d: *const 
                     d.scratch_len as usize,
                 )
             };
-            s::solve_many_into(a, b, n, k, out, scratch)
+            s::solve_batch_into(a, b, n, k, m, out, scratch)
         }
     }
 }

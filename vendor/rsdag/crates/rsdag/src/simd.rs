@@ -24,6 +24,16 @@ trait Quad: Copy {
     fn add(self, o: Self) -> Self;
     fn sub(self, o: Self) -> Self;
     fn mul(self, o: Self) -> Self;
+    fn div(self, o: Self) -> Self;
+    /// The magnitude, the sign bit cleared (as `f64::abs`).
+    fn abs(self) -> Self;
+    /// All bits set in the lanes where `self > o` (false where either is
+    /// NaN), clear elsewhere.
+    fn gt(self, o: Self) -> Self;
+    /// All bits set in the lanes where `self == o`.
+    fn eq(self, o: Self) -> Self;
+    /// `t` in the lanes where `mask` (a comparison's) is set, `e` elsewhere.
+    fn select(mask: Self, t: Self, e: Self) -> Self;
     #[inline(always)]
     fn zero() -> Self {
         Self::splat(0.0)
@@ -81,6 +91,29 @@ impl V2 {
     fn mul(self, o: V2) -> V2 {
         unsafe { V2(std::arch::aarch64::vmulq_f64(self.0, o.0)) }
     }
+    #[inline(always)]
+    fn div(self, o: V2) -> V2 {
+        unsafe { V2(std::arch::aarch64::vdivq_f64(self.0, o.0)) }
+    }
+    #[inline(always)]
+    fn abs(self) -> V2 {
+        unsafe { V2(std::arch::aarch64::vabsq_f64(self.0)) }
+    }
+    #[inline(always)]
+    fn gt(self, o: V2) -> V2 {
+        use std::arch::aarch64::*;
+        unsafe { V2(vreinterpretq_f64_u64(vcgtq_f64(self.0, o.0))) }
+    }
+    #[inline(always)]
+    fn eq(self, o: V2) -> V2 {
+        use std::arch::aarch64::*;
+        unsafe { V2(vreinterpretq_f64_u64(vceqq_f64(self.0, o.0))) }
+    }
+    #[inline(always)]
+    fn select(mask: V2, t: V2, e: V2) -> V2 {
+        use std::arch::aarch64::*;
+        unsafe { V2(vbslq_f64(vreinterpretq_u64_f64(mask.0), t.0, e.0)) }
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -108,6 +141,33 @@ impl V2 {
     #[inline(always)]
     fn mul(self, o: V2) -> V2 {
         unsafe { V2(std::arch::x86_64::_mm_mul_pd(self.0, o.0)) }
+    }
+    #[inline(always)]
+    fn div(self, o: V2) -> V2 {
+        unsafe { V2(std::arch::x86_64::_mm_div_pd(self.0, o.0)) }
+    }
+    #[inline(always)]
+    fn abs(self) -> V2 {
+        use std::arch::x86_64::*;
+        unsafe { V2(_mm_andnot_pd(_mm_set1_pd(-0.0), self.0)) }
+    }
+    #[inline(always)]
+    fn gt(self, o: V2) -> V2 {
+        unsafe { V2(std::arch::x86_64::_mm_cmpgt_pd(self.0, o.0)) }
+    }
+    #[inline(always)]
+    fn eq(self, o: V2) -> V2 {
+        unsafe { V2(std::arch::x86_64::_mm_cmpeq_pd(self.0, o.0)) }
+    }
+    #[inline(always)]
+    fn select(mask: V2, t: V2, e: V2) -> V2 {
+        use std::arch::x86_64::*;
+        unsafe {
+            V2(_mm_or_pd(
+                _mm_and_pd(mask.0, t.0),
+                _mm_andnot_pd(mask.0, e.0),
+            ))
+        }
     }
 }
 
@@ -137,6 +197,35 @@ impl V2 {
     #[inline(always)]
     fn mul(self, o: V2) -> V2 {
         V2([self.0[0] * o.0[0], self.0[1] * o.0[1]])
+    }
+    #[inline(always)]
+    fn div(self, o: V2) -> V2 {
+        V2([self.0[0] / o.0[0], self.0[1] / o.0[1]])
+    }
+    #[inline(always)]
+    fn abs(self) -> V2 {
+        V2([self.0[0].abs(), self.0[1].abs()])
+    }
+    #[inline(always)]
+    fn gt(self, o: V2) -> V2 {
+        let m = |c: bool| f64::from_bits(if c { u64::MAX } else { 0 });
+        V2([m(self.0[0] > o.0[0]), m(self.0[1] > o.0[1])])
+    }
+    #[inline(always)]
+    fn eq(self, o: V2) -> V2 {
+        let m = |c: bool| f64::from_bits(if c { u64::MAX } else { 0 });
+        V2([m(self.0[0] == o.0[0]), m(self.0[1] == o.0[1])])
+    }
+    #[inline(always)]
+    fn select(mask: V2, t: V2, e: V2) -> V2 {
+        let pick = |l: usize| {
+            if mask.0[l].to_bits() != 0 {
+                t.0[l]
+            } else {
+                e.0[l]
+            }
+        };
+        V2([pick(0), pick(1)])
     }
 }
 
@@ -169,6 +258,26 @@ impl Quad for Pair {
     #[inline(always)]
     fn mul(self, o: Pair) -> Pair {
         Pair(self.0.mul(o.0), self.1.mul(o.1))
+    }
+    #[inline(always)]
+    fn div(self, o: Pair) -> Pair {
+        Pair(self.0.div(o.0), self.1.div(o.1))
+    }
+    #[inline(always)]
+    fn abs(self) -> Pair {
+        Pair(self.0.abs(), self.1.abs())
+    }
+    #[inline(always)]
+    fn gt(self, o: Pair) -> Pair {
+        Pair(self.0.gt(o.0), self.1.gt(o.1))
+    }
+    #[inline(always)]
+    fn eq(self, o: Pair) -> Pair {
+        Pair(self.0.eq(o.0), self.1.eq(o.1))
+    }
+    #[inline(always)]
+    fn select(mask: Pair, t: Pair, e: Pair) -> Pair {
+        Pair(V2::select(mask.0, t.0, e.0), V2::select(mask.1, t.1, e.1))
     }
 }
 
@@ -206,6 +315,29 @@ impl Quad for Avx {
     #[inline(always)]
     fn mul(self, o: Avx) -> Avx {
         unsafe { Avx(std::arch::x86_64::_mm256_mul_pd(self.0, o.0)) }
+    }
+    #[inline(always)]
+    fn div(self, o: Avx) -> Avx {
+        unsafe { Avx(std::arch::x86_64::_mm256_div_pd(self.0, o.0)) }
+    }
+    #[inline(always)]
+    fn abs(self) -> Avx {
+        use std::arch::x86_64::*;
+        unsafe { Avx(_mm256_andnot_pd(_mm256_set1_pd(-0.0), self.0)) }
+    }
+    #[inline(always)]
+    fn gt(self, o: Avx) -> Avx {
+        use std::arch::x86_64::*;
+        unsafe { Avx(_mm256_cmp_pd::<_CMP_GT_OQ>(self.0, o.0)) }
+    }
+    #[inline(always)]
+    fn eq(self, o: Avx) -> Avx {
+        use std::arch::x86_64::*;
+        unsafe { Avx(_mm256_cmp_pd::<_CMP_EQ_OQ>(self.0, o.0)) }
+    }
+    #[inline(always)]
+    fn select(mask: Avx, t: Avx, e: Avx) -> Avx {
+        unsafe { Avx(std::arch::x86_64::_mm256_blendv_pd(e.0, t.0, mask.0)) }
     }
 }
 
@@ -255,6 +387,12 @@ entry!(
 entry!(
     /// [`gemm`] with every entry stored through `st(index, value)`.
     fn gemm_with<F: FnMut(usize, f64)>(a: &[f64], b: &[f64], m: usize, k: usize, n: usize, st: F) = gemm_q
+);
+entry!(
+    /// [`crate::semantics::solve_batch_into`] in `f64`: four systems at a
+    /// time side by side in the lanes where they are small, the rest one
+    /// by one.
+    fn solve_batch<>(a: &[f64], b: &[f64], n: usize, k: usize, count: usize, out: &mut [f64], scratch: &mut [f64]) = solve_batch_q
 );
 entry!(
     /// [`crate::semantics::solve_many_t`] in `f64`: the same panel-blocked
@@ -461,10 +599,205 @@ fn solve_q<Q: Quad>(
     scratch: &mut [f64],
 ) {
     use crate::semantics::{lu_panel, LU_PANEL_LARGE, LU_PANEL_SMALL};
+    macro_rules! fixed {
+        ($($n:literal)*) => {
+            match n {
+                $($n => return solve_fixed::<$n>(a, b, k, out),)*
+                _ => {}
+            }
+        };
+    }
+    fixed!(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16);
     match lu_panel(n) {
         0 => solve_unblocked::<Q>(a, b, n, k, out, scratch),
         LU_PANEL_SMALL => solve_blocked::<Q, LU_PANEL_SMALL>(a, b, n, k, out, scratch),
         _ => solve_blocked::<Q, LU_PANEL_LARGE>(a, b, n, k, out, scratch),
+    }
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn solve_batch_q<Q: Quad>(
+    a: &[f64],
+    b: &[f64],
+    n: usize,
+    k: usize,
+    count: usize,
+    out: &mut [f64],
+    scratch: &mut [f64],
+) {
+    let (sa, sb) = (n * n, n * k);
+    let mut c = 0;
+    use crate::semantics::{SOLVE_BATCH_MAX_K, SOLVE_BATCH_MAX_N};
+    if n <= SOLVE_BATCH_MAX_N && k <= SOLVE_BATCH_MAX_K {
+        macro_rules! lanes {
+            ($($n:literal)*) => {
+                match n {
+                    $($n => while c + 4 <= count {
+                        solve_lanes::<Q, $n>(&a[c * sa..], &b[c * sb..], k, &mut out[c * sb..]);
+                        c += 4;
+                    },)*
+                    _ => {}
+                }
+            };
+        }
+        lanes!(1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16);
+    }
+    for c in c..count {
+        solve_q::<Q>(
+            &a[c * sa..(c + 1) * sa],
+            &b[c * sb..(c + 1) * sb],
+            n,
+            k,
+            &mut out[c * sb..(c + 1) * sb],
+            scratch,
+        );
+    }
+}
+
+/// Four systems of `N` unknowns and `k` right-hand sides (at most
+/// [`crate::semantics::SOLVE_BATCH_MAX_K`]) side by side, lane `q` system `q`: `a` holds their
+/// matrices back to back, `b` and `out` their right-hand sides and
+/// solutions. Each lane runs [`solve_fixed`] on its own system: its own
+/// pivot, its rows swapped where its pivot says (a lane select), its own
+/// products, differences and quotients in the reference's order, so every
+/// solution is bit-identical to its system solved alone. Four independent
+/// eliminations share one chain of latencies.
+#[inline(always)]
+fn solve_lanes<Q: Quad, const N: usize>(a: &[f64], b: &[f64], k: usize, out: &mut [f64]) {
+    let (sa, sb) = (N * N, N * k);
+    // `col[j][i]` is entry `(i, j)`, `x[c][i]` entry `i` of right-hand
+    // side `c`, of every lane's system.
+    let mut col = [[Q::zero(); N]; N];
+    for i in 0..N {
+        for (j, cj) in col.iter_mut().enumerate() {
+            cj[i] = Q::of(std::array::from_fn(|q| a[q * sa + i * N + j]));
+        }
+    }
+    let mut x = [[Q::zero(); N]; crate::semantics::SOLVE_BATCH_MAX_K];
+    for (c, xc) in x.iter_mut().enumerate().take(k) {
+        for (i, xi) in xc.iter_mut().enumerate() {
+            *xi = Q::of(std::array::from_fn(|q| b[q * sb + c * N + i]));
+        }
+    }
+    for kk in 0..N {
+        let mut best = col[kk][kk].abs();
+        let mut p = Q::splat(kk as f64);
+        for i in kk + 1..N {
+            let v = col[kk][i].abs();
+            let gt = v.gt(best);
+            best = Q::select(gt, v, best);
+            p = Q::select(gt, Q::splat(i as f64), p);
+        }
+        for i in kk + 1..N {
+            let swap = p.eq(Q::splat(i as f64));
+            for cj in col.iter_mut() {
+                let (u, v) = (cj[kk], cj[i]);
+                cj[kk] = Q::select(swap, v, u);
+                cj[i] = Q::select(swap, u, v);
+            }
+            for xc in x.iter_mut().take(k) {
+                let (u, v) = (xc[kk], xc[i]);
+                xc[kk] = Q::select(swap, v, u);
+                xc[i] = Q::select(swap, u, v);
+            }
+        }
+        let piv = col[kk][kk];
+        let mut l = [Q::zero(); N];
+        for i in kk + 1..N {
+            l[i] = col[kk][i].div(piv);
+            col[kk][i] = l[i];
+        }
+        for cj in col.iter_mut().skip(kk + 1) {
+            let u = cj[kk];
+            for i in kk + 1..N {
+                cj[i] = cj[i].sub(l[i].mul(u));
+            }
+        }
+        for xc in x.iter_mut().take(k) {
+            let u = xc[kk];
+            for i in kk + 1..N {
+                xc[i] = xc[i].sub(l[i].mul(u));
+            }
+        }
+    }
+    for (c, xc) in x.iter_mut().enumerate().take(k) {
+        for i in (0..N).rev() {
+            let mut s = xc[i];
+            for j in i + 1..N {
+                s = s.sub(col[j][i].mul(xc[j]));
+            }
+            xc[i] = s.div(col[i][i]);
+            for (q, v) in xc[i].lanes().into_iter().enumerate() {
+                out[q * sb + c * N + i] = v;
+            }
+        }
+    }
+}
+
+/// The unblocked elimination of `N` unknowns with the size a constant, so
+/// its loops unroll, the matrix by columns on the stack: the pivot search,
+/// the multipliers and each column's update run down a column, four rows
+/// to a vector. The right-hand sides are eliminated in `out`. Every entry
+/// sees the reference's products and differences in the reference's
+/// order (a row update is entry by entry, the right-hand sides' columns
+/// included), so the result is bit-identical.
+#[inline(always)]
+fn solve_fixed<const N: usize>(a: &[f64], b: &[f64], k: usize, out: &mut [f64]) {
+    // `col[j][i]` is entry `(i, j)`.
+    let mut col = [[0.0f64; N]; N];
+    for i in 0..N {
+        for j in 0..N {
+            col[j][i] = a[i * N + j];
+        }
+    }
+    let x = &mut out[..N * k];
+    x.copy_from_slice(&b[..N * k]);
+    for kk in 0..N {
+        let mut p = kk;
+        let mut best = col[kk][kk].abs();
+        for i in kk + 1..N {
+            if col[kk][i].abs() > best {
+                best = col[kk][i].abs();
+                p = i;
+            }
+        }
+        if p != kk {
+            for c in col.iter_mut() {
+                c.swap(kk, p);
+            }
+            for c in 0..k {
+                x.swap(c * N + kk, c * N + p);
+            }
+        }
+        let piv = col[kk][kk];
+        let mut l = [0.0f64; N];
+        for i in kk + 1..N {
+            l[i] = col[kk][i] / piv;
+            col[kk][i] = l[i];
+        }
+        for c in col.iter_mut().skip(kk + 1) {
+            let u = c[kk];
+            for i in kk + 1..N {
+                c[i] -= l[i] * u;
+            }
+        }
+        for c in 0..k {
+            let u = x[c * N + kk];
+            for i in kk + 1..N {
+                x[c * N + i] -= l[i] * u;
+            }
+        }
+    }
+    for c in 0..k {
+        let x = &mut x[c * N..(c + 1) * N];
+        for i in (0..N).rev() {
+            let mut s = x[i];
+            for j in i + 1..N {
+                s -= col[j][i] * x[j];
+            }
+            x[i] = s / col[i][i];
+        }
     }
 }
 

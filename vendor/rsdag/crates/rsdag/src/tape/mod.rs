@@ -116,14 +116,17 @@ pub enum Op {
         n: u32,
         acc: Option<Accum>,
     },
-    /// The dense solve of `k` right-hand sides against one `n` by `n` `a`:
-    /// `b` holds `k` vectors of `n` back to back, the `k` solutions go to
-    /// `dst .. dst + n*k` the same way (see [`crate::semantics::solve_many_t`]).
+    /// The dense solves of `count` systems of one shape, each `k`
+    /// right-hand sides against its `n` by `n` matrix: `a` holds the
+    /// matrices back to back, `b` each system's `k` vectors of `n` back to
+    /// back, the solutions go to `dst .. dst + count*n*k` the same way (see
+    /// [`crate::semantics::solve_batch_into`]).
     Solve {
         a: Src,
         b: Src,
         n: u32,
         k: u32,
+        count: u32,
     },
 }
 
@@ -422,10 +425,24 @@ impl Tape {
                         m * n
                     )
                 }
-                Op::Solve { a, b, n, k: 1 } => {
+                Op::Solve {
+                    a,
+                    b,
+                    n,
+                    k: 1,
+                    count: 1,
+                } => {
                     format!("Solve({n}x{n} {}, {}) -> {n}", src(a, n * n), src(b, n))
                 }
-                Op::Solve { a, b, n, k } => {
+                Op::Solve { a, b, n, k, count } if count > 1 => {
+                    format!(
+                        "SolveBatch({count} of {n}x{n} {}, {k} rhs {}) -> {}",
+                        src(a, count * n * n),
+                        src(b, count * n * k),
+                        count * n * k
+                    )
+                }
+                Op::Solve { a, b, n, k, .. } => {
                     format!(
                         "SolveMany({n}x{n} {}, {k} rhs {}) -> {}",
                         src(a, n * n),
@@ -591,7 +608,7 @@ impl Tape {
         hi: usize,
         sink: &mut S,
     ) {
-        use crate::semantics::{reduce_slice_t, solve_many_into};
+        use crate::semantics::{reduce_slice_t, solve_batch_into};
         // The gather scratch at the tail of `work`, so nothing is allocated
         // per call.
         let (work, scratch) = work.split_at_mut(self.n_work);
@@ -760,19 +777,20 @@ impl Tape {
                     }
                     continue;
                 }
-                Op::Solve { a, b, n, k } => {
-                    let (n, k) = (n as usize, k as usize);
+                Op::Solve { a, b, n, k, count } => {
+                    let (n, k, count) = (n as usize, k as usize, count as usize);
+                    let (la, lb) = (count * n * n, count * n * k);
                     // The operands gathered at the front of the scratch, the
                     // solve working behind them.
                     let (scratch, lent) = scratch.split_at_mut(self.max_args);
                     let (ra, rb) =
-                        dense_operands(inputs, work, scratch, &self.arg_pool, a, n * n, b, n * k);
+                        dense_operands(inputs, work, scratch, &self.arg_pool, a, la, b, lb);
                     let base = work.as_mut_ptr();
-                    let av: &[T] = dense_slice(inputs, base, scratch, ra, n * n);
-                    let bv: &[T] = dense_slice(inputs, base, scratch, rb, n * k);
-                    let reads = [Some((ra, n * n)), Some((rb, n * k)), None];
-                    let out = unsafe { out_block(base, work.len(), d, n * k, &reads) };
-                    solve_many_into(av, bv, n, k, out, lent);
+                    let av: &[T] = dense_slice(inputs, base, scratch, ra, la);
+                    let bv: &[T] = dense_slice(inputs, base, scratch, rb, lb);
+                    let reads = [Some((ra, la)), Some((rb, lb)), None];
+                    let out = unsafe { out_block(base, work.len(), d, lb, &reads) };
+                    solve_batch_into(av, bv, n, k, count, out, lent);
                     continue;
                 }
             };
@@ -888,9 +906,9 @@ impl Tape {
                 dense(b, n * k, f);
                 acc(c, m * n, f);
             }
-            Op::Solve { a, b, n, k } => {
-                dense(a, n * n, f);
-                dense(b, n * k, f);
+            Op::Solve { a, b, n, k, count } => {
+                dense(a, count * n * n, f);
+                dense(b, count * n * k, f);
             }
         }
     }
@@ -906,7 +924,7 @@ impl Tape {
             } => n_groups * self.bundles[bundle as usize].state_len() as u32,
             Op::Gemv { m, .. } => m,
             Op::Gemm { m, n, .. } => m * n,
-            Op::Solve { n, k, .. } => n * k,
+            Op::Solve { n, k, count, .. } => count * n * k,
             _ => 1,
         }
     }

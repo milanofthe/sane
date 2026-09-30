@@ -33,9 +33,10 @@ use crate::field::Field;
 use crate::func::{Body, FuncId};
 use crate::graph::Graph;
 use crate::node::{ArgList, ExprId, Node, SymbolId};
+use crate::semantics::{SOLVE_BATCH_MAX_K, SOLVE_BATCH_MAX_N};
 
 /// Row dots against one vector fuse into a `Gemv` from this many rows on.
-const GEMV_MIN_ROWS: usize = 8;
+const GEMV_MIN_ROWS: usize = 2;
 
 /// A call's operands and the slot of its state block (the last operand of
 /// a stateful call), or [`NO_STATE`](super::NO_STATE).
@@ -255,10 +256,13 @@ pub(super) enum Kind {
         n: u32,
         acc: Option<Vec<u32>>,
     },
-    /// `k` right-hand sides against one matrix.
+    /// `k` right-hand sides against one matrix, for each of `count`
+    /// systems of one shape (matrices first, then right-hand sides, each
+    /// system's back to back).
     Solve {
         n: u32,
         k: u32,
+        count: u32,
     },
 }
 
@@ -629,7 +633,7 @@ impl Tape {
                     n,
                     acc: codes(acc),
                 },
-                Op::Solve { n, k, .. } => Kind::Solve { n, k },
+                Op::Solve { n, k, count, .. } => Kind::Solve { n, k, count },
             };
             // A kernel's accumulator entries, one per output after the
             // factors: the operand where its fold reads it, else the
@@ -959,6 +963,7 @@ impl Forest {
         }
         self.merge_gemm(ctx, &mut groups);
         self.merge_solves(ctx, &mut groups, &depth);
+        self.merge_solve_batches(ctx, &mut groups, &depth);
         // A gemv group of too few rows at its depth, or a call group of one
         // argument list, is no kernel: its members lower on their own.
         let mut kernel_of: Vec<Option<usize>> = vec![None; m];
@@ -974,7 +979,10 @@ impl Forest {
                     }
                     distinct.len() >= 2
                 }
-                GroupKey::Gemm(..) | GroupKey::Solve(..) | GroupKey::SolveMany(..) => true,
+                GroupKey::Gemm(..)
+                | GroupKey::Solve(..)
+                | GroupKey::SolveMany(..)
+                | GroupKey::SolveBatch(..) => true,
             };
             if is_kernel {
                 for &i in members {
@@ -1088,6 +1096,57 @@ impl Forest {
                 .flat_map(|&g| std::mem::take(&mut groups[g].1))
                 .collect();
             groups[gs[0]] = (GroupKey::SolveMany(a, lists), members);
+        }
+    }
+
+    /// Solves of one shape (unknowns and right-hand sides) at one depth and
+    /// of one purity, over different matrices, are one batch: their
+    /// systems side by side in one kernel, four to a vector; only shapes
+    /// up to [`SOLVE_BATCH_MAX_N`] unknowns and [`SOLVE_BATCH_MAX_K`]
+    /// right-hand sides batch (a larger system gains nothing from it and
+    /// the batch gathers its operands). At one depth none reads another's solution (a
+    /// group's depth is above every group it reads). A merged-away group is
+    /// left empty.
+    fn merge_solve_batches<K: Field>(
+        &self,
+        ctx: &Graph<K>,
+        groups: &mut [(GroupKey, Vec<usize>)],
+        depth: &[u32],
+    ) {
+        let system = |key: &GroupKey| -> Option<System> {
+            match key {
+                GroupKey::Solve(l, _) => {
+                    let n = Graph::<K>::solve_n(l.len());
+                    Some((ctx.args(*l)[..n * n].to_vec(), vec![*l]))
+                }
+                GroupKey::SolveMany(a, lists) => Some((a.clone(), lists.clone())),
+                _ => None,
+            }
+        };
+        let mut by_shape: HashMap<(usize, usize, u32, bool), Vec<usize>> = HashMap::default();
+        for (g, (key, members)) in groups.iter().enumerate() {
+            let (Some((a, lists)), Some(&first)) = (system(key), members.first()) else {
+                continue;
+            };
+            // `a` holds the n by n entries.
+            if a.len() > SOLVE_BATCH_MAX_N * SOLVE_BATCH_MAX_N || lists.len() > SOLVE_BATCH_MAX_K {
+                continue;
+            }
+            by_shape
+                .entry((a.len(), lists.len(), depth[first], self.pure[first]))
+                .or_default()
+                .push(g);
+        }
+        let mut batches: Vec<Vec<usize>> =
+            by_shape.into_values().filter(|gs| gs.len() >= 2).collect();
+        batches.sort();
+        for gs in batches {
+            let systems: Vec<System> = gs.iter().filter_map(|&g| system(&groups[g].0)).collect();
+            let members: Vec<usize> = gs
+                .iter()
+                .flat_map(|&g| std::mem::take(&mut groups[g].1))
+                .collect();
+            groups[gs[0]] = (GroupKey::SolveBatch(systems), members);
         }
     }
 
@@ -1256,7 +1315,7 @@ impl Forest {
                     .enumerate()
                     .map(|(c, &l)| (l, c as u32))
                     .collect();
-                let inst = lw.push(Kind::Solve { n, k }, ins, n * k, pure);
+                let inst = lw.push(Kind::Solve { n, k, count: 1 }, ins, n * k, pure);
                 for &mi in members {
                     let Node::Solve(l, c) = *ctx.node(base[mi]) else {
                         unreachable!()
@@ -1264,11 +1323,38 @@ impl Forest {
                     lw.value[mi] = Some(Ref::Value(inst, col_of[&l] * n + c));
                 }
             }
+            GroupKey::SolveBatch(systems) => {
+                let n = Graph::<K>::solve_n(ctx.args(systems[0].1[0]).len());
+                let k = systems[0].1.len();
+                let mut ins: Vec<Ref> = systems
+                    .iter()
+                    .flat_map(|(a, _)| a.iter().map(|&e| val(lw, e)))
+                    .collect();
+                // Each right-hand side's place: system, then its column.
+                let mut col_of: HashMap<ArgList, usize> = HashMap::default();
+                for (l, &list) in systems.iter().flat_map(|(_, lists)| lists).enumerate() {
+                    ins.extend(ctx.args(list)[n * n..].iter().map(|&e| val(lw, e)));
+                    col_of.insert(list, l);
+                }
+                let count = systems.len();
+                let kind = Kind::Solve {
+                    n: n as u32,
+                    k: k as u32,
+                    count: count as u32,
+                };
+                let inst = lw.push(kind, ins, (count * n * k) as u32, pure);
+                for &mi in members {
+                    let Node::Solve(l, c) = *ctx.node(base[mi]) else {
+                        unreachable!()
+                    };
+                    lw.value[mi] = Some(Ref::Value(inst, (col_of[&l] * n) as u32 + c));
+                }
+            }
             GroupKey::Solve(l, _) => {
                 let all = ctx.args(*l);
                 let n = Graph::<K>::solve_n(all.len()) as u32;
                 let ins: Vec<Ref> = all.iter().map(|&a| val(lw, a)).collect();
-                let inst = lw.push(Kind::Solve { n, k: 1 }, ins, n, pure);
+                let inst = lw.push(Kind::Solve { n, k: 1, count: 1 }, ins, n, pure);
                 for &mi in members {
                     let Node::Solve(_, c) = *ctx.node(base[mi]) else {
                         unreachable!()
@@ -1432,7 +1518,12 @@ enum GroupKey {
     /// One matrix against several right-hand sides (their lists, in
     /// first-encounter order).
     SolveMany(Vec<ExprId>, Vec<ArgList>),
+    /// Systems of one shape over different matrices, side by side.
+    SolveBatch(Vec<System>),
 }
+
+/// A system of a solve kernel: its matrix and its right-hand sides' lists.
+type System = (Vec<ExprId>, Vec<ArgList>);
 
 /// The kernel groups of a forest (see [`Forest::groups`]): members by base
 /// position, and the group, if a kernel, each position belongs to.
@@ -1712,7 +1803,9 @@ impl Program {
                     }
                     r
                 }
-                Kind::Solve { n, k } => vec![(n * n) as usize, (n * k) as usize],
+                Kind::Solve { n, k, count } => {
+                    vec![(count * n * n) as usize, (count * n * k) as usize]
+                }
                 _ => continue,
             };
             let ins = self.ins(i as usize);
@@ -1934,12 +2027,12 @@ impl Program {
                         acc,
                     }
                 }
-                Kind::Solve { n, k } => {
-                    let (a, b) = o.split_at((n * n) as usize);
+                Kind::Solve { n, k, count } => {
+                    let (a, b) = o.split_at((count * n * n) as usize);
                     let a = dense(&mut arg_pool, &mut max_args, a);
                     let b = dense(&mut arg_pool, &mut max_args, b);
-                    max_args = max_args.max((n * n + n * k) as usize);
-                    Op::Solve { a, b, n, k }
+                    max_args = max_args.max((count * (n * n + n * k)) as usize);
+                    Op::Solve { a, b, n, k, count }
                 }
             };
             ops.push(op);

@@ -264,7 +264,7 @@ impl NativeTape {
         if !cfg!(any(target_arch = "aarch64", target_arch = "x86_64")) {
             return Err(JitError::Unsupported);
         }
-        let mut ops = crate::ir::record(tape);
+        let (mut ops, split) = crate::ir::record(tape);
         // Function bodies that are tapes become native bodies of their own.
         let bundles: Result<Bundles, JitError> = tape
             .bundles()
@@ -324,7 +324,7 @@ impl NativeTape {
         // The scratch lent to a called bundle, or to a dense solve.
         let solves = ops.iter().map(|op| match op {
             ROp::Kernel(Kernel {
-                kind: KernelKind::Solve { n, k },
+                kind: KernelKind::Solve { n, k, .. },
                 ..
             }) => rsdag::semantics::solve_scratch_len(*n as usize, *k as usize),
             _ => 0,
@@ -342,9 +342,8 @@ impl NativeTape {
             total: (n_work + gather_len + scratch_len).max(1),
         };
         // Chunk the prolog and main phases separately so no chunk straddles
-        // the split; the recorded stream is 1:1 with the tape's ops.
+        // the split.
         let chunk_ops = chunk_ops.max(1);
-        let split = tape.prolog_len().min(ops.len());
         let (pro, main) = ops.split_at(split);
         let jobs: Vec<&[ROp]> = pro
             .chunks(chunk_ops)
@@ -956,7 +955,7 @@ impl<'a, I: Isa> Emitter<'a, I> {
                 let (kind, m, k, n) = match kn.kind {
                     KernelKind::Gemv { m, n } => (0, m, 0, n),
                     KernelKind::Gemm { m, k, n } => (1, m, k, n),
-                    KernelKind::Solve { n, k } => (2, 0, k, n),
+                    KernelKind::Solve { n, k, count } => (2, count, k, n),
                 };
                 let desc = host::KernelDesc {
                     kind,

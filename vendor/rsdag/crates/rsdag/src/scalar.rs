@@ -98,6 +98,31 @@ pub trait Scalar: Copy + Send + Sync + std::fmt::Debug + 'static {
     ) {
         crate::semantics::solve_generic_into(a, b, n, k, out, scratch)
     }
+    /// `count` solves of one shape (see
+    /// [`crate::semantics::solve_batch_into`]): one after the other, or in
+    /// `f64` side by side in the lanes of a vector.
+    #[allow(clippy::too_many_arguments)]
+    fn solve_batch(
+        a: &[Self],
+        b: &[Self],
+        n: usize,
+        k: usize,
+        count: usize,
+        out: &mut [Self],
+        scratch: &mut [Self],
+    ) {
+        let (sa, sb) = (n * n, n * k);
+        for c in 0..count {
+            Self::solve_many(
+                &a[c * sa..(c + 1) * sa],
+                &b[c * sb..(c + 1) * sb],
+                n,
+                k,
+                &mut out[c * sb..(c + 1) * sb],
+                scratch,
+            );
+        }
+    }
     /// Call a bundle on arguments in `Self`, its outputs back in `Self`.
     /// A bundle computes in `f64`, so a scalar that is not `f64` converts
     /// both ways; `f64` itself calls straight through. The conversion
@@ -239,6 +264,17 @@ impl Scalar for f64 {
         scratch: &mut [Self],
     ) {
         crate::simd::solve_many(a, b, n, k, out, scratch)
+    }
+    fn solve_batch(
+        a: &[Self],
+        b: &[Self],
+        n: usize,
+        k: usize,
+        count: usize,
+        out: &mut [Self],
+        scratch: &mut [Self],
+    ) {
+        crate::simd::solve_batch(a, b, n, k, count, out, scratch)
     }
     fn magnitude(self) -> f64 {
         self.abs()

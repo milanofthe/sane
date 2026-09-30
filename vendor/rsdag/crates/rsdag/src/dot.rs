@@ -922,8 +922,11 @@ fn op_view(tape: &Tape, i: usize) -> OpView {
         Op::CallProlog { n_groups, .. } => (format!("prolog x{n_groups}"), Kind::Call),
         Op::Gemv { m, n, .. } => (format!("gemv {m}x{n}"), Kind::Kernel),
         Op::Gemm { m, k, n, .. } => (format!("gemm {m}x{k}x{n}"), Kind::Kernel),
-        Op::Solve { n, k: 1, .. } => (format!("solve {n}"), Kind::Kernel),
-        Op::Solve { n, k, .. } => (format!("solve {n}, {k} rhs"), Kind::Kernel),
+        Op::Solve {
+            n, k: 1, count: 1, ..
+        } => (format!("solve {n}"), Kind::Kernel),
+        Op::Solve { n, k, count: 1, .. } => (format!("solve {n}, {k} rhs"), Kind::Kernel),
+        Op::Solve { n, count, .. } => (format!("solve {n} x{count}"), Kind::Kernel),
     };
     let bundle = match tape.ops()[i] {
         Op::Call { bundle, .. } | Op::CallProlog { bundle, .. } => Some(bundle),

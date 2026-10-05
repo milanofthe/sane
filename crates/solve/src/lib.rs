@@ -67,7 +67,6 @@ pub mod hb;
 pub use delay::DelayHistory;
 // Device controlling-voltage limiting (pnjlim/fetlim) is an internal solver
 // step with no external consumers.
-mod bundle;
 pub(crate) mod limiting;
 // Construction of a `CompiledDc` (Jacobian extraction, tape compilation).
 mod compile;
@@ -93,8 +92,6 @@ mod tests;
 mod transient;
 mod transient_adjoint;
 
-#[cfg(feature = "jit")]
-pub(crate) use eval::jit_enabled;
 pub(crate) use eval::{PrologToken, StepEval};
 use schur::{LinCache, Partition};
 use sens::{CompiledHessian, HistJac, ParamJac};
@@ -245,10 +242,10 @@ impl Convergence {
         }
     }
 }
-/// The worker pool's thread count for the parallel passes (sweeps, the
-/// harmonic-balance sampling): `0` restores the default, `n` asks for `n`
-/// threads. Takes effect before the pool is first used (see
-/// [`parallel`]).
+/// The thread count for the parallel work (the sweeps, the harmonic-balance
+/// sampling, and in every solve the device instances of each evaluation):
+/// `0` restores the default, `n` asks for `n` threads. Takes effect before
+/// the pools are first used (see [`parallel`]).
 pub fn set_parallelism(threads: usize) {
     sane_core::update_config(|c| c.threads = if threads == 0 { None } else { Some(threads) });
 }
@@ -410,6 +407,10 @@ pub struct CompiledDc {
     /// lazily on first `hessian()` call (it is the heaviest, ~O(n^2) extract stage
     /// and is only needed for second-order sensitivity), via [`ensure_hessian`].
     chess: std::sync::OnceLock<CompiledHessian>,
+    /// Compiled `dF/d(input)` per input symbol (an independent source's value,
+    /// the AC and pole-zero excitation), built on the first query for that
+    /// input by [`input_jacobian`](Self::input_jacobian).
+    input_jacs: std::sync::Mutex<HashMap<SymbolId, std::sync::Arc<StepEval>>>,
     /// Base input symbols (x, differential xdot, params, t), kept so the lazy
     /// parameter-Jacobian and Hessian tapes can be compiled on demand.
     base_inputs: Vec<SymbolId>,
@@ -772,6 +773,20 @@ impl CompiledDc {
     /// state at each time in `t_eval` (one inner vector per time point), or an
     /// error string if integration fails.
     pub fn solve_transient(
+        &self,
+        method: TransientMethod,
+        p: &[f64],
+        x0: &[f64],
+        t_eval: &[f64],
+        rtol: f64,
+        atol: f64,
+        dt_max: Option<f64>,
+    ) -> Result<Vec<Vec<f64>>, String> {
+        crate::parallel::solve(|| self.solve_transient_here(method, p, x0, t_eval, rtol, atol, dt_max))
+    }
+
+    /// [`solve_transient`](Self::solve_transient) on this thread.
+    fn solve_transient_here(
         &self,
         method: TransientMethod,
         p: &[f64],

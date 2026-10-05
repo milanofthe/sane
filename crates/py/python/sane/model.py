@@ -125,6 +125,17 @@ class ParamNode:
         return f"<sane.ParamNode {pre!r}: {self._children()}>"
 
 
+def _flat_paths(paths):
+    """Parameter paths given variadically or as iterables, flattened."""
+    flat = []
+    for p in paths:
+        if isinstance(p, str):
+            flat.append(p)
+        else:
+            flat.extend(str(x) for x in p)
+    return flat
+
+
 class Model:
     """A circuit as an analyzable symbolic graph: the differential-algebraic
     system ``F(x, x', t) = 0`` with its analytic Jacobians, and the front-end to
@@ -1657,16 +1668,38 @@ class Model:
             tuned = model.fold("X1")            # freeze subcircuit X1's parameters
             s = tuned.sensitivity("out")        # sensitivity over the few remaining knobs
         """
-        flat = []
-        for p in paths:
-            if isinstance(p, str):
-                flat.append(p)
-            else:
-                flat.extend(str(x) for x in p)
-        raw = self._d.fold(flat)
+        raw = self._d.fold(_flat_paths(paths))
         return Model(raw, self._names, self.values)
 
-    def linearize(self, canonical=False):
+    def keep(self, *paths):
+        """Fold every parameter except the ones under ``paths``: the named
+        parameters (and groups) stay symbolic, every other one becomes a
+        constant at its current value -- the inverse of :meth:`fold`, for a
+        model with a few tuning knobs among thousands of fixed device
+        parameters. A source driven as an AC input must be kept.
+
+        Parameters
+        ----------
+        *paths : str | iterable[str]
+            parameter or group paths to keep, as for :meth:`fold`
+
+        Returns
+        -------
+        Model
+            the folded model, in the same context
+
+        Example
+        -------
+
+        .. code-block:: python
+
+            knobs = model.keep("R1", "C1", "V1")   # everything else folded
+            s = knobs.sensitivity("out")
+        """
+        raw = self._d.keep(_flat_paths(paths))
+        return Model(raw, self._names, self.values)
+
+    def linearize(self):
         """Linearise about the operating point into the **small-signal linear
         mass-matrix DAE** :math:`G\\,\\delta x + C\\,\\delta\\dot x = 0`, sharing
         this context.
@@ -1678,21 +1711,13 @@ class Model:
         nonlinear residual assembly does. :meth:`system_matrix` on the result
         reproduces this model's :math:`A(s)` exactly.
 
-        Parameters
-        ----------
-        canonical : bool
-            if ``True``, split each stamp to a single canonical small-signal
-            element (``coef * port``) -- the element graph then lives directly in
-            the returned model's stamps (one element per stamp). Otherwise the stamps
-            mirror the source elements.
-
         Returns
         -------
         Model
             the linear small-signal system, in the same context (render it with
             :meth:`to_dot`, read :meth:`system_matrix` / :meth:`transfer_function`).
         """
-        raw = self._d.linearize(canonical)
+        raw = self._d.linearize()
         return Model(raw, self._names, self.values)
 
     # --- symbolic graph access --------------------------------------------

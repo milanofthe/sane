@@ -25,7 +25,7 @@ use rsdag::{Node, SymbolId};
 use sane_core::constants::{DC_OP_MAXIT, DC_OP_TOL};
 use sane_core::log_stage;
 use sane_core::Graph;
-use sane_dae::linearize::{linearize_with, Granularity};
+use sane_dae::linearize::linearize;
 use sane_dae::{eliminate_nodes as dae_eliminate_nodes, reduce_graph};
 use sane_solve::{CompiledDc, Convergence, SolverTricks, TransientMethod};
 
@@ -258,11 +258,10 @@ struct ModelInner {
 /// elements responsible and points at `dt_max`, which already exists for
 /// bounding the step. It does not bound it on the caller's behalf.
 fn detect_index2(
-    circuit: &sane_mna::Circuit,
-    devices: &[sane_dae::DeviceInstance],
+    elements: &[sane_mna::Element],
+    terminals: &[Vec<usize>],
 ) -> sane_mna::index2::Index2Report {
-    let terminals: Vec<Vec<usize>> = devices.iter().map(|d| d.terminals.clone()).collect();
-    let rep = sane_mna::index2::detect(circuit, &terminals);
+    let rep = sane_mna::index2::detect(elements, terminals);
     if rep.is_index2() {
         sane_core::log::warn_captured(&format!(
             "index-2 topology ({}): its constraint carries no truncation error, so the adaptive transient step may stride past the resolution you asked for -- set dt_max if the trace looks coarse",
@@ -289,7 +288,9 @@ impl Model {
         } = prepare(src).map_err(ModelError::Parse)?;
         let pnames = cdc.param_names(&ctx);
         task.finish(format!("dim: {}, params: {}", dae.dim(), pnames.len()));
-        let index2 = detect_index2(&parsed.circuit, &parsed.devices);
+        let (elements, terminals) =
+            sane_dae::topology(&parsed.circuit, &parsed.devices, &parsed.instances);
+        let index2 = detect_index2(&elements, &terminals);
         let store = ParamStore::new(
             pnames,
             parsed.values.iter().map(|(k, v)| (k.clone(), *v)).collect(),
@@ -336,12 +337,11 @@ impl Model {
         cdc: CompiledDc,
         values: HashMap<String, f64>,
         node_names: Vec<String>,
-        // element graph the DAE came from, for topological index detection;
-        // None for models assembled without one
-        circuit: Option<&sane_mna::Circuit>,
-        // the nonlinear devices of that graph (they conduct, so they break
-        // cutsets); empty when there are none
-        devices: &[sane_dae::DeviceInstance],
+        // the element graph the DAE came from and its devices' terminals
+        // (they conduct, so they break cutsets), in the top frame (see
+        // `sane_dae::topology`), for topological index detection; None for
+        // models assembled without one
+        topology: Option<(&[sane_mna::Element], &[Vec<usize>])>,
     ) -> Model {
         let pnames = {
             let c = ctx.lock().unwrap();
@@ -354,8 +354,8 @@ impl Model {
                 ctx,
                 dae,
                 cdc,
-                index2: circuit
-                    .map(|c| detect_index2(c, devices))
+                index2: topology
+                    .map(|(e, t)| detect_index2(e, t))
                     .unwrap_or_default(),
                 store,
                 unknowns,
@@ -765,21 +765,8 @@ impl Model {
         let out_idx = self
             .resolve(output)
             .ok_or_else(|| ModelError::UnknownRef(output.to_string()))?;
-        let mut ctx = self.inner.ctx.lock().unwrap();
-        let (freqs, mag_db, phase_deg) = crate::ac_on_dae(
-            &mut ctx,
-            &self.inner.dae,
-            &self.inner.cdc,
-            &self.inner.store.pnames,
-            input,
-            out_idx,
-            &x,
-            &p,
-            fstart,
-            fstop,
-            points,
-        )
-        .map_err(ModelError::Numeric)?;
+        let (freqs, mag_db, phase_deg) =
+            self.ac_sweep(input, out_idx, x, p, fstart, fstop, points)?;
         Ok(AcResponse {
             freqs,
             mag_db,
@@ -997,7 +984,6 @@ impl Model {
             self.inner.node_names.clone(),
             // a transformed DAE has no element graph of its own
             None,
-            &[],
         );
         (model, pruned)
     }
@@ -1019,22 +1005,15 @@ impl Model {
             self.inner.node_names.clone(),
             // a transformed DAE has no element graph of its own
             None,
-            &[],
         );
         (model, gone)
     }
 
     /// Linearise about the operating point into the small-signal mass-matrix DAE
-    /// `G dx + C dx' = 0`, sharing this context. `canonical` emits a single
-    /// canonical small-signal element per stamp. Returns the linearised `Model`.
-    pub fn linearize(&self, canonical: bool) -> Model {
-        let gran = if canonical {
-            Granularity::Canonical
-        } else {
-            Granularity::PerElement
-        };
+    /// `G dx + C dx' = 0`, sharing this context. Returns the linearised `Model`.
+    pub fn linearize(&self) -> Model {
         let mut c = self.inner.ctx.lock().unwrap();
-        let lin = linearize_with(&mut c, &self.inner.dae, gran);
+        let lin = linearize(&mut c, &self.inner.dae);
         let cdc = CompiledDc::new(&mut c, &lin);
         drop(c);
         Model::from_parts(
@@ -1044,7 +1023,6 @@ impl Model {
             self.values(),
             self.inner.node_names.clone(),
             None,
-            &[],
         )
     }
 
@@ -1052,12 +1030,33 @@ impl Model {
     /// in a derived `Model` (sharing this context). Its now-constant subexpressions
     /// collapse (smaller graph / faster eval) and it leaves the parameter set
     /// (`params()` shrinks -> no `dF/dp` column, no sensitivity). A `path` is either
-    /// a single parameter (`X1.R1`, `N1.vth0`) or a group prefix (`X1` -> all
+    /// a single parameter (`X1.R1`, `nmos.vth0`) or a group prefix (`X1` -> all
     /// `X1.*`, recursively). Same transform family as `linearize` /
     /// `eliminate_nodes`; the master `Model` is unchanged.
     pub fn fold(&self, paths: &[&str]) -> Result<Model, ModelError> {
-        // Resolve each path to canonical parameter names: a leaf parameter, or
-        // every parameter under a group prefix.
+        let names = self.resolve_paths(paths)?;
+        self.fold_names(&names)
+    }
+
+    /// [`fold`](Self::fold) every parameter except those under `paths`: the
+    /// named ones stay symbolic, the rest become constants. A source driven
+    /// as an AC input has to be kept.
+    pub fn keep(&self, paths: &[&str]) -> Result<Model, ModelError> {
+        let kept = self.resolve_paths(paths)?;
+        let names: HashSet<String> = self
+            .inner
+            .store
+            .pnames
+            .iter()
+            .filter(|n| !kept.contains(*n))
+            .cloned()
+            .collect();
+        self.fold_names(&names)
+    }
+
+    /// The canonical parameter names under `paths`: a leaf parameter, or every
+    /// parameter under a group prefix.
+    fn resolve_paths(&self, paths: &[&str]) -> Result<HashSet<String>, ModelError> {
         let mut names: HashSet<String> = HashSet::new();
         for &path in paths {
             if let Some(canon) = self.inner.store.resolve(path) {
@@ -1073,11 +1072,15 @@ impl Model {
                 return Err(ModelError::UnknownParam(path.to_string()));
             }
         }
+        Ok(names)
+    }
 
+    /// The derived `Model` with the parameters `names` folded to their values.
+    fn fold_names(&self, names: &HashSet<String>) -> Result<Model, ModelError> {
         let mut c = self.inner.ctx.lock().unwrap();
         // (param symbol, frozen current value) pairs for the substitution.
         let mut fold: Vec<(SymbolId, f64)> = Vec::with_capacity(names.len());
-        for name in &names {
+        for name in names {
             let val = self.inner.store.get(name).unwrap_or(0.0);
             let e = c.sym(name);
             if let Node::Symbol(s) = c.node(e) {
@@ -1090,7 +1093,7 @@ impl Model {
 
         // The folded parameters are constants now: drop them from the value store.
         let mut values = self.values();
-        for name in &names {
+        for name in names {
             values.remove(name);
         }
         Ok(Model::from_parts(
@@ -1101,7 +1104,6 @@ impl Model {
             self.inner.node_names.clone(),
             // folding parameters keeps the topology, but not the graph object
             None,
-            &[],
         ))
     }
 }

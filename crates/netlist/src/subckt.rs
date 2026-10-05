@@ -1,12 +1,14 @@
-//! Subcircuit flattening: expand `.subckt`/`X` hierarchy into a flat list of
-//! primitive element lines before parsing.
+//! Subcircuit hierarchy: the `.subckt`/`X` structure as a tree of instances,
+//! each with its body's lines in the body's own names.
 //!
-//! Each `X` instance is expanded recursively: port nodes map to the caller's
-//! nodes, internal nodes and element names are prefixed with the instance path
-//! (`X1.`, `X1.X2.`, ...), and subcircuit/instance parameters are folded into a
-//! local numeric environment used to evaluate `{...}` value expressions.
+//! An `X` instance's body is written out per instance, in the namespace of its
+//! subcircuit (`__inv__.`): element names and internal nodes carry it, ports are
+//! the body's nodes `__inv__.<port>`, and subcircuit/instance parameters are
+//! folded into a local numeric environment used to evaluate `{...}` value
+//! expressions. The placement turns each body into a `sane_dae::Instance`,
+//! which renames the namespace to the instance's path (`X1.`, `X1.X2.`).
 //! Subcircuit names are a global namespace (a common simplification); `.model`
-//! cards inside a subckt are emitted unprefixed (global).
+//! cards inside a subckt are collected unprefixed (global).
 
 use rustc_hash::FxHashMap as HashMap;
 
@@ -44,9 +46,30 @@ fn is_ground(key: &str) -> bool {
     matches!(key, "0" | "gnd" | "ground")
 }
 
-/// Flatten all subcircuit instances. Returns a flat line list with no
-/// `.subckt`/`.ends`/`X`.
-pub fn flatten(lines: &[Line], global_env: &HashMap<String, f64>) -> Result<Vec<Line>, ParseError> {
+/// A top-level or body line: an element or directive, or a subcircuit instance.
+pub(crate) enum Item {
+    Line(Line),
+    Inst(Inst),
+}
+
+/// A subcircuit instance with its body in the body's names.
+pub(crate) struct Inst {
+    /// The instance's name in the caller's frame (`X1`, `__inv__.Xa`).
+    pub name: String,
+    /// The body's namespace (`__inv__.`).
+    pub ns: String,
+    /// The body's port nodes and the caller's nodes they connect to.
+    pub ports: Vec<String>,
+    pub conn: Vec<String>,
+    pub body: Vec<Item>,
+}
+
+/// The netlist as a tree of subcircuit instances, plus the `.model` cards the
+/// subcircuit bodies declare (a global namespace). No `.subckt`/`.ends` left.
+pub fn hierarchy(
+    lines: &[Line],
+    global_env: &HashMap<String, f64>,
+) -> Result<(Vec<Item>, Vec<Line>), ParseError> {
     let (subckts, top) = collect(lines)?;
     // `.global <node>...`: these node names keep their identity inside every
     // subcircuit instance (supply rails), instead of being instance-prefixed
@@ -57,6 +80,7 @@ pub fn flatten(lines: &[Line], global_env: &HashMap<String, f64>) -> Result<Vec<
         .collect();
 
     let mut out = Vec::new();
+    let mut models = Vec::new();
     for line in &top {
         let head = &line.tokens[0];
         if head.eq_ignore_ascii_case(".global") {
@@ -65,12 +89,12 @@ pub fn flatten(lines: &[Line], global_env: &HashMap<String, f64>) -> Result<Vec<
         if head.starts_with('X') || head.starts_with('x') {
             let mut nmap = HashMap::default();
             let inst = parse_instance(line, &mut nmap, "", &globals)?;
-            expand(&inst, "", global_env, &subckts, &mut out, 0, &globals)?;
+            out.push(Item::Inst(expand(&inst, global_env, &subckts, &mut models, 0, &globals)?));
         } else {
-            out.push(line.clone());
+            out.push(Item::Line(line.clone()));
         }
     }
-    Ok(out)
+    Ok((out, models))
 }
 
 /// Split lines into subcircuit definitions (global) and top-level lines.
@@ -307,16 +331,27 @@ fn is_behavioral_value(s: &str) -> bool {
     l.contains("v(") || l.contains("i(")
 }
 
-#[allow(clippy::too_many_arguments)]
+/// A subcircuit's namespace (`__inv__.`): an identifier to the expression
+/// lexer (a body's `V(...)`/`I(...)` references carry it), and a prefix no
+/// deck name starts with.
+fn namespace(subname: &str) -> String {
+    let id: String = subname
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    format!("__{id}__.")
+}
+
+/// Write out `inst`'s body in its subcircuit's namespace, its parameters
+/// folded; the `.model` cards it declares go to `models`.
 fn expand(
     inst: &Instance,
-    parent_prefix: &str,
     env_caller: &HashMap<String, f64>,
     subckts: &HashMap<String, Subckt>,
-    out: &mut Vec<Line>,
+    models: &mut Vec<Line>,
     depth: u32,
     globals: &std::collections::HashSet<String>,
-) -> Result<(), ParseError> {
+) -> Result<Inst, ParseError> {
     if depth > 64 {
         return Err(err(inst.line, "subcircuit nesting too deep (recursion?)"));
     }
@@ -336,12 +371,16 @@ fn expand(
         ));
     }
 
-    // Node map: ports -> caller nodes (internal nodes added lazily, prefixed).
-    let new_prefix = format!("{}{}.", parent_prefix, inst.inst_name);
+    // Node map: every body node in the namespace, ports included (internal
+    // nodes added lazily).
+    let new_prefix = namespace(&inst.subname);
     let mut nmap: HashMap<String, String> = HashMap::default();
-    for (p, c) in sub.ports.iter().zip(inst.conn.iter()) {
-        nmap.insert(p.to_ascii_lowercase(), c.clone());
-    }
+    let ports: Vec<String> = sub
+        .ports
+        .iter()
+        .map(|p| resolve_node(p, &new_prefix, &mut nmap, globals))
+        .collect();
+    let mut out = Vec::new();
 
     // Local env: caller env + subckt defaults + instance params (overriding).
     let mut env = env_caller.clone();
@@ -369,17 +408,17 @@ fn expand(
             continue;
         }
         if head.eq_ignore_ascii_case(".model") {
-            out.push(line.clone()); // global model namespace
+            models.push(line.clone()); // global model namespace
             continue;
         }
         if head.starts_with('X') || head.starts_with('x') {
             let nested = parse_instance(line, &mut nmap, &new_prefix, globals)?;
-            // Instance name carries the path; recurse.
+            // The instance is named in this body's namespace; recurse.
             let nested = Instance {
                 inst_name: format!("{new_prefix}{}", nested.inst_name),
                 ..nested
             };
-            expand(&nested, "", &env, subckts, out, depth + 1, globals)?;
+            out.push(Item::Inst(expand(&nested, &env, subckts, models, depth + 1, globals)?));
             continue;
         }
 
@@ -478,13 +517,19 @@ fn expand(
                 newtoks.extend(line.tokens[1..].iter().cloned());
             }
         }
-        out.push(Line {
+        out.push(Item::Line(Line {
             no: line.no,
             col: line.col,
             tokens: newtoks,
-        });
+        }));
     }
-    Ok(())
+    Ok(Inst {
+        name: inst.inst_name.clone(),
+        ns: new_prefix,
+        ports,
+        conn: inst.conn.clone(),
+        body: out,
+    })
 }
 
 /// Substitute a value token: evaluate an expression wrapped in `{...}` (SPICE)

@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use num_complex::Complex64;
 use rsdag::{eval, Node, SymbolId};
 use sane_core::Graph;
-use sane_dae::{assemble_dae, small_signal_transfer};
+use sane_dae::small_signal_transfer;
 use sane_netlist::parse;
 
 #[test]
@@ -24,7 +24,7 @@ C1 out 0 1u
     let out = parsed.node("out").expect("out node");
 
     let mut ctx = Graph::new();
-    let dae = assemble_dae(&mut ctx, &parsed.circuit, &parsed.devices);
+    let dae = parsed.assemble(&mut ctx);
     // The output node id maps to the unknown `v{id}`.
     let out_u = format!("v{out}");
     let h = small_signal_transfer(&mut ctx, &dae, "V1", &out_u).expect("transfer exists");

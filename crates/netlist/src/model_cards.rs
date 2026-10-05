@@ -28,6 +28,10 @@ impl BinRange {
 /// declares `lmin/lmax/wmin/wmax`).
 #[derive(Clone, Default)]
 pub(crate) struct ModelCard {
+    /// The card's name as declared (lowercase; `nch.1` for a bin): the scope
+    /// of its parameter symbols, `{name}.{param}`, shared by every instance
+    /// that uses the card.
+    pub name: String,
     pub mtype: String,
     pub params: Vec<(String, f64)>,
     pub bin: Option<BinRange>,
@@ -188,7 +192,12 @@ pub(crate) fn parse_model_cards(lines: &[Line], env: &HashMap<String, f64>) -> M
         lib.bins
             .entry(model_base_name(&name).to_string())
             .or_default()
-            .push(ModelCard { mtype, params, bin });
+            .push(ModelCard {
+                name: name.clone(),
+                mtype,
+                params,
+                bin,
+            });
     }
     lib
 }

@@ -21,6 +21,12 @@ pub struct VerilogADevice {
     pub params: HashMap<String, f64>,
     /// Parameter names the deck/instance explicitly set, for `$param_given`.
     pub given: HashSet<String>,
+    /// The `.model` card the instance uses: a module parameter the instance
+    /// does not set itself is the card's, the symbol `{card}.{param}` shared
+    /// by every instance of the card.
+    pub card: Option<String>,
+    /// Parameters the instance sets itself (`{name}.{param}` symbols).
+    pub inline: HashSet<String>,
     /// Parallel multiplicity `m` (instance `m=`/`mult=`): the device behaves as
     /// `m` identical devices in parallel, so every flow contribution scales by `m`
     /// and `$mfactor` returns it. Default 1.0.
@@ -34,6 +40,8 @@ impl VerilogADevice {
             module,
             params: HashMap::default(),
             given: HashSet::default(),
+            card: None,
+            inline: HashSet::default(),
             mfactor: 1.0,
         }
     }
@@ -49,7 +57,18 @@ impl VerilogADevice {
             module,
             params,
             given,
+            card: None,
+            inline: HashSet::default(),
             mfactor: 1.0,
+        }
+    }
+
+    /// The name of the symbol module parameter `param` binds to: the
+    /// instance's when it sets it or uses no card, else the card's.
+    pub fn param_symbol(&self, param: &str) -> String {
+        match &self.card {
+            Some(card) if !self.inline.contains(param) => format!("{card}.{param}"),
+            _ => format!("{}.{param}", self.name),
         }
     }
 
@@ -78,12 +97,6 @@ impl VerilogADevice {
 }
 
 impl DeviceModel for VerilogADevice {
-    fn template_group(&self) -> Option<String> {
-        // Group by module: instances of the same module share the bundling
-        // decision even when parameter signatures split their cache keys.
-        Some(self.module.name.clone())
-    }
-
     fn n_terminals(&self) -> usize {
         self.module.ports.len()
     }
@@ -94,6 +107,14 @@ impl DeviceModel for VerilogADevice {
 
     fn instance_name(&self) -> Option<&str> {
         Some(&self.name)
+    }
+
+    fn card_name(&self) -> Option<&str> {
+        self.card.as_deref()
+    }
+
+    fn param_symbol(&self, param: &str) -> Option<String> {
+        Some(VerilogADevice::param_symbol(self, param))
     }
 
     fn param_default(&self, name: &str) -> Option<f64> {
@@ -125,11 +146,10 @@ impl DeviceModel for VerilogADevice {
         terminal_vdot: &[ExprId],
         _control_i: &[ExprId],
     ) -> BehavioralFragment {
-        // Lower via the model-instance template cache (see `crate::template`): the
-        // first instance of a (module, structure) is lowered directly, every
-        // sibling is cloned by symbol substitution rather than re-walking the
-        // analog block. Unsupported constructs are caught at load time by
-        // `validate()`, so a lowering error here is a bug and panics inside.
+        // A call of the module's function for this structure (see
+        // `crate::template`), built on the first such instance. Unsupported
+        // constructs are caught at load time by `validate()`, so a lowering
+        // error here is a bug and panics inside.
         crate::template::lower_templated(self, lo, terminal_v, terminal_vdot)
     }
 }

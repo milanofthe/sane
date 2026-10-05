@@ -74,7 +74,7 @@ def test_ac_complex_gradient_matches_fd():
     """The AC adjoint gradient dH/dp (all params, including the operating-point
     shift) matches finite differences of the numeric response."""
     f = 1000.0
-    for deck, params in ((RC, ["R1", "C1"]), (DIODE_RC, ["R1", "C1", "D1.Is"])):
+    for deck, params in ((RC, ["R1", "C1"]), (DIODE_RC, ["R1", "C1", "dm.Is"])):
         dae = sane.Circuit.parse(deck).extract()
         res = dae.ac("V1", "out", [f])
         g = _ac_cgrad(dae, f, res._x, res._p)
@@ -110,7 +110,7 @@ def test_ac_sensitivity_nonlinear_param_matches_fd():
     # Diode Is: nonlinear conductance g = Is/Vt * exp(Vd/Vt) depends on the bias.
     dae = sane.Circuit.parse(DIODE_RC).extract()
     base = dae.values
-    for pn in ("D1.Is", "R1", "C1"):
+    for pn in ("dm.Is", "R1", "C1"):
         ad = dae.ac_sensitivity("V1", pn, "out", [f])[0]
         p0 = base[pn]
         h = abs(p0) * 1e-6
@@ -122,7 +122,7 @@ def test_ac_sensitivity_nonlinear_param_matches_fd():
     # MOSFET Kp: transconductance gm = sqrt(2 Kp W/L Id) depends on the bias too.
     amp = sane.Circuit.parse(MOS_AMP).extract()
     base = amp.values
-    for pn in ("M1.Kp", "RD"):
+    for pn in ("nm.Kp", "RD"):
         ad = amp.ac_sensitivity("VG", pn, "d", [f])[0]
         p0 = base[pn]
         h = abs(p0) * 1e-6
@@ -287,7 +287,7 @@ def test_hb_sensitivity_matches_fd():
         cg = dict(zip(sc.params, sc.complex))
         sm = hb.sensitivity("mid", k, metric="mag")
         gm = dict(zip(sm.params, sm.gradient))
-        for pn in ("R1", "C1", "D1.Is"):
+        for pn in ("R1", "C1", "dmod.Is"):
             p0 = base[pn]
             h = abs(p0) * 1e-6
             xp = dae.harmonic_balance(f0, harmonics=K, values={pn: p0 + h}).harmonic("mid", k)
@@ -316,7 +316,7 @@ def test_hb_hessian_matches_fd():
     )
     dae = sane.Circuit.parse(deck).extract()
     f0, K, k = 1000.0, 6, 1
-    knobs = ["R1", "C1", "D1.Is"]
+    knobs = ["R1", "C1", "dmod.Is"]
     hb = dae.harmonic_balance(f0, harmonics=K)
     assert hb.converged
     base = dae.values
@@ -375,7 +375,7 @@ def test_hb_hessian_nonlinear_charge_matches_fd():
     )
     dae = sane.Circuit.parse(deck).extract()
     f0, K, k = 1000.0, 6, 1
-    knobs = ["R1", "C1", "D1.Is", "D1.Cj0", "D1.Vj"]
+    knobs = ["R1", "C1", "dm.Is", "dm.Cj0", "dm.Vj"]
     hb = dae.harmonic_balance(f0, harmonics=K)
     assert hb.converged
     base = dae.values

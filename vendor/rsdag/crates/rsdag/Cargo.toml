@@ -29,6 +29,10 @@ complex = ["dep:num-complex"]
 # consumers that want to fuzz their own pipelines, not for production paths.
 synth = []
 
+# `rayon::ThreadPool` as a `parallel::Pool`, the pool a program's
+# independent calls run on (`rsdag::parallel`).
+rayon = ["dep:rayon"]
+
 # Serialization of a module (`Module`, `rsdag::module`): the interchange
 # format for caching analyses, code generation and FMI export.
 serde = ["dep:serde", "num-rational?/serde", "num-bigint?/serde"]
@@ -42,12 +46,13 @@ num-rational = { workspace = true, optional = true }
 num-traits = { workspace = true, optional = true }
 num-complex = { workspace = true, optional = true }
 egg = { workspace = true, optional = true }
+rayon = { workspace = true, optional = true }
 
 [dev-dependencies]
 # The crate's own integration tests and the benchmarks draw synthetic
 # programs; a dev-dependency on self is how a test gets an optional feature
 # of its own crate.
-rsdag = { path = ".", features = ["synth", "serde", "exact", "complex"] }
+rsdag = { path = ".", features = ["synth", "serde", "exact", "complex", "rayon"] }
 # The integration tests link against the crate, not against its
 # dependencies, so the few they name themselves are listed again here.
 num-complex.workspace = true
@@ -55,6 +60,7 @@ num-rational.workspace = true
 num-traits.workspace = true
 rustc-hash.workspace = true
 serde_json = "1"
+rayon.workspace = true
 
 [lints]
 workspace = true

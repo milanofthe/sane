@@ -1,31 +1,42 @@
-//! Configurable worker pool for SANE's data-parallel sweeps.
+//! Configurable worker pools for SANE's parallel work.
 //!
 //! The engine's outer loops that are embarrassingly parallel -- AC / noise over
 //! a frequency grid, harmonic-balance device sampling over the period -- run on
 //! one shared [`rayon::ThreadPool`] so the parallelism is bounded and explicit
-//! rather than grabbing every core.
+//! rather than grabbing every core. The solvers ([`solve`]) run the device
+//! instances of each evaluation on rsdag's [`Workers`](rsdag::parallel::Workers)
+//! (`rsdag::parallel`), bit for bit as serially; its workers stay awake across
+//! the short serial stretches of a Newton loop.
 //!
-//! The default is **4 worker threads**. Override it either with the
+//! The default is **4 threads**, in each pool. Override it either with the
 //! `SANE_THREADS` environment variable or programmatically via [`configure`]
-//! (both must take effect before the pool is first used).
+//! (both must take effect before the pools are first used).
 //!
 //! Sweep parallelism is *outer*: each task solves its systems sequentially
-//! (rslab's KLU is sequential), so the sweep
-//! never nests with another pool and oversubscribes the machine.
+//! (rslab's KLU is sequential, and inside a sweep no solver runs its devices
+//! on the workers), so the two never nest and oversubscribe the machine.
 
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use rayon::{ThreadPool, ThreadPoolBuilder};
+use rsdag::parallel::{Parallel, Workers};
 
 /// Worker-thread count when neither `SANE_THREADS` nor [`configure`] is set.
 pub const DEFAULT_THREADS: usize = 4;
 
 static POOL: OnceLock<ThreadPool> = OnceLock::new();
+static WORKERS: OnceLock<Arc<Workers>> = OnceLock::new();
+/// The count [`configure`] set (0: none).
+static CONFIGURED: AtomicUsize = AtomicUsize::new(0);
 
-/// The configured thread count (`Config::threads`), otherwise
+/// The configured thread count: [`configure`], `Config::threads`, otherwise
 /// [`DEFAULT_THREADS`].
 fn requested_threads() -> usize {
-    sane_core::config().threads.unwrap_or(DEFAULT_THREADS)
+    match CONFIGURED.load(Ordering::Relaxed) {
+        0 => sane_core::config().threads.unwrap_or(DEFAULT_THREADS),
+        n => n,
+    }
 }
 
 fn build(n: usize) -> ThreadPool {
@@ -36,30 +47,36 @@ fn build(n: usize) -> ThreadPool {
         .expect("failed to build SANE worker pool")
 }
 
-/// Set the worker-thread count. Effective only if called before the pool is
-/// first used (the first [`pool`]/[`install`] call); returns `false` if the
-/// pool was already built, in which case the count is unchanged.
+/// Set the thread count. Effective only if called before the pools are
+/// first used; returns `false` if one was already built, in which case the
+/// count is unchanged.
 pub fn configure(threads: usize) -> bool {
-    if cfg!(target_arch = "wasm32") {
+    if cfg!(target_arch = "wasm32") || WORKERS.get().is_some() {
         return false;
     }
+    CONFIGURED.store(threads.max(1), Ordering::Relaxed);
     POOL.set(build(threads)).is_ok()
 }
 
-/// The shared worker pool, built on first use with the configured thread count.
+/// The shared sweep pool, built on first use with the configured thread count.
 pub fn pool() -> &'static ThreadPool {
     POOL.get_or_init(|| build(requested_threads()))
 }
 
-/// Number of worker threads in the (possibly lazily built) pool.
+/// The solvers' workers, built on first use with the configured thread count.
+fn workers() -> &'static Arc<Workers> {
+    WORKERS.get_or_init(|| Arc::new(Workers::new(requested_threads())))
+}
+
+/// The configured number of threads.
 pub fn threads() -> usize {
     if cfg!(target_arch = "wasm32") {
         return 1;
     }
-    pool().current_num_threads()
+    requested_threads()
 }
 
-/// Run `f` on the shared worker pool. rayon parallel iterators created inside
+/// Run `f` on the shared sweep pool. rayon parallel iterators created inside
 /// `f` use this pool's threads.
 ///
 /// On wasm32 there is no custom pool (a `ThreadPoolBuilder::build` would fail:
@@ -71,4 +88,15 @@ pub fn install<R: Send>(f: impl FnOnce() -> R + Send) -> R {
         return f();
     }
     pool().install(f)
+}
+
+/// Run the solver `f` with the workers lent to rsdag: the programs `f`
+/// evaluates run their independent calls (the device instances) on them
+/// (`rsdag::parallel`), with the same results as serially. Serial with one
+/// thread, inside another `solve`, and on wasm32.
+pub fn solve<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    if cfg!(target_arch = "wasm32") || rsdag::parallel::current().is_some() || threads() < 2 {
+        return f();
+    }
+    rsdag::parallel::install(Parallel::new(workers().clone()), f)
 }

@@ -48,6 +48,34 @@ fn split_state(o: &[u32], stateful: bool) -> (&[u32], u32) {
 }
 
 impl Tape {
+    /// The program of `roots` over a composition of functions: the
+    /// composite functions (whose bodies call others) inlined, so the
+    /// program has no boundary but its leaves, and the calls of one leaf
+    /// from every instance batch together (see
+    /// [`Graph::inline_composite`]); then [`compile`](Self::compile).
+    /// Differentiate and specialize on the composition first: that work
+    /// stays on its functions.
+    pub fn compose<K: Field>(
+        ctx: &mut Graph<K>,
+        roots: &[ExprId],
+        input_syms: &[SymbolId],
+    ) -> Tape {
+        let program = ctx.inline_composite(roots);
+        Self::compile_inner(ctx, &program, input_syms, None)
+    }
+
+    /// [`compose`](Self::compose) with the prolog split of
+    /// [`compile_split`](Self::compile_split).
+    pub fn compose_split<K: Field>(
+        ctx: &mut Graph<K>,
+        roots: &[ExprId],
+        input_syms: &[SymbolId],
+        pure_inputs: &[bool],
+    ) -> Tape {
+        let program = ctx.inline_composite(roots);
+        Self::compile_inner(ctx, &program, input_syms, Some(pure_inputs))
+    }
+
     /// Compile a tape computing `roots`, where `inputs[k]` (passed to
     /// [`eval`](Self::eval)) is the value of symbol `input_syms[k]`. Symbols not
     /// listed evaluate to `NaN`.
@@ -723,11 +751,18 @@ impl Forest {
         // size, not the graph's.
         let mut base: Vec<ExprId> = Vec::new();
         let mut stack = roots.to_vec();
+        // the calls of one instance share their list: walked once
+        let mut walked: HashSet<ArgList> = HashSet::default();
         while let Some(id) = stack.pop() {
             if !t.mark(id) {
                 continue;
             }
             base.push(id);
+            if let Node::Call(_, l) = *ctx.node(id) {
+                if !walked.insert(l) {
+                    continue;
+                }
+            }
             stack.extend_from_slice(&ctx.operands(id));
         }
         base.sort_unstable_by_key(|e| e.0);
@@ -742,13 +777,17 @@ impl Forest {
         // unmapped symbol is a NaN constant and so pure.
         let mut pure = vec![false; m];
         if let Some(mask) = pure_inputs {
+            let mut pure_list: HashMap<ArgList, bool> = HashMap::default();
             for (i, id) in base.iter().enumerate() {
-                pure[i] = match ctx.node(*id) {
+                pure[i] = match *ctx.node(*id) {
                     Node::Const(_) => true,
-                    Node::Symbol(s) => match t.input(*s) {
+                    Node::Symbol(s) => match t.input(s) {
                         None => true,
                         Some(k) => mask.get(k as usize).copied().unwrap_or(false),
                     },
+                    Node::Call(_, l) => *pure_list
+                        .entry(l)
+                        .or_insert_with(|| ctx.args(l).iter().all(|a| pure[bp(*a)])),
                     _ => ctx.operands(*id).iter().all(|a| pure[bp(*a)]),
                 };
             }
@@ -758,7 +797,13 @@ impl Forest {
             is_root[bp(*r)] = true;
         }
         let mut uses = vec![0u32; m];
+        walked.clear();
         for id in &base {
+            if let Node::Call(_, l) = *ctx.node(*id) {
+                if !walked.insert(l) {
+                    continue;
+                }
+            }
             for a in ctx.operands(*id).iter() {
                 uses[bp(*a)] += 1;
             }
@@ -865,16 +910,14 @@ impl Forest {
         for &id in &self.base {
             if let Node::Call(o, l) = *ctx.node(id) {
                 let (f, out) = ctx.output(o);
-                let v = per_call.entry((f.0, l)).or_default();
-                if !v.contains(&out) {
-                    v.push(out);
-                }
+                per_call.entry((f.0, l)).or_default().push(out);
             }
         }
         let mut ids: HashMap<(u32, Vec<u32>), u32> = HashMap::default();
         let mut calls = CallSets::default();
         for ((f, l), mut outs) in per_call {
             outs.sort_unstable();
+            outs.dedup();
             let id = *ids.entry((f, outs.clone())).or_insert_with(|| {
                 calls.sets.push(outs);
                 calls.sets.len() as u32 - 1
@@ -930,13 +973,17 @@ impl Forest {
             };
         }
         let mut depth = vec![0u32; m];
+        let mut list_depth: HashMap<ArgList, u32> = HashMap::default();
         for (i, &id) in base.iter().enumerate() {
-            let over = ctx
-                .operands(id)
-                .iter()
-                .map(|&a| depth[self.pos(a)])
-                .max()
-                .unwrap_or(0);
+            let deepest = |depth: &[u32], ops: &[ExprId]| {
+                ops.iter().map(|&a| depth[self.pos(a)]).max().unwrap_or(0)
+            };
+            let over = match *ctx.node(id) {
+                Node::Call(_, l) => *list_depth
+                    .entry(l)
+                    .or_insert_with(|| deepest(&depth, ctx.args(l))),
+                _ => deepest(&depth, &ctx.operands(id)),
+            };
             depth[i] = over + u32::from(is_member[i]);
         }
         // Groups by first encounter.
@@ -1167,13 +1214,26 @@ impl Forest {
             .iter()
             .map(|(_, ms)| ms.first().copied().unwrap_or(0))
             .collect();
+        // The calls of one instance are one instruction: one unit, by the
+        // first of them, over the one list.
+        let mut site_first: HashMap<(u32, ArgList), usize> = HashMap::default();
+        let mut site_of: Vec<usize> = (0..m).collect();
+        for (i, &id) in self.base.iter().enumerate() {
+            if let Node::Call(o, l) = *ctx.node(id) {
+                site_of[i] = *site_first.entry((ctx.output(o).0 .0, l)).or_insert(i);
+            }
+        }
         let unit_of = |i: usize| -> usize {
             match kernel_of[i] {
                 Some(g) => first_member[g],
-                None => i,
+                None => site_of[i],
             }
         };
         let deps_of_node = |i: usize, out: &mut Vec<usize>| {
+            if let Node::Call(_, l) = *ctx.node(self.base[i]) {
+                out.extend(ctx.args(l).iter().map(|&a| unit_of(self.pos(a))));
+                return;
+            }
             for &a in ctx.operands(self.base[i]).iter() {
                 let pa = self.pos(a);
                 if self.fused_into[pa] == Some(i) {
@@ -1191,13 +1251,21 @@ impl Forest {
         // distinct ones, reused: a million units are not two million
         // allocations.
         let mut stamp: Vec<usize> = vec![usize::MAX; m];
+        let mut lists: HashSet<ArgList> = HashSet::default();
         let mut raw: Vec<usize> = Vec::new();
         let mut deps: Vec<usize> = Vec::new();
         let mut deps_of_unit = |u: usize, deps: &mut Vec<usize>| {
             raw.clear();
             match kernel_of[u] {
                 Some(g) => {
+                    // a member's list once: the instances of the group
+                    lists.clear();
                     for &mi in &groups[g].1 {
+                        if let Node::Call(_, l) = *ctx.node(self.base[mi]) {
+                            if !lists.insert(l) {
+                                continue;
+                            }
+                        }
                         deps_of_node(mi, &mut raw);
                     }
                 }
@@ -2052,7 +2120,9 @@ impl Program {
             .chain(solves)
             .max()
             .unwrap_or(0);
+        let stages = super::plan_stages(&ops, &dst, &arg_pool, &self.bundles, prolog_ops);
         Tape {
+            stages,
             lent,
             ops,
             dst,

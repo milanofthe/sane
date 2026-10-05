@@ -2,11 +2,11 @@
 //! Jacobian evaluation, DC solve, exact first/second-order DC sensitivities,
 //! and the raw state-space / temperature-sweep / model-reduction kernels.
 
-use rsdag::{differentiate, Node};
+use rsdag::Node;
 use sane_core::log_stage;
 
 use crate::model::{Model, ModelError};
-use crate::{model_reduce_on_dae, op_env, state_space_on_dae, temp_sweep_on_dae};
+use crate::{model_reduce_on_dae, state_space_on_dae, temp_sweep_on_dae};
 
 impl Model {
     /// Residual `F(x, x', t)` as a numeric vector.
@@ -88,14 +88,9 @@ impl Model {
             Node::Symbol(s) => *s,
             _ => return Err(ModelError::Numeric(format!("'{input}' is not a symbol"))),
         };
-        let residuals = dae.residuals.clone();
-        let db: Vec<_> = residuals
-            .iter()
-            .map(|&r| differentiate(&mut c, r, isym))
-            .collect();
-        let pnames = self.cdc().param_names(&c);
-        let env = op_env(&mut c, dae, &pnames, &x, &xdot, &p, t);
-        Ok(rsdag::eval(&c, &db, &env))
+        Ok(self
+            .cdc()
+            .input_jacobian(&mut c, dae, isym, &x, &xdot, &p, t))
     }
 
     /// Exact first-order sensitivity `dy/dp` of `y = output` (an unknown name)

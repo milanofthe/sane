@@ -29,7 +29,7 @@ use pyo3::prelude::*;
 
 use rsdag::ExprId;
 use sane_core::Graph;
-use sane_dae::{assemble_dae, small_signal_matrix, small_signal_transfer, DeviceInstance};
+use sane_dae::{small_signal_matrix, small_signal_transfer, DeviceInstance};
 use sane_device::CSwitch;
 use sane_export::{export_latex, latex_expr};
 use sane_mna::{Circuit as MnaCircuit, Kind, SourceFn};
@@ -55,6 +55,8 @@ fn kind_name(k: &Kind) -> &'static str {
 struct Circuit {
     circuit: MnaCircuit,
     devices: Vec<DeviceInstance>,
+    /// Subcircuit instances of a parsed deck (none for a built circuit).
+    instances: Vec<sane_dae::Instance>,
     values: HashMap<String, f64>,
     node_names: Vec<String>,
     /// Power ports from `P` elements, in deck order: `(name, node, z0)`.
@@ -71,6 +73,7 @@ impl Circuit {
         Circuit {
             circuit: MnaCircuit::new(),
             devices: Vec::new(),
+            instances: Vec::new(),
             values: HashMap::new(),
             node_names: vec!["0".to_string()],
             ports: Vec::new(),
@@ -170,8 +173,9 @@ impl Circuit {
         self.circuit.set_source(SourceFn::Pwl(n));
     }
 
-    /// Linear/controlled elements as tuples `(name, kind, node_a, node_b,
-    /// control_element)`. Nonlinear devices (D/M/Q/switches) are not included.
+    /// The top level's linear/controlled elements as tuples `(name, kind,
+    /// node_a, node_b, control_element)`. Nonlinear devices (D/M/Q/switches)
+    /// and the elements inside subcircuit instances are not included.
     fn elements(&self) -> Vec<(String, String, usize, usize, Option<String>)> {
         self.circuit
             .elements()
@@ -202,7 +206,8 @@ impl Circuit {
         self.circuit.node_count()
     }
 
-    /// Number of nonlinear device instances (D/M/Q/switches).
+    /// Number of the top level's nonlinear device instances (D/M/Q/switches);
+    /// devices inside subcircuit instances are not counted.
     fn device_count(&self) -> usize {
         self.devices.len()
     }
@@ -210,18 +215,18 @@ impl Circuit {
     /// Extract the symbolic DAE `F(x, x', t) = 0` (with its analytic Jacobians).
     fn extract_dae(&self, py: Python<'_>) -> PyResult<PyModel> {
         let mut core = Graph::new();
-        let inner = assemble_dae(&mut core, &self.circuit, &self.devices);
+        let inner = sane_dae::assemble(&mut core, &self.circuit, &self.devices, &self.instances);
         let (cdc, _cprof) = CompiledDc::new_profiled(&mut core, &inner);
         let arc = std::sync::Arc::new(std::sync::Mutex::new(core));
         let symctx = Py::new(py, symbolic::Context::from_arc(arc.clone()))?;
+        let (elements, terminals) = sane_dae::topology(&self.circuit, &self.devices, &self.instances);
         let model = sane_analysis::Model::from_parts(
             arc,
             inner,
             cdc,
             self.values.clone(),
             self.node_names.clone(),
-            Some(&self.circuit),
-            &self.devices,
+            Some((&elements, &terminals)),
         );
         Ok(PyModel {
             inner: model,
@@ -243,6 +248,7 @@ fn parse(netlist: &str) -> PyResult<Circuit> {
     Ok(Circuit {
         circuit: parsed.circuit,
         devices: parsed.devices,
+        instances: parsed.instances,
         values: parsed.values.into_iter().collect(),
         node_names: parsed.node_names,
         ports: parsed
@@ -263,8 +269,9 @@ fn value_symbol_name(name: &str) -> String {
     sane_mna::value_symbol_name(name)
 }
 
-/// The worker pool's thread count for the parallel passes: `0` = the
-/// default, `n` = `n` threads. Takes effect before the pool is first used.
+/// The thread count for the parallel work (the sweeps, and in every solve
+/// the device instances of each evaluation): `0` = the default, `n` = `n`
+/// threads. Takes effect before the pools are first used.
 #[pyfunction]
 fn set_parallelism(threads: usize) {
     sane_solve::set_parallelism(threads);
@@ -540,6 +547,14 @@ impl PyModel {
         let symctx = Py::new(py, symbolic::Context::from_arc(inner.context_arc()))?;
         Ok(PyModel { inner, symctx })
     }
+    /// Fold every parameter except the ones under `paths` (the inverse of
+    /// `fold`). Returns the folded model; this one is unchanged.
+    fn keep(&self, py: Python<'_>, paths: Vec<String>) -> PyResult<PyModel> {
+        let refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
+        let inner = self.inner.keep(&refs).map_err(model_err)?;
+        let symctx = Py::new(py, symbolic::Context::from_arc(inner.context_arc()))?;
+        Ok(PyModel { inner, symctx })
+    }
     fn resolve(&self, reference: &str) -> Option<usize> {
         self.inner.resolve(reference)
     }
@@ -746,7 +761,7 @@ impl PyModel {
     /// The residual equations `F(x, x', t)` as a LaTeX `aligned` block.
     fn to_latex(&self) -> String {
         let arc = self.inner.context_arc();
-        let s = export_latex(&arc.lock_ctx(), self.inner.dae());
+        let s = export_latex(&mut arc.lock_ctx(), self.inner.dae());
         s
     }
 
@@ -977,11 +992,9 @@ impl PyModel {
     }
 
     /// Linearise about the operating point into the small-signal mass-matrix DAE
-    /// `G dx + C dx' = 0`, sharing this context. `canonical=True` emits a single
-    /// canonical small-signal element per stamp. Returns the linearised `Model`.
-    #[pyo3(signature = (canonical=false))]
-    fn linearize(&self, py: Python<'_>, canonical: bool) -> PyModel {
-        let model = self.inner.linearize(canonical);
+    /// `G dx + C dx' = 0`, sharing this context. Returns the linearised `Model`.
+    fn linearize(&self, py: Python<'_>) -> PyModel {
+        let model = self.inner.linearize();
         PyModel {
             inner: model,
             symctx: self.symctx.clone_ref(py),

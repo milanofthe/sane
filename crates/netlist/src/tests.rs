@@ -1,4 +1,4 @@
-﻿use super::*;
+use super::*;
 use sane_mna::SourceFn;
 
 #[test]
@@ -65,10 +65,15 @@ fn binds_model_and_inline_params() {
     let p =
         parse("D1 a 0 dmod\nD2 b 0 dmod Is=2e-14\n.model dmod D(Is=1e-14 N=1.0 Vt=0.02585)\n.end")
             .unwrap();
-    assert!((p.values["D1.Is"] - 1e-14).abs() < 1e-26);
-    assert!((p.values["D1.N"] - 1.0).abs() < 1e-12);
-    assert!((p.values["D1.Vt"] - 0.02585).abs() < 1e-9);
-    assert!((p.values["D2.Is"] - 2e-14).abs() < 1e-26); // inline overrides model
+    assert!((bound(&p, "D1", "Is") - 1e-14).abs() < 1e-26);
+    assert!((bound(&p, "D1", "N") - 1.0).abs() < 1e-12);
+    assert!((bound(&p, "D1", "Vt") - 0.02585).abs() < 1e-9);
+    assert!((bound(&p, "D2", "Is") - 2e-14).abs() < 1e-26); // inline overrides model
+                                                            // The card's parameters are the card's symbols, shared by its instances;
+                                                            // an inline value is the instance's own.
+    assert_eq!(p.param_symbol("D1", "Is").as_deref(), Some("dmod.Is"));
+    assert_eq!(p.param_symbol("D2", "N").as_deref(), Some("dmod.N"));
+    assert_eq!(p.param_symbol("D2", "Is").as_deref(), Some("D2.Is"));
 }
 
 #[test]
@@ -80,7 +85,7 @@ fn mixed_case_inline_comment_and_continuation() {
     assert_eq!(p.node("OUT"), p.node("out"));
     assert_eq!(p.values["R1"], 1e3);
     // .model continued across a `+` line still binds.
-    assert!((p.values["D1.Is"] - 1e-14).abs() < 1e-26);
+    assert!((bound(&p, "D1", "Is") - 1e-14).abs() < 1e-26);
 }
 
 #[test]
@@ -149,7 +154,7 @@ fn compat_report_flags_ignored_directives_and_unknown_params() {
     assert!(!b.report.unknown_params.iter().any(|s| s.contains("Rb")));
     assert!(!b.report.unknown_params.iter().any(|s| s.contains("Rc")));
     assert!(!b.report.unknown_params.iter().any(|s| s.contains("Re")));
-    assert_eq!(b.param_value("Q1.Rb"), Some(500.0));
+    assert_eq!(bound(&b, "Q1", "Rb"), 500.0);
 
     // A plain, fully-supported deck reports clean.
     let q = parse("V1 a 0 1\nR1 a 0 1k\n.end").unwrap();
@@ -260,8 +265,8 @@ fn model_binning_selects_by_geometry() {
     )
     .unwrap();
     // M1 (L=0.5u) -> bin .1; M2 (L=2u) -> bin .2.
-    assert_eq!(p.param_value("M1.Vto"), Some(0.4));
-    assert_eq!(p.param_value("M2.Vto"), Some(0.7));
+    assert_eq!(bound(&p, "M1", "Vto"), 0.4);
+    assert_eq!(bound(&p, "M2", "Vto"), 0.7);
     // Binning bounds are not bound as device parameters.
     assert!(!p.values.contains_key("M1.lmin"));
 }
@@ -369,12 +374,8 @@ fn subckt_prefixes_controller_names() {
          .end",
     )
     .unwrap();
-    let h = p
-        .circuit
-        .elements()
-        .iter()
-        .find(|e| e.name == "X1.H1")
-        .unwrap();
+    let (elements, _) = sane_dae::topology(&p.circuit, &p.devices, &p.instances);
+    let h = elements.iter().find(|e| e.name == "X1.H1").unwrap();
     assert_eq!(h.ctrl_elem.as_deref(), Some("X1.Vs"));
 }
 
@@ -393,8 +394,8 @@ fn nested_subckt() {
 #[test]
 fn spice_param_aliasing() {
     let p = parse("Q1 c b e qm\n.model qm NPN(Bf=120 IS=2e-15)\n.end").unwrap();
-    assert_eq!(p.values["Q1.betaF"], 120.0); // Bf -> betaF
-    assert!((p.values["Q1.Is"] - 2e-15).abs() < 1e-27); // IS -> Is
+    assert_eq!(bound(&p, "Q1", "betaF"), 120.0); // Bf -> betaF
+    assert!((bound(&p, "Q1", "Is") - 2e-15).abs() < 1e-27); // IS -> Is
 }
 
 #[test]
@@ -458,15 +459,11 @@ fn global_nodes_pass_through_subckts() {
     )
     .unwrap();
     // X1's internal R1 must connect to the TOP vdd (voltage divider a = 2.5)
-    let names: Vec<_> = p
-        .circuit
-        .elements()
-        .iter()
-        .map(|e| e.name.clone())
-        .collect();
-    assert!(names.iter().any(|n| n.contains("R1")), "{names:?}");
+    let (elements, _) = sane_dae::topology(&p.circuit, &p.devices, &p.instances);
+    let r1 = elements.iter().find(|e| e.name == "X1.R1").unwrap();
+    assert_eq!((r1.a, r1.b), (p.node("vdd").unwrap(), p.node("a").unwrap()));
     let mut ctx = sane_core::Graph::new();
-    let dae = sane_dae::assemble_dae(&mut ctx, &p.circuit, &p.devices);
+    let dae = p.assemble(&mut ctx);
     assert!(
         dae.unknowns.iter().any(|u| u == "vvdd" || u == "v1"),
         "{:?}",
@@ -479,9 +476,9 @@ fn global_nodes_pass_through_subckts() {
 #[test]
 fn diode_cjo_spelling_activates_charge() {
     let p = parse("D1 a 0 dm\n.model dm d is=1e-14 cjo=1p m=0.4 vj=0.8\n.end").unwrap();
-    assert_eq!(p.values["D1.Cj0"], 1e-12);
-    assert_eq!(p.values["D1.M"], 0.4);
-    assert_eq!(p.values["D1.Vj"], 0.8);
+    assert_eq!(bound(&p, "D1", "Cj0"), 1e-12);
+    assert_eq!(bound(&p, "D1", "M"), 0.4);
+    assert_eq!(bound(&p, "D1", "Vj"), 0.8);
 }
 
 #[test]
@@ -489,8 +486,8 @@ fn parses_voltage_switch() {
     let p = parse("S1 1 0 c 0 sw\n.model sw SW(Ron=1 Roff=1Meg Vt=0.5)\n.end").unwrap();
     assert_eq!(p.devices.len(), 1);
     assert_eq!(p.devices[0].terminals.len(), 4);
-    assert!((p.values["S1.Ron"] - 1.0).abs() < 1e-12);
-    assert!((p.values["S1.Roff"] - 1e6).abs() < 1.0);
+    assert!((bound(&p, "S1", "Ron") - 1.0).abs() < 1e-12);
+    assert!((bound(&p, "S1", "Roff") - 1e6).abs() < 1.0);
 }
 
 #[test]
@@ -532,4 +529,12 @@ fn parses_devices() {
     assert_eq!(p.devices[0].terminals, vec![p.node("d").unwrap(), 0]);
     // R1 is the only linear non-source... plus V1; devices are separate.
     assert!(p.node("c").is_some() && p.node("b").is_some() && p.node("e").is_some());
+}
+
+/// The value device instance `inst` reads for its module parameter `param`,
+/// through the symbol it binds it to.
+fn bound(p: &ParsedCircuit, inst: &str, param: &str) -> f64 {
+    let sym = p.param_symbol(inst, param).expect("a placed device");
+    p.param_value(&sym)
+        .unwrap_or_else(|| panic!("{sym} unbound"))
 }

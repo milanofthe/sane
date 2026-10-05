@@ -275,6 +275,11 @@ pub const HOMOTOPY_DLAM_MAX: f64 = 0.25;
 pub const HOMOTOPY_DLAM_MIN: f64 = 1e-4;
 /// Hard cap on continuation points.
 pub const HOMOTOPY_MAX_STEPS: usize = 400;
+/// Failed correctors at `lambda = 1` before a continuation gives up. A path
+/// that holds up to just below the end and fails at the end itself is not
+/// cured by smaller steps: the end point's own Newton basin is the problem,
+/// and the next homotopy in the cascade gets its turn.
+pub const HOMOTOPY_ENDPOINT_TRIES: usize = 2;
 
 /// Harmonic-balance source-stepping continuation (fixed-factor `lambda` ramp of
 /// the drive amplitudes). Distinct from the predictor-corrector `HOMOTOPY_*`

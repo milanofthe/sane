@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use rsdag::{differentiate, ExprId, ReduceOp, SymbolId};
 use sane_core::Graph;
 
-use crate::{coo, stamp, sym2, Dae, UnknownKind};
+use crate::{coo, sym2, Dae, UnknownKind};
 
 /// Directional derivative `D_d e = sum_l d_x[l]*de/dx_l + de/dp` along the
 /// combined `(x, p)` direction `d = (d_x, e_p)` (the unknowns move along the
@@ -22,7 +22,8 @@ fn directional(
     x_syms: &[SymbolId],
     p_sym: SymbolId,
 ) -> ExprId {
-    let fs = ctx.free_symbols(e);
+    // what the derivative can be nonzero in, through calls exactly
+    let fs = ctx.support_in(&[e]);
     let mut acc = ctx.zero();
     for (l, &xs) in x_syms.iter().enumerate() {
         if d_x[l] != 0.0 && fs.contains(&xs) {
@@ -178,7 +179,6 @@ pub fn augment_with_scaled_sensitivities(
         residuals.extend(res);
     }
 
-    let stamps = stamp::stamps_from_residuals(ctx, &residuals);
     Dae {
         n_nodes: dae.n_nodes,
         param_defaults: dae.param_defaults.clone(),
@@ -190,7 +190,6 @@ pub fn augment_with_scaled_sensitivities(
         t: dae.t,
         events: dae.events.clone(),
         delays: dae.delays.clone(),
-        stamps,
         companion: Vec::new(),
         noise_sources: Vec::new(),
         op_vars: dae.op_vars.clone(),
@@ -198,6 +197,7 @@ pub fn augment_with_scaled_sensitivities(
         limits: Vec::new(),
         sources: dae.sources.clone(),
         source_names: dae.source_names.clone(),
+        labels: dae.labels.clone(),
     }
 }
 
@@ -310,37 +310,44 @@ pub fn lagrangian_hessian(ctx: &mut Graph, dae: &Dae, params: &[SymbolId]) -> He
     }
     let l = ctx.reduce(ReduceOp::Sum, terms);
 
-    // Gradients ∂L/∂x, ∂L/∂x' and ∂L/∂p (each linear in λ). The rate gradient is
-    // kept aligned with the state index: a zero where a state has no `x'` symbol.
-    let x_syms = dae.x.clone();
+    // The gradient of L over x, x' and p in one reverse sweep (each entry
+    // linear in λ). The rate gradient is kept aligned with the state index: a
+    // zero where a state has no `x'` symbol.
+    let n_xd = dae.xdot.iter().flatten().count();
+    let wrt: Vec<SymbolId> = dae
+        .x
+        .iter()
+        .copied()
+        .chain(dae.xdot.iter().flatten().copied())
+        .chain(params.iter().copied())
+        .collect();
+    let g = rsdag::gradient(ctx, l, &wrt);
+    let (gx, rest) = g.split_at(n);
+    let (gxd_flat, gp) = rest.split_at(n_xd);
     let zero = ctx.zero();
-    let gx: Vec<ExprId> = x_syms.iter().map(|&xm| differentiate(ctx, l, xm)).collect();
+    let mut flat = gxd_flat.iter();
     let gxd: Vec<ExprId> = dae
         .xdot
         .iter()
-        .map(|o| match o {
-            Some(s) => differentiate(ctx, l, *s),
-            None => zero,
-        })
+        .map(|o| o.map_or(zero, |_| *flat.next().expect("one gradient entry per rate")))
         .collect();
-    let gp: Vec<ExprId> = params.iter().map(|&pi| differentiate(ctx, l, pi)).collect();
 
-    // Second-derivative blocks (sparse): differentiate the gradients again.
-    let x_col: HashMap<SymbolId, usize> = x_syms.iter().enumerate().map(|(c, &s)| (s, c)).collect();
-    // Rate columns, also indexed by state index (so the contraction can share
-    // the same flattening as `x`).
-    let xd_col: HashMap<SymbolId, usize> = dae
+    // Second-derivative blocks (sparse): the Jacobians of the gradients. Rate
+    // columns are indexed by state index, so the contraction shares the
+    // flattening of `x`.
+    let x_col: Vec<(usize, SymbolId)> = dae.x.iter().copied().enumerate().collect();
+    let xd_col: Vec<(usize, SymbolId)> = dae
         .xdot
         .iter()
         .enumerate()
-        .filter_map(|(i, o)| o.map(|s| (s, i)))
+        .filter_map(|(i, o)| o.map(|s| (i, s)))
         .collect();
-    let p_col: HashMap<SymbolId, usize> = params.iter().enumerate().map(|(c, &s)| (s, c)).collect();
-    let xx = coo(ctx, &gx, &x_col);
-    let xp = coo(ctx, &gx, &p_col);
-    let pp = coo(ctx, &gp, &p_col);
+    let p_col: Vec<(usize, SymbolId)> = params.iter().copied().enumerate().collect();
+    let xx = coo(ctx, gx, &x_col);
+    let xp = coo(ctx, gx, &p_col);
+    let pp = coo(ctx, gp, &p_col);
     let xdxd = coo(ctx, &gxd, &xd_col);
-    let xxd = coo(ctx, &gx, &xd_col);
+    let xxd = coo(ctx, gx, &xd_col);
     let xdp = coo(ctx, &gxd, &p_col);
 
     HessianSym {

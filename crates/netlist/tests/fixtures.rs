@@ -7,7 +7,6 @@ use std::path::PathBuf;
 
 use rsdag::{ExprId, Node};
 use sane_core::Graph;
-use sane_dae::assemble_dae;
 use sane_netlist::parse;
 
 /// Count the unique DAG nodes reachable from `roots` (shared nodes once).
@@ -56,7 +55,7 @@ fn all_fixtures_parse_and_extract() {
 
         let parsed = parse(&text).unwrap_or_else(|e| panic!("{name}: parse failed: {e}"));
         let mut ctx = Graph::new();
-        let dae = assemble_dae(&mut ctx, &parsed.circuit, &parsed.devices);
+        let dae = parsed.assemble(&mut ctx);
         assert!(dae.dim() > 0, "{name}: empty DAE");
 
         let res_nodes = count_nodes(&ctx, &dae.residuals);

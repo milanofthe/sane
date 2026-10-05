@@ -3,7 +3,7 @@
 Library copy of the rslab sparse direct solver
 (https://github.com/milanofthe/rslab).
 
-- Vendored from: commit `18af8d0` (rslab 1.0.0), "Supernodal refactor with kernel scratch kept in the solver (#146)"
+- Vendored from: commit `09d1775` (rslab 1.1.0), "release 1.1.0 (#149)"
 - Contents: `src/` (library only) plus the ordering crates
   `crates/{rslab-ordering-core,rslab-amd,rslab-amf,rslab-metis}`, the license files, and a manifest trimmed
   to the library.

@@ -17,7 +17,7 @@ use crate::graph::Graph;
 use crate::node::{ExprId, Node, ReduceOp, SymbolId, UnaryOp};
 
 /// Polynomial degree in the variables.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Degree {
     /// A polynomial of this degree; `Finite(0)` does not depend on the
     /// variables at all.
@@ -69,7 +69,7 @@ impl Degree {
 }
 
 /// A set of unary ops, one bit each.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct UnarySet(u64);
 
 const _: () = assert!(crate::node::UNARY_OPS.len() <= 64);
@@ -95,7 +95,7 @@ impl UnarySet {
 
 /// The classification of an expression, or of a whole residual system, as
 /// far as a harmonic-balance solve cares.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Nonlinearity {
     pub degree: Degree,
     /// Elementary functions applied to a variable-dependent argument (the
@@ -158,11 +158,40 @@ pub fn nonlinearity<K: Field>(
 
 /// Classify a residual system: the worst degree over the residuals and the
 /// union of their flags. What the solver has to plan for.
+///
+/// A call is classified through its function's body, each parameter taking
+/// its argument's class: the same answer as for the inlined expression,
+/// computed once per output and argument classes. A call into an extern
+/// body is opaque.
 pub fn nonlinearity_of<K: Field>(
     g: &Graph<K>,
     exprs: &[ExprId],
     vars: &BTreeSet<SymbolId>,
 ) -> Nonlinearity {
+    let leaf = |s: SymbolId| Nonlinearity {
+        degree: Degree::Finite(vars.contains(&s) as u32),
+        ..Default::default()
+    };
+    let classes = classify_cone(g, exprs, &leaf, &mut HashMap::default());
+    let mut acc = Nonlinearity::constant();
+    for c in classes {
+        acc.degree = acc.degree.plus(c.degree);
+        acc.absorb(&c);
+    }
+    acc
+}
+
+/// The classes of the calls already classified: by output and argument
+/// classes.
+type CallMemo = HashMap<(crate::func::OutputId, Vec<Nonlinearity>), Nonlinearity>;
+
+/// The classes of `exprs`, a symbol classified by `leaf`.
+fn classify_cone<K: Field>(
+    g: &Graph<K>,
+    exprs: &[ExprId],
+    leaf: &dyn Fn(SymbolId) -> Nonlinearity,
+    calls: &mut CallMemo,
+) -> Vec<Nonlinearity> {
     // One sweep over the nodes the expressions reach, ascending (a node
     // after its operands), each classified from its operands'.
     let mut cone: Vec<ExprId> = Vec::new();
@@ -177,23 +206,69 @@ pub fn nonlinearity_of<K: Field>(
     cone.sort_unstable();
     let mut memo: HashMap<ExprId, Nonlinearity> = HashMap::default();
     for &e in &cone {
-        let c = classify(g, e, vars, |a| memo[&a]);
+        let c = match *g.node(e) {
+            Node::Symbol(s) => leaf(s),
+            Node::Call(o, l) => {
+                let args: Vec<Nonlinearity> = g.args(l).iter().map(|a| memo[a]).collect();
+                classify_call(g, o, args, calls)
+            }
+            _ => classify(g, e, |a| memo[&a]),
+        };
         memo.insert(e, c);
     }
-    let mut acc = Nonlinearity::constant();
-    for e in exprs {
-        let c = memo[e];
-        acc.degree = acc.degree.plus(c.degree);
-        acc.absorb(&c);
+    exprs.iter().map(|e| memo[e]).collect()
+}
+
+/// Output `o` called on arguments of classes `args`: its body classified with
+/// each parameter taking its argument's class (opaque for an extern body).
+fn classify_call<K: Field>(
+    g: &Graph<K>,
+    o: crate::func::OutputId,
+    args: Vec<Nonlinearity>,
+    calls: &mut CallMemo,
+) -> Nonlinearity {
+    let key = (o, args);
+    if let Some(&c) = calls.get(&key) {
+        return c;
     }
-    acc
+    let (f, out) = g.output(o);
+    let func = g.func(f);
+    let args = &key.1;
+    let c = match func.outputs()[out as usize] {
+        crate::func::Output::Zero => Nonlinearity::constant(),
+        crate::func::Output::Slot(_) => {
+            if args.iter().all(Nonlinearity::is_constant) {
+                Nonlinearity::constant()
+            } else {
+                let mut out = Nonlinearity::unbounded(|o| o.opaque = true);
+                for a in args {
+                    out.absorb(a);
+                }
+                out
+            }
+        }
+        crate::func::Output::Expr(e) => {
+            let params: HashMap<SymbolId, Nonlinearity> = func
+                .params()
+                .iter()
+                .copied()
+                .zip(args.iter().copied())
+                .collect();
+            // A symbol of the body that is no parameter (a global the
+            // function reads) is constant: the function's parameters are
+            // its free symbols.
+            let leaf = |s: SymbolId| params.get(&s).copied().unwrap_or_default();
+            classify_cone(g, &[e], &leaf, calls)[0]
+        }
+    };
+    calls.insert(key, c);
+    c
 }
 
 /// Node `expr` classified from its operands' classes, `sub`.
 fn classify<K: Field>(
     g: &Graph<K>,
     expr: ExprId,
-    vars: &BTreeSet<SymbolId>,
     sub: impl Fn(ExprId) -> Nonlinearity,
 ) -> Nonlinearity {
     // Every operand's flags, and whether any moves with the variables.
@@ -206,10 +281,7 @@ fn classify<K: Field>(
     };
     match *g.node(expr) {
         Node::Const(_) => Nonlinearity::constant(),
-        Node::Symbol(s) => Nonlinearity {
-            degree: Degree::Finite(vars.contains(&s) as u32),
-            ..Default::default()
-        },
+        Node::Symbol(_) | Node::Call(..) => unreachable!("classified by the cone sweep"),
         Node::Neg(a) => sub(a),
         Node::Add(a, b) => joined(
             &[sub(a), sub(b)],
@@ -253,7 +325,7 @@ fn classify<K: Field>(
         // sense as a unary one when either argument moves; there is no
         // unary op to name it by, so the flag is the piecewise-free
         // "unbounded" alone.
-        Node::Binary(..) | Node::Cmp(..) | Node::Solve(..) | Node::Call(..) => {
+        Node::Binary(..) | Node::Cmp(..) | Node::Solve(..) => {
             let parts = parts();
             if parts.iter().all(Nonlinearity::is_constant) {
                 return Nonlinearity::constant();
@@ -262,8 +334,6 @@ fn classify<K: Field>(
                 Node::Cmp(..) => o.piecewise = true,
                 // Rational in the matrix, linear in the right-hand side.
                 Node::Solve(..) => o.rational = true,
-                // A call's body is not classified here.
-                Node::Call(..) => o.opaque = true,
                 _ => {}
             });
             joined(&parts, out)

@@ -53,26 +53,15 @@ pub struct LoweredDelay {
 /// exprs. See [`DeviceModel::lower_behavioral`].
 pub struct Lowerer<'a> {
     ctx: &'a mut Graph,
-    /// Instance count per template group (see
-    /// [`DeviceModel::template_group`](crate::DeviceModel::template_group)),
-    /// filled by the assembler before the device loop. A frontend uses it to
-    /// decide whether the FIRST instance of a template also routes through the
-    /// shared compiled bundle (multi-instance circuits: SIMD-lane execution for
-    /// all instances) or keeps its fully symbolic fragment (single-instance
-    /// circuits: transparent to symbolic tooling).
-    pub instance_groups: std::collections::HashMap<String, usize>,
     pub extras: Vec<LoweredUnknown>,
     /// Transport delays minted alongside `extras` (drained together per device).
     pub delays: Vec<LoweredDelay>,
-    /// Device-bundle templates minted by the frontend (one per template group,
-    /// keyed by the template cache key; drained once at end of assembly).
     /// Per-extract lowering cache, persisting across device instances (the
     /// assembler builds one `Lowerer` for the whole device loop). Type-erased so
     /// this crate stays agnostic of what a frontend caches; the Verilog-A
-    /// frontend stores model-instance templates here, keyed by
-    /// (module, terminal pattern, parameter signature), so a large compact model
-    /// is lowered once and every further instance is cloned by symbol
-    /// substitution instead of re-walking its analog block.
+    /// frontend keeps its model functions here, keyed by (module, terminal
+    /// pattern, multiplicity), so a compact model is lowered once per
+    /// structure and every instance is a call.
     cache: HashMap<String, Box<dyn Any>>,
 }
 
@@ -80,7 +69,6 @@ impl<'a> Lowerer<'a> {
     pub fn new(ctx: &'a mut Graph) -> Self {
         Self {
             ctx,
-            instance_groups: std::collections::HashMap::new(),
             extras: Vec::new(),
             delays: Vec::new(),
             cache: HashMap::new(),

@@ -11,7 +11,6 @@ use std::time::Instant;
 
 use sane_core::constants::DC_OP_MAXIT;
 use sane_core::Graph;
-use sane_dae::assemble_dae;
 use sane_netlist::parse;
 use sane_solve::{CompiledDc, Convergence, SolverTricks};
 
@@ -60,7 +59,7 @@ fn main() {
             continue;
         };
         let mut ctx = Graph::new();
-        let dae = assemble_dae(&mut ctx, &parsed.circuit, &parsed.devices);
+        let dae = parsed.assemble(&mut ctx);
         let mut cdc = CompiledDc::new(&mut ctx, &dae);
         let p = parsed.pvec(&cdc.param_names(&ctx));
         let mut row = format!(

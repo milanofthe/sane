@@ -38,6 +38,10 @@ pub struct Graph<K: Field = F64> {
     f64_cache: HashMap<u64, ExprId>,
     arg_pool: Vec<ExprId>,
     arg_dedup: HashMap<Box<[ExprId]>, ArgList>,
+    /// The fingerprint of each interned list's operands, once per list: a
+    /// call's fingerprint is its callee's and this, so the calls of one
+    /// instance of a wide body cost its width once.
+    list_shape: HashMap<ArgList, u64>,
     /// The interned constants `0` and `1` (created in `new`), so identity
     /// folding is an id compare and `zero()`/`one()` never hash.
     zero: ExprId,
@@ -105,6 +109,7 @@ impl Memo {
 }
 
 mod calls;
+mod compose;
 
 impl<K: Field> Default for Graph<K> {
     fn default() -> Self {
@@ -123,6 +128,7 @@ impl<K: Field> Graph<K> {
             f64_cache: HashMap::default(),
             arg_pool: Vec::new(),
             arg_dedup: HashMap::default(),
+            list_shape: HashMap::default(),
             zero: ExprId(0),
             one: ExprId(0),
             symbol_names: Vec::new(),
@@ -257,13 +263,16 @@ impl<K: Field> Graph<K> {
             Node::Call(o, l) => {
                 let (func, k) = self.output(o);
                 let callee = of_hash(self.func(func).name());
-                list(Tag::Call, mix(callee, k as u64), l)
+                mix(
+                    mix(Tag::Call as u64, mix(callee, k as u64)),
+                    self.list_shape[&l],
+                )
             }
         }
     }
 
     /// Intern an operand list by content.
-    fn intern_args(&mut self, args: &[ExprId]) -> ArgList {
+    pub(crate) fn intern_args(&mut self, args: &[ExprId]) -> ArgList {
         if let Some(&l) = self.arg_dedup.get(args) {
             return l;
         }
@@ -273,6 +282,10 @@ impl<K: Field> Graph<K> {
         };
         self.arg_pool.extend_from_slice(args);
         self.arg_dedup.insert(args.into(), l);
+        let shape = args.iter().fold(0, |h, &a| {
+            crate::node::shape::mix(h, self.shape[a.0 as usize])
+        });
+        self.list_shape.insert(l, shape);
         l
     }
 

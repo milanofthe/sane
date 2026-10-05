@@ -5,7 +5,10 @@
 //! node with several parents. A focus set keeps its nodes at full strength
 //! and fades the rest (the nodes a transform added, the arms a
 //! specialization keeps), clusters group nodes (a function body), links add
-//! dashed edges between nodes. [`TapeView`] draws a program's dataflow, one
+//! dashed edges between nodes; `bodies` draws the bodies of the functions
+//! the drawn calls reach, each once in its frame, every call linked to it;
+//! `inline` draws every call as its body, once per instance, in nested
+//! frames: the complete graph. [`TapeView`] draws a program's dataflow, one
 //! node per instruction, the prolog and the main phase as two clusters and
 //! the values the prolog leaves in the state as dashed edges.
 //!
@@ -16,8 +19,9 @@ use std::fmt::Write;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::field::Field;
+use crate::func::{FuncId, Output};
 use crate::graph::Graph;
-use crate::node::{ExprId, Node, ReduceOp, SymbolId};
+use crate::node::{ArgList, ExprId, Node, ReduceOp, SymbolId};
 use crate::tape::{input_index, Op, Tape};
 
 /// What a node is, which decides its hue and shape.
@@ -479,6 +483,40 @@ pub struct GraphView<'g, K: Field> {
     focus: Option<FxHashSet<ExprId>>,
     clusters: Vec<(String, Vec<ExprId>)>,
     links: Vec<(ExprId, ExprId, String)>,
+    bodies: bool,
+    inline: bool,
+    labels: FxHashMap<ExprId, String>,
+}
+
+/// The graph a [`GraphView`] draws, as data: for a consumer that lays it out
+/// and draws it itself. Node ids are the DOT names (`n{expr}`, `out{root}`).
+#[derive(Clone, Debug, Default)]
+pub struct GraphData {
+    pub nodes: Vec<GraphNode>,
+    /// `(from, to, label)` by node index, operand to consumer (a select's
+    /// operands labelled `if`, `then`, `else`).
+    pub edges: Vec<(usize, usize, &'static str)>,
+    /// The frames' labels; a node names its frame by index.
+    pub clusters: Vec<String>,
+    /// The frame each frame sits in (nested instances, see
+    /// [`GraphView::inline`]).
+    pub parents: Vec<Option<usize>>,
+    /// `(from, to, label)` by node index: the dashed links (a call to the
+    /// output of the body it calls).
+    pub links: Vec<(usize, usize, String)>,
+}
+
+/// One node of [`GraphData`].
+#[derive(Clone, Debug)]
+pub struct GraphNode {
+    /// The DOT name.
+    pub id: String,
+    pub label: String,
+    pub kind: Kind,
+    /// The frame it sits in.
+    pub cluster: Option<usize>,
+    /// Outside the focus.
+    pub faded: bool,
 }
 
 impl<'g, K: Field> GraphView<'g, K> {
@@ -492,7 +530,16 @@ impl<'g, K: Field> GraphView<'g, K> {
             focus: None,
             clusters: Vec::new(),
             links: Vec::new(),
+            bodies: false,
+            inline: false,
+            labels: FxHashMap::default(),
         }
+    }
+
+    /// Draw node `e` labelled `label` instead of its own.
+    pub fn label(mut self, e: ExprId, label: &str) -> Self {
+        self.labels.insert(e, label.to_string());
+        self
     }
 
     pub fn theme(mut self, theme: Theme) -> Self {
@@ -539,12 +586,105 @@ impl<'g, K: Field> GraphView<'g, K> {
         self
     }
 
+    /// Draw the bodies of the functions the drawn calls reach, to the
+    /// bottom: each function once, in a frame named after it, and every
+    /// call linked (dashed) to the output it calls. The whole hierarchy,
+    /// a function shared by its instances rather than repeated per call.
+    pub fn bodies(mut self) -> Self {
+        self.bodies = true;
+        self
+    }
+
+    /// Draw every call as what it computes: the called function's body,
+    /// its parameters bound to the call's arguments, once per instance (the
+    /// calls of one function over one argument list), in a frame inside its
+    /// caller's frame, named by the call's label or else the function. The
+    /// complete graph, its hierarchy as nested frames; instances stay apart
+    /// however equal their bodies' expressions are.
+    pub fn inline(mut self) -> Self {
+        self.inline = true;
+        self
+    }
+
+    /// The clusters and links of the called functions' bodies (see
+    /// [`bodies`](Self::bodies)), after the given ones: a body's frame
+    /// holds the nodes it reaches that nothing drawn before reaches.
+    /// The bodies' parameters with the `Param` role are drawn as
+    /// parameters.
+    #[allow(clippy::type_complexity)]
+    fn with_bodies(
+        &self,
+        seeds: &[ExprId],
+    ) -> (
+        Vec<(String, Vec<ExprId>)>,
+        Vec<(ExprId, ExprId, String)>,
+        FxHashSet<SymbolId>,
+    ) {
+        let g = self.g;
+        let mut clusters = self.clusters.clone();
+        let mut links = self.links.clone();
+        let mut params = self.params.clone();
+        if !self.bodies {
+            return (clusters, links, params);
+        }
+        let mut drawn = reachable(g, seeds);
+        let mut frame: FxHashMap<FuncId, usize> = FxHashMap::default();
+        let mut entered: FxHashSet<(FuncId, u32)> = FxHashSet::default();
+        let mut todo: Vec<ExprId> = drawn.iter().copied().collect();
+        while !todo.is_empty() {
+            todo.sort_by_key(|e| e.0);
+            let mut next = Vec::new();
+            for e in todo {
+                let Node::Call(o, _) = *g.node(e) else {
+                    continue;
+                };
+                let (f, k) = g.output(o);
+                let Output::Expr(b) = g.func(f).outputs()[k as usize] else {
+                    continue;
+                };
+                links.push((e, b, String::new()));
+                if !entered.insert((f, k)) {
+                    continue;
+                }
+                let c = *frame.entry(f).or_insert_with(|| {
+                    let func = g.func(f);
+                    params.extend(
+                        func.params()
+                            .iter()
+                            .zip(func.param_roles())
+                            .filter(|(_, r)| matches!(r, crate::ParamRole::Param))
+                            .map(|(&s, _)| s),
+                    );
+                    clusters.push((func.name().to_string(), Vec::new()));
+                    clusters.len() - 1
+                });
+                for n in reachable(g, &[b]) {
+                    if drawn.insert(n) {
+                        clusters[c].1.push(n);
+                        next.push(n);
+                    }
+                }
+            }
+            todo = next;
+        }
+        (clusters, links, params)
+    }
+
     fn faded(&self, e: ExprId) -> bool {
         self.focus.as_ref().is_some_and(|f| !f.contains(&e))
     }
 
     /// The label and kind of node `e`.
-    fn style(&self, e: ExprId) -> (String, Kind) {
+    fn style(&self, e: ExprId, params: &FxHashSet<SymbolId>) -> (String, Kind) {
+        let (label, kind) = self.own_style(e, params);
+        match self.labels.get(&e) {
+            Some(l) => (l.clone(), kind),
+            None => (label, kind),
+        }
+    }
+
+    /// The node's own label and its kind.
+    fn own_style(&self, e: ExprId, params: &FxHashSet<SymbolId>) -> (String, Kind) {
         let g = self.g;
         let math = self.theme.notation == Notation::Math;
         match *g.node(e) {
@@ -558,7 +698,7 @@ impl<'g, K: Field> GraphView<'g, K> {
             }
             Node::Symbol(s) => (
                 g.symbol_name(s).to_string(),
-                if self.params.contains(&s) {
+                if params.contains(&s) {
                     Kind::Param
                 } else {
                     Kind::Input
@@ -615,9 +755,12 @@ impl<'g, K: Field> GraphView<'g, K> {
         }
     }
 
-    pub fn render(&self) -> String {
+    /// The graph this view draws (see [`GraphData`]).
+    pub fn data(&self) -> GraphData {
+        if self.inline {
+            return Inliner::new(self).data();
+        }
         let g = self.g;
-        let t = &self.theme;
         let mut seeds: Vec<ExprId> = self.roots.iter().map(|r| r.0).collect();
         for (_, ids) in &self.clusters {
             seeds.extend(ids.iter().copied());
@@ -626,74 +769,272 @@ impl<'g, K: Field> GraphView<'g, K> {
             seeds.push(a);
             seeds.push(b);
         }
+        let (clusters, links, params) = self.with_bodies(&seeds);
+        for (_, ids) in &clusters {
+            seeds.extend(ids.iter().copied());
+        }
         // Nodes in id order: operands before the nodes that read them.
-        let mut nodes: Vec<ExprId> = reachable(g, &seeds).into_iter().collect();
-        nodes.sort_by_key(|e| e.0);
+        let mut exprs: Vec<ExprId> = reachable(g, &seeds).into_iter().collect();
+        exprs.sort_by_key(|e| e.0);
         let mut home: FxHashMap<ExprId, usize> = FxHashMap::default();
-        for (c, (_, ids)) in self.clusters.iter().enumerate() {
+        for (c, (_, ids)) in clusters.iter().enumerate() {
             for &e in ids {
                 home.entry(e).or_insert(c);
             }
         }
-        let mut s = t.header(self.rankdir);
-        let node_line = |e: ExprId| {
-            let (label, kind) = self.style(e);
-            format!("n{} [{}];\n", e.0, t.node(kind, &label, self.faded(e)))
+        let mut data = GraphData {
+            clusters: clusters.iter().map(|(l, _)| l.clone()).collect(),
+            parents: vec![None; clusters.len()],
+            ..GraphData::default()
         };
-        for (c, (label, _)) in self.clusters.iter().enumerate() {
-            let _ = writeln!(s, "  subgraph cluster_{c} {{\n    {}", t.cluster(label));
-            for &e in nodes.iter().filter(|e| home.get(e) == Some(&c)) {
-                s.push_str("    ");
-                s.push_str(&node_line(e));
-            }
-            s.push_str("  }\n");
+        let mut at: FxHashMap<ExprId, usize> = FxHashMap::default();
+        for &e in &exprs {
+            let (label, kind) = self.style(e, &params);
+            at.insert(e, data.nodes.len());
+            data.nodes.push(GraphNode {
+                id: format!("n{}", e.0),
+                label,
+                kind,
+                cluster: home.get(&e).copied(),
+                faded: self.faded(e),
+            });
         }
-        for &e in nodes.iter().filter(|e| !home.contains_key(e)) {
-            s.push_str("  ");
-            s.push_str(&node_line(e));
-        }
-        for &e in &nodes {
-            let ops = g.operands(e);
+        for &e in &exprs {
             let select = matches!(g.node(e), Node::Select(..));
-            for (k, &a) in ops.iter().enumerate() {
-                let mut attrs: Vec<String> = Vec::new();
-                if select {
-                    attrs.push(format!("label=\"{}\"", ["if", "then", "else"][k]));
-                }
-                if self.faded(e) || self.faded(a) {
-                    attrs.push(t.faded_edge());
-                }
-                let _ = writeln!(s, "  n{} -> n{} [{}];", a.0, e.0, attrs.join(", "));
+            for (k, a) in g.operands(e).iter().enumerate() {
+                let label = if select {
+                    ["if", "then", "else"][k]
+                } else {
+                    ""
+                };
+                data.edges.push((at[a], at[&e], label));
             }
         }
         for (i, (e, name)) in self.roots.iter().enumerate() {
             if name.is_empty() {
                 continue;
             }
-            let faded = self.faded(*e);
-            let _ = writeln!(
-                s,
-                "  out{i} [{}];\n  n{} -> out{i}{};",
-                t.node(Kind::Output, name, faded),
-                e.0,
-                if faded {
-                    format!(" [{}]", t.faded_edge())
-                } else {
-                    String::new()
-                }
-            );
+            data.nodes.push(GraphNode {
+                id: format!("out{i}"),
+                label: name.clone(),
+                kind: Kind::Output,
+                cluster: None,
+                faded: self.faded(*e),
+            });
+            data.edges.push((at[e], data.nodes.len() - 1, ""));
         }
-        for (a, b, label) in &self.links {
+        for (a, b, label) in &links {
+            data.links.push((at[a], at[b], label.clone()));
+        }
+        data
+    }
+
+    pub fn render(&self) -> String {
+        let t = &self.theme;
+        let data = self.data();
+        let mut s = t.header(self.rankdir);
+        let node_line =
+            |n: &GraphNode| format!("{} [{}];\n", n.id, t.node(n.kind, &n.label, n.faded));
+        fn frame(
+            s: &mut String,
+            data: &GraphData,
+            t: &Theme,
+            c: usize,
+            node_line: &dyn Fn(&GraphNode) -> String,
+        ) {
             let _ = writeln!(
                 s,
-                "  n{} -> n{} [style=dashed, label=\"{}\", constraint=false];",
-                a.0,
-                b.0,
+                "  subgraph cluster_{c} {{\n    {}",
+                t.cluster(&data.clusters[c])
+            );
+            for n in data.nodes.iter().filter(|n| n.cluster == Some(c)) {
+                s.push_str("    ");
+                s.push_str(&node_line(n));
+            }
+            for d in (0..data.clusters.len()).filter(|&d| data.parents[d] == Some(c)) {
+                frame(s, data, t, d, node_line);
+            }
+            s.push_str("  }\n");
+        }
+        for c in (0..data.clusters.len()).filter(|&c| data.parents[c].is_none()) {
+            frame(&mut s, &data, t, c, &node_line);
+        }
+        for n in data.nodes.iter().filter(|n| n.cluster.is_none()) {
+            s.push_str("  ");
+            s.push_str(&node_line(n));
+        }
+        for &(a, b, label) in &data.edges {
+            let (na, nb) = (&data.nodes[a], &data.nodes[b]);
+            let mut attrs: Vec<String> = Vec::new();
+            if !label.is_empty() {
+                attrs.push(format!("label=\"{label}\""));
+            }
+            if na.faded || nb.faded {
+                attrs.push(t.faded_edge());
+            }
+            let attrs = if attrs.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", attrs.join(", "))
+            };
+            let _ = writeln!(s, "  {} -> {}{attrs};", na.id, nb.id);
+        }
+        for (a, b, label) in &data.links {
+            let _ = writeln!(
+                s,
+                "  {} -> {} [style=dashed, label=\"{}\", constraint=false];",
+                data.nodes[*a].id,
+                data.nodes[*b].id,
                 escape(label)
             );
         }
         s.push_str("}\n");
         s
+    }
+}
+
+/// [`GraphView::inline`]: the drawn graph with every call replaced by its
+/// body, per instance. A node is an expression in a frame (0 the top, an
+/// instance's frame the index of its cluster plus one); a body's parameter
+/// is the argument in the caller's frame, a call's output the body's output
+/// in the instance's frame.
+struct Inliner<'v, 'g, K: Field> {
+    view: &'v GraphView<'g, K>,
+    /// Per frame: the frame it sits in and its parameters' arguments there.
+    frames: Vec<(usize, FxHashMap<SymbolId, ExprId>)>,
+    instances: FxHashMap<(usize, FuncId, ArgList), usize>,
+    at: FxHashMap<(usize, ExprId), usize>,
+    data: GraphData,
+}
+
+impl<'v, 'g, K: Field> Inliner<'v, 'g, K> {
+    fn new(view: &'v GraphView<'g, K>) -> Self {
+        Inliner {
+            view,
+            frames: vec![(0, FxHashMap::default())],
+            instances: FxHashMap::default(),
+            at: FxHashMap::default(),
+            data: GraphData::default(),
+        }
+    }
+
+    /// The node `(frame, e)` stands for: a bound parameter is its argument
+    /// in the caller's frame, a free symbol the top frame's, a call of a
+    /// symbolic output that output in the instance's frame.
+    fn resolve(&mut self, mut fr: usize, mut e: ExprId) -> (usize, ExprId) {
+        let g = self.view.g;
+        loop {
+            match *g.node(e) {
+                Node::Symbol(s) if fr != 0 => match self.frames[fr].1.get(&s) {
+                    Some(&a) => (fr, e) = (self.frames[fr].0, a),
+                    None => return (0, e),
+                },
+                Node::Call(o, l) => {
+                    let (f, k) = g.output(o);
+                    let Output::Expr(b) = g.func(f).outputs()[k as usize] else {
+                        return (fr, e);
+                    };
+                    let c = match self.instances.get(&(fr, f, l)) {
+                        Some(&c) => c,
+                        None => {
+                            let func = g.func(f);
+                            let bind = func.params().iter().copied().zip(g.args(l).iter().copied());
+                            self.frames.push((fr, bind.collect()));
+                            let c = self.frames.len() - 1;
+                            self.instances.insert((fr, f, l), c);
+                            let label = match self.view.labels.get(&e) {
+                                Some(l) => l.clone(),
+                                None => func.name().to_string(),
+                            };
+                            self.data.clusters.push(label);
+                            self.data.parents.push(fr.checked_sub(1));
+                            c
+                        }
+                    };
+                    (fr, e) = (c, b);
+                }
+                _ => return (fr, e),
+            }
+        }
+    }
+
+    /// The node index of `(frame, e)`, drawing it and what it reads.
+    fn node(&mut self, fr: usize, e: ExprId) -> usize {
+        let g = self.view.g;
+        let root = self.resolve(fr, e);
+        let mut stack = vec![(root, false)];
+        while let Some((key, ready)) = stack.pop() {
+            if self.at.contains_key(&key) {
+                continue;
+            }
+            let (kf, ke) = key;
+            let ops: Vec<(usize, ExprId)> = g
+                .operands(ke)
+                .iter()
+                .map(|&a| self.resolve(kf, a))
+                .collect();
+            if !ready {
+                stack.push((key, true));
+                stack.extend(
+                    ops.into_iter()
+                        .filter(|k| !self.at.contains_key(k))
+                        .map(|k| (k, false)),
+                );
+                continue;
+            }
+            let (label, kind) = self.view.style(ke, &self.view.params);
+            let n = self.data.nodes.len();
+            self.data.nodes.push(GraphNode {
+                id: if kf == 0 {
+                    format!("n{}", ke.0)
+                } else {
+                    format!("n{}_{kf}", ke.0)
+                },
+                label,
+                kind,
+                cluster: kf.checked_sub(1),
+                faded: self.view.faded(ke),
+            });
+            self.at.insert(key, n);
+            let select = matches!(g.node(ke), Node::Select(..));
+            for (k, op) in ops.iter().enumerate() {
+                let label = if select {
+                    ["if", "then", "else"][k]
+                } else {
+                    ""
+                };
+                self.data.edges.push((self.at[op], n, label));
+            }
+        }
+        self.at[&root]
+    }
+
+    fn data(mut self) -> GraphData {
+        let view = self.view;
+        for (_, ids) in &view.clusters {
+            for &e in ids {
+                self.node(0, e);
+            }
+        }
+        for (i, (e, name)) in view.roots.iter().enumerate() {
+            let n = self.node(0, *e);
+            if name.is_empty() {
+                continue;
+            }
+            self.data.nodes.push(GraphNode {
+                id: format!("out{i}"),
+                label: name.clone(),
+                kind: Kind::Output,
+                cluster: None,
+                faded: view.faded(*e),
+            });
+            self.data.edges.push((n, self.data.nodes.len() - 1, ""));
+        }
+        for (a, b, label) in &view.links {
+            let (a, b) = (self.node(0, *a), self.node(0, *b));
+            self.data.links.push((a, b, label.clone()));
+        }
+        self.data
     }
 }
 

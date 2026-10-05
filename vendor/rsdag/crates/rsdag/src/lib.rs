@@ -23,6 +23,7 @@ pub mod mathfn;
 pub mod module;
 pub mod node;
 pub mod nonlinearity;
+pub mod parallel;
 pub mod role;
 pub mod scalar;
 pub mod scope;
@@ -44,7 +45,7 @@ pub use autodiff::{
 pub use builder::{Builder, Numeric};
 pub use display::to_string;
 pub use eval::{eval, eval_named};
-pub use extern_fn::ExternBundle;
+pub use extern_fn::{BackendCache, ExternBundle};
 #[cfg(feature = "exact")]
 pub use field::ratio_powi;
 pub use field::{Field, F64};

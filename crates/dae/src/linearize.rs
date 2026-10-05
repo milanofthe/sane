@@ -16,15 +16,12 @@
 //! This is the matrix assembly `A(s) = G + sC` living in the graph exactly the
 //! way the nonlinear residual assembly does: [`crate::small_signal_matrix`] on
 //! the linearised DAE reproduces `A(s)` node-for-node (the verification test).
-//! Mapping the per-element stamps to canonical R/C/L and controlled sources is
-//! then a further read of this linear DAE, not a separate representation.
 
 use rustc_hash::FxHashMap;
 
-use rsdag::{differentiate, ExprId, SymbolId};
+use rsdag::{ExprId, SymbolId};
 use sane_core::Graph;
 
-use crate::stamp::Stamp;
 use crate::Dae;
 
 /// The operating-point freeze map: every unknown symbol `x_j` and its derivative
@@ -46,73 +43,29 @@ pub fn freeze_op_point(ctx: &mut Graph, dae: &Dae) -> FxHashMap<SymbolId, ExprId
     map
 }
 
-/// How finely the linearised DAE's stamps are split.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum Granularity {
-    /// One stamp per source-element contribution (the linearised image of each
-    /// original stamp). Mirrors the nonlinear DAE's structure.
-    #[default]
-    PerElement,
-    /// One stamp per canonical matrix entry: each stamp is a single
-    /// `coefficient * port` (instantaneous) or `coefficient * port'` (reactive)
-    /// monomial. The canonical small-signal elements then live *directly in the
-    /// graph* as the DAE's stamps -- no separate structure needed to hold them.
-    Canonical,
-}
-
-/// Linearise the DAE about its operating point into the linear mass-matrix DAE
-/// `G dx + C dx' = 0`, with per-element stamps ([`Granularity::PerElement`]). See
-/// [`linearize_with`].
-pub fn linearize(ctx: &mut Graph, dae: &Dae) -> Dae {
-    linearize_with(ctx, dae, Granularity::PerElement)
-}
-
 /// Linearise the DAE about its operating point into the linear mass-matrix DAE
 /// `G dx + C dx' = 0` (see the module docs). The returned [`Dae`] keeps the same
-/// unknowns, derivative symbols and time symbol; its residuals are linear forms.
-/// The stamps are the small-signal contributions -- grouped per source element
-/// ([`Granularity::PerElement`]) or split to one canonical element each
-/// ([`Granularity::Canonical`]). Either way, summing a row's stamps reproduces
-/// that row's residual exactly.
-pub fn linearize_with(ctx: &mut Graph, dae: &Dae, gran: Granularity) -> Dae {
+/// unknowns, derivative symbols and time symbol; row `i` of its residuals is
+/// `sum_j G_ij x_j + C_ij x'_j`, the Jacobians frozen at the operating point.
+pub fn linearize(ctx: &mut Graph, dae: &Dae) -> Dae {
     let freeze = freeze_op_point(ctx, dae);
-
-    // Frozen perturbation-expression for each unknown / derivative (the dx_j and
-    // dx'_j the linear forms multiply -- the original symbols, now meaning phasor
-    // perturbations, since the bias copies inside the coefficients were frozen).
-    let x_expr: Vec<ExprId> = dae.x.iter().map(|&s| ctx.symbol_expr(s)).collect();
-    let xdot_expr: Vec<Option<ExprId>> = dae
-        .xdot
-        .iter()
-        .map(|opt| opt.map(|s| ctx.symbol_expr(s)))
-        .collect();
-
-    // Linearise each source stamp into its `coef*port` monomials. The residual
-    // rows fall out by summing the monomials; the stamps are either one summed
-    // stamp per source element or one stamp per monomial (canonical elements).
-    let mut stamps = Vec::with_capacity(dae.stamps.len());
-    let n = dae.dim();
-    let zero = ctx.zero();
-    let mut residuals = vec![zero; n];
-    for st in &dae.stamps {
-        let terms = linear_terms(ctx, st.expr, dae, &freeze, &x_expr, &xdot_expr);
-        match gran {
-            Granularity::PerElement => {
-                let mut acc = zero;
-                for t in &terms {
-                    acc = ctx.add(acc, *t);
-                }
-                residuals[st.row] = ctx.add(residuals[st.row], acc);
-                stamps.push(Stamp::new(st.row, acc));
-            }
-            Granularity::Canonical => {
-                for t in terms {
-                    residuals[st.row] = ctx.add(residuals[st.row], t);
-                    stamps.push(Stamp::new(st.row, t));
-                }
-            }
-        }
+    let (jx, jxd) = dae.jacobian_x_xdot_coo(ctx);
+    let coefs: Vec<ExprId> = jx.2.iter().chain(&jxd.2).copied().collect();
+    let frozen = rsdag::substitute(ctx, &coefs, &freeze);
+    let ports = jx.1.iter().map(|&j| dae.x[j]).chain(
+        jxd.1
+            .iter()
+            .map(|&j| dae.xdot[j].expect("a differential unknown")),
+    );
+    let mut terms: Vec<Vec<ExprId>> = vec![Vec::new(); dae.dim()];
+    for ((&row, port), coef) in jx.0.iter().chain(&jxd.0).zip(ports).zip(frozen) {
+        let p = ctx.symbol_expr(port);
+        terms[row].push(ctx.mul(coef, p));
     }
+    let residuals = terms
+        .into_iter()
+        .map(|t| ctx.reduce(rsdag::ReduceOp::Sum, t))
+        .collect();
 
     Dae {
         n_nodes: dae.n_nodes,
@@ -125,7 +78,6 @@ pub fn linearize_with(ctx: &mut Graph, dae: &Dae, gran: Granularity) -> Dae {
         x: dae.x.clone(),
         xdot: dae.xdot.clone(),
         t: dae.t,
-        stamps,
         // A linear DAE carries no homotopy companion network, device limits or
         // (re-derived) noise sources; those stay with the nonlinear DAE the
         // operating point was solved on. Source shapes (transient breakpoints / HB
@@ -137,47 +89,8 @@ pub fn linearize_with(ctx: &mut Graph, dae: &Dae, gran: Granularity) -> Dae {
         limits: Vec::new(),
         sources: Vec::new(),
         source_names: Vec::new(),
+        labels: dae.labels.clone(),
     }
-}
-
-/// The monomials of the first-order Taylor of one expression about the operating
-/// point: each nonzero `(dexpr/dx_j)|_op dx_j` and `(dexpr/dx'_j)|_op dx'_j`,
-/// where `|_op` freezes the bias unknowns to their operating-point constants.
-/// Each returned term is one `coefficient * port` canonical element. The constant
-/// term `expr|_op` is dropped (the operating-point residual, zero by KCL).
-fn linear_terms(
-    ctx: &mut Graph,
-    expr: ExprId,
-    dae: &Dae,
-    freeze: &FxHashMap<SymbolId, ExprId>,
-    x_expr: &[ExprId],
-    xdot_expr: &[Option<ExprId>],
-) -> Vec<ExprId> {
-    let fs = ctx.free_symbols(expr);
-    let mut terms = Vec::new();
-    for (j, &xs) in dae.x.iter().enumerate() {
-        if fs.contains(&xs) {
-            let d = differentiate(ctx, expr, xs);
-            let df = rsdag::substitute(ctx, &[d], freeze)[0];
-            let term = ctx.mul(df, x_expr[j]);
-            if !ctx.is_zero(term) {
-                terms.push(term);
-            }
-        }
-    }
-    for (j, opt) in dae.xdot.iter().enumerate() {
-        if let (Some(xds), Some(xe)) = (opt, xdot_expr[j]) {
-            if fs.contains(xds) {
-                let d = differentiate(ctx, expr, *xds);
-                let df = rsdag::substitute(ctx, &[d], freeze)[0];
-                let term = ctx.mul(df, xe);
-                if !ctx.is_zero(term) {
-                    terms.push(term);
-                }
-            }
-        }
-    }
-    terms
 }
 
 /// Shared verification helpers for the small-signal transforms (used by both the
@@ -294,16 +207,13 @@ mod tests {
     use crate::small_signal_matrix;
 
     /// The linearised DAE's `A(s)` reproduces the original DAE's `A(s)` (the matrix
-    /// assembly carried into the linear graph), with the dimension preserved -- at
-    /// both stamp granularities (canonical splitting must not change the operator).
+    /// assembly carried into the linear graph), with the dimension preserved.
     fn assert_reassembles(ctx: &mut Graph, dae: &Dae) {
         let a_orig = small_signal_matrix(ctx, dae);
-        for gran in [Granularity::PerElement, Granularity::Canonical] {
-            let lin = linearize_with(ctx, dae, gran);
-            assert_eq!(dae.dim(), lin.dim(), "dimension preserved");
-            let a_lin = small_signal_matrix(ctx, &lin);
-            assert_matrix_eq(ctx, &a_orig, &a_lin);
-        }
+        let lin = linearize(ctx, dae);
+        assert_eq!(dae.dim(), lin.dim(), "dimension preserved");
+        let a_lin = small_signal_matrix(ctx, &lin);
+        assert_matrix_eq(ctx, &a_orig, &a_lin);
     }
 
     #[test]
@@ -318,26 +228,6 @@ mod tests {
         let mut ctx = Graph::new();
         let dae = diode_rc(&mut ctx);
         assert_reassembles(&mut ctx, &dae);
-    }
-
-    /// With canonical granularity each stamp is a single `coef * port` monomial:
-    /// exactly one perturbation port appears in it. This is the canonical element
-    /// living directly in the graph.
-    #[test]
-    fn canonical_stamps_are_atomic() {
-        let mut ctx = Graph::new();
-        let dae = rlc(&mut ctx);
-        let lin = linearize_with(&mut ctx, &dae, Granularity::Canonical);
-        let ports: std::collections::BTreeSet<SymbolId> = lin
-            .x
-            .iter()
-            .copied()
-            .chain(lin.xdot.iter().flatten().copied())
-            .collect();
-        for st in &lin.stamps {
-            let touched = ctx.free_symbols(st.expr).intersection(&ports).count();
-            assert_eq!(touched, 1, "a canonical stamp touches exactly one port");
-        }
     }
 
     /// The linearised residuals are genuinely linear: differentiating row `i`

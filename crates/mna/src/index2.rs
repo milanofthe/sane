@@ -22,7 +22,9 @@
 
 use std::collections::HashMap;
 
-use crate::{Circuit, Kind};
+use crate::{Element, Kind};
+#[cfg(test)]
+use crate::Circuit;
 
 /// One offending topology: the elements that form it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -122,7 +124,8 @@ impl Forest {
     }
 }
 
-/// Detect the index-2 topologies of a circuit.
+/// Detect the index-2 topologies of a circuit, given as its elements (a
+/// hierarchy's in the top frame, see `sane_dae::topology`).
 ///
 /// `device_terminals` carries the nonlinear devices (transistors, diodes): they
 /// live outside the linear element list but are still branches, so they break
@@ -130,7 +133,7 @@ impl Forest {
 /// look isolated -- which reports a phantom cutset on essentially every analog
 /// deck. They never *create* one of these topologies: a device is neither an
 /// ideal capacitor nor an ideal source.
-pub fn detect(circuit: &Circuit, device_terminals: &[Vec<usize>]) -> Index2Report {
+pub fn detect(elems: &[Element], device_terminals: &[Vec<usize>]) -> Index2Report {
     // a node that appears only on a device terminal never raised the element
     // graph's node count, so size the forests over both
     let n = device_terminals
@@ -139,9 +142,14 @@ pub fn detect(circuit: &Circuit, device_terminals: &[Vec<usize>]) -> Index2Repor
         .copied()
         .max()
         .unwrap_or(0)
-        .max(circuit.node_count())
+        .max(
+            elems
+                .iter()
+                .flat_map(|e| [e.a, e.b].into_iter().chain(e.ctrl.into_iter().flat_map(|(p, q)| [p, q])))
+                .max()
+                .unwrap_or(0),
+        )
         + 1;
-    let elems = circuit.elements();
     let mut report = Index2Report::default();
 
     // --- CV loops: grow a forest of capacitors, then close it with sources ---
@@ -287,7 +295,7 @@ mod tests {
 
     #[test]
     fn detects_a_capacitor_source_loop() {
-        let r = detect(&cv_circuit(), &[]);
+        let r = detect(cv_circuit().elements(), &[]);
         assert!(r.is_index2());
         assert_eq!(r.cv_loops.len(), 1);
         assert_eq!(r.cv_loops[0].source, "V1");
@@ -303,7 +311,7 @@ mod tests {
         c.voltage_source("V1", 1, 0);
         c.resistor("R1", 1, 0);
         c.capacitor("C1", 1, 0);
-        let r = detect(&c, &[]);
+        let r = detect(c.elements(), &[]);
         assert_eq!(r.cv_loops.len(), 1);
         assert_eq!(r.cv_loops[0].source, "V1");
         assert_eq!(r.cv_loops[0].storage, vec!["C1"]);
@@ -319,7 +327,7 @@ mod tests {
         c.capacitor("C1", 1, 3);
         c.resistor("Rx", 3, 2);
         c.capacitor("C2", 2, 0);
-        assert!(!detect(&c, &[]).is_index2());
+        assert!(!detect(c.elements(), &[]).is_index2());
     }
 
     #[test]
@@ -329,7 +337,7 @@ mod tests {
         c.current_source("I1", 0, 1);
         c.inductor("L1", 1, 2);
         c.resistor("R2", 2, 0);
-        let r = detect(&c, &[]);
+        let r = detect(c.elements(), &[]);
         assert_eq!(r.li_cutsets.len(), 1);
         assert_eq!(r.li_cutsets[0].source, "I1");
         assert_eq!(r.li_cutsets[0].storage, vec!["L1"]);
@@ -342,7 +350,7 @@ mod tests {
         c.inductor("L1", 1, 2);
         c.resistor("R1", 1, 0); // gives the source a path around the inductor
         c.resistor("R2", 2, 0);
-        assert!(!detect(&c, &[]).is_index2());
+        assert!(!detect(c.elements(), &[]).is_index2());
     }
 
     #[test]
@@ -356,13 +364,13 @@ mod tests {
         c.inductor("L1", 1, 2);
         c.resistor("R2", 2, 0);
         assert_eq!(
-            detect(&c, &[]).li_cutsets.len(),
+            detect(c.elements(), &[]).li_cutsets.len(),
             1,
             "without a bypass it is a cutset"
         );
         let dev = vec![vec![1usize, 0]]; // a device conducting from node 1 to ground
         assert!(
-            detect(&c, &dev).li_cutsets.is_empty(),
+            detect(c.elements(), &dev).li_cutsets.is_empty(),
             "the device gives the source a path around the inductor"
         );
     }
@@ -374,7 +382,7 @@ mod tests {
         let mut c = Circuit::new();
         c.current_source("I1", 0, 1);
         c.resistor("R1", 2, 0);
-        assert!(detect(&c, &[]).li_cutsets.is_empty());
+        assert!(detect(c.elements(), &[]).li_cutsets.is_empty());
     }
 
     #[test]
@@ -383,6 +391,6 @@ mod tests {
         c.voltage_source("V1", 1, 0);
         c.resistor("R1", 1, 2);
         c.capacitor("C1", 2, 0);
-        assert!(!detect(&c, &[]).is_index2());
+        assert!(!detect(c.elements(), &[]).is_index2());
     }
 }

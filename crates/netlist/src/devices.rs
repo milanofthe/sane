@@ -67,7 +67,7 @@ pub(crate) fn place_device(
 ) {
     devices.push(DeviceInstance::new(model, terminals).with_mfactor(mfactor));
     let m = devices.last().unwrap().model.as_ref();
-    bind_device_params(name, extras, card, params, values, m, report);
+    let _ = bind_device_params(name, None, extras, card, params, values, m, report);
     let m = devices.last().unwrap().model.as_ref();
     apply_defaults(name, m, values);
 }
@@ -100,6 +100,7 @@ pub(crate) fn place_va_device(
     params: &HashMap<String, f64>,
     type_override: Option<f64>,
     geom_scale: Option<f64>,
+    inst_scale: &[(&str, f64)],
     nf_scales_mfactor: bool,
     line_no: usize,
     line_col: usize,
@@ -110,26 +111,47 @@ pub(crate) fn place_va_device(
     let mut extras: Vec<&str> = vec![modelname];
     extras.extend_from_slice(inst_kv);
     let probe = VerilogADevice::new(name, em.clone());
-    bind_device_params(name, &extras, mcard, params, values, &probe, report);
+    let card = mcard.map(|c| c.name.as_str());
+    let inline = bind_device_params(name, card, &extras, mcard, params, values, &probe, report);
+    let mut dev = VerilogADevice::new(name, em.clone());
+    dev.card = card.map(str::to_string);
+    dev.inline = inline;
     // MOS polarity from the card's nmos/pmos token -> module `type` parameter.
     if let Some(t) = type_override {
-        if em
+        if let Some(p) = em
             .params
             .iter()
-            .any(|p| p.name.eq_ignore_ascii_case("type"))
+            .find(|p| p.name.eq_ignore_ascii_case("type"))
         {
-            values.insert(format!("{name}.type"), t);
+            values.insert(dev.param_symbol(&p.name), t);
         }
     }
     // `.option scale` converts drawn geometry to the meters the model expects.
     // Applied here, before the parameter snapshot, using the module's own L/W
     // parameter names (compact-model VA modules do not apply scale internally).
+    // Geometry is the instance's: a card-given L/W scales into an instance
+    // value, the card's stays as declared.
     if let Some(scale) = geom_scale.filter(|&s| s != 1.0) {
         for key in ["L", "W"] {
             if let Some(p) = em.params.iter().find(|p| p.name.eq_ignore_ascii_case(key)) {
-                if let Some(v) = values.get_mut(&format!("{name}.{}", p.name)) {
-                    *v *= scale;
+                if let Some(v) = values.get(&dev.param_symbol(&p.name)).copied() {
+                    dev.inline.insert(p.name.clone());
+                    values.insert(dev.param_symbol(&p.name), v * scale);
                 }
+            }
+        }
+    }
+    // Instance multipliers of module parameters (a BJT's area): the bound
+    // value, or the module default, scaled, as the instance's own.
+    for &(key, f) in inst_scale {
+        if let Some(p) = em.params.iter().find(|p| p.name.eq_ignore_ascii_case(key)) {
+            let v = values
+                .get(&dev.param_symbol(&p.name))
+                .copied()
+                .or_else(|| em.default_map.get(&p.name).copied());
+            if let Some(v) = v {
+                dev.inline.insert(p.name.clone());
+                values.insert(dev.param_symbol(&p.name), v * f);
             }
         }
     }
@@ -142,7 +164,7 @@ pub(crate) fn place_va_device(
     let given: HashSet<String> = em
         .params
         .iter()
-        .filter(|p| values.contains_key(&format!("{name}.{}", p.name)))
+        .filter(|p| values.contains_key(&dev.param_symbol(&p.name)))
         .map(|p| p.name.clone())
         .collect();
     let pvals: HashMap<String, f64> = em
@@ -150,7 +172,7 @@ pub(crate) fn place_va_device(
         .iter()
         .filter_map(|p| {
             values
-                .get(&format!("{name}.{}", p.name))
+                .get(&dev.param_symbol(&p.name))
                 .map(|v| (p.name.clone(), *v))
         })
         .collect();
@@ -196,7 +218,8 @@ pub(crate) fn place_va_device(
             })
             .unwrap_or(1.0);
     }
-    let mut dev = VerilogADevice::with_instance(name, em.clone(), pvals, given);
+    dev.params = pvals;
+    dev.given = given;
     dev.mfactor = mfactor;
     // Surface any unsupported construct up front (logged + parse error) rather
     // than producing unexpected results during analysis. Done once per module
@@ -220,17 +243,21 @@ pub(crate) fn place_va_device(
 const INSTANCE_MODIFIERS: &[&str] = &["m", "mult", "nf"];
 
 /// Bind a device's parameter values: from its referenced `.model` card, then
-/// any inline `key=value` tokens (which override the model). Keys land as
-/// `"{name}.{key}"` to match the instance-scoped device symbols.
+/// any inline `key=value` tokens (which override the model). An inline key
+/// lands as `"{name}.{key}"`; a card key as `"{card_scope}.{key}"` (the card's
+/// symbols, shared by its instances) or, without a scope, as the instance's.
+/// Returns the parameters set inline.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn bind_device_params(
     name: &str,
+    card_scope: Option<&str>,
     extras: &[&str],
     card: Option<&ModelCard>,
     env: &HashMap<String, f64>,
     values: &mut HashMap<String, f64>,
     model: &dyn DeviceModel,
     report: &mut CompatReport,
-) {
+) -> HashSet<String> {
     // Resolve each deck key to the model's exact-case parameter name: first
     // the semantic SPICE alias (`BF` -> `betaF`, `VTO` -> `Vto`, ...), then the
     // model's own case-insensitive lookup (which also covers its `aliasparam`
@@ -252,13 +279,15 @@ pub(crate) fn bind_device_params(
     let is_modifier = |k: &str| INSTANCE_MODIFIERS.iter().any(|m| k.eq_ignore_ascii_case(m));
 
     if let Some(card) = card {
+        let scope = card_scope.unwrap_or(name);
         for (k, v) in &card.params {
             if !known(k) {
                 report.unknown_param(name, k);
             }
-            values.insert(format!("{name}.{}", resolve(k)), *v);
+            values.insert(format!("{scope}.{}", resolve(k)), *v);
         }
     }
+    let mut inline = HashSet::default();
     for (k, v) in extras
         .iter()
         .filter_map(|t| t.split_once('='))
@@ -267,8 +296,11 @@ pub(crate) fn bind_device_params(
         if !known(k) && !is_modifier(k) {
             report.unknown_param(name, k);
         }
-        values.insert(format!("{name}.{}", resolve(k)), v);
+        let key = resolve(k);
+        values.insert(format!("{name}.{key}"), v);
+        inline.insert(key);
     }
+    inline
 }
 
 /// Build and register an OSDI compiled-model instance. Parameters come from

@@ -207,6 +207,7 @@ impl Placer<'_> {
             self.params,
             None,
             None,
+            &[],
             false,
             line_no,
             line_col,
@@ -241,6 +242,7 @@ impl Placer<'_> {
             self.params,
             None,
             None,
+            &[],
             false,
             line_no,
             line_col,
@@ -367,6 +369,7 @@ impl Placer<'_> {
             self.params,
             None,
             None,
+            &[],
             false,
             line_no,
             line_col,
@@ -454,6 +457,7 @@ impl Placer<'_> {
                     self.params,
                     Some(sign),
                     Some(self.options.scale()),
+                    &[],
                     false,
                     line_no,
                     line_col,
@@ -492,6 +496,7 @@ impl Placer<'_> {
             self.params,
             Some(sign),
             Some(self.options.scale()),
+            &[],
             true,
             line_no,
             line_col,
@@ -524,6 +529,20 @@ impl Placer<'_> {
             .copied()
             .unwrap_or(base);
         let em = builtin_module("sane_bjt").expect("builtin bjt");
+        // Area multiplier (bare number after the model) = N parallel
+        // devices: saturation/leakage currents and knee currents scale by
+        // area, series resistances by 1/area.
+        let area = extras
+            .iter()
+            .filter(|t| !t.contains('='))
+            .find_map(|t| resolve_value(t, self.params));
+        let area_scale: Vec<(&str, f64)> = area
+            .map(|a| {
+                let currents = ["Is", "IKF", "IKR", "ISE", "ISC"].map(|k| (k, a));
+                let resistances = ["Rb", "Rc", "Re"].map(|k| (k, 1.0 / a));
+                currents.into_iter().chain(resistances).collect()
+            })
+            .unwrap_or_default();
         place_va_device(
             &mut self.devices,
             &mut self.values,
@@ -538,38 +557,11 @@ impl Placer<'_> {
             self.params,
             Some(sign),
             None,
+            &area_scale,
             false,
             line_no,
             line_col,
         )?;
-        // Area multiplier (bare number after the model) = N parallel
-        // devices: saturation/leakage currents and knee currents scale
-        // by area, series resistances by 1/area (after defaults, so it
-        // scales defaulted self.values too).
-        if let Some(area) = extras
-            .iter()
-            .filter(|t| !t.contains('='))
-            .find_map(|t| resolve_value(t, self.params))
-        {
-            // A parameter the deck left at its default is bound here
-            // (scaled), since defaults are not expanded per instance.
-            let mul = |values: &mut HashMap<String, f64>, key: &str, f: f64| {
-                let full = format!("{name}.{key}");
-                let base = values
-                    .get(&full)
-                    .copied()
-                    .or_else(|| em.default_map.get(key).copied());
-                if let Some(v) = base {
-                    values.insert(full, v * f);
-                }
-            };
-            for k in ["Is", "IKF", "IKR", "ISE", "ISC"] {
-                mul(&mut self.values, k, area);
-            }
-            for k in ["Rb", "Rc", "Re"] {
-                mul(&mut self.values, k, 1.0 / area);
-            }
-        }
         Ok(())
     }
     pub(crate) fn place_jfet(&mut self, el: &Elem<'_>) -> Result<(), ParseError> {
@@ -608,6 +600,7 @@ impl Placer<'_> {
             self.params,
             Some(sign),
             None,
+            &[],
             false,
             line_no,
             line_col,
@@ -674,6 +667,7 @@ impl Placer<'_> {
             self.params,
             Some(sign),
             None,
+            &[],
             false,
             line_no,
             line_col,
@@ -788,6 +782,7 @@ impl Placer<'_> {
             self.params,
             None,
             None,
+            &[],
             false,
             line_no,
             line_col,

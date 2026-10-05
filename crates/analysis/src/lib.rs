@@ -29,7 +29,6 @@
 use rsdag::{differentiate, Node, SymbolId};
 use sane_core::Graph;
 use sane_core::{log, log_stage};
-use sane_dae::assemble_dae;
 
 /// Re-export the engine logger so hosts (the Python API, embedding apps) can
 /// configure logging without depending on `sane-core` directly.
@@ -69,7 +68,7 @@ mod pz;
 mod reduce;
 mod sweep;
 
-pub use ac::{ac_h, ac_on_dae, ac_response_sensitivity, state_space_on_dae};
+pub use ac::{ac_h, ac_response_sensitivity, state_space_on_dae};
 pub use noise::noise_on_dae;
 pub use pz::{dominant_subset, finite_pencil_roots, pencil_eigvectors, pencil_root_sensitivity};
 pub use reduce::{
@@ -118,7 +117,7 @@ fn prepare(netlist: &str) -> Result<Prepared, String> {
     let mut ctx = Graph::new();
     let dae = log_stage!(
         "dae/assemble",
-        assemble_dae(&mut ctx, &parsed.circuit, &parsed.devices)
+        parsed.assemble(&mut ctx)
     );
     let mut cdc = log_stage!("compile", CompiledDc::new(&mut ctx, &dae));
     // `.nodeset` symmetry breaking: device-emitted DC seeds first (`idt(u, ic)`

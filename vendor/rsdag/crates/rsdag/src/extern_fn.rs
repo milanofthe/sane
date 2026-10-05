@@ -19,6 +19,36 @@
 /// point of compilation, so the outputs of one extern function are slots of a
 /// single `ExternBundle`. The compiled tape calls the bundle once per distinct
 /// argument list and scatters its outputs to every call that reads one.
+/// The forms a backend compiled of a bundle, kept with the bundle so every
+/// program that calls it shares them (a native body is emitted once, not
+/// once per calling program). Keyed by the backend's options.
+#[derive(Default)]
+pub struct BackendCache(std::sync::Mutex<Vec<(u64, std::sync::Arc<dyn ExternBundle>)>>);
+
+impl BackendCache {
+    /// The form compiled under `key`, compiled by `make` on its first use.
+    pub fn get_or_try_insert<E>(
+        &self,
+        key: u64,
+        make: impl FnOnce() -> Result<std::sync::Arc<dyn ExternBundle>, E>,
+    ) -> Result<std::sync::Arc<dyn ExternBundle>, E> {
+        let find = |v: &[(u64, std::sync::Arc<dyn ExternBundle>)]| {
+            v.iter().find(|(k, _)| *k == key).map(|(_, b)| b.clone())
+        };
+        if let Some(b) = find(&self.0.lock().unwrap()) {
+            return Ok(b);
+        }
+        // Compiled outside the lock: a body's own calls take their bodies'.
+        let b = make()?;
+        let mut v = self.0.lock().unwrap();
+        if let Some(first) = find(&v) {
+            return Ok(first);
+        }
+        v.push((key, b.clone()));
+        Ok(b)
+    }
+}
+
 pub trait ExternBundle: Send + Sync {
     /// Number of outputs this bundle writes.
     fn n_outputs(&self) -> usize;
@@ -107,6 +137,11 @@ pub trait ExternBundle: Send + Sync {
     /// body is emitted once and called per instance instead of being
     /// unrolled into every call site. `None` for an opaque body.
     fn body(&self) -> Option<&crate::tape::Tape> {
+        None
+    }
+    /// Where a backend keeps what it compiled of this bundle's
+    /// [`body`](Self::body); `None` compiles it per program.
+    fn backend_cache(&self) -> Option<&BackendCache> {
         None
     }
 }

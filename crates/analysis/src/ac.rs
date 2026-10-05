@@ -2,12 +2,9 @@
 //! sensitivity, and the descriptor state-space at the operating point.
 
 use crate::linalg::{lu_factor_complex, lu_solve_complex};
-use crate::{input_vector, op_env};
+use crate::input_vector;
 use num_complex::Complex64;
-use rayon::prelude::*;
-use rsdag::{differentiate, Node};
 use sane_core::constants::{DC_OP_MAXIT, DC_OP_TOL};
-use sane_core::log_stage;
 use sane_core::Graph;
 use sane_solve::CompiledDc;
 use std::f64::consts::PI;
@@ -15,7 +12,6 @@ use std::f64::consts::PI;
 #[cfg(test)]
 use crate::solve_complex;
 #[cfg(test)]
-use sane_dae::assemble_dae;
 #[cfg(test)]
 use sane_netlist::parse;
 
@@ -43,98 +39,6 @@ pub fn ac_h(
     let b: Vec<Complex64> = db.iter().map(|v| Complex64::new(-v, 0.0)).collect();
     let sys = crate::sparse_ac::AcSystem::assemble(n, (&gr, &gc, &gv), (&cr, &cc, &cv), w);
     sys.solve(&b).map(|v| v[out_idx])
-}
-
-/// Reusable AC sweep core: `H(jω) = e_out^T (G + jω·C)^{-1} B` over a log grid
-/// `[fstart, fstop]`, at an already-solved operating point `(x, p)`. Returns
-/// `(freqs, mag_db, phase_deg)`. Shared by [`ac_analysis`] and [`Model::ac`].
-pub fn ac_on_dae(
-    ctx: &mut Graph,
-    dae: &sane_dae::Dae,
-    cdc: &CompiledDc,
-    pnames: &[String],
-    input: &str,
-    out_idx: usize,
-    x: &[f64],
-    p: &[f64],
-    fstart: f64,
-    fstop: f64,
-    points: usize,
-) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>), String> {
-    if !(fstart > 0.0) || !(fstop > fstart) || points < 2 {
-        return Err("AC needs 0 < fstart < fstop and points >= 2".into());
-    }
-    let n = dae.dim();
-    let xdot0 = vec![0.0; n];
-    // Sparse G (+ gmin diagonal) and C, fetched once; A = G + jwC is assembled and
-    // factored per frequency on the sparse path.
-    let (g_r, g_c, g_v) = log_stage!("ac/assemble_g", cdc.system_triplets_dc(x, p));
-    let (c_r, c_c, c_v) = log_stage!("ac/assemble_c", cdc.jacobian_xdot_sparse(x, &xdot0, p, 0.0));
-
-    let ie = ctx.sym(input);
-    let input_sym = match ctx.node(ie) {
-        Node::Symbol(s) => *s,
-        _ => return Err(format!("input '{input}' is not a source parameter")),
-    };
-    // B = -dF/d(input), evaluated at the operating point (xdot = 0).
-    let db: Vec<_> = log_stage!(
-        "ac/input_jac",
-        dae.residuals
-            .iter()
-            .map(|&r| differentiate(ctx, r, input_sym))
-            .collect::<Vec<_>>()
-    );
-    let env = op_env(ctx, dae, pnames, &x, &[], p, 0.0);
-    let b_real = log_stage!("ac/eval_b", rsdag::eval(ctx, &db, &env));
-    let b: Vec<Complex64> = b_real.iter().map(|v| Complex64::new(-v, 0.0)).collect();
-
-    // The sweep is embarrassingly parallel: G, C and B are fixed, and the pattern
-    // of A = G + jwC is fixed too, so its symbolic factorisation is built once and
-    // reused at every frequency (numeric refactor only). Each frequency solves
-    // independently on SANE's worker pool with faer pinned sequential so the
-    // per-frequency LU does not nest with the sweep. `into_par_iter().collect()`
-    // keeps the points in frequency order.
-    let sys = log_stage!(
-        "ac/symbolic",
-        crate::sparse_ac::SymbolicAc::new(n, (&g_r, &g_c, &g_v), (&c_r, &c_c, &c_v), false)
-    );
-    let (l0, l1) = (fstart.log10(), fstop.log10());
-    let rows: Vec<(f64, f64, f64)> = log_stage!(
-        "ac/sweep",
-        sane_solve::parallel::install(|| {
-            (0..points)
-                .into_par_iter()
-                // Per-worker sweep state: the first frequency a worker touches
-                // factors with full pivoting, the rest replay the frozen pivot
-                // sequence (KLU numeric-only refactor) on the refreshed values.
-                .map_init(
-                    || sys.as_ref().map(|s| s.solver()),
-                    |fac, k| {
-                        let fk = 10f64.powf(l0 + (l1 - l0) * k as f64 / (points - 1) as f64);
-                        let w = 2.0 * PI * fk;
-                        match fac.as_mut().and_then(|f| f.solve(w, &b)).map(|v| v[out_idx]) {
-                            Some(h) => (fk, 20.0 * h.norm().max(1e-30).log10(), h.arg().to_degrees()),
-                            // Singular A = G + jwC at this frequency: no small-signal
-                            // solution. Emit NaN mag/phase rather than a silent 0.0 that
-                            // reads as a flat -600 dB response (issue #39).
-                            None => (fk, f64::NAN, f64::NAN),
-                        }
-                    },
-                )
-                .collect()
-        })
-    );
-    let (mut f, mut mag_db, mut phase_deg) = (
-        Vec::with_capacity(points),
-        Vec::with_capacity(points),
-        Vec::with_capacity(points),
-    );
-    for (fk, mag, phase) in rows {
-        f.push(fk);
-        mag_db.push(mag);
-        phase_deg.push(phase);
-    }
-    Ok((f, mag_db, phase_deg))
 }
 
 /// Exact AC-transfer sensitivity `dH/dp(jw)` at each frequency, solved natively:
@@ -236,7 +140,7 @@ mod sparse_ac_equiv {
         let net = "V1 in 0 1\nR1 in a 100\nL1 a out 1m\nC1 out 0 1u\nR2 out 0 1k\n";
         let parsed = parse(net).unwrap();
         let mut ctx = Graph::new();
-        let dae = assemble_dae(&mut ctx, &parsed.circuit, &parsed.devices);
+        let dae = parsed.assemble(&mut ctx);
         let cdc = CompiledDc::new(&mut ctx, &dae);
         let pnames = cdc.param_names(&ctx);
         let p: Vec<f64> = parsed.pvec(&pnames);

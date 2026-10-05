@@ -3,7 +3,6 @@
 //! parameters (instance overrides + module defaults), and assemble into a DAE.
 
 use sane_core::Graph;
-use sane_dae::assemble_dae;
 use sane_netlist::parse;
 
 const DECK: &str = r#"
@@ -29,16 +28,28 @@ fn inline_veriloga_diode_parses_and_binds() {
     let p = parse(DECK).expect("deck parses");
     assert_eq!(p.devices.len(), 1, "one VA device");
     // Instance override and module default both bound under the instance name.
-    assert_eq!(p.param_value("N1.Is"), Some(2e-14), "instance override");
-    assert_eq!(p.param_value("N1.N"), Some(1.0), "module default");
-    assert_eq!(p.param_value("N1.Vt"), Some(0.025852), "module default");
+    assert_eq!(
+        p.param_value(&p.param_symbol("N1", "Is").unwrap()),
+        Some(2e-14),
+        "instance override"
+    );
+    assert_eq!(
+        p.param_value(&p.param_symbol("N1", "N").unwrap()),
+        Some(1.0),
+        "module default"
+    );
+    assert_eq!(
+        p.param_value(&p.param_symbol("N1", "Vt").unwrap()),
+        Some(0.025852),
+        "module default"
+    );
 }
 
 #[test]
 fn inline_veriloga_diode_assembles_dae() {
     let p = parse(DECK).expect("deck parses");
     let mut ctx = Graph::new();
-    let dae = assemble_dae(&mut ctx, &p.circuit, &p.devices);
+    let dae = p.assemble(&mut ctx);
     // nodes v1, v2 + branch i_V1.
     assert!(dae.dim() >= 3, "dim {}", dae.dim());
     assert!(dae.unknowns.iter().any(|u| u == "v2"));
@@ -89,7 +100,7 @@ fn switch_branch_lowers_per_instance() {
     let p = parse(SWITCH).expect("parse");
     assert_eq!(p.devices.len(), 2);
     let mut ctx = Graph::new();
-    let dae = assemble_dae(&mut ctx, &p.circuit, &p.devices);
+    let dae = p.assemble(&mut ctx);
     // The shorted instance mints a branch-current unknown (voltage source);
     // the resistor instance mints none -> at least one extra branch unknown.
     assert!(dae.dim() >= 3, "dim {}", dae.dim());
@@ -112,7 +123,7 @@ fn multiple_modules_per_block() {
     let p = parse(MULTI).expect("parse");
     assert_eq!(p.devices.len(), 2);
     let mut ctx = Graph::new();
-    let dae = assemble_dae(&mut ctx, &p.circuit, &p.devices);
+    let dae = p.assemble(&mut ctx);
     assert!(dae.unknowns.iter().any(|u| u == "v2"));
 }
 
@@ -156,7 +167,7 @@ R2 out 0 1k
     let p = parse(deck).expect("current-controlled model parses + lowers");
     assert_eq!(p.devices.len(), 1);
     let mut ctx = Graph::new();
-    let dae = assemble_dae(&mut ctx, &p.circuit, &p.devices);
+    let dae = p.assemble(&mut ctx);
     assert!(
         dae.unknowns.iter().any(|u| u.contains("flow_")),
         "promoted current unknown: {:?}",
@@ -181,18 +192,22 @@ N1 d d 0 0 ekv26_va W=10u L=1u
     let p = parse(deck).expect("EKV file loads, instance binds + lowers");
     assert_eq!(p.devices.len(), 1, "one EKV device");
     assert!(
-        (p.values["N1.W"] - 10e-6).abs() < 1e-15,
+        (p.param_value(&p.param_symbol("N1", "W").unwrap()).unwrap() - 10e-6).abs() < 1e-15,
         "instance W override: {}",
-        p.values["N1.W"]
+        p.param_value(&p.param_symbol("N1", "W").unwrap()).unwrap()
     );
     assert!(
-        (p.values["N1.L"] - 1e-6).abs() < 1e-15,
+        (p.param_value(&p.param_symbol("N1", "L").unwrap()).unwrap() - 1e-6).abs() < 1e-15,
         "instance L override: {}",
-        p.values["N1.L"]
+        p.param_value(&p.param_symbol("N1", "L").unwrap()).unwrap()
     );
-    assert_eq!(p.param_value("N1.VTO"), Some(0.5), "model default VTO");
+    assert_eq!(
+        p.param_value(&p.param_symbol("N1", "VTO").unwrap()),
+        Some(0.5),
+        "model default VTO"
+    );
     let mut ctx = Graph::new();
-    let dae = assemble_dae(&mut ctx, &p.circuit, &p.devices);
+    let dae = p.assemble(&mut ctx);
     // node d (index 1 -> "v1") + branch i_V1.
     assert!(dae.dim() >= 2, "dim {}", dae.dim());
     assert!(
@@ -238,13 +253,27 @@ fn compact_level_card_routes_to_va_via_model_alias() {
     let p = parse(&deck).expect("compact M routes to VA module");
     assert_eq!(p.devices.len(), 1, "one routed VA device");
     // nmos type token -> module `type` = +1; geometry + card param bound.
-    assert_eq!(p.param_value("M1.type"), Some(1.0), "nmos polarity");
-    assert_eq!(p.param_value("M1.L"), Some(2.0));
-    assert_eq!(p.param_value("M1.W"), Some(8.0));
-    assert_eq!(p.param_value("M1.gain"), Some(2e-3), "card param bound");
+    assert_eq!(
+        p.param_value(&p.param_symbol("M1", "type").unwrap()),
+        Some(1.0),
+        "nmos polarity"
+    );
+    assert_eq!(
+        p.param_value(&p.param_symbol("M1", "L").unwrap()),
+        Some(2.0)
+    );
+    assert_eq!(
+        p.param_value(&p.param_symbol("M1", "W").unwrap()),
+        Some(8.0)
+    );
+    assert_eq!(
+        p.param_value(&p.param_symbol("M1", "gain").unwrap()),
+        Some(2e-3),
+        "card param bound"
+    );
     // It actually assembles into a DAE (the device lowered).
     let mut ctx = Graph::new();
-    let dae = assemble_dae(&mut ctx, &p.circuit, &p.devices);
+    let dae = p.assemble(&mut ctx);
     assert!(
         dae.unknowns.iter().any(|u| u == "v1"),
         "node d present: {:?}",
@@ -257,7 +286,7 @@ fn compact_pmos_card_sets_negative_type() {
     let deck = compact_deck(".model pch pmos level=54", "M1 d g s 0 pch L=1 W=4");
     let p = parse(&deck).expect("pmos routes");
     assert_eq!(
-        p.param_value("M1.type"),
+        p.param_value(&p.param_symbol("M1", "type").unwrap()),
         Some(-1.0),
         "pmos polarity -> type=-1"
     );
@@ -271,8 +300,16 @@ fn compact_routing_applies_option_scale_to_geometry() {
         "M1 d g s 0 nch L=2 W=8",
     );
     let p = parse(&deck).expect("scale routes");
-    assert_eq!(p.param_value("M1.L"), Some(4.0), "L scaled by 2");
-    assert_eq!(p.param_value("M1.W"), Some(16.0), "W scaled by 2");
+    assert_eq!(
+        p.param_value(&p.param_symbol("M1", "L").unwrap()),
+        Some(4.0),
+        "L scaled by 2"
+    );
+    assert_eq!(
+        p.param_value(&p.param_symbol("M1", "W").unwrap()),
+        Some(16.0),
+        "W scaled by 2"
+    );
 }
 
 #[test]
@@ -287,11 +324,10 @@ fn compact_m_routing_matches_n_element() {
     let pm = parse(&m).expect("M");
     let pn = parse(&n).expect("N");
     for key in ["type", "L", "W", "gain"] {
-        assert_eq!(
-            pm.param_value(&format!("M1.{key}")),
-            pn.param_value(&format!("N1.{key}")),
-            "param {key} parity"
-        );
+        let bound = |p: &sane_netlist::ParsedCircuit, inst: &str| {
+            p.param_value(&p.param_symbol(inst, key).unwrap())
+        };
+        assert_eq!(bound(&pm, "M1"), bound(&pn, "N1"), "param {key} parity");
     }
 }
 
@@ -324,22 +360,32 @@ X1 d g 0 0 sky130_nfet l='2' w='WDES*1' m='1'
 .end
 "#;
     let p = parse(deck).expect("device-subckt + binning + scale + quotes parses");
-    assert_eq!(p.devices.len(), 1, "one routed VA device");
+    assert_eq!(p.instances[0].devices.len(), 1, "one routed VA device");
     // scale=1u: drawn l=2 -> 2e-6 m, w=4 -> 4e-6 m (bound on the device).
     assert!(
-        (p.values["X1.M0.L"] - 2e-6).abs() < 1e-18,
+        (p.param_value(&p.param_symbol("X1.M0", "L").unwrap())
+            .unwrap()
+            - 2e-6)
+            .abs()
+            < 1e-18,
         "scaled L: {}",
-        p.values["X1.M0.L"]
+        p.param_value(&p.param_symbol("X1.M0", "L").unwrap())
+            .unwrap()
     );
     assert!(
-        (p.values["X1.M0.W"] - 4e-6).abs() < 1e-18,
+        (p.param_value(&p.param_symbol("X1.M0", "W").unwrap())
+            .unwrap()
+            - 4e-6)
+            .abs()
+            < 1e-18,
         "scaled W: {}",
-        p.values["X1.M0.W"]
+        p.param_value(&p.param_symbol("X1.M0", "W").unwrap())
+            .unwrap()
     );
     // L=2e-6 lands in the SECOND bin [5e-7,1e-4) -> gain=20e-3 (not the first
     // bin's 10e-3). Without scaling the bin select, raw L=2 matches no window.
     assert_eq!(
-        p.param_value("X1.M0.gain"),
+        p.param_value(&p.param_symbol("X1.M0", "gain").unwrap()),
         Some(20e-3),
         "scaled-L bin selected"
     );
@@ -371,7 +417,7 @@ M1 d g s 0 nch L=2 W=8
 .end
 "#;
     let p = parse(deck).expect("card with AGAUSS expression parses");
-    let toxe = p.param_value("M1.toxe");
+    let toxe = p.param_value(&p.param_symbol("M1", "toxe").unwrap());
     assert_eq!(
         toxe,
         Some(4.148e-9),
@@ -412,7 +458,7 @@ N1 1 0 vres res=2k
 ";
     let p = parse(deck).expect("deck parses");
     assert_eq!(
-        p.param_value("N1.R"),
+        p.param_value(&p.param_symbol("N1", "R").unwrap()),
         Some(2000.0),
         "alias binds the target"
     );
@@ -446,9 +492,9 @@ V1 1 0 1
     let doubled = format!("{module}N1 1 0 vres mult2=2\n.end\n");
     let mut ctx = Graph::new();
     let p1 = parse(&base).expect("base parses");
-    let d1 = assemble_dae(&mut ctx, &p1.circuit, &p1.devices);
+    let d1 = p1.assemble(&mut ctx);
     let p2 = parse(&doubled).expect("doubled parses");
-    let d2 = assemble_dae(&mut ctx, &p2.circuit, &p2.devices);
+    let d2 = p2.assemble(&mut ctx);
     // Evaluate the node-1 KCL residual at the same point: the m=2 device
     // contributes exactly twice the branch current.
     let mut env = std::collections::HashMap::new();

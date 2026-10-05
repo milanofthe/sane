@@ -9,10 +9,12 @@ use sane_core::Graph;
 use sane_dae::Dae;
 
 /// The residual equations `0 = F_i(x, x', t)` as a LaTeX `aligned` block.
-pub fn export_latex(ctx: &Graph, dae: &Dae) -> String {
+pub fn export_latex(ctx: &mut Graph, dae: &Dae) -> String {
+    // Device instances are calls; the equations print their expressions.
+    let residuals = ctx.inline_all(&dae.residuals);
     let mut s = String::new();
     s.push_str("\\begin{aligned}\n");
-    for &r in &dae.residuals {
+    for &r in &residuals {
         s.push_str(&format!("0 &= {} \\\\\n", latex_expr(ctx, r)));
     }
     s.push_str("\\end{aligned}\n");
@@ -143,7 +145,9 @@ pub fn export_dot(ctx: &Graph, roots: &[(ExprId, String)], highlight: &[ExprId])
             _ => None,
         })
         .collect();
-    let mut view = GraphView::new(ctx).theme(theme()).params(&params);
+    // The whole hierarchy: every device model and subcircuit body the
+    // residuals call, drawn once in its frame, each call linked to it.
+    let mut view = GraphView::new(ctx).theme(theme()).params(&params).bodies();
     for (r, name) in roots {
         view = view.root(*r, name);
     }
@@ -226,7 +230,7 @@ mod tests {
             vec![2, 0],
         )];
         let dae = assemble_dae(&mut ctx, &c, &devs);
-        let tex = export_latex(&ctx, &dae);
+        let tex = export_latex(&mut ctx, &dae);
         assert!(tex.contains("\\begin{aligned}"));
         assert!(tex.contains("\\exp\\left"));
         assert_eq!(tex.matches("0 &=").count(), dae.dim());

@@ -71,7 +71,7 @@ HSPICE single-quoted geometry expressions. Source waveforms: `DC`, `AC`, `SIN`,
 |---|---|
 | `.param name=expr` | named parameter, usable in `{expr}` |
 | `.model name type(...)` | model card; `type` is a built-in or a bound Verilog-A module |
-| `.subckt` / `X` | subcircuit definition / instance (flattened) |
+| `.subckt` / `X` | subcircuit definition / instance (one shared function per body) |
 | `.veriloga "file.va"` or inline `.veriloga ... .endveriloga` | load a Verilog-A module |
 | `.model_alias level=N module` | bind a SPICE `level` to a Verilog-A module |
 | `.temp` / `.option scale=...` | global temperature [°C] / drawn-to-meter scale |
@@ -125,7 +125,7 @@ is a thin wrapper; orchestration, parameter store and analyses are in Rust
 | Function | Returns | Purpose |
 |---|---|---|
 | `parse(netlist)` | `Circuit` | shorthand for `Circuit.parse` |
-| `set_parallelism(threads)` | `None` | worker threads of the parallel sweeps (AC/noise over frequency, HB device sampling): `n`=n, `0`=the default (4). Set it before the first sweep |
+| `set_parallelism(threads)` | `None` | threads for the parallel work: the sweeps (AC/noise over frequency, HB device sampling) and, in every solve, the device instances of each evaluation: `n`=n, `0`=the default (4). Set it before the first analysis |
 | `set_log_level(level="info")` | `None` | native logging: `"debug"`/`"info"`/`"warning"`/`"error"`/`"off"` |
 | `profile_begin()` / `profile_take()` | `None` / `list[(stage, ms)]` | collect per-stage timings |
 | `reduced_netlist(netlist, transforms)` | `str` | apply graph transforms, emit a smaller netlist |
@@ -145,7 +145,9 @@ for chaining. A node reference is a string name (or `0`/ground alias).
 **Construction**
 - `Circuit()` — empty circuit
 - `Circuit.parse(netlist: str) -> Circuit` *(classmethod)* — parse a SPICE netlist
-- `extract() -> Model` — lower to an analyzable `Model`
+- `extract(fold=None, keep=None) -> Model` — lower to an analyzable `Model`;
+  `fold` names parameters (or groups) to fold to their values, `keep` the only
+  ones to keep symbolic
 
 **Linear / controlled elements** — each returns `Circuit`
 - `resistor(name, n1, n2, value=None)`
@@ -247,10 +249,11 @@ The model shares the symbolic `Context`, so its equations come back as `Expr`.
 - `latex() -> str`, `transfer_latex(input, output) -> str`, `to_dot(...) -> str`
 
 **Transforms** (return a new `Model` on the same context)
-- `linearize(canonical=False)` — small-signal mass-matrix DAE `G·dx + C·dx' = 0`
+- `linearize()` — small-signal mass-matrix DAE `G·dx + C·dx' = 0`
 - `reduce(rel_tol=1e-3, freqs=None, values=None, x0=None)` — OP-guided branch pruning; sets `.transforms`
 - `eliminate(keep=None)` — exact resistive-node elimination; sets `.eliminated`
 - `fold(*paths)` — bind parameters/groups to their current value (constant-fold, drop from the sensitivity set)
+- `keep(*paths)` — fold every parameter except the named ones/groups (a few tuning knobs among many fixed device parameters)
 
 ## Result objects
 
@@ -442,10 +445,9 @@ benchmarking and debugging; the log level (`SANE_LOG`) and the test-corpus locat
 
 | Variable | Effect |
 |---|---|
-| `SANE_THREADS` | worker threads of the parallel sweeps, default 4 (see also `set_parallelism`); the linear solves themselves are sequential |
+| `SANE_THREADS` | threads, default 4 (see also `set_parallelism`): the sweeps' frequencies and HB samples, and in every solve the device instances of each evaluation; the linear solves themselves are sequential |
 | `SANE_JIT` | `0` disables the native compilation of hot tapes (default on; build must have the `jit` feature) |
 | `SANE_TAPE_SPEC` | `0` disables choice specialization of the circuit-level tapes |
-| `SANE_NO_DEVBUNDLE` | set to inline every Verilog-A instance as its own graph clone instead of calls into one shared function body |
 | `SANE_TRAN_FIXED` | force a fixed transient step instead of adaptive |
 | `SANE_EVENTS` | `0` disables locating the declared switching surfaces (the controller then finds every mode change through rejects; the A/B reference) |
 | `SANE_LOG` | log level (`debug`/`info`/`warning`/`error`); the sparse solver's own records (rslab: ordering picked, fill, threads, factor time) appear at `debug` with an `rslab:` prefix, its warnings at `warning`, and rsdag's compile stages likewise with an `rsdag:` prefix |
@@ -453,7 +455,11 @@ benchmarking and debugging; the log level (`SANE_LOG`) and the test-corpus locat
 | `SANE_TRAN_TRACE` | per-candidate transient step trace: time, size, error, verdict, located events, stage Newton iterations |
 | `SANE_VA_CORPUS` | path to a Verilog-A model corpus (for the corpus tests) |
 | `SANE_VA_TRACE_NAN` | report non-finite compile-time constants during VA lowering |
-| `SANE_NO_TEMPLATE` | lower every Verilog-A instance from scratch instead of once per module structure |
+| `SANE_VA_DEBUG_WHILE` | trace the unrolling scan of Verilog-A `while` loops |
+| `SANE_NO_COLLAPSE` | lower every statically zero-volt Verilog-A branch as an explicit source with its own unknown instead of merging its nodes |
+| `SANE_HB_BAND` | harmonic-balance Jacobian bandwidth `B` (harmonics k and l coupled only within B of each other); unset keeps the full blocks |
+| `SANE_DUMP_MATRIX` | directory to write the assembled linear systems to, as Matrix Market (`sane_<n>_<k>.mtx`, right-hand side `sane_<n>_<k>_b.mtx`), real and complex alike |
+| `SANE_DUMP_LIMIT` | how many systems `SANE_DUMP_MATRIX` writes, default 1 |
 
 ## Crates
 
@@ -462,7 +468,7 @@ benchmarking and debugging; the log level (`SANE_LOG`) and the test-corpus locat
 | `sane-core` | SANE's constants, configuration, logging, profiling and the lowering of named math calls; the graph itself is rsdag |
 | `vendor/rsdag` | the expression graph, differentiation, tape, native backend and the sparse solve programs (vendored, see `vendor/rsdag/VENDOR.md`) |
 | `sane-mna` | MNA stamps, symbolic determinant, Cramer → `H(s)` |
-| `sane-netlist` | SPICE parser (preprocessor, expressions, subckt flattening) |
+| `sane-netlist` | SPICE parser (preprocessor, expressions, subckt hierarchy) |
 | `sane-veriloga` | native Verilog-A frontend (parse → elaborate → lower to DAG); ships the built-in device models as Verilog-A source (`builtin/*.va`) |
 | `sane-device` | the device contract (`lower_behavioral` → DAE fragment) and lowering support types |
 | `sane-dae` | DAE assembly + small-signal matrix |
@@ -470,6 +476,37 @@ benchmarking and debugging; the log level (`SANE_LOG`) and the test-corpus locat
 | `sane-analysis` | high-level analyses (OP/transient/AC/sweeps/PZ/noise/MOR/opt) |
 | `sane-export` | export to LaTeX and Python/NumPy |
 | `sane-py` | PyO3 binding |
+
+## Performance
+
+Against ngspice-41 and Xyce 7.10 on an AMD Ryzen 9 9900X (Windows 11), every
+tool on one thread. SANE runs each analysis once untimed, then five times, and
+records the best; ngspice the mean of 20 runs in one session, Xyce the best of
+three solver run times. Every tool starts from the same node set and, in
+transient, runs with the same step bound and relative tolerance (1e-4).
+
+The fifteen SKY130 AnalogGym amplifiers (BSIM4, 148 to 252 unknowns): the
+operating point about as fast as ngspice (faster on 9 of 15) and ten times
+faster than Xyce; the AC sweep at half ngspice's speed and 3.4 times faster
+than Xyce.
+
+![AnalogGym amplifiers against ngspice and Xyce](assets/bench/amplifiers.svg)
+
+The textbook corpus (30 circuits up to the uA741): the AC sweep at 0.8 times
+ngspice's speed and 6.7 times faster than Xyce, the transient at 0.4 times
+ngspice's speed and 2.6 times faster than Xyce (geometric means).
+
+![Corpus against ngspice and Xyce](assets/bench/corpus.svg)
+
+SANE runs on 4 threads by default (`SANE_THREADS`, `set_parallelism`): in
+every solve the device instances of each evaluation (the operating point,
+the transient, harmonic balance), and the frequencies of AC and noise
+sweeps. On the amplifiers at 4 threads the operating point takes 3.8 ms
+instead of 5.6 and the AC sweep 3.8 ms instead of 9.1, against ngspice's 4.7
+and 4.0 ms, which its OpenMP device load does not change on circuits of this
+size. The results do not depend on the thread count.
+
+![The amplifiers over the thread count](assets/bench/threads.svg)
 
 ## Validation
 

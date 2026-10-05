@@ -730,10 +730,11 @@ class Circuit:
 
     @property
     def elements(self):
-        """list[dict]: the linear / controlled elements, each as
+        """list[dict]: the top level's linear / controlled elements, each as
         ``{"name", "kind", "nodes", "control"}`` (node ids mapped back to names;
         ``control`` is the sensed element for F/H sources, else ``None``).
-        Nonlinear devices are not included; see :attr:`device_count`."""
+        Nonlinear devices and the elements inside subcircuit instances are not
+        included; see :attr:`device_count`."""
         names = self._names
         out = []
         for name, kind, a, b, ctrl in self._raw.elements():
@@ -753,10 +754,11 @@ class Circuit:
 
     @property
     def device_count(self):
-        """int: number of nonlinear device instances (D/M/Q/switches)."""
+        """int: number of the top level's nonlinear device instances
+        (D/M/Q/switches); devices inside subcircuit instances are not counted."""
         return self._raw.device_count()
 
-    def extract(self):
+    def extract(self, fold=None, keep=None):
         """Extract the circuit as an analyzable :class:`~sane.model.Model`
         (the symbolic differential-algebraic system ``F(x, x', t) = 0`` with its
         analytic Jacobians).
@@ -764,6 +766,18 @@ class Circuit:
         The returned object carries every analysis (DC operating point,
         transient, small-signal poles / AC response, and exact component
         sensitivity), all labeled by node and parameter name.
+
+        Every parameter is symbolic by default. ``fold`` names parameters (or
+        groups) to fold to their values, ``keep`` the only ones to keep
+        symbolic (see :meth:`~sane.model.Model.fold` and
+        :meth:`~sane.model.Model.keep`); give at most one.
+
+        Parameters
+        ----------
+        fold : iterable[str], optional
+            parameter or group paths to fold
+        keep : iterable[str], optional
+            parameter or group paths to keep; every other one is folded
 
         Returns
         -------
@@ -793,6 +807,12 @@ class Circuit:
         # power ports from deck `P` elements: (name, node, z0) per port, in
         # deck order; Model.sp() picks these up when no ports are passed
         m._deck_ports = list(self._raw.ports()) if hasattr(self._raw, "ports") else []
+        if fold is not None and keep is not None:
+            raise ValueError("extract: give fold or keep, not both")
+        if fold is not None or keep is not None:
+            ports = m._deck_ports
+            m = m.fold(fold) if fold is not None else m.keep(keep)
+            m._deck_ports = ports
         return m
 
     def extract_dae(self):

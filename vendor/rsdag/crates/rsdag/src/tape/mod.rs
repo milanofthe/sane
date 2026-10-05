@@ -218,6 +218,141 @@ mod topo;
 
 pub use specialize::SpecializedTape;
 
+/// Consecutive calls of a tape that read nothing another of them writes:
+/// every instance of every call in it is a piece of work of its own, run
+/// together on the installed pool ([`crate::parallel`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stage {
+    /// The calls are ops `lo..hi`.
+    pub lo: u32,
+    pub hi: u32,
+    /// Instances over all its calls.
+    pub instances: u32,
+    /// Ops it carries: per call, its instances times its body's ops.
+    pub ops: u64,
+}
+
+/// Ops a call of a bundle without a body ([`ExternBundle::body`]) counts as,
+/// per instance.
+const OPAQUE_OPS: u64 = 1000;
+
+/// Ops one instance of `call` runs in its bundle's body: the prolog for a
+/// prolog, the main phase for a call over a state, all of it for a call
+/// without one. A bundle without a body counts [`OPAQUE_OPS`].
+pub fn call_ops(bundle: &dyn ExternBundle, call: &Op) -> u64 {
+    let Some(t) = bundle.body() else {
+        return OPAQUE_OPS;
+    };
+    let (all, prolog) = (t.n_ops() as u64, t.prolog_len() as u64);
+    match *call {
+        Op::CallProlog { .. } => prolog.max(1),
+        Op::Call { state, .. } if state != NO_STATE => (all - prolog).max(1),
+        _ => all.max(1),
+    }
+}
+
+/// The stages of an op stream (see [`Stage`]): each maximal run of
+/// consecutive calls, within the prolog or within the main phase, in which
+/// no call reads or overwrites a slot another one writes, and which holds
+/// at least two instances.
+fn plan_stages(
+    ops: &[Op],
+    dst: &[u32],
+    pool: &[u32],
+    bundles: &[Arc<dyn ExternBundle>],
+    prolog_ops: usize,
+) -> Vec<Stage> {
+    // Per call: the slots it reads, the slots it writes, instances, ops.
+    let call = |i: usize| -> Option<(Vec<(u32, u32)>, (u32, u32), u32, u64)> {
+        let d = dst[i];
+        let slots = |start: u32, len: u32| {
+            pool[start as usize..(start + len) as usize]
+                .iter()
+                .filter(|&&k| input_index(k).is_none())
+                .map(|&k| (k, k + 1))
+                .collect::<Vec<_>>()
+        };
+        let (bundle, mut reads, width, ng) = match ops[i] {
+            Op::Call {
+                bundle,
+                start,
+                n_groups,
+                n_args,
+                n_out,
+                state,
+            } => {
+                let mut r = slots(start, n_groups * n_args);
+                if state != NO_STATE {
+                    let sl = bundles[bundle as usize].state_len() as u32;
+                    r.push((state, state + n_groups * sl));
+                }
+                (bundle, r, n_groups * n_out, n_groups)
+            }
+            Op::CallProlog {
+                bundle,
+                start,
+                n_groups,
+                n_pure,
+            } => {
+                let sl = bundles[bundle as usize].state_len() as u32;
+                (
+                    bundle,
+                    slots(start, n_groups * n_pure),
+                    n_groups * sl,
+                    n_groups,
+                )
+            }
+            _ => return None,
+        };
+        reads.sort_unstable();
+        let per = call_ops(&*bundles[bundle as usize], &ops[i]);
+        Some((reads, (d, d + width), ng, ng as u64 * per))
+    };
+    let overlaps = |a: (u32, u32), b: (u32, u32)| a.0 < b.1 && b.0 < a.1;
+    let mut stages = Vec::new();
+    let mut i = 0;
+    while i < ops.len() {
+        let Some(first) = call(i) else {
+            i += 1;
+            continue;
+        };
+        let end = if i < prolog_ops {
+            prolog_ops
+        } else {
+            ops.len()
+        };
+        let (mut reads, mut writes) = (first.0, vec![first.1]);
+        let (mut instances, mut work) = (first.2, first.3);
+        let mut hi = i + 1;
+        while hi < end {
+            let Some((r, w, ng, o)) = call(hi) else {
+                break;
+            };
+            let clash = r.iter().any(|&a| writes.iter().any(|&b| overlaps(a, b)))
+                || writes.iter().any(|&b| overlaps(w, b))
+                || reads.iter().any(|&a| overlaps(a, w));
+            if clash {
+                break;
+            }
+            reads.extend(r);
+            writes.push(w);
+            instances += ng;
+            work += o;
+            hi += 1;
+        }
+        if instances >= 2 {
+            stages.push(Stage {
+                lo: i as u32,
+                hi: hi as u32,
+                instances,
+                ops: work,
+            });
+        }
+        i = hi;
+    }
+    stages
+}
+
 /// A compiled evaluator for a set of expression roots.
 pub struct Tape {
     ops: Vec<Op>,
@@ -243,6 +378,8 @@ pub struct Tape {
     state_len: usize,
     /// The inputs it was compiled over (`input_syms.len()`).
     n_inputs: usize,
+    /// Its independent calls, by op range (see [`Stage`]).
+    stages: Vec<Stage>,
 }
 
 /// A compiled program as a solver drives it, whichever backend runs it:
@@ -613,7 +750,21 @@ impl Tape {
         // per call.
         let (work, scratch) = work.split_at_mut(self.n_work);
         let pool = |start: u32, len: u32| &self.arg_pool[start as usize..(start + len) as usize];
+        // The next stage at or after `lo`, and the op a stage run jumps to.
+        let mut next = self.stages.partition_point(|st| (st.lo as usize) < lo);
+        let mut skip = lo;
         for i in lo..hi {
+            if i < skip {
+                continue;
+            }
+            if let Some(st) = self.stages.get(next).filter(|st| st.lo as usize == i) {
+                next += 1;
+                if st.hi as usize <= hi && crate::parallel::worth(st.ops as usize) {
+                    self.run_stage(inputs, work, st);
+                    skip = st.hi as usize;
+                    continue;
+                }
+            }
             let g = |k: u32| read(inputs, work, k);
             let d = self.dst[i] as usize;
             let v = match self.ops[i] {
@@ -798,6 +949,93 @@ impl Tape {
         }
     }
 
+    /// The calls of `st` on the installed pool: every instance of every call
+    /// a piece of work (in blocks, see [`crate::parallel::block`]), over
+    /// scratch of the thread running it. An instance computes what the
+    /// serial loop does: its arguments, its state, its bundle's call.
+    fn run_stage<T: Scalar>(&self, inputs: &[T], work: &mut [T], st: &Stage) {
+        let bs = crate::parallel::block(st.instances as usize) as u32;
+        // (op, first instance, past the last) per piece of work.
+        let mut items: Vec<(u32, u32, u32)> = Vec::new();
+        for i in st.lo..st.hi {
+            let ng = match self.ops[i as usize] {
+                Op::Call { n_groups, .. } | Op::CallProlog { n_groups, .. } => n_groups,
+                _ => unreachable!("a stage holds calls only"),
+            };
+            items.extend(
+                (0..ng)
+                    .step_by(bs as usize)
+                    .map(|g0| (i, g0, (g0 + bs).min(ng))),
+            );
+        }
+        let base = SharedSlots(work.as_mut_ptr(), work.len());
+        let run = |item: usize| {
+            let (i, g0, g1) = items[item];
+            let d = self.dst[i as usize] as usize;
+            // SAFETY: `plan_stages` admits a call to a stage only if it reads
+            // no slot another call of the stage writes and writes no slot
+            // another one reads or writes, and an instance writes its own
+            // part of its call's block: every slice below is either read by
+            // all or written by exactly one piece of work.
+            let slot = |k: u32| match input_index(k) {
+                Some(j) => inputs.get(j as usize).copied().unwrap_or(T::nan()),
+                None => unsafe { base.get(k as usize) },
+            };
+            match self.ops[i as usize] {
+                Op::Call {
+                    bundle,
+                    start,
+                    n_args,
+                    n_out,
+                    state,
+                    ..
+                } => {
+                    let b = &*self.bundles[bundle as usize];
+                    let (na, no) = (n_args as usize, n_out as usize);
+                    let args = &self.arg_pool[start as usize..];
+                    crate::parallel::with_scratch(na + b.work_len(), T::zero(), |sc| {
+                        let (a, bwork) = sc.split_at_mut(na);
+                        for gi in g0 as usize..g1 as usize {
+                            for (j, &k) in args[gi * na..(gi + 1) * na].iter().enumerate() {
+                                a[j] = slot(k);
+                            }
+                            let out = unsafe { base.slice_mut(d + gi * no, no) };
+                            if state == NO_STATE {
+                                T::call_bundle_whole(b, a, bwork, out);
+                            } else {
+                                let sl = b.state_len();
+                                let st = unsafe { base.slice(state as usize + gi * sl, sl) };
+                                T::call_bundle_main(b, a, st, bwork, out);
+                            }
+                        }
+                    });
+                }
+                Op::CallProlog {
+                    bundle,
+                    start,
+                    n_pure,
+                    ..
+                } => {
+                    let b = &*self.bundles[bundle as usize];
+                    let (np, sl) = (n_pure as usize, b.state_len());
+                    let args = &self.arg_pool[start as usize..];
+                    crate::parallel::with_scratch(np + b.work_len(), T::zero(), |sc| {
+                        let (a, bwork) = sc.split_at_mut(np);
+                        for gi in g0 as usize..g1 as usize {
+                            for (j, &k) in args[gi * np..(gi + 1) * np].iter().enumerate() {
+                                a[j] = slot(k);
+                            }
+                            let out = unsafe { base.slice_mut(d + gi * sl, sl) };
+                            T::call_bundle_prolog(b, a, bwork, out);
+                        }
+                    });
+                }
+                _ => unreachable!("a stage holds calls only"),
+            }
+        };
+        crate::parallel::run(items.len(), st.ops as usize, &run);
+    }
+
     /// Output operands, one per root: a slot, or an input when tagged.
     pub fn outputs(&self) -> &[u32] {
         &self.outputs
@@ -934,6 +1172,11 @@ impl Tape {
     pub fn n_ops(&self) -> usize {
         self.ops.len()
     }
+
+    /// Its stages of independent calls, in op order (see [`Stage`]).
+    pub fn stages(&self) -> &[Stage] {
+        &self.stages
+    }
 }
 
 /// A tape with the buffers to run it, for callers that want values rather
@@ -971,6 +1214,39 @@ impl<T: Scalar> Runner<'_, T> {
     /// The outputs of the last evaluation.
     pub fn outputs(&self) -> &[T] {
         &self.out
+    }
+}
+
+/// The slots of a work buffer shared by the pieces of work of a stage, which
+/// read and write disjoint parts of it (see [`Tape::run_stage`]).
+#[derive(Clone, Copy)]
+struct SharedSlots<T>(*mut T, usize);
+
+// SAFETY: the pieces of work of a stage access disjoint parts of the
+// buffer, or read the same slots; see `plan_stages`.
+unsafe impl<T: Send> Send for SharedSlots<T> {}
+unsafe impl<T: Sync> Sync for SharedSlots<T> {}
+
+impl<T: Copy> SharedSlots<T> {
+    /// # Safety
+    /// No piece of work writes slot `k` while this runs.
+    unsafe fn get(self, k: usize) -> T {
+        assert!(k < self.1);
+        unsafe { *self.0.add(k) }
+    }
+    /// # Safety
+    /// No piece of work writes `at..at + n` while the slice lives.
+    unsafe fn slice<'a>(self, at: usize, n: usize) -> &'a [T] {
+        assert!(at + n <= self.1);
+        unsafe { std::slice::from_raw_parts(self.0.add(at), n) }
+    }
+    /// # Safety
+    /// No other piece of work reads or writes `at..at + n` while the slice
+    /// lives.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn slice_mut<'a>(self, at: usize, n: usize) -> &'a mut [T] {
+        assert!(at + n <= self.1);
+        unsafe { std::slice::from_raw_parts_mut(self.0.add(at), n) }
     }
 }
 

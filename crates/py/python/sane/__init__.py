@@ -132,19 +132,20 @@ from .netlist import reduced_netlist
 
 
 def set_parallelism(threads):
-    """Set the sparse-LU parallelism: ``1`` sequential, ``0`` all rayon threads,
-    ``n`` exactly ``n`` threads.
+    """Set the number of threads for the parallel work: the sweeps (AC and
+    noise over frequency, harmonic-balance device sampling) and, in every
+    solve (operating point, transient, harmonic balance), the device
+    instances of each evaluation. Results do not depend on it. The linear
+    solves themselves are sequential.
 
-    The solver runs sequentially by default. Measured, faer's parallel sparse LU
-    is neutral-to-harmful on the narrow elimination trees of 2D parasitic meshes,
-    so this is an opt-in knob -- most useful for pinning ``1`` (sequential)
-    inside an outer parallel sweep (frequency / tolerance), which is where real
-    throughput parallelism lives.
+    Takes effect before the first analysis; the default is 4 (or the
+    ``SANE_THREADS`` environment variable).
 
     Parameters
     ----------
     threads : int
-        ``1`` sequential, ``0`` all available threads, ``n`` for ``n`` threads
+        ``n`` for ``n`` threads, ``1`` for none in parallel, ``0`` for the
+        default
     """
     _core.set_parallelism(threads)
 

@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::f64::consts::PI;
 
 use num_complex::Complex64;
+use rayon::prelude::*;
 use rsdag::{differentiate, eval, ExprId, Node, SymbolId};
 use sane_core::log;
 use sane_core::Graph;
@@ -13,6 +14,10 @@ use sane_dae::{ac_param_derivatives, small_signal_transfer, Dae as CoreDae};
 use sane_solve::CompiledDc;
 
 use crate::model::{Model, ModelError};
+
+/// Frequencies per block of an AC sweep: one pivoting factorization each, a
+/// unit of work for one worker.
+pub const AC_BLOCK: usize = 64;
 use crate::op_env;
 
 /// Cached weighted-adjoint tape for one AC input (see
@@ -132,6 +137,11 @@ impl Model {
     /// `out_idx`, at the operating point `x`, solved numerically per frequency in
     /// Rust: `e_out^T (G + jwC)^{-1} (-dF/d(input))`. Returns `(re, im)` per
     /// frequency.
+    ///
+    /// The frequencies run in blocks of [`AC_BLOCK`] on SANE's worker pool
+    /// (`SANE_THREADS`): a block factors at its first frequency with pivoting
+    /// and refactors numerically after it. The blocks are fixed, so the result
+    /// does not depend on the thread count.
     pub fn ac_response(
         &self,
         input: &str,
@@ -168,23 +178,35 @@ impl Model {
             (&cr, &cc, &cv),
             (&dr, &dc, &dv, &dtau),
             false,
+            2.0 * PI * freqs_hz.first().copied().unwrap_or(0.0),
         );
-        let mut fac = sym.as_ref().map(|s| s.solver());
-        let mut out = Vec::with_capacity(freqs_hz.len());
-        for f in freqs_hz {
-            let w = 2.0 * PI * f;
-            // A singular A = G + jwC (floating subnet, ideal VCVS/inductor loop,
-            // garbage DC point) has no small-signal solution at this frequency.
-            // Surface it as NaN -- a catchable signal the Python layer turns into a
-            // warning -- instead of silently coercing to 0.0, which reads as a flat
-            // ~-600 dB response and masquerades as a size limit (issue #39).
-            let h = fac
-                .as_mut()
-                .and_then(|fa| fa.solve(w, &b))
-                .map(|xx| xx[out_idx])
-                .unwrap_or(Complex64::new(f64::NAN, f64::NAN));
-            out.push((h.re, h.im));
-        }
+        let blocks: Vec<Vec<(f64, f64)>> = sane_solve::parallel::install(|| {
+            freqs_hz
+                .par_chunks(AC_BLOCK)
+                .map(|block| {
+                    let mut fac = sym.as_ref().map(|s| s.solver());
+                    block
+                        .iter()
+                        .map(|&f| {
+                            // A singular A = G + jwC (floating subnet, ideal
+                            // VCVS/inductor loop, garbage DC point) has no
+                            // small-signal solution at this frequency. Surface it
+                            // as NaN -- a catchable signal the Python layer turns
+                            // into a warning -- instead of silently coercing to
+                            // 0.0, which reads as a flat ~-600 dB response and
+                            // masquerades as a size limit (issue #39).
+                            let h = fac
+                                .as_mut()
+                                .and_then(|fa| fa.solve(2.0 * PI * f, &b))
+                                .map(|xx| xx[out_idx])
+                                .unwrap_or(Complex64::new(f64::NAN, f64::NAN));
+                            (h.re, h.im)
+                        })
+                        .collect()
+                })
+                .collect()
+        });
+        let out: Vec<(f64, f64)> = blocks.concat();
         let singular = out.iter().filter(|(re, _)| re.is_nan()).count();
         task.finish(if singular > 0 {
             format!("points: {}, singular: {singular}", out.len())
@@ -192,6 +214,38 @@ impl Model {
             format!("points: {}", out.len())
         });
         Ok(out)
+    }
+
+    /// The AC sweep over a log grid of `points` frequencies in `[fstart, fstop]`
+    /// at the operating point `(x, p)`: [`ac_response`](Self::ac_response) as
+    /// `(freqs, mag_db, phase_deg)`.
+    #[allow(clippy::type_complexity)]
+    pub fn ac_sweep(
+        &self,
+        input: &str,
+        out_idx: usize,
+        x: Vec<f64>,
+        p: Vec<f64>,
+        fstart: f64,
+        fstop: f64,
+        points: usize,
+    ) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>), ModelError> {
+        if !(fstart > 0.0) || !(fstop > fstart) || points < 2 {
+            return Err(ModelError::Numeric(
+                "AC needs 0 < fstart < fstop and points >= 2".into(),
+            ));
+        }
+        let (l0, l1) = (fstart.log10(), fstop.log10());
+        let freqs: Vec<f64> = (0..points)
+            .map(|k| 10f64.powf(l0 + (l1 - l0) * k as f64 / (points - 1) as f64))
+            .collect();
+        let h = self.ac_response(input, out_idx, x, p, freqs.clone())?;
+        let mag_db = h
+            .iter()
+            .map(|&(re, im)| 20.0 * re.hypot(im).max(1e-30).log10())
+            .collect();
+        let phase_deg = h.iter().map(|&(re, im)| im.atan2(re).to_degrees()).collect();
+        Ok((freqs, mag_db, phase_deg))
     }
 
     /// Exact AC-transfer sensitivity `dH/dp(jw)` from `input` w.r.t. `param` at
@@ -240,55 +294,69 @@ impl Model {
         p: Vec<f64>,
         freq: f64,
     ) -> Result<Vec<(String, f64, f64)>, ModelError> {
+        let (names, mut rows) = self.ac_gradient_sweep(input, out_idx, x, p, &[freq])?;
+        let (_, d) = rows.pop().unwrap_or_default();
+        Ok(names.into_iter().zip(d).map(|(nm, (re, im))| (nm, re, im)).collect())
+    }
+
+    /// [`Model::ac_gradient`] over a sweep: per frequency the transfer `H`
+    /// and `(dHre/dp, dHim/dp)` for every parameter (in the order of the
+    /// returned names), the frequency-independent setup done once.
+    #[allow(clippy::type_complexity)]
+    pub fn ac_gradient_sweep(
+        &self,
+        input: &str,
+        out_idx: usize,
+        x: Vec<f64>,
+        p: Vec<f64>,
+        freqs: &[f64],
+    ) -> Result<(Vec<String>, Vec<((f64, f64), Vec<(f64, f64)>)>), ModelError> {
         self.ensure_no_delays("ac_gradient")?;
         let _g = log::scope("sens/ac_gradient");
         let setup = self.ac_adjoint_setup(input, &x, &p)?;
-        let w = 2.0 * PI * freq;
-        let sys = crate::sparse_ac::AcSystem::assemble(
-            setup.n,
-            (&setup.gr_s, &setup.gc_s, &setup.gv_s),
-            (&setup.cr_s, &setup.cc_s, &setup.cv_s),
-            w,
-        );
-        let lu = sys
-            .factored()
-            .ok_or_else(|| ModelError::Numeric("ac_gradient: singular A".to_string()))?;
-        let v = lu
-            .solve(&setup.b)
-            .map_err(|_| ModelError::Numeric("ac_gradient: singular A".to_string()))?;
-        let mut e_out = vec![Complex64::new(0.0, 0.0); setup.n];
-        e_out[out_idx] = Complex64::new(1.0, 0.0);
-        let lam = lu
-            .solve_transpose(&e_out)
-            .map_err(|_| ModelError::Numeric("ac_gradient: singular A^T".to_string()))?;
-
-        // Two weight assignments on the SAME tape: the real and imaginary
-        // parts of Psi = lam^T (b - A v) (see AcVjpTape).
-        let (u_re, expl_re) = self.ac_adjoint_pull(&setup, &lam, &v, w, false)?;
-        let (u_im, expl_im) = self.ac_adjoint_pull(&setup, &lam, &v, w, true)?;
-
-        // Operating-point shift: one complex DC transpose solve carries re/im.
-        let urhs: Vec<Complex64> = (0..setup.n)
-            .map(|m| Complex64::new(u_re[m], u_im[m]))
-            .collect();
-        let mu = setup
-            .gsys
-            .solve_transpose(&urhs)
-            .ok_or_else(|| ModelError::Numeric("ac_gradient: singular DC Jacobian".to_string()))?;
         let np = setup.pnames.len();
-        let mut sh_re = vec![0.0; np];
-        let mut sh_im = vec![0.0; np];
-        for t in 0..setup.prv.len() {
-            let (i, k) = (setup.prr[t], setup.prc[t]);
-            sh_re[k] -= mu[i].re * setup.prv[t];
-            sh_im[k] -= mu[i].im * setup.prv[t];
+        let mut rows = Vec::with_capacity(freqs.len());
+        for &f in freqs {
+            let w = 2.0 * PI * f;
+            let sys = crate::sparse_ac::AcSystem::assemble(
+                setup.n,
+                (&setup.gr_s, &setup.gc_s, &setup.gv_s),
+                (&setup.cr_s, &setup.cc_s, &setup.cv_s),
+                w,
+            );
+            let lu = sys
+                .factored()
+                .ok_or_else(|| ModelError::Numeric("ac_gradient: singular A".to_string()))?;
+            let v = lu
+                .solve(&setup.b)
+                .map_err(|_| ModelError::Numeric("ac_gradient: singular A".to_string()))?;
+            let mut e_out = vec![Complex64::new(0.0, 0.0); setup.n];
+            e_out[out_idx] = Complex64::new(1.0, 0.0);
+            let lam = lu
+                .solve_transpose(&e_out)
+                .map_err(|_| ModelError::Numeric("ac_gradient: singular A^T".to_string()))?;
+
+            // Two weight assignments on the SAME tape: the real and imaginary
+            // parts of Psi = lam^T (b - A v) (see AcVjpTape).
+            let (u_re, expl_re) = self.ac_adjoint_pull(&setup, &lam, &v, w, false)?;
+            let (u_im, expl_im) = self.ac_adjoint_pull(&setup, &lam, &v, w, true)?;
+
+            // Operating-point shift: one complex DC transpose solve carries re/im.
+            let urhs: Vec<Complex64> = (0..setup.n)
+                .map(|m| Complex64::new(u_re[m], u_im[m]))
+                .collect();
+            let mu = setup.gsys.solve_transpose(&urhs).ok_or_else(|| {
+                ModelError::Numeric("ac_gradient: singular DC Jacobian".to_string())
+            })?;
+            let mut d: Vec<(f64, f64)> = (0..np).map(|k| (expl_re[k], expl_im[k])).collect();
+            for t in 0..setup.prv.len() {
+                let (i, k) = (setup.prr[t], setup.prc[t]);
+                d[k].0 -= mu[i].re * setup.prv[t];
+                d[k].1 -= mu[i].im * setup.prv[t];
+            }
+            rows.push(((v[out_idx].re, v[out_idx].im), d));
         }
-        Ok(setup
-            .pnames
-            .iter()
-            .enumerate()
-            .map(|(k, name)| (name.clone(), expl_re[k] + sh_re[k], expl_im[k] + sh_im[k]))
-            .collect())
+        Ok((setup.pnames, rows))
     }
 
     /// Native VJP sweep for S-parameter (and general multi-output AC) losses:
@@ -804,7 +872,6 @@ impl Model {
             x: xs,
             xdot: vec![None; 3 * n],
             t: self.dae().t,
-            stamps: Vec::new(),
             companion: Vec::new(),
             noise_sources: Vec::new(),
             op_vars: Vec::new(),
@@ -812,6 +879,7 @@ impl Model {
             limits: Vec::new(),
             sources: Vec::new(),
             source_names: Vec::new(),
+            labels: Default::default(),
         };
         let cdc_c = CompiledDc::new(c, &combined);
         cdc_c.ensure_param_jac(c, &combined);

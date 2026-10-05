@@ -5,8 +5,9 @@ use sane_mna::index2;
 fn report(src: &str) -> index2::Index2Report {
     let parsed = sane_netlist::parse(src).expect("parse");
     // the nonlinear devices conduct too, so they break cutsets
-    let terminals: Vec<Vec<usize>> = parsed.devices.iter().map(|d| d.terminals.clone()).collect();
-    index2::detect(&parsed.circuit, &terminals)
+    let (elements, terminals) =
+        sane_dae::topology(&parsed.circuit, &parsed.devices, &parsed.instances);
+    index2::detect(&elements, &terminals)
 }
 
 #[test]

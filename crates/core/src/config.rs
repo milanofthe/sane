@@ -26,14 +26,6 @@ pub struct Config {
     /// Choice-specialise the circuit-level tapes after a solve settles
     /// (`SANE_TAPE_SPEC`, `0` disables).
     pub tape_specialization: bool,
-    /// Lower the instances of a multiply-instantiated Verilog-A module as
-    /// calls into one shared compiled body (`SANE_NO_DEVBUNDLE` disables: every
-    /// instance becomes its own graph clone -- the differential reference).
-    pub device_bundles: bool,
-    /// Lower a Verilog-A module once per structure and clone the instances by
-    /// substitution (`SANE_NO_TEMPLATE` disables: every instance is lowered
-    /// from scratch -- the differential reference).
-    pub device_templates: bool,
     /// Merge the nodes of statically zero-volt Verilog-A branches before
     /// lowering (`SANE_NO_COLLAPSE` disables: every such branch lowers as an
     /// explicit source with its own unknown).
@@ -69,8 +61,6 @@ impl Default for Config {
         Config {
             jit: true,
             tape_specialization: true,
-            device_bundles: true,
-            device_templates: true,
             node_collapse: true,
             threads: None,
             transient_fixed_step: false,
@@ -100,12 +90,6 @@ impl Config {
         }
         if off("SANE_TAPE_SPEC") {
             c.tape_specialization = false;
-        }
-        if set("SANE_NO_DEVBUNDLE") {
-            c.device_bundles = false;
-        }
-        if set("SANE_NO_TEMPLATE") {
-            c.device_templates = false;
         }
         if set("SANE_NO_COLLAPSE") {
             c.node_collapse = false;
@@ -162,7 +146,7 @@ mod tests {
     #[test]
     fn defaults_are_the_documented_ones() {
         let c = Config::default();
-        assert!(c.jit && c.tape_specialization && c.device_bundles && c.device_templates);
+        assert!(c.jit && c.tape_specialization);
         assert!(c.threads.is_none() && c.hb_band.is_none());
     }
 

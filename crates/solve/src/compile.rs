@@ -11,7 +11,7 @@ use sane_core::{time_stage, Profile};
 use sane_dae::Dae;
 
 use crate::schur::Partition;
-use crate::{bundle, sparse, CompiledDc, InputSrc, SolverTricks, StepEval, Symbolic};
+use crate::{sparse, CompiledDc, InputSrc, SolverTricks, StepEval, Symbolic};
 
 impl CompiledDc {
     /// Build from a DAE, computing its sparse symbolic Jacobians and compiling
@@ -31,31 +31,16 @@ impl CompiledDc {
         // ~3x slower at n=1e4). The `set_parallelism` knob remains for opt-in
         // experimentation; real throughput parallelism belongs at the outer
         // loop (frequency / tolerance sweeps), not the inner LU.
-        // Assemble the symbolic Jacobians from per-element stamp templates
-        // (differentiate once per distinct element structure, instantiate the rest
-        // by substitution). Transformed DAEs carry no stamps, so fall back to
-        // differentiating the residuals directly.
-        let templated = !dae.stamps.is_empty();
-        let ((jr, jc, je), (xr, xc, xe)) = if templated {
-            // One pass builds both blocks (shared canonicalisation and
-            // instantiation per stamp).
-            time_stage!(
-                prof,
-                "jac_x_xdot_coo",
-                dae.jacobian_x_xdot_coo_templated(ctx)
-            )
-        } else {
-            let jx = time_stage!(prof, "jac_x_coo", dae.jacobian_x_coo(ctx));
-            let jxd = time_stage!(prof, "jac_xdot_coo", dae.jacobian_xdot_coo(ctx));
-            (jx, jxd)
-        };
+        // The symbolic Jacobians in x and x', one sparse Jacobian over both.
+        let ((jr, jc, je), (xr, xc, xe)) =
+            time_stage!(prof, "jac_x_xdot_coo", dae.jacobian_x_xdot_coo(ctx));
         let param_syms = time_stage!(prof, "params", dae.params(ctx));
 
         // The system as a function with roles; every program over it takes
         // its inputs in the function's signature: x, the differential xdot,
         // the parameters, t, the delay histories. The solver also reads what
         // a guard is, and which way it has to cross, off the roles.
-        let sys = dae.register_function(ctx, "dae");
+        let sys = time_stage!(prof, "register", dae.register_function(ctx, "dae"));
         let sig = rsdag::Signature::of(ctx.func(sys));
         let input_syms = sig.syms.clone();
         let mut n_param = 0;
@@ -80,10 +65,6 @@ impl CompiledDc {
             "the parameters in the parameter vector's order"
         );
         let delay_src: Vec<usize> = dae.delays.iter().map(|dl| dl.src).collect();
-        let tape_tau = (!dae.delays.is_empty()).then(|| {
-            let roots: Vec<_> = dae.delays.iter().map(|dl| dl.tau).collect();
-            Tape::compile(ctx, &roots, &param_syms)
-        });
 
         let n_nodes = dae.n_nodes;
         let kinds = dae.unknown_kinds();
@@ -91,16 +72,6 @@ impl CompiledDc {
 
         let mut step_roots = dae.residuals.clone();
         step_roots.extend(je.iter().copied());
-        // Instance batching, phase 1: bind the bundle outputs the RESIDUAL
-        // roots reach to a residual-only body, and compile `tape_res` while
-        // that binding holds (the tape interns the bundle by Arc). The inner
-        // Newton's residual-only evaluations then run a body without the
-        // Jacobian partials -- most of a compact model's work.
-        time_stage!(
-            prof,
-            "function_bodies_res",
-            bundle::ensure_function_bodies(ctx, &dae.residuals)
-        );
         // Tape compilation is the biggest extraction stage on large circuits, and
         // the three passes are independent (`Tape::compile` only reads `&Graph`),
         // so they are embarrassingly parallel. They are kept *sequential* on
@@ -115,16 +86,6 @@ impl CompiledDc {
         // preprocessing, bin interpolation, temperature scalings) hoists into a
         // prefix the Newton loops evaluate once per parameter binding.
         let pure_inputs = sig.pure_mask();
-        let tape_res = time_stage!(
-            prof,
-            "tape_res",
-            crate::eval::step_eval(Tape::compile_split(
-                ctx,
-                &dae.residuals,
-                &input_syms,
-                &pure_inputs
-            ))
-        );
         // Instance batching, phase 2: rebind the union (outputs + partial
         // markers) for the Jacobian-bearing tapes. `tape_res` above keeps the
         // residual-only body it interned; both bodies compute identical bits
@@ -146,26 +107,6 @@ impl CompiledDc {
                 _ => unreachable!("selected by role"),
             })
             .collect();
-        {
-            let mut broots = step_roots.clone();
-            broots.extend(xe.iter().copied());
-            broots.extend(event_roots.iter().copied());
-            time_stage!(
-                prof,
-                "function_bodies",
-                bundle::ensure_function_bodies(ctx, &broots)
-            );
-        }
-        let tape_step = time_stage!(
-            prof,
-            "tape_step",
-            crate::eval::step_eval(Tape::compile_split(
-                ctx,
-                &step_roots,
-                &input_syms,
-                &pure_inputs
-            ))
-        );
         // The hot loops -- every DC Newton and the transient stages -- run at
         // x' = 0: their tapes take the derivatives as zero and every call
         // specialized to that, one pass over the residuals and the Jacobian
@@ -181,28 +122,55 @@ impl CompiledDc {
             let rest = rsdag::substitute(ctx, &step_roots, &at_rest);
             ctx.specialize_calls(&rest)
         });
-        let res_dc = &step_dc[..dae.residuals.len()];
-        time_stage!(
+        // The programs see no boundary but the device bodies: the composite
+        // functions (subcircuit bodies) inlined, so the device calls of every
+        // instance batch together, as in a flat circuit; everything symbolic
+        // above stays on the hierarchy.
+        let taus: Vec<ExprId> = dae.delays.iter().map(|dl| dl.tau).collect();
+        let flat = time_stage!(prof, "inline", {
+            let roots: Vec<ExprId> = step_roots
+                .iter()
+                .chain(&step_dc)
+                .chain(&xe)
+                .chain(&event_roots)
+                .chain(&taus)
+                .copied()
+                .collect();
+            ctx.inline_composite(&roots)
+        });
+        let (step_roots, flat) = flat.split_at(step_roots.len());
+        let (step_dc, flat) = flat.split_at(step_dc.len());
+        let (xe_flat, flat) = flat.split_at(xe.len());
+        let (event_roots, taus) = flat.split_at(event_roots.len());
+        let residuals = &step_roots[..dae.residuals.len()];
+        let tape_tau = (!taus.is_empty()).then(|| Tape::compile(ctx, taus, &param_syms));
+        let tape_res = time_stage!(
             prof,
-            "function_bodies_res_dc",
-            bundle::ensure_function_bodies(ctx, res_dc)
+            "tape_res",
+            crate::eval::step_eval(Tape::compile_split(ctx, residuals, &input_syms, &pure_inputs))
         );
+        let tape_step = time_stage!(
+            prof,
+            "tape_step",
+            crate::eval::step_eval(Tape::compile_split(
+                ctx,
+                step_roots,
+                &input_syms,
+                &pure_inputs
+            ))
+        );
+        let res_dc = &step_dc[..dae.residuals.len()];
         let tape_res_dc = time_stage!(
             prof,
             "tape_res_dc",
             crate::eval::step_eval(Tape::compile_split(ctx, res_dc, &input_syms, &pure_inputs))
-        );
-        time_stage!(
-            prof,
-            "function_bodies_dc",
-            bundle::ensure_function_bodies(ctx, &step_dc)
         );
         let tape_step_dc = time_stage!(
             prof,
             "tape_step_dc",
             crate::eval::step_eval(Tape::compile_split(
                 ctx,
-                &step_dc,
+                step_dc,
                 &input_syms,
                 &pure_inputs
             ))
@@ -210,14 +178,14 @@ impl CompiledDc {
         let tape_jxd = time_stage!(
             prof,
             "tape_jxd",
-            crate::eval::step_eval(Tape::compile(ctx, &xe, &input_syms))
+            crate::eval::step_eval(Tape::compile(ctx, xe_flat, &input_syms))
         );
         // The switching surfaces, evaluated once per candidate transient step.
         let tape_event = (!event_roots.is_empty()).then(|| {
             time_stage!(
                 prof,
                 "tape_event",
-                Tape::compile(ctx, &event_roots, &input_syms)
+                Tape::compile(ctx, event_roots, &input_syms)
             )
         });
         let event_names: Vec<String> = dae.events.iter().map(|e| e.name.clone()).collect();
@@ -243,23 +211,20 @@ impl CompiledDc {
         // balance keeps constant entries frequency-diagonal instead of dense
         // Toeplitz blocks; the Schur partition treats variable entries as the
         // nonlinear block.
-        let var_set: std::collections::HashSet<SymbolId> = dae
+        let vars: Vec<SymbolId> = dae
             .x
             .iter()
             .copied()
             .chain(dae.xdot.iter().flatten().copied())
             .chain(std::iter::once(dae.t))
             .collect();
-        let jx_var: Vec<bool> = je
-            .iter()
-            .map(|&e| ctx.free_symbols(e).iter().any(|s| var_set.contains(s)))
-            .collect();
         // Same classification for the jxd nonzeros (charge storage): a linear
         // capacitor's dC entry is constant, so its harmonic block stays diagonal.
-        let jxd_var: Vec<bool> = xe
-            .iter()
-            .map(|&e| ctx.free_symbols(e).iter().any(|s| var_set.contains(s)))
-            .collect();
+        let (jx_var, jxd_var): (Vec<bool>, Vec<bool>) = time_stage!(
+            prof,
+            "variable_entries",
+            (ctx.depends_on(&je, &vars), ctx.depends_on(&xe, &vars))
+        );
         // SPICE node-current scale tape: the additive current terms of each KCL
         // node row as separate roots, so summing their magnitudes per node yields
         // `sum|I_branch|` for the relative convergence test (no symbolic abs op
@@ -271,7 +236,7 @@ impl CompiledDc {
             if jx_var.iter().any(|&v| v) {
                 let mut terms: Vec<ExprId> = Vec::new();
                 let mut rows: Vec<(usize, usize)> = Vec::with_capacity(n_nodes);
-                for &r in dae.residuals.iter().take(n_nodes) {
+                for &r in residuals.iter().take(n_nodes) {
                     let start = terms.len();
                     match ctx.node(r) {
                         Node::Reduce(ReduceOp::Sum, l) => terms.extend_from_slice(ctx.args(*l)),
@@ -424,6 +389,7 @@ impl CompiledDc {
             base_inputs,
             companion: dae.companion.clone(),
             companion_symbolic: std::sync::OnceLock::new(),
+            input_jacs: Default::default(),
             limits: dae.limits.clone(),
             n_nodes,
             tape_iscale,

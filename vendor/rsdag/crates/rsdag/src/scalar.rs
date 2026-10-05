@@ -129,6 +129,15 @@ pub trait Scalar: Copy + Send + Sync + std::fmt::Debug + 'static {
     /// buffers are borrowed from a thread-local stack and returned, so a
     /// call in a loop does not allocate.
     fn call_bundle(b: &dyn crate::extern_fn::ExternBundle, args: &[Self], out: &mut [Self]) {
+        // A body that is a tape runs in this scalar: a complex small-signal
+        // evaluation through a call stays complex. An opaque body runs in f64.
+        if let Some(tape) = b.body() {
+            with_scratch::<Self, _>(|work, res| {
+                tape.eval(args, work, res);
+                out.copy_from_slice(&res[..out.len()]);
+            });
+            return;
+        }
         with_f64_scratch(args.len(), out.len(), |a, o| {
             for (dst, &x) in a.iter_mut().zip(args) {
                 *dst = x.to_f64();
@@ -180,6 +189,17 @@ pub trait Scalar: Copy + Send + Sync + std::fmt::Debug + 'static {
         n_args: usize,
         out: &mut [Self],
     ) {
+        if b.body().is_some() {
+            let n_out = b.n_outputs();
+            for g in 0..n_groups {
+                Self::call_bundle(
+                    b,
+                    &args[g * n_args..(g + 1) * n_args],
+                    &mut out[g * n_out..(g + 1) * n_out],
+                );
+            }
+            return;
+        }
         with_f64_scratch(args.len(), out.len(), |a, o| {
             for (dst, &x) in a.iter_mut().zip(args) {
                 *dst = x.to_f64();
@@ -215,6 +235,28 @@ fn with_f64_scratch<R>(
     }
     let r = f(&mut a[..n_args], &mut o[..n_out]);
     STACK.with(|s| s.borrow_mut().push((a, o)));
+    r
+}
+
+/// A work and an output buffer of scalar `T`, borrowed from a thread-local
+/// stack (a body that calls a body nests) and returned afterwards, so a call
+/// in a loop allocates only on its first round.
+fn with_scratch<T: Scalar, R>(f: impl FnOnce(&mut Vec<T>, &mut Vec<T>) -> R) -> R {
+    thread_local! {
+        static STACK: std::cell::RefCell<Vec<Box<dyn std::any::Any>>> = const {
+            std::cell::RefCell::new(Vec::new())
+        };
+    }
+    let mut bufs: Box<(Vec<T>, Vec<T>)> = STACK
+        .with(|s| {
+            let mut s = s.borrow_mut();
+            let at = s.iter().rposition(|b| b.is::<(Vec<T>, Vec<T>)>())?;
+            s.swap_remove(at).downcast().ok()
+        })
+        .unwrap_or_default();
+    let (work, out) = &mut *bufs;
+    let r = f(work, out);
+    STACK.with(|s| s.borrow_mut().push(bufs));
     r
 }
 

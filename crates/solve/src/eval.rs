@@ -9,11 +9,6 @@ use rsdag::{Adaptive, Policy, Tape};
 pub(crate) type StepEval = Adaptive;
 pub(crate) type PrologToken = rsdag::Episode;
 
-#[cfg(feature = "jit")]
-pub(crate) fn jit_enabled() -> bool {
-    sane_core::config().jit
-}
-
 /// A hot tape under SANE's configuration.
 pub(crate) fn step_eval(tape: Tape) -> StepEval {
     let cfg = sane_core::config();

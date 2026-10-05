@@ -3,7 +3,6 @@
 //! `if(cond, then, else)` conditional lower correctly through to the DC solve.
 
 use sane_core::Graph;
-use sane_dae::assemble_dae;
 use sane_netlist::parse;
 use sane_solve::CompiledDc;
 
@@ -11,7 +10,7 @@ use sane_solve::CompiledDc;
 fn dc_node(src: &str, node: &str) -> f64 {
     let parsed = parse(src).expect("parse");
     let mut ctx = Graph::new();
-    let dae = assemble_dae(&mut ctx, &parsed.circuit, &parsed.devices);
+    let dae = parsed.assemble(&mut ctx);
     let cdc = CompiledDc::new(&mut ctx, &dae);
     let pnames = cdc.param_names(&ctx);
     let p: Vec<f64> = parsed.pvec(&pnames);
@@ -81,7 +80,7 @@ fn diode_series_resistance_drops_voltage() {
     let src = format!("V1 in 0 1\nR1 in a 1k\nD1 a 0 dm\n.model dm D(Is=1e-14 Rs={rs})\n.end");
     let parsed = parse(&src).expect("parse");
     let mut ctx = Graph::new();
-    let dae = assemble_dae(&mut ctx, &parsed.circuit, &parsed.devices);
+    let dae = parsed.assemble(&mut ctx);
     // The internal node adds one unknown.
     assert!(
         dae.unknowns.iter().any(|u| u == "D1.ai"),

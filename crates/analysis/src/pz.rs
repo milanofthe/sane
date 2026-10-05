@@ -247,8 +247,6 @@ use sane_core::constants::{DC_OP_MAXIT, DC_OP_TOL};
 #[cfg(test)]
 use sane_core::Graph;
 #[cfg(test)]
-use sane_dae::assemble_dae;
-#[cfg(test)]
 use sane_netlist::parse;
 #[cfg(test)]
 use sane_solve::CompiledDc;
@@ -729,7 +727,7 @@ N1 a 0 vadio
         // as they take different step sequences).
         let parsed = parse("Vin a 0 SIN(0 1 1e6)\nR1 a b 1k\nC1 b 0 1n\n").unwrap();
         let mut ctx = Graph::new();
-        let dae = assemble_dae(&mut ctx, &parsed.circuit, &parsed.devices);
+        let dae = parsed.assemble(&mut ctx);
         let cdc = CompiledDc::new(&mut ctx, &dae);
         let pnames = cdc.param_names(&ctx);
         let p: Vec<f64> = parsed.pvec(&pnames);

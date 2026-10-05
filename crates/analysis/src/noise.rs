@@ -142,7 +142,13 @@ pub fn noise_on_dae(
     // pool with faer pinned sequential; `collect` preserves frequency order.
     let sys = log_stage!(
         "noise/symbolic",
-        crate::sparse_ac::SymbolicAc::new(n, (&g_r, &g_c, &g_v), (&c_r, &c_c, &c_v), true)
+        crate::sparse_ac::SymbolicAc::new(
+            n,
+            (&g_r, &g_c, &g_v),
+            (&c_r, &c_c, &c_v),
+            true,
+            2.0 * PI * fstart,
+        )
     );
     let (l0, l1) = (fstart.log10(), fstop.log10());
     let mut tracker = ProgressTracker::with_details(

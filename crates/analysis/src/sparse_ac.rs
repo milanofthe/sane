@@ -9,7 +9,7 @@
 //! are preserved.
 
 use num_complex::Complex64;
-use rslab::{GeneralCsc, KluSettings, KluSolver, KluSymbolic};
+use rslab::{GeneralCsc, KluSettings, KluSolver, KluSymbolic, SolveWork};
 
 /// Sparse complex system `A = G + jwC` in summed-triplet form, with on-demand
 /// KLU factorisation of `A` (and transpose solves for the adjoint).
@@ -110,13 +110,13 @@ impl AcSystem {
 /// analysis computed once and reused at every frequency.
 ///
 /// Across a sweep only the numeric values change with `w`; the sparsity pattern
-/// of `A` (and thus KLU's BTF + fill-reducing ordering) is fixed. So the
-/// analysis is paid once, and per frequency only the complex values are
-/// refilled and numerically factored. A sweep worker obtained via
-/// [`solver`](Self::solver) goes further: its first frequency factors with full
-/// pivoting and every following one replays the frozen pivot sequence (KLU
-/// numeric-only `refactor`, no DFS, no pivot search) -- values move smoothly in
-/// `w`, so the pivots stay valid and the replay transparently falls back to a
+/// of `A` is fixed. The analysis (BTF, the maximum-product matching, the
+/// fill-reducing order) runs once on the values at a reference frequency, the
+/// matching being value dependent; per frequency only the values are refilled
+/// in place. A sweep worker obtained via [`solver`](Self::solver) factors with
+/// pivoting at its first frequency and replays the frozen pivot sequence after
+/// (rslab's numeric-only `refactor`, no DFS, no pivot search) -- values move
+/// smoothly in `w`, so the pivots stay valid, and the replay falls back to a
 /// full factor if one degenerates. Set `transpose` to build `A^T` instead (the
 /// adjoint system the noise analysis solves).
 pub struct SymbolicAc {
@@ -124,31 +124,52 @@ pub struct SymbolicAc {
     /// Fixed CSC pattern of `A` (or `A^T`), deduplicated.
     col_ptr: Vec<usize>,
     row_idx: Vec<usize>,
-    /// CSC slot of each `G` entry / each `C` entry (duplicates share slots).
-    slot_g: Vec<usize>,
+    vals: AcValues,
+    sym: KluSymbolic,
+}
+
+/// The values of `A = G + jwC (+ delays)` over the pattern, per frequency.
+struct AcValues {
+    /// The frequency-independent values: `G` summed into the pattern.
+    base: Vec<Complex64>,
+    /// CSC slot of each `C` entry / each delay entry (duplicates share slots).
     slot_c: Vec<usize>,
     slot_d: Vec<usize>,
-    /// Real `G` and `C` values; the per-frequency value set is `g + jw c`.
-    g_v: Vec<f64>,
     c_v: Vec<f64>,
     /// transport-delay coupling: value and delay per entry (see new_with_delays)
     d_v: Vec<f64>,
     d_tau: Vec<f64>,
-    sym: KluSymbolic,
+}
+
+impl AcValues {
+    /// The values at `w` into `values`.
+    fn fill(&self, w: f64, values: &mut Vec<Complex64>) {
+        values.clear();
+        values.extend_from_slice(&self.base);
+        for (&k, &cv) in self.slot_c.iter().zip(&self.c_v) {
+            values[k].im += w * cv;
+        }
+        for (k, &dv) in self.d_v.iter().enumerate() {
+            values[self.slot_d[k]] += dv * Complex64::from_polar(1.0, -w * self.d_tau[k]);
+        }
+    }
 }
 
 impl SymbolicAc {
     /// Build the reusable symbolic analysis of `A = G + jwC` (or `A^T` if
-    /// `transpose`) from sparse real `G`/`C` as `(rows, cols, vals)`. Duplicate
-    /// `(i, j)` contributions are summed, matching [`AcSystem::assemble`].
-    /// `None` if the pattern is degenerate (structurally singular).
+    /// `transpose`) from sparse real `G`/`C` as `(rows, cols, vals)`, analyzed
+    /// on the values at angular frequency `w_ref` (the sweep's first, say).
+    /// Duplicate `(i, j)` contributions are summed, matching
+    /// [`AcSystem::assemble`]. `None` if the pattern is degenerate
+    /// (structurally singular).
     pub fn new(
         n: usize,
         g: (&[usize], &[usize], &[f64]),
         c: (&[usize], &[usize], &[f64]),
         transpose: bool,
+        w_ref: f64,
     ) -> Option<Self> {
-        Self::new_with_delays(n, g, c, (&[], &[], &[], &[]), transpose)
+        Self::new_with_delays(n, g, c, (&[], &[], &[], &[]), transpose, w_ref)
     }
 
     /// As [`new`](Self::new), plus transport-delay coupling: entry `k` adds
@@ -161,6 +182,7 @@ impl SymbolicAc {
         c: (&[usize], &[usize], &[f64]),
         d: (&[usize], &[usize], &[f64], &[f64]),
         transpose: bool,
+        w_ref: f64,
     ) -> Option<Self> {
         let ng = g.2.len();
         let nc = c.2.len();
@@ -206,62 +228,51 @@ impl SymbolicAc {
         for j in 0..n {
             col_ptr[j + 1] += col_ptr[j];
         }
-        let pattern = GeneralCsc {
-            n,
-            col_ptr: col_ptr.clone(),
-            row_idx: row_idx.clone(),
-            values: vec![Complex64::new(1.0, 0.0); row_idx.len()],
-        };
-        let sym = KluSymbolic::analyze(&pattern, &KluSettings::default()).ok()?;
-        let (slot_g, slot_c, slot_d) = (
-            slot[..ng].to_vec(),
-            slot[ng..ng + nc].to_vec(),
-            slot[ng + nc..].to_vec(),
-        );
-        Some(Self {
-            n,
-            col_ptr,
-            row_idx,
-            slot_g,
-            slot_c,
-            slot_d,
-            g_v: g.2.to_vec(),
+        let mut base = vec![Complex64::new(0.0, 0.0); row_idx.len()];
+        for (k, &gv) in g.2.iter().enumerate() {
+            base[slot[k]] += Complex64::new(gv, 0.0);
+        }
+        let vals = AcValues {
+            base,
+            slot_c: slot[ng..ng + nc].to_vec(),
+            slot_d: slot[ng + nc..].to_vec(),
             c_v: c.2.to_vec(),
             d_v: d.2.to_vec(),
             d_tau: d.3.to_vec(),
+        };
+        let mut at_ref = GeneralCsc {
+            n,
+            col_ptr,
+            row_idx,
+            values: Vec::new(),
+        };
+        vals.fill(w_ref, &mut at_ref.values);
+        let sym = KluSymbolic::analyze(&at_ref, &KluSettings::default()).ok()?;
+        Some(Self {
+            n,
+            col_ptr: at_ref.col_ptr,
+            row_idx: at_ref.row_idx,
+            vals,
             sym,
         })
     }
 
-    /// Scatter `g + jw c` into a fresh CSC over the fixed pattern.
-    fn scatter(&self, w: f64) -> GeneralCsc<Complex64> {
-        let mut vals = vec![Complex64::new(0.0, 0.0); self.row_idx.len()];
-        for (k, &gv) in self.g_v.iter().enumerate() {
-            vals[self.slot_g[k]] += Complex64::new(gv, 0.0);
-        }
-        for (k, &cv) in self.c_v.iter().enumerate() {
-            vals[self.slot_c[k]] += Complex64::new(0.0, w * cv);
-        }
-        for (k, &dv) in self.d_v.iter().enumerate() {
-            vals[self.slot_d[k]] += dv * Complex64::from_polar(1.0, -w * self.d_tau[k]);
-        }
-        GeneralCsc {
-            n: self.n,
-            col_ptr: self.col_ptr.clone(),
-            row_idx: self.row_idx.clone(),
-            values: vals,
-        }
-    }
-
-    /// A sweep worker holding per-thread factorization state: first call
-    /// factors with full pivoting, subsequent calls run KLU's numeric-only
-    /// refactor on the refreshed values (transparent full-factor fallback).
-    /// Each rayon worker gets its own (e.g. via `map_init`).
+    /// A sweep worker holding per-thread factorization state and buffers:
+    /// first call factors with pivoting, subsequent calls run the numeric-only
+    /// refactor on the values refilled in place (full-factor fallback). Each
+    /// rayon worker gets its own (e.g. via `map_init`).
     pub fn solver(&self) -> AcSweepSolver<'_> {
         AcSweepSolver {
             sys: self,
-            csc: self.scatter(0.0),
+            csc: GeneralCsc {
+                n: self.n,
+                col_ptr: self.col_ptr.clone(),
+                row_idx: self.row_idx.clone(),
+                values: Vec::with_capacity(self.row_idx.len()),
+            },
             solver: None,
+            x: vec![Complex64::new(0.0, 0.0); self.n],
+            work: SolveWork::default(),
         }
     }
 }
@@ -269,45 +280,32 @@ impl SymbolicAc {
 /// Per-worker sweep state for [`SymbolicAc`]; see [`SymbolicAc::solver`].
 pub struct AcSweepSolver<'a> {
     sys: &'a SymbolicAc,
-    /// Scratch CSC (pattern fixed, values rewritten per frequency).
+    /// The CSC of `A`: pattern fixed, values refilled per frequency.
     csc: GeneralCsc<Complex64>,
     solver: Option<KluSolver<Complex64>>,
+    /// The solution and the solve's workspace, kept across frequencies.
+    x: Vec<Complex64>,
+    work: SolveWork<Complex64>,
 }
 
 impl AcSweepSolver<'_> {
     /// Solve at angular frequency `w` (refactor fast path; `None` on a
-    /// singular system at this frequency).
-    pub fn solve(&mut self, w: f64, b: &[Complex64]) -> Option<Vec<Complex64>> {
+    /// singular system at this frequency). The solution lives in the worker
+    /// until the next solve.
+    pub fn solve(&mut self, w: f64, b: &[Complex64]) -> Option<&[Complex64]> {
         let sys = self.sys;
-        for v in self.csc.values.iter_mut() {
-            *v = Complex64::new(0.0, 0.0);
-        }
-        for (k, &gv) in sys.g_v.iter().enumerate() {
-            self.csc.values[sys.slot_g[k]] += Complex64::new(gv, 0.0);
-        }
-        for (k, &cv) in sys.c_v.iter().enumerate() {
-            self.csc.values[sys.slot_c[k]] += Complex64::new(0.0, w * cv);
-        }
-        for (k, &dv) in sys.d_v.iter().enumerate() {
-            self.csc.values[sys.slot_d[k]] += dv * Complex64::from_polar(1.0, -w * sys.d_tau[k]);
-        }
+        sys.vals.fill(w, &mut self.csc.values);
         sane_solve::dump_system(&self.csc, b);
-        if let Some(s) = self.solver.as_mut() {
-            if s.refactor(&self.csc).is_ok() {
-                return s.solve(b).ok();
-            }
+        let refactored = match self.solver.as_mut() {
+            Some(s) => s.refactor(&self.csc).is_ok(),
+            None => false,
+        };
+        if !refactored {
+            self.solver = sys.sym.factor(&self.csc, &KluSettings::default()).ok();
         }
-        match sys.sym.factor(&self.csc, &KluSettings::default()) {
-            Ok(s) => {
-                let x = s.solve(b).ok();
-                self.solver = Some(s);
-                x
-            }
-            Err(_) => {
-                self.solver = None;
-                None
-            }
-        }
+        let s = self.solver.as_ref()?;
+        s.solve_into(b, &mut self.x, &mut self.work).ok()?;
+        Some(&self.x)
     }
 }
 
@@ -371,8 +369,8 @@ mod tests {
             Complex64::new(0.0, 20.0),
             Complex64::new(8.0, 3.0),
         ];
-        let sym = SymbolicAc::new(3, (&g.0, &g.1, &g.2), (&c.0, &c.1, &c.2), false).expect("sym");
-        let symt = SymbolicAc::new(3, (&g.0, &g.1, &g.2), (&c.0, &c.1, &c.2), true).expect("symT");
+        let sym = SymbolicAc::new(3, (&g.0, &g.1, &g.2), (&c.0, &c.1, &c.2), false, 2.0).expect("sym");
+        let symt = SymbolicAc::new(3, (&g.0, &g.1, &g.2), (&c.0, &c.1, &c.2), true, 2.0).expect("symT");
         let mut sweep = sym.solver();
         let mut sweep_t = symt.solver();
         for &w in &[0.0, 1.0, 7.5, 1e3] {

@@ -12,6 +12,7 @@ rustc-hash.workspace = true
 sane-core.workspace = true
 sane-mna.workspace = true
 sane-device = { path = "../device" }
+sane-dae = { path = "../dae" }
 sane-veriloga = { path = "../veriloga" }
 
 [dev-dependencies]

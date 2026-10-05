@@ -784,6 +784,11 @@ impl<'a> CompiledHb<'a> {
     /// warm-started from the DC operating point `x_dc` (all higher harmonics
     /// zero). `w0` is the fundamental angular frequency (must match the drive).
     pub fn solve(&self, p: &[f64], x_dc: &[f64], w0: f64, tol: f64, max_iter: usize) -> HbResult {
+        crate::parallel::solve(|| self.solve_here(p, x_dc, w0, tol, max_iter))
+    }
+
+    /// [`solve`](Self::solve) on this thread.
+    fn solve_here(&self, p: &[f64], x_dc: &[f64], w0: f64, tol: f64, max_iter: usize) -> HbResult {
         let start = self.dc_start(x_dc);
         let (spectra, converged, iters, last_norm) = self.newton_from(p, start, w0, tol, max_iter);
         HbResult {
@@ -807,6 +812,19 @@ impl<'a> CompiledHb<'a> {
     /// cannot -- large signal swings that cross device regions. `iters` returns
     /// the total Newton iterations across all continuation steps.
     pub fn solve_continuation(
+        &self,
+        p: &[f64],
+        x_dc: &[f64],
+        w0: f64,
+        ramp: &[usize],
+        tol: f64,
+        max_iter: usize,
+    ) -> HbResult {
+        crate::parallel::solve(|| self.solve_continuation_here(p, x_dc, w0, ramp, tol, max_iter))
+    }
+
+    /// [`solve_continuation`](Self::solve_continuation) on this thread.
+    fn solve_continuation_here(
         &self,
         p: &[f64],
         x_dc: &[f64],

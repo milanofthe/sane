@@ -12,7 +12,7 @@
 //! derivatives `vdot{n}`, branch currents `i_{name}`, inductor current
 //! derivatives `idot_{name}`, and time `t`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use rsdag::determinant;
 use rsdag::{differentiate, sparse_jacobian, Crossing, ExprId, Node, SymbolId};
@@ -21,23 +21,22 @@ use sane_mna::SourceFn;
 
 // Assembly of the symbolic DAE from a parsed circuit.
 mod assemble;
+// Subcircuit instances: placed bodies, their renaming and topology.
+mod hierarchy;
 pub mod linearize;
 // Sensitivity machinery: directional derivatives, augmentation, Hessian blocks.
 mod sens;
-// Jacobian-stamp assembly is an internal detail of DAE construction; only the
-// opaque `Stamp` (carried in `Dae::stamps`) crosses the crate boundary.
-pub(crate) mod stamp;
 // Graph transformations (shorts / opens / exact node elimination).
 #[cfg(test)]
 mod tests;
 mod transform;
 
-pub use assemble::assemble_dae;
+pub use assemble::{assemble, assemble_dae};
+pub use hierarchy::{topology, Instance};
 pub use sens::{
     ac_param_derivatives, augment_with_scaled_sensitivities, augment_with_sensitivities, hessian,
     lagrangian_hessian, HessianSym,
 };
-pub use stamp::Stamp;
 pub use transform::{eliminate_nodes, reduce_graph};
 
 pub use sane_device::{DeviceInstance, DeviceModel, LimitKind, NoiseSource, UnknownKind};
@@ -113,11 +112,6 @@ pub struct Dae {
     /// delay-free circuits. Transforms that cannot preserve the unknown
     /// indexing drop these (the analysis layer guards misuse).
     pub delays: Vec<DelaySpec>,
-    /// Per-element contributions to the residual rows (the node KCL terms, branch
-    /// constraints and internal-node residuals). The Jacobian is assembled from
-    /// these via per-structure templates (see [`stamp`]); summing a row's stamps
-    /// reproduces its residual exactly.
-    pub stamps: Vec<stamp::Stamp>,
     /// Companion conductance network (node-KCL row, node-voltage col, value) for
     /// homotopy continuation: each device's linear `lambda = 0` form (see
     /// [`sane_device::DeviceModel::companion`]). Empty for transformed DAEs.
@@ -152,6 +146,11 @@ pub struct Dae {
     /// current). Empty for transformed or hand-built DAEs, where the solver
     /// falls back to the name heuristic.
     pub source_names: Vec<String>,
+    /// Display names of nodes the residuals reach, for views of the graph:
+    /// a call by the instance that made it (`X1`, `M1`; inside a subcircuit
+    /// body the body's own name, `__inv__.M1`), a subcircuit body's formal
+    /// net by the net's name in the body.
+    pub labels: rustc_hash::FxHashMap<ExprId, String>,
 }
 
 impl Dae {
@@ -286,17 +285,7 @@ impl Dae {
             .copied()
             .chain(self.xdot.iter().flatten().copied())
             .collect();
-        // Device instances appear in the residuals as calls; classify the
-        // called functions' bodies too (their parameters stand for the
-        // instances' unknowns), so the analysis sees through the calls.
-        let mut roots = self.residuals.clone();
-        for o in ctx.free_calls_in(&self.residuals) {
-            let (f, out) = ctx.output(o);
-            if let Some(e) = ctx.output_expr(f, out) {
-                roots.push(e);
-            }
-        }
-        rsdag::nonlinearity_of(ctx, &roots, &vars)
+        rsdag::nonlinearity_of(ctx, &self.residuals, &vars)
     }
 
     /// Jacobian `∂F/∂x`, dense (zero where a residual does not depend on
@@ -315,178 +304,105 @@ impl Dae {
             .collect()
     }
 
-    /// Jacobian `∂F/∂x'` (zero columns for algebraic unknowns).
+    /// Jacobian `∂F/∂x'`, dense (zero columns for algebraic unknowns).
     pub fn jacobian_xdot(&self, ctx: &mut Graph) -> Vec<Vec<ExprId>> {
+        let (rows, cols, exprs) = self.jacobian_xdot_coo(ctx);
         let zero = ctx.zero();
-        let mut out = Vec::with_capacity(self.residuals.len());
-        for &r in &self.residuals {
-            let mut row = Vec::with_capacity(self.xdot.len());
-            for opt in &self.xdot {
-                row.push(match opt {
-                    Some(s) => differentiate(ctx, r, *s),
-                    None => zero,
-                });
-            }
-            out.push(row);
+        let mut dense = vec![vec![zero; self.xdot.len()]; self.residuals.len()];
+        for ((r, c), e) in rows.into_iter().zip(cols).zip(exprs) {
+            dense[r][c] = e;
         }
-        out
+        dense
     }
 
-    /// Sparse symbolic `∂F/∂x` as `(rows, cols, exprs)`: for each residual,
-    /// only differentiate w.r.t. the unknowns it actually depends on (its free
-    /// symbols), so this costs ~O(nnz) differentiations rather than O(n^2).
-    pub fn jacobian_x_coo(&self, ctx: &mut Graph) -> (Vec<usize>, Vec<usize>, Vec<ExprId>) {
-        let col_of: HashMap<SymbolId, usize> =
-            self.x.iter().enumerate().map(|(i, &s)| (s, i)).collect();
-        coo(ctx, &self.residuals, &col_of)
+    /// The columns of `∂F/∂x`: `(index in x, unknown)`.
+    fn x_cols(&self) -> Vec<(usize, SymbolId)> {
+        self.x.iter().copied().enumerate().collect()
     }
 
-    /// The set of differentiation variables (unknowns and their derivatives) --
-    /// used by the stamp templater to tell ports from parameters.
-    fn var_set(&self) -> HashSet<SymbolId> {
-        self.x
+    /// The columns of `∂F/∂x'`: `(index in x, derivative)`, the
+    /// differential unknowns only.
+    fn xdot_cols(&self) -> Vec<(usize, SymbolId)> {
+        self.xdot
             .iter()
-            .copied()
-            .chain(self.xdot.iter().flatten().copied())
+            .enumerate()
+            .filter_map(|(i, o)| o.map(|s| (i, s)))
             .collect()
     }
 
-    /// Sparse `∂F/∂x` assembled from per-element stamp templates (identical entries
-    /// to [`jacobian_x_coo`], built once per distinct element structure instead of
-    /// once per element). Columns index `x`.
-    pub fn jacobian_x_coo_templated(
-        &self,
-        ctx: &mut Graph,
-    ) -> (Vec<usize>, Vec<usize>, Vec<ExprId>) {
-        let vars = self.var_set();
-        let col_of: HashMap<SymbolId, usize> =
-            self.x.iter().enumerate().map(|(i, &s)| (s, i)).collect();
-        stamp::assemble_jacobian(ctx, &self.stamps, self.t, &|s| vars.contains(&s), &|s| {
-            col_of.get(&s).copied()
-        })
+    /// Sparse `∂F/∂x` as `(rows, cols, exprs)`, columns indexed like `x`.
+    pub fn jacobian_x_coo(&self, ctx: &mut Graph) -> Coo {
+        coo(ctx, &self.residuals, &self.x_cols())
     }
 
-    /// Both [`jacobian_x_coo_templated`](Self::jacobian_x_coo_templated) and
-    /// [`jacobian_xdot_coo_templated`](Self::jacobian_xdot_coo_templated) in
-    /// one pass over the stamps (each stamp canonicalised and instantiated
-    /// once for both blocks). This is what a solver compile should call.
-    pub fn jacobian_x_xdot_coo_templated(
-        &self,
-        ctx: &mut Graph,
-    ) -> (stamp::SparseBlock, stamp::SparseBlock) {
-        let vars = self.var_set();
-        let col_x: HashMap<SymbolId, usize> =
-            self.x.iter().enumerate().map(|(i, &s)| (s, i)).collect();
-        let col_xd: HashMap<SymbolId, usize> = self
-            .xdot
-            .iter()
+    /// Sparse `∂F/∂x'` as `(rows, cols, exprs)`, columns indexed like `x`
+    /// (only differential unknowns contribute).
+    pub fn jacobian_xdot_coo(&self, ctx: &mut Graph) -> Coo {
+        coo(ctx, &self.residuals, &self.xdot_cols())
+    }
+
+    /// [`jacobian_x_coo`](Self::jacobian_x_coo) and
+    /// [`jacobian_xdot_coo`](Self::jacobian_xdot_coo) from one sparse Jacobian
+    /// over the unknowns and their derivatives together.
+    pub fn jacobian_x_xdot_coo(&self, ctx: &mut Graph) -> (Coo, Coo) {
+        let mut cols = self.x_cols();
+        let nx = cols.len();
+        cols.extend(self.xdot_cols());
+        let wrt: Vec<SymbolId> = cols.iter().map(|&(_, s)| s).collect();
+        let (mut x, mut xd) = (Coo::default(), Coo::default());
+        for (i, row) in sparse_jacobian(ctx, &self.residuals, &wrt)
+            .into_iter()
             .enumerate()
-            .filter_map(|(i, o)| o.map(|s| (s, i)))
-            .collect();
-        let fx = |s: SymbolId| col_x.get(&s).copied();
-        let fxd = |s: SymbolId| col_xd.get(&s).copied();
-        let mut blocks = stamp::assemble_jacobians(
-            ctx,
-            &self.stamps,
-            self.t,
-            &|s| vars.contains(&s),
-            &[&fx, &fxd],
-        );
-        let xd = blocks.pop().expect("two blocks");
-        let x = blocks.pop().expect("two blocks");
+        {
+            for (j, e) in row {
+                let block = if j < nx { &mut x } else { &mut xd };
+                block.0.push(i);
+                block.1.push(cols[j].0);
+                block.2.push(e);
+            }
+        }
         (x, xd)
     }
 
-    /// Sparse `∂F/∂x'` assembled from stamp templates (columns index `x`, only
-    /// differential unknowns contribute). Reuses the same templates as
-    /// [`jacobian_x_coo_templated`].
-    pub fn jacobian_xdot_coo_templated(
-        &self,
-        ctx: &mut Graph,
-    ) -> (Vec<usize>, Vec<usize>, Vec<ExprId>) {
-        let vars = self.var_set();
-        let col_of: HashMap<SymbolId, usize> = self
-            .xdot
-            .iter()
-            .enumerate()
-            .filter_map(|(i, o)| o.map(|s| (s, i)))
-            .collect();
-        stamp::assemble_jacobian(ctx, &self.stamps, self.t, &|s| vars.contains(&s), &|s| {
-            col_of.get(&s).copied()
-        })
-    }
-
-    /// Sparse `∂F/∂p` assembled from stamp templates, columns indexed like
-    /// `params`. Because `col_of` selects the columns, passing a *subset* of the
-    /// parameters builds only those columns -- parameter-group scoping for cheap
-    /// targeted sensitivity / optimization on large circuits.
-    pub fn jacobian_p_coo_templated(
-        &self,
-        ctx: &mut Graph,
-        params: &[SymbolId],
-    ) -> (Vec<usize>, Vec<usize>, Vec<ExprId>) {
-        let vars = self.var_set();
-        let col_of: HashMap<SymbolId, usize> =
-            params.iter().enumerate().map(|(c, &s)| (s, c)).collect();
-        stamp::assemble_jacobian(ctx, &self.stamps, self.t, &|s| vars.contains(&s), &|s| {
-            col_of.get(&s).copied()
-        })
-    }
-
-    /// Sparse symbolic `∂F/∂x'` as `(rows, cols, exprs)` (columns indexed like
-    /// `x`; only differential unknowns contribute).
-    pub fn jacobian_xdot_coo(&self, ctx: &mut Graph) -> (Vec<usize>, Vec<usize>, Vec<ExprId>) {
-        let col_of: HashMap<SymbolId, usize> = self
-            .xdot
-            .iter()
-            .enumerate()
-            .filter_map(|(i, o)| o.map(|s| (s, i)))
-            .collect();
-        coo(ctx, &self.residuals, &col_of)
-    }
-
-    /// Sparse symbolic `∂F/∂hist` as `(rows, cols, exprs)`, columns indexed
-    /// like `delays`. In the frequency domain a delayed source contributes
+    /// Sparse `∂F/∂hist` as `(rows, cols, exprs)`, columns indexed like
+    /// `delays`. In the frequency domain a delayed source contributes
     /// `Hist_k = e^{-jωτ_k} X_{src_k}`, so these entries move to column
     /// `delays[k].src` scaled by `e^{-jωτ_k}` (see the AC path).
-    pub fn jacobian_hist_coo(&self, ctx: &mut Graph) -> (Vec<usize>, Vec<usize>, Vec<ExprId>) {
-        let col_of: HashMap<SymbolId, usize> = self
+    pub fn jacobian_hist_coo(&self, ctx: &mut Graph) -> Coo {
+        let cols: Vec<(usize, SymbolId)> = self
             .delays
             .iter()
             .enumerate()
-            .map(|(c, d)| (d.hist, c))
+            .map(|(c, d)| (c, d.hist))
             .collect();
-        coo(ctx, &self.residuals, &col_of)
+        coo(ctx, &self.residuals, &cols)
     }
 
-    /// Sparse symbolic `∂F/∂p` as `(rows, cols, exprs)`, columns indexed like
-    /// `params`. The basis for exact (adjoint) component sensitivity analysis.
-    pub fn jacobian_p_coo(
-        &self,
-        ctx: &mut Graph,
-        params: &[SymbolId],
-    ) -> (Vec<usize>, Vec<usize>, Vec<ExprId>) {
-        let col_of: HashMap<SymbolId, usize> =
-            params.iter().enumerate().map(|(c, &s)| (s, c)).collect();
-        coo(ctx, &self.residuals, &col_of)
+    /// Sparse `∂F/∂p` as `(rows, cols, exprs)`, columns indexed like
+    /// `params` (a subset of the parameters builds only those columns). The
+    /// basis for exact (adjoint) component sensitivity analysis.
+    pub fn jacobian_p_coo(&self, ctx: &mut Graph, params: &[SymbolId]) -> Coo {
+        coo(
+            ctx,
+            &self.residuals,
+            &params.iter().copied().enumerate().collect::<Vec<_>>(),
+        )
     }
 
     /// Parameter symbols: free symbols in the residuals that are neither
     /// unknowns nor derivatives nor time, sorted by id.
     pub fn params(&self, ctx: &Graph) -> Vec<SymbolId> {
-        let mut all = std::collections::BTreeSet::new();
-        for &r in &self.residuals {
-            all.extend(ctx.free_symbols(r));
-        }
-        // delay times are parameters even though they appear only in the
-        // delay registry, not in any residual
-        for dl in &self.delays {
-            all.extend(ctx.free_symbols(dl.tau));
-        }
-        // a switching surface may reference a parameter nothing else does
-        for ev in &self.events {
-            all.extend(ctx.free_symbols(ev.g));
-        }
+        // The residuals, the delay times (parameters even though they appear
+        // only in the delay registry) and the switching surfaces (which may
+        // reference a parameter nothing else does), in one walk.
+        let roots: Vec<ExprId> = self
+            .residuals
+            .iter()
+            .copied()
+            .chain(self.delays.iter().map(|dl| dl.tau))
+            .chain(self.events.iter().map(|ev| ev.g))
+            .collect();
+        let mut all = ctx.free_symbols_in(&roots);
         for s in &self.x {
             all.remove(s);
         }
@@ -520,11 +436,6 @@ impl Dae {
             .residuals
             .iter()
             .map(|&r| rsdag::substitute(ctx, &[r], fold)[0])
-            .collect();
-        let stamps = self
-            .stamps
-            .iter()
-            .map(|s| stamp::Stamp::new(s.row, rsdag::substitute(ctx, &[s.expr], fold)[0]))
             .collect();
         let noise_sources = self
             .noise_sources
@@ -570,7 +481,6 @@ impl Dae {
             x: self.x.clone(),
             xdot: self.xdot.clone(),
             t: self.t,
-            stamps,
             companion: self.companion.clone(),
             noise_sources,
             op_vars,
@@ -578,6 +488,7 @@ impl Dae {
             limits: self.limits.clone(),
             sources: self.sources.clone(),
             source_names: self.source_names.clone(),
+            labels: self.labels.clone(),
         }
     }
 }
@@ -646,34 +557,25 @@ pub fn small_signal_transfer_nd(
     Some((det_b, det_a))
 }
 
-/// Sparse symbolic Jacobian builder. For each residual, compute its free
-/// symbols once, then differentiate only w.r.t. the columns whose symbol
-/// appears. `col_sym(c)` maps a column slot to `(column_index, symbol)`.
-pub(crate) fn coo(
-    ctx: &mut Graph,
-    residuals: &[ExprId],
-    col_of: &HashMap<SymbolId, usize>,
-) -> (Vec<usize>, Vec<usize>, Vec<ExprId>) {
-    let mut rows = Vec::new();
-    let mut cols = Vec::new();
-    let mut exprs = Vec::new();
-    // Iterate the residual's *own* free symbols and look up each one's column,
-    // rather than scanning all columns per row -- so this is O(nnz) (the number
-    // of structural nonzeros), not O(n_residuals x ncols).
-    for (i, &r) in residuals.iter().enumerate() {
-        let fs: Vec<SymbolId> = ctx.free_symbols(r).into_iter().collect();
-        for s in fs {
-            if let Some(&col) = col_of.get(&s) {
-                let d = differentiate(ctx, r, s);
-                if !ctx.is_zero(d) {
-                    rows.push(i);
-                    cols.push(col);
-                    exprs.push(d);
-                }
-            }
+/// A sparse block as `(rows, cols, exprs)`.
+pub type Coo = (Vec<usize>, Vec<usize>, Vec<ExprId>);
+
+/// `rsdag::sparse_jacobian` of `residuals` over the symbols of `cols`, each
+/// column labelled with its paired index.
+pub(crate) fn coo(ctx: &mut Graph, residuals: &[ExprId], cols: &[(usize, SymbolId)]) -> Coo {
+    let wrt: Vec<SymbolId> = cols.iter().map(|&(_, s)| s).collect();
+    let mut out = Coo::default();
+    for (i, row) in sparse_jacobian(ctx, residuals, &wrt)
+        .into_iter()
+        .enumerate()
+    {
+        for (j, e) in row {
+            out.0.push(i);
+            out.1.push(cols[j].0);
+            out.2.push(e);
         }
     }
-    (rows, cols, exprs)
+    out
 }
 
 pub(crate) fn sym2(ctx: &mut Graph, name: &str) -> (ExprId, SymbolId) {

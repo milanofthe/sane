@@ -41,8 +41,14 @@ D1 a 0 dmod
 
     let parsed = parse_with_base(deck, Some(&dir)).expect("parse with include");
     // The diode model was found via the included card -> its params are bound.
-    assert_eq!(parsed.param_value("D1.Is"), Some(1e-15));
-    assert_eq!(parsed.param_value("D1.N"), Some(1.2));
+    assert_eq!(
+        parsed.param_value(&parsed.param_symbol("D1", "Is").unwrap()),
+        Some(1e-15)
+    );
+    assert_eq!(
+        parsed.param_value(&parsed.param_symbol("D1", "N").unwrap()),
+        Some(1.2)
+    );
 
     fs::remove_dir_all(&dir).ok();
 }
@@ -67,7 +73,10 @@ D1 a 0 dmod
 
     let parsed = parse_with_base(deck, Some(&dir)).expect("parse with .lib");
     // `tt` Is, not `ff` Is.
-    assert_eq!(parsed.param_value("D1.Is"), Some(1e-15));
+    assert_eq!(
+        parsed.param_value(&parsed.param_symbol("D1", "Is").unwrap()),
+        Some(1e-15)
+    );
 
     fs::remove_dir_all(&dir).ok();
 }

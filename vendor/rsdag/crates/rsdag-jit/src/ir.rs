@@ -90,6 +90,23 @@ pub(crate) struct CallSite {
     pub(crate) state_len: u32,
     /// Several instances through the bundle's own batch entry.
     pub(crate) batch: bool,
+    /// Where in the gather area its arguments go: apart from the other
+    /// calls of its stage.
+    pub(crate) gather_at: usize,
+    /// Its part in a stage of independent calls ([`rsdag::Stage`]).
+    pub(crate) stage: StageRole,
+    /// Ops it carries: its instances times its body's.
+    pub(crate) ops: u64,
+}
+
+/// A call's part in a stage: alone (through `h_call`), one whose host call
+/// the stage's last makes, or the last, making it for the `n` calls of the
+/// stage (through `h_stage`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StageRole {
+    Alone,
+    Deferred,
+    Last(u32),
 }
 
 /// A dense operand: a run of inputs or of work slots read in place, or
@@ -206,7 +223,7 @@ impl ROp {
     pub(crate) fn gather_len(&self) -> usize {
         match self {
             ROp::Reduce(_, ReduceOp::Min | ReduceOp::Max, args) => args.len(),
-            ROp::Call(c) => c.args.len(),
+            ROp::Call(c) => c.gather_at + c.args.len(),
             ROp::Kernel(k) => k.operands.iter().map(|(d, _)| d.gathered()).sum(),
             _ => 0,
         }
@@ -297,6 +314,31 @@ pub(crate) fn record(tape: &Tape) -> (Vec<ROp>, usize) {
     };
     let mut ops = Vec::with_capacity(tape.n_ops());
     let mut split = 0;
+    // The stage op `i` is in, and the gather offset of its next call.
+    let stages = tape.stages();
+    let mut si = 0;
+    let mut stage_at = 0usize;
+    let mut role = |i: usize, n_args: usize| -> (StageRole, usize) {
+        while si < stages.len() && stages[si].hi as usize <= i {
+            si += 1;
+        }
+        match stages.get(si) {
+            Some(st) if st.lo as usize <= i => {
+                let at = stage_at;
+                stage_at += n_args;
+                if i + 1 == st.hi as usize {
+                    stage_at = 0;
+                    (StageRole::Last(st.hi - st.lo), at)
+                } else {
+                    (StageRole::Deferred, at)
+                }
+            }
+            _ => (StageRole::Alone, 0),
+        }
+    };
+    let body_ops = |i: usize, b: u32, ng: u32| {
+        ng as u64 * rsdag::tape::call_ops(&*tape.bundles()[b as usize], &tape.ops()[i])
+    };
     for i in 0..tape.n_ops() {
         if i == tape.prolog_len() {
             split = ops.len();
@@ -323,22 +365,28 @@ pub(crate) fn record(tape: &Tape) -> (Vec<ROp>, usize) {
                 n_args,
                 n_out,
                 state,
-            } => ROp::Call(CallSite {
-                dst,
-                bundle,
-                args: tape.pool(start, n_groups * n_args).to_vec(),
-                n_groups,
-                n_args,
-                n_out,
-                kind: if state == NO_STATE {
-                    CallKind::Whole
-                } else {
-                    CallKind::Main
-                },
-                state: if state == NO_STATE { 0 } else { state },
-                state_len: tape.bundles()[bundle as usize].state_len() as u32,
-                batch: n_groups > 1,
-            }),
+            } => {
+                let (stage, gather_at) = role(i, (n_groups * n_args) as usize);
+                ROp::Call(CallSite {
+                    dst,
+                    bundle,
+                    args: tape.pool(start, n_groups * n_args).to_vec(),
+                    n_groups,
+                    n_args,
+                    n_out,
+                    kind: if state == NO_STATE {
+                        CallKind::Whole
+                    } else {
+                        CallKind::Main
+                    },
+                    state: if state == NO_STATE { 0 } else { state },
+                    state_len: tape.bundles()[bundle as usize].state_len() as u32,
+                    batch: n_groups > 1,
+                    gather_at,
+                    stage,
+                    ops: body_ops(i, bundle, n_groups),
+                })
+            }
             Op::CallProlog {
                 bundle,
                 start,
@@ -346,6 +394,7 @@ pub(crate) fn record(tape: &Tape) -> (Vec<ROp>, usize) {
                 n_pure,
             } => {
                 let state_len = tape.bundles()[bundle as usize].state_len() as u32;
+                let (stage, gather_at) = role(i, (n_groups * n_pure) as usize);
                 ROp::Call(CallSite {
                     dst,
                     bundle,
@@ -357,6 +406,9 @@ pub(crate) fn record(tape: &Tape) -> (Vec<ROp>, usize) {
                     state: dst,
                     state_len,
                     batch: n_groups > 1,
+                    gather_at,
+                    stage,
+                    ops: body_ops(i, bundle, n_groups),
                 })
             }
             Op::Gemv { a, x, m, n, acc } if m < INLINE_ROWS => {

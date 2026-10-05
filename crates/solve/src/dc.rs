@@ -7,7 +7,10 @@
 use sane_core::constants::*;
 use sane_core::log_stage;
 
-use crate::{limiting, newton, sparse, CompiledDc, Convergence, LinCache, SolverTricks, Symbolic};
+use crate::{
+    limiting, newton, sparse, CompiledDc, Convergence, LinCache, PrologToken, SolverTricks,
+    StepEval, Symbolic,
+};
 
 /// A `.nodeset` pin: stiff springs `g*(x_i - target_i)` on selected unknown rows
 /// for the first phase of a node-set solve. Forcing the pinned unknowns toward
@@ -404,10 +407,9 @@ impl CompiledDc {
         // Diagonal position of each node within the Jacobian value array, fixed
         // by the sparsity pattern and precomputed once in `CompiledDc`.
         let diag_idx = &self.diag_idx;
-        let xdot: &[f64] = &[];
         let mut x = vec![0.0; n];
-        let (mut inputs, mut work, mut out) = (Vec::new(), Vec::new(), Vec::new());
-        let (mut inb, mut wb, mut ob) = (Vec::new(), Vec::new(), Vec::new());
+        // One Jacobian and one residual episode: `p` is fixed over the solve.
+        let (mut sb, mut rb) = (TapeBufs::default(), TapeBufs::default());
         let mut valbuf = Vec::new();
         let mut jacbuf: Vec<f64> = Vec::new();
         // Per-iteration scratch reused across the whole solve (no realloc per step).
@@ -424,8 +426,8 @@ impl CompiledDc {
 
         for _ in 0..ADAPT_MAX_ITER {
             iters += 1;
-            self.fill_inputs(&x, xdot, p, 0.0, &mut inputs);
-            self.tape_step_dc.eval(&inputs, &mut work, &mut out);
+            self.eval_episode(&self.tape_step_dc, &x, p, &mut sb);
+            let out = &sb.out;
             let fnorm = shunted_norm(&out[..n], &x, GMIN_DC);
             if fnorm < best_fnorm {
                 best_fnorm = fnorm;
@@ -476,7 +478,7 @@ impl CompiledDc {
                 // stalled, so accept if the KCL imbalance is small relative to the
                 // node branch-current scale (not just the absolute floor).
                 if let Some(tape) = &self.tape_iscale {
-                    tape.eval(&inputs, &mut iwork, &mut iterms);
+                    tape.eval(&sb.inputs, &mut iwork, &mut iterms);
                     if self.residual_relative_ok(&out[..n], &iterms, &x, GMIN_DC, conv) {
                         return (x, true, iters);
                     }
@@ -500,8 +502,8 @@ impl CompiledDc {
                 fnorm,
                 LINE_SEARCH_TRIES,
                 |trial| {
-                    self.fill_inputs(trial, xdot, p, 0.0, &mut inb);
-                    self.tape_res_dc.eval(&inb, &mut wb, &mut ob);
+                    self.eval_episode(&self.tape_res_dc, trial, p, &mut rb);
+                    let ob = &rb.out;
                     shunted_norm(&ob, trial, GMIN_DC)
                 },
             );
@@ -560,6 +562,18 @@ impl CompiledDc {
     /// a fallback. Disabling a trick removes exactly that stage, so a caller can
     /// A/B a single aid or enable device limiting for hard FET-dense circuits.
     pub fn solve_dc_conv_with(
+        &self,
+        p: &[f64],
+        x0: &[f64],
+        conv: Convergence,
+        max_iter: usize,
+        tricks: SolverTricks,
+    ) -> (Vec<f64>, bool, usize) {
+        crate::parallel::solve(|| self.solve_dc_conv_with_here(p, x0, conv, max_iter, tricks))
+    }
+
+    /// [`solve_dc_conv_with`](Self::solve_dc_conv_with) on this thread.
+    fn solve_dc_conv_with_here(
         &self,
         p: &[f64],
         x0: &[f64],
@@ -1035,6 +1049,18 @@ impl CompiledDc {
         max_iter: usize,
         tricks: SolverTricks,
     ) -> (Vec<f64>, bool, usize) {
+        crate::parallel::solve(|| self.solve_dc_nodeset_with_here(p, nodeset, conv, max_iter, tricks))
+    }
+
+    /// [`solve_dc_nodeset_with`](Self::solve_dc_nodeset_with) on this thread.
+    fn solve_dc_nodeset_with_here(
+        &self,
+        p: &[f64],
+        nodeset: &[(usize, f64)],
+        conv: Convergence,
+        max_iter: usize,
+        tricks: SolverTricks,
+    ) -> (Vec<f64>, bool, usize) {
         use sane_core::log;
         if nodeset.is_empty() {
             return self.dc_cascade(p, &[], conv, max_iter, tricks, &self.nodeset);
@@ -1068,14 +1094,13 @@ impl CompiledDc {
         max_iter: usize,
     ) -> (Vec<f64>, bool, usize) {
         let n = self.n;
-        let xdot: &[f64] = &[];
         let mut x = if x_init.len() == n {
             x_init.to_vec()
         } else {
             vec![0.0; n]
         };
-        let (mut inputs, mut work, mut out) = (Vec::new(), Vec::new(), Vec::new());
-        let (mut inb, mut wb, mut ob) = (Vec::new(), Vec::new(), Vec::new());
+        // One Jacobian and one residual episode: `p` is fixed over the solve.
+        let (mut sb, mut rb) = (TapeBufs::default(), TapeBufs::default());
         // The pinned matrix is `dF/dx + diag(GMIN_DC + g on the pinned rows)` -- the
         // pin entries land on the augmented diagonal, so its pattern is exactly the
         // precomputed `self.symbolic` (dF/dx nonzeros + full diagonal). Reuse that
@@ -1087,8 +1112,8 @@ impl CompiledDc {
         // Rescale each pinned row's spring to dominate that row's own couplings
         // at the start point (one extra tape evaluation).
         let gpin: Vec<f64> = {
-            self.fill_inputs(&x, xdot, p, 0.0, &mut inputs);
-            self.tape_step_dc.eval(&inputs, &mut work, &mut out);
+            self.eval_episode(&self.tape_step_dc, &x, p, &mut sb);
+            let out = &sb.out;
             let jac = &out[n..];
             pin.idx
                 .iter()
@@ -1126,8 +1151,8 @@ impl CompiledDc {
 
         let mut stall = newton::StallGuard::new();
         for it in 0..max_iter {
-            self.fill_inputs(&x, xdot, p, 0.0, &mut inputs);
-            self.tape_step_dc.eval(&inputs, &mut work, &mut out); // residual ++ jac-x
+            self.eval_episode(&self.tape_step_dc, &x, p, &mut sb); // residual ++ jac-x
+            let out = &sb.out;
             pin_res(&x, &out[..n], &mut h);
             let fnorm = norm2(&h);
             if stall.stalled(fnorm) {
@@ -1149,8 +1174,8 @@ impl CompiledDc {
             }
             // Backtracking line search on the pinned residual norm.
             newton::backtrack(&mut x, &dx, &mut trial, fnorm, LINE_SEARCH_TRIES, |trial| {
-                self.fill_inputs(trial, xdot, p, 0.0, &mut inb);
-                self.tape_res_dc.eval(&inb, &mut wb, &mut ob);
+                self.eval_episode(&self.tape_res_dc, trial, p, &mut rb);
+                let ob = &rb.out;
                 pin_res(trial, &ob, &mut h);
                 norm2(&h)
             });
@@ -1204,15 +1229,12 @@ impl CompiledDc {
         let mut tangent = vec![0.0; n];
         // Tangent-solve factorization cache (fixed SOURCE_GMIN along the ramp).
         let mut fac: Option<sparse::Refactorable> = None;
-        let mut lambda = 0.0_f64;
-        let mut dlam = HOMOTOPY_DLAM0;
-        let mut steps = 0usize;
-        while lambda < 1.0 {
-            steps += 1;
-            if steps > HOMOTOPY_MAX_STEPS {
+        let mut ramp = Ramp::new();
+        while ramp.lambda < 1.0 {
+            let Some(target) = ramp.target() else {
                 return (x, false, iters);
-            }
-            let target = (lambda + dlam).min(1.0);
+            };
+            let lambda = ramp.lambda;
 
             // dF/dlambda = b_src = residual(x; full sources) - residual(x; off).
             let r_full = self.residual(&x, &xdot, &p_full, 0.0);
@@ -1249,13 +1271,9 @@ impl CompiledDc {
             iters += it;
             if cc {
                 x = xc;
-                lambda = target;
-                dlam = (dlam * HOMOTOPY_GROW).min(HOMOTOPY_DLAM_MAX);
-            } else {
-                dlam *= HOMOTOPY_SHRINK;
-                if dlam < HOMOTOPY_DLAM_MIN {
-                    return (x, false, iters);
-                }
+            }
+            if !ramp.record(target, cc) {
+                return (x, false, iters);
             }
         }
 
@@ -1401,11 +1419,21 @@ impl CompiledDc {
         (row != usize::MAX).then(|| (row, f64::from_bits(self.last_gmin_share.load(Relaxed))))
     }
 
+    /// Evaluate `tape` at `(x, p)` into `tb.out`: the prolog on the buffers'
+    /// first evaluation, the main phase on every one. `tb` must stay with
+    /// `tape` and `p` for its lifetime.
+    fn eval_episode(&self, tape: &StepEval, x: &[f64], p: &[f64], tb: &mut TapeBufs) {
+        self.fill_inputs(x, &[], p, 0.0, &mut tb.inputs);
+        let ep = tb
+            .episode
+            .get_or_insert_with(|| tape.eval_prolog(&tb.inputs, &mut tb.work));
+        tape.eval_main(ep, &tb.inputs, &mut tb.work, &mut tb.out);
+    }
+
     /// Companion residual `H = F(x) + (1 - lambda)*G_comp*x` at `(x, lambda)`.
     fn companion_residual(&self, x: &[f64], p: &[f64], lambda: f64, tb: &mut TapeBufs) {
         let n = self.n;
-        self.fill_inputs(x, &[], p, 0.0, &mut tb.inputs);
-        self.tape_res_dc.eval(&tb.inputs, &mut tb.work, &mut tb.out);
+        self.eval_episode(&self.tape_res_dc, x, p, tb);
         let h = &mut tb.out;
         let s = 1.0 - lambda;
         for &(r, c, g) in &self.companion {
@@ -1436,9 +1464,7 @@ impl CompiledDc {
         fac: &mut Option<sparse::Refactorable<'a>>,
     ) -> bool {
         let n = self.n;
-        self.fill_inputs(x, &[], p, 0.0, &mut tb.inputs);
-        self.tape_step_dc
-            .eval(&tb.inputs, &mut tb.work, &mut tb.out);
+        self.eval_episode(&self.tape_step_dc, x, p, tb);
         let jac = &tb.out[n..];
         let s = 1.0 - lambda;
         // Reuse a precomputed symbolic (#52): the pattern (dF/dx nonzeros + companion
@@ -1495,6 +1521,7 @@ impl CompiledDc {
     /// Damped Newton on the companion-augmented system at a fixed `lambda`.
     /// `tricks` gates the per-step shaping (uniform clamp, device limiting, line
     /// search), exactly as in [`newton`](Self::newton).
+    #[allow(clippy::too_many_arguments)]
     fn companion_newton(
         &self,
         p: &[f64],
@@ -1503,6 +1530,7 @@ impl CompiledDc {
         conv: &Convergence,
         max_iter: usize,
         tricks: SolverTricks,
+        (res, jac): &mut (TapeBufs, TapeBufs),
     ) -> (Vec<f64>, bool, usize) {
         let n = self.n;
         let mut x = if x_init.len() == n {
@@ -1510,13 +1538,12 @@ impl CompiledDc {
         } else {
             vec![0.0; n]
         };
-        let (mut res, mut jac) = (TapeBufs::default(), TapeBufs::default());
         let (mut step, mut trial) = (vec![0.0; n], vec![0.0; n]);
         // Companion-pattern factorization cache for this lambda's corrector.
         let mut fac: Option<sparse::Refactorable> = None;
         let mut stall = newton::StallGuard::new();
         for it in 0..max_iter {
-            self.companion_residual(&x, p, lambda, &mut res);
+            self.companion_residual(&x, p, lambda, res);
             let h = &res.out;
             let fnorm = norm2(h);
             if stall.stalled(fnorm) {
@@ -1534,7 +1561,7 @@ impl CompiledDc {
             if self.residual_converged(h, &x, 0.0, conv) {
                 return (x, true, it);
             }
-            if !self.companion_solve(&x, p, lambda, h, &mut step, &mut jac, &mut fac) {
+            if !self.companion_solve(&x, p, lambda, h, &mut step, jac, &mut fac) {
                 return (x, false, it);
             }
             // Curve-aware per-device limiting (path-only; see `newton`).
@@ -1548,7 +1575,7 @@ impl CompiledDc {
                 1
             };
             newton::backtrack(&mut x, &step, &mut trial, fnorm, tries, |trial| {
-                self.companion_residual(trial, p, lambda, &mut res);
+                self.companion_residual(trial, p, lambda, res);
                 norm2(&res.out)
             });
         }
@@ -1574,23 +1601,24 @@ impl CompiledDc {
         }
         let n = self.n;
         // lambda = 0: the companion-dominated linear network.
-        let (mut x, c0, it0) = self.companion_newton(p, &[], 0.0, conv, GMIN_STEP_MAX_ITER, tricks);
+        // One residual and one Jacobian episode for the whole ramp: `p` is
+        // fixed along it, so the tapes' prologs run once.
+        let mut bufs = (TapeBufs::default(), TapeBufs::default());
+        let (mut x, c0, it0) =
+            self.companion_newton(p, &[], 0.0, conv, GMIN_STEP_MAX_ITER, tricks, &mut bufs);
         iters += it0;
         if !c0 {
             return (x, false, iters);
         }
-        let mut lambda = 0.0_f64;
-        let mut dlam = HOMOTOPY_DLAM0;
-        let mut steps = 0usize;
+        let mut ramp = Ramp::new();
         // Tangent-solve factorization cache (pattern fixed along the ramp).
         let mut fac_t: Option<sparse::Refactorable> = None;
-        let (mut tb, mut tangent) = (TapeBufs::default(), vec![0.0; n]);
-        while lambda < 1.0 {
-            steps += 1;
-            if steps > HOMOTOPY_MAX_STEPS {
+        let mut tangent = vec![0.0; n];
+        while ramp.lambda < 1.0 {
+            let Some(target) = ramp.target() else {
                 return (x, false, iters);
-            }
-            let target = (lambda + dlam).min(1.0);
+            };
+            let lambda = ramp.lambda;
             // Exact tangent: [dH/dx] t = (G_comp + GMIN_START*I_nodes) x.
             let mut rhs_t = vec![0.0; n];
             for i in (0..n).filter(|&i| self.is_node(i)) {
@@ -1601,14 +1629,21 @@ impl CompiledDc {
             }
             let dl = target - lambda;
             let solved =
-                self.companion_solve(&x, p, lambda, &rhs_t, &mut tangent, &mut tb, &mut fac_t);
+                self.companion_solve(&x, p, lambda, &rhs_t, &mut tangent, &mut bufs.1, &mut fac_t);
             let x_pred: Vec<f64> = if solved {
                 (0..n).map(|i| x[i] + tangent[i] * dl).collect()
             } else {
                 x.clone()
             };
-            let (xc, cc, it) =
-                self.companion_newton(p, &x_pred, target, conv, GMIN_STEP_MAX_ITER, tricks);
+            let (xc, cc, it) = self.companion_newton(
+                p,
+                &x_pred,
+                target,
+                conv,
+                GMIN_STEP_MAX_ITER,
+                tricks,
+                &mut bufs,
+            );
             iters += it;
             sane_core::log::debug(&format!(
                 "companion: lambda {lambda:.4} -> {target:.4} {} ({it} iters)",
@@ -1616,13 +1651,9 @@ impl CompiledDc {
             ));
             if cc {
                 x = xc;
-                lambda = target;
-                dlam = (dlam * HOMOTOPY_GROW).min(HOMOTOPY_DLAM_MAX);
-            } else {
-                dlam *= HOMOTOPY_SHRINK;
-                if dlam < HOMOTOPY_DLAM_MIN {
-                    return (x, false, iters);
-                }
+            }
+            if !ramp.record(target, cc) {
+                return (x, false, iters);
             }
         }
         // lambda = 1: companion gone -> final polish at the baseline shunt.
@@ -1631,14 +1662,61 @@ impl CompiledDc {
     }
 }
 
+/// The step control of a predictor-corrector continuation: `lambda` from 0
+/// to 1, the step grown after a held corrector and shrunk after a failed one.
+/// The ramp gives up past `HOMOTOPY_MAX_STEPS` points, below
+/// `HOMOTOPY_DLAM_MIN`, or after `HOMOTOPY_ENDPOINT_TRIES` failed correctors
+/// at `lambda = 1` itself.
+struct Ramp {
+    lambda: f64,
+    dlam: f64,
+    steps: usize,
+    endpoint_fails: usize,
+}
+
+impl Ramp {
+    fn new() -> Ramp {
+        Ramp {
+            lambda: 0.0,
+            dlam: HOMOTOPY_DLAM0,
+            steps: 0,
+            endpoint_fails: 0,
+        }
+    }
+
+    /// The next corrector's target, `None` past the step cap.
+    fn target(&mut self) -> Option<f64> {
+        self.steps += 1;
+        (self.steps <= HOMOTOPY_MAX_STEPS).then(|| (self.lambda + self.dlam).min(1.0))
+    }
+
+    /// Take the corrector's verdict at `target`; `false` gives the ramp up.
+    fn record(&mut self, target: f64, held: bool) -> bool {
+        if held {
+            self.lambda = target;
+            self.dlam = (self.dlam * HOMOTOPY_GROW).min(HOMOTOPY_DLAM_MAX);
+            return true;
+        }
+        if target == 1.0 {
+            self.endpoint_fails += 1;
+        }
+        self.dlam *= HOMOTOPY_SHRINK;
+        self.dlam >= HOMOTOPY_DLAM_MIN && self.endpoint_fails < HOMOTOPY_ENDPOINT_TRIES
+    }
+}
+
 /// One tape evaluation site's buffers, and the factor values built from its
-/// outputs: kept by a Newton loop across its iterations.
+/// outputs: kept by a Newton loop across its iterations. The buffers belong
+/// to one tape at one parameter binding: the first evaluation runs the
+/// tape's parameter-pure prolog into `work`, every later one only the main
+/// phase (see [`CompiledDc::eval_episode`]).
 #[derive(Default)]
 struct TapeBufs {
     inputs: Vec<f64>,
     work: Vec<f64>,
     out: Vec<f64>,
     vals: Vec<f64>,
+    episode: Option<PrologToken>,
 }
 
 fn norm2(v: &[f64]) -> f64 {

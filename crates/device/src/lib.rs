@@ -145,14 +145,6 @@ pub struct BehavioralFragment {
 /// `Send + Sync` so device instances can live inside types shared across FFI
 /// boundaries (e.g. the Python `Circuit`).
 pub trait DeviceModel: Send + Sync {
-    /// Template-group key for instance counting (the assembler pre-counts
-    /// instances per group so the frontend can decide whether the first
-    /// instance also routes through the shared compiled bundle). `None` for
-    /// devices without a template/bundle path.
-    fn template_group(&self) -> Option<String> {
-        None
-    }
-
     /// Number of terminals (length of the voltage/current vectors).
     fn n_terminals(&self) -> usize;
 
@@ -192,6 +184,18 @@ pub trait DeviceModel: Send + Sync {
     /// parameters are bound numerically (nothing to look up by name).
     fn instance_name(&self) -> Option<&str> {
         None
+    }
+
+    /// The `.model` card whose parameters the instance shares (their symbols
+    /// are `{card}.{param}`), if it uses one.
+    fn card_name(&self) -> Option<&str> {
+        None
+    }
+
+    /// The name of the symbol module parameter `param` binds to: the
+    /// instance's `{inst}.{param}` unless the device shares a card's.
+    fn param_symbol(&self, param: &str) -> Option<String> {
+        self.instance_name().map(|inst| format!("{inst}.{param}"))
     }
 
     /// The module default of one parameter (unsuffixed name). The netlist
@@ -256,20 +260,31 @@ pub trait DeviceModel: Send + Sync {
 /// place the "unstated parameter takes the module default" rule lives; the
 /// netlist front end binds only what a deck states.
 pub struct ParamDefaults<'a> {
-    by_inst: rustc_hash::FxHashMap<&'a str, &'a dyn DeviceModel>,
+    by_inst: rustc_hash::FxHashMap<String, &'a dyn DeviceModel>,
 }
 
 impl<'a> ParamDefaults<'a> {
     pub fn new(devices: &'a [DeviceInstance]) -> Self {
-        let by_inst = devices
-            .iter()
-            .filter_map(|d| d.model.instance_name().map(|n| (n, &*d.model)))
-            .collect();
-        Self { by_inst }
+        let mut d = Self {
+            by_inst: Default::default(),
+        };
+        d.add(devices, &|n| n.to_string());
+        d
     }
 
-    /// The device default of parameter symbol `name` (`M1.W`), if the device
-    /// placed as its instance prefix declares it.
+    /// Add `devices` under their names in the lookup's frame (a subcircuit
+    /// body's devices renamed into the top level's).
+    pub fn add(&mut self, devices: &'a [DeviceInstance], rename: &dyn Fn(&str) -> String) {
+        for d in devices {
+            let m = &*d.model;
+            for n in m.instance_name().into_iter().chain(m.card_name()) {
+                self.by_inst.insert(rename(n), m);
+            }
+        }
+    }
+
+    /// The device default of parameter symbol `name` (`M1.W`, `nmos.vth0`),
+    /// if the device placed as its instance or card prefix declares it.
     pub fn get(&self, name: &str) -> Option<f64> {
         let (inst, p) = name.rsplit_once('.')?;
         self.by_inst.get(inst)?.param_default(p)

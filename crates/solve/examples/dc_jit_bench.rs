@@ -6,7 +6,6 @@
 //!   cargo run -q --release --example dc_jit_bench -- <deck.cir>
 
 use sane_core::Graph;
-use sane_dae::assemble_dae;
 use sane_solve::CompiledDc;
 use std::time::Instant;
 
@@ -17,7 +16,7 @@ fn main() {
     let text = std::fs::read_to_string(&path).expect("read deck");
     let parsed = sane_netlist::parse(&text).expect("parse deck");
     let mut ctx = Graph::new();
-    let dae = assemble_dae(&mut ctx, &parsed.circuit, &parsed.devices);
+    let dae = parsed.assemble(&mut ctx);
     let cdc = CompiledDc::new(&mut ctx, &dae);
     // Parameter vector from the deck's bound values (the same source the
     // analysis-layer ParamStore uses), unbound entries at 0, $temp nominal.

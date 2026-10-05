@@ -4,13 +4,13 @@
 
 use std::sync::atomic::Ordering;
 
-use rsdag::Tape;
+use rsdag::{SymbolId, Tape};
 use sane_core::constants::GMIN_DC;
 use sane_core::log_stage;
 use sane_core::Graph;
 use sane_dae::{lagrangian_hessian, Dae};
 
-use crate::{bundle, sparse, CompiledDc, StepEval, FACTOR_FX_CALLS};
+use crate::{sparse, CompiledDc, StepEval, FACTOR_FX_CALLS};
 
 /// Compiled `∂F/∂hist` triplets (see [`CompiledDc::ensure_hist_jac`]).
 pub(crate) struct HistJac {
@@ -57,7 +57,7 @@ impl CompiledDc {
             return;
         }
         let (r, c, e) = dae.jacobian_hist_coo(ctx);
-        let tape = crate::eval::step_eval(Tape::compile(ctx, &e, &self.base_inputs));
+        let tape = crate::eval::step_eval(Tape::compose(ctx, &e, &self.base_inputs));
         let _ = self.hjac.set(HistJac {
             tape,
             rows: r,
@@ -79,6 +79,45 @@ impl CompiledDc {
         (hj.rows.clone(), hj.cols.clone(), out)
     }
 
+    /// `dF/d(input)` at `(x, xdot, p, t)`: the residuals' derivative in the
+    /// symbol `input` (an independent source's value, the excitation of the
+    /// AC and pole-zero analyses). Its tape is compiled on the first query
+    /// for `input` and kept; later queries only evaluate it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn input_jacobian(
+        &self,
+        ctx: &mut Graph,
+        dae: &Dae,
+        input: SymbolId,
+        x: &[f64],
+        xdot: &[f64],
+        p: &[f64],
+        t: f64,
+    ) -> Vec<f64> {
+        let tape = {
+            let mut cache = self.input_jacs.lock().unwrap();
+            cache
+                .entry(input)
+                .or_insert_with(|| {
+                    let roots: Vec<_> = dae
+                        .residuals
+                        .iter()
+                        .map(|&r| rsdag::differentiate(ctx, r, input))
+                        .collect();
+                    std::sync::Arc::new(crate::eval::step_eval(Tape::compose(
+                        ctx,
+                        &roots,
+                        &self.base_inputs,
+                    )))
+                })
+                .clone()
+        };
+        let (mut inputs, mut work, mut out) = (Vec::new(), Vec::new(), Vec::new());
+        self.fill_inputs(x, xdot, p, t, &mut inputs);
+        tape.eval(&inputs, &mut work, &mut out);
+        out
+    }
+
     /// Build the parameter Jacobian `dF/dp` tape on demand (idempotent). Call
     /// before any sensitivity query; split out of `new` so it is paid only when a
     /// sensitivity is asked for, not on every extract.
@@ -88,16 +127,11 @@ impl CompiledDc {
         }
         let (pr, pc, pe) = log_stage!(
             "sens/param_jac_coo",
-            if dae.stamps.is_empty() {
-                dae.jacobian_p_coo(ctx, &self.param_syms)
-            } else {
-                dae.jacobian_p_coo_templated(ctx, &self.param_syms)
-            }
+            dae.jacobian_p_coo(ctx, &self.param_syms)
         );
-        bundle::ensure_function_bodies(ctx, &pe);
         let tape = log_stage!(
             "sens/param_jac_tape",
-            crate::eval::step_eval(Tape::compile(ctx, &pe, &self.base_inputs))
+            crate::eval::step_eval(Tape::compose(ctx, &pe, &self.base_inputs))
         );
         let _ = self.pjac.set(ParamJac {
             tape,
@@ -132,7 +166,6 @@ impl CompiledDc {
         h_roots.extend(hs.xdxd.2.iter().copied());
         h_roots.extend(hs.xxd.2.iter().copied());
         h_roots.extend(hs.xdp.2.iter().copied());
-        bundle::ensure_function_bodies(ctx, &h_roots);
         let ch = CompiledHessian {
             np: self.param_syms.len(),
             nxx: hs.xx.2.len(),
@@ -148,7 +181,7 @@ impl CompiledDc {
             xdp_rc: (hs.xdp.0, hs.xdp.1),
             tape: log_stage!(
                 "sens/hessian_tape",
-                crate::eval::step_eval(Tape::compile(ctx, &h_roots, &h_input_syms))
+                crate::eval::step_eval(Tape::compose(ctx, &h_roots, &h_input_syms))
             ),
         };
         let _ = self.chess.set(ch);

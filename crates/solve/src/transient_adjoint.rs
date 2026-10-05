@@ -62,6 +62,17 @@ impl CompiledDc {
         t_eval: &[f64],
         dc_guess: &[f64],
     ) -> Result<Vec<Vec<f64>>, String> {
+        crate::parallel::solve(|| self.solve_transient_grid_here(p, x0, t_eval, dc_guess))
+    }
+
+    /// [`solve_transient_grid`](Self::solve_transient_grid) on this thread.
+    fn solve_transient_grid_here(
+        &self,
+        p: &[f64],
+        x0: &[f64],
+        t_eval: &[f64],
+        dc_guess: &[f64],
+    ) -> Result<Vec<Vec<f64>>, String> {
         self.esdirk32_grid(p, x0, t_eval, dc_guess)
             .map(|(states, _)| states)
     }
@@ -198,6 +209,18 @@ impl CompiledDc {
     /// Requires the parameter Jacobian tape (`ensure_param_jac`), like the
     /// other sensitivity entry points.
     pub fn transient_adjoint(
+        &self,
+        p: &[f64],
+        x0: &[f64],
+        t_eval: &[f64],
+        cotangent: &[Vec<f64>],
+        dc_guess: &[f64],
+    ) -> Result<Vec<f64>, String> {
+        crate::parallel::solve(|| self.transient_adjoint_here(p, x0, t_eval, cotangent, dc_guess))
+    }
+
+    /// [`transient_adjoint`](Self::transient_adjoint) on this thread.
+    fn transient_adjoint_here(
         &self,
         p: &[f64],
         x0: &[f64],

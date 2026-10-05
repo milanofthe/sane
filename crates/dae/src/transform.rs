@@ -9,17 +9,15 @@ use rustc_hash::FxHashMap;
 use rsdag::{differentiate, ExprId, Node, ReduceOp, SymbolId};
 use sane_core::Graph;
 
-use crate::{stamp, Dae, UnknownKind};
+use crate::{Dae, UnknownKind};
 
 impl Dae {
-    /// A transformed copy of this DAE over a (possibly reduced) unknown layout,
-    /// with the Jacobian stamps rebuilt from the new residuals. The analysis-only
-    /// registries a graph transform cannot preserve (delays, events, companion
-    /// network, noise sources, op-vars, device limits, source shapes) are
-    /// cleared; the time symbol carries over.
+    /// A transformed copy of this DAE over a (possibly reduced) unknown layout
+    /// and new residuals. The analysis-only registries a graph transform cannot
+    /// preserve (delays, events, companion network, noise sources, op-vars,
+    /// device limits, source shapes) are cleared; the time symbol carries over.
     fn transformed(
         &self,
-        ctx: &mut Graph,
         n_nodes: usize,
         residuals: Vec<ExprId>,
         unknowns: Vec<String>,
@@ -27,7 +25,6 @@ impl Dae {
         x: Vec<SymbolId>,
         xdot: Vec<Option<SymbolId>>,
     ) -> Dae {
-        let stamps = stamp::stamps_from_residuals(ctx, &residuals);
         Dae {
             residuals,
             n_nodes,
@@ -39,7 +36,6 @@ impl Dae {
             t: self.t,
             events: Vec::new(),
             delays: Vec::new(),
-            stamps,
             companion: Vec::new(),
             noise_sources: Vec::new(),
             op_vars: Vec::new(),
@@ -49,6 +45,7 @@ impl Dae {
             limits: Vec::new(),
             sources: Vec::new(),
             source_names: Vec::new(),
+            labels: Default::default(),
         }
     }
 }
@@ -142,15 +139,7 @@ pub(crate) fn merge_nodes(
 
     let n_nodes = survivors.iter().filter(|&&i| i < nn).count();
     let new_kinds: Vec<UnknownKind> = survivors.iter().map(|&i| dae.kinds[i]).collect();
-    let reduced = dae.transformed(
-        ctx,
-        n_nodes,
-        new_res,
-        new_unknowns,
-        new_kinds,
-        new_x,
-        new_xdot,
-    );
+    let reduced = dae.transformed(n_nodes, new_res, new_unknowns, new_kinds, new_x, new_xdot);
     (reduced, survivors)
 }
 
@@ -252,7 +241,7 @@ pub fn eliminate_nodes(ctx: &mut Graph, dae: &Dae, keep: &HashSet<String>) -> (D
     }
 
     let n_nodes = nn - eliminated.len();
-    let reduced = dae.transformed(ctx, n_nodes, residuals, unknowns, kinds, x, xdot);
+    let reduced = dae.transformed(n_nodes, residuals, unknowns, kinds, x, xdot);
     (reduced, eliminated)
 }
 
@@ -459,7 +448,6 @@ pub(crate) fn prune_graph(
         .collect();
 
     let reduced = dae.transformed(
-        ctx,
         dae.n_nodes,
         new_residuals,
         dae.unknowns.clone(),

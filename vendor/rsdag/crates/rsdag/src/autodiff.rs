@@ -302,17 +302,52 @@ fn inert(node: &Node) -> usize {
     }
 }
 
+/// Whether `test` holds for every operand of `e` that carries a derivative
+/// (see [`carrying`]), without collecting them: the per-node test of a
+/// forward sweep.
+fn all_carrying<K: Field>(ctx: &Graph<K>, e: ExprId, mut test: impl FnMut(ExprId) -> bool) -> bool {
+    match *ctx.node(e) {
+        Node::Call(o, l) => {
+            let (f, k) = ctx.output(o);
+            let args = ctx.args(l);
+            ctx.output_support(f, k)
+                .iter()
+                .all(|&p| test(args[p as usize]))
+        }
+        ref node => ctx.operands(e)[inert(node)..].iter().all(|&c| test(c)),
+    }
+}
+
+/// The operands of `e` its derivative reads, in operand order, into `out`:
+/// all but a comparison's and a selector's condition, and of a call only the
+/// arguments the called output's support names (see
+/// [`Graph::output_support`]), so a derivative through a call is as sparse
+/// as the body it calls.
+pub(crate) fn carrying<K: Field>(ctx: &Graph<K>, e: ExprId, out: &mut Vec<ExprId>) {
+    out.clear();
+    match *ctx.node(e) {
+        Node::Call(o, l) => {
+            let (f, k) = ctx.output(o);
+            let args = ctx.args(l);
+            out.extend(ctx.output_support(f, k).iter().map(|&p| args[p as usize]));
+        }
+        ref node => out.extend_from_slice(&ctx.operands(e)[inert(node)..]),
+    }
+}
+
 /// The nodes under `root` through operands that carry a derivative, marked
 /// in `seen`, in ascending id order: a topological one, a hash-consed node
 /// having a larger id than its operands.
 fn cone<K: Field>(ctx: &Graph<K>, root: ExprId, seen: &mut Memo) -> Vec<ExprId> {
     let mut out = Vec::new();
     let mut stack = vec![root];
+    let mut ops = Vec::new();
     while let Some(e) = stack.pop() {
         if seen.get(e).is_none() {
             seen.set(e, e);
             out.push(e);
-            stack.extend_from_slice(&ctx.operands(e)[inert(ctx.node(e))..]);
+            carrying(ctx, e, &mut ops);
+            stack.extend_from_slice(&ops);
         }
     }
     out.sort_unstable();
@@ -333,6 +368,7 @@ fn forward<K: Field>(
 ) -> Vec<ExprId> {
     let mut stack: Vec<(ExprId, bool)> = Vec::with_capacity(64);
     stack.extend(roots.iter().rev().map(|&r| (r, false)));
+    let mut ops = Vec::new();
     while let Some((e, expanded)) = stack.pop() {
         // Done already: shared, or a solve component set by a sibling.
         if memo.get(e).is_some() {
@@ -343,11 +379,8 @@ fn forward<K: Field>(
             memo.set(e, d);
         } else {
             stack.push((e, true));
-            let ops = ctx.operands(e);
-            let pending = ops[inert(ctx.node(e))..]
-                .iter()
-                .rev()
-                .filter(|&&c| memo.get(c).is_none());
+            carrying(ctx, e, &mut ops);
+            let pending = ops.iter().rev().filter(|&&c| memo.get(c).is_none());
             stack.extend(pending.map(|&c| (c, false)));
         }
     }
@@ -367,10 +400,7 @@ fn tangent<K: Field>(ctx: &mut Graph<K>, e: ExprId, wrt: SymbolId, memo: &mut Me
         return if s == wrt { ctx.one() } else { zero };
     }
     let d = |c: ExprId| memo.get(c).expect("operand differentiated");
-    if ctx.operands(e)[inert(&node)..]
-        .iter()
-        .all(|&c| d(c) == zero)
-    {
+    if all_carrying(ctx, e, |c| d(c) == zero) {
         return zero;
     }
     match node {
@@ -473,17 +503,21 @@ fn tangent<K: Field>(ctx: &mut Graph<K>, e: ExprId, wrt: SymbolId, memo: &mut Me
         // Chain rule through a call: d/dx f_out(a) = Σ_i (∂f_out/∂p_i)(a) · da_i,
         // each partial a call into the function's derivative output.
         Node::Call(o, l) => {
-            let args = ctx.args(l).to_vec();
             let (f, out) = ctx.output(o);
-            let moving: Vec<(u32, ExprId)> = (0..args.len() as u32)
-                .map(|i| (i, d(args[i as usize])))
-                .filter(|&(_, da)| da != zero)
-                .collect();
+            let moving: Vec<(u32, ExprId)> = {
+                let args = ctx.args(l);
+                ctx.output_support(f, out)
+                    .iter()
+                    .map(|&i| (i, d(args[i as usize])))
+                    .filter(|&(_, da)| da != zero)
+                    .collect()
+            };
             let params: Vec<u32> = moving.iter().map(|&(i, _)| i).collect();
             let ks = ctx.derivative_outputs(f, out, &params);
             let mut acc = zero;
             for (&(_, dai), k) in moving.iter().zip(ks) {
-                let partial = ctx.call(f, k, &args);
+                // over the call's own list: no width to hash again
+                let partial = ctx.call_list(f, k, l);
                 let term = ctx.mul(partial, dai);
                 acc = ctx.add(acc, term);
             }
@@ -504,7 +538,8 @@ pub const REVERSE_MIN_TOUCHED: usize = 16;
 /// Sparse Jacobian of `residuals` with respect to `wrt`: row `i` lists the
 /// nonzero `(column, d residuals[i] / d wrt[column])`, by column.
 ///
-/// Only the symbols a row actually contains can have a nonzero derivative.
+/// Only the symbols in a row's support can have a nonzero derivative (see
+/// [`Graph::support_in`]): through a call, the ones the called output reads.
 /// A row that touches few unknowns is differentiated forward, one sweep
 /// per unknown, and a sweep is shared by every such row that touches that
 /// unknown, so a subexpression common to several rows (a device current
@@ -524,7 +559,7 @@ pub fn sparse_jacobian<K: Field>(
         .iter()
         .map(|&r| {
             let mut t: Vec<(usize, SymbolId)> = ctx
-                .free_symbols(r)
+                .support_in(&[r])
                 .into_iter()
                 .filter_map(|s| col.get(&s).map(|&j| (j, s)))
                 .collect();
@@ -588,13 +623,14 @@ pub fn gradient<K: Field>(ctx: &mut Graph<K>, f: ExprId, wrt: &[SymbolId]) -> Ve
     // nothing.
     let wanted: rustc_hash::FxHashSet<SymbolId> = wrt.iter().copied().collect();
     let mut active = vec![false; nodes.len()];
+    let mut ops = Vec::new();
     for (k, &e) in nodes.iter().enumerate() {
-        let node = ctx.node(e);
-        active[k] = match *node {
+        active[k] = match *ctx.node(e) {
             Node::Symbol(s) => wanted.contains(&s),
-            _ => ctx.operands(e)[inert(node)..]
-                .iter()
-                .any(|&c| active[at(c)]),
+            _ => {
+                carrying(ctx, e, &mut ops);
+                ops.iter().any(|&c| active[at(c)])
+            }
         };
     }
     let act = |e: ExprId| active[at(e)];
@@ -790,16 +826,21 @@ pub fn gradient<K: Field>(ctx: &mut Graph<K>, f: ExprId, wrt: &[SymbolId]) -> Ve
             // Chain rule through a call: the same derivative outputs as the
             // forward mode, for the arguments that move.
             Node::Call(o, l) => {
-                let args = ctx.args(l).to_vec();
                 let (func, out) = ctx.output(o);
-                let moving: Vec<u32> = (0..args.len() as u32)
-                    .filter(|&i| act(args[i as usize]))
-                    .collect();
-                let ks = ctx.derivative_outputs(func, out, &moving);
-                for (&i, k) in moving.iter().zip(ks) {
-                    let partial = ctx.call(func, k, &args);
+                let moving: Vec<(u32, ExprId)> = {
+                    let args = ctx.args(l);
+                    ctx.output_support(func, out)
+                        .iter()
+                        .map(|&i| (i, args[i as usize]))
+                        .filter(|&(_, a)| act(a))
+                        .collect()
+                };
+                let params: Vec<u32> = moving.iter().map(|&(i, _)| i).collect();
+                let ks = ctx.derivative_outputs(func, out, &params);
+                for (&(_, arg), k) in moving.iter().zip(ks) {
+                    let partial = ctx.call_list(func, k, l);
                     let t = ctx.mul(a_bar, partial);
-                    push(&mut adj, args[i as usize], t);
+                    push(&mut adj, arg, t);
                 }
             }
         }

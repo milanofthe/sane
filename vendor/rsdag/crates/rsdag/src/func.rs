@@ -80,9 +80,18 @@ pub struct Function {
     /// The numeric bundle of an extern function; `None` for a symbolic one.
     extern_body: Option<Arc<dyn ExternBundle>>,
     compiled: Vec<Body>,
+    /// The interpreted bodies [`body_for`](Function::body_for) built, one per
+    /// set of outputs a program asked for: every later program over the
+    /// graph that calls a subset of one takes it, so a body is compiled once
+    /// per function rather than once per program.
+    interpreted: std::sync::Mutex<Vec<Body>>,
     /// Derivative output `d outputs[out] / d params[param]`, by index: the
     /// outputs whose role is [`OutputRole::Derivative`].
     deriv_index: HashMap<(u32, u32), u32>,
+    /// Per output, its support once asked for (see
+    /// [`Graph::output_support`](crate::Graph::output_support)). An output
+    /// never changes once pushed, so neither does its support.
+    support: std::sync::Mutex<Vec<Option<Arc<[u32]>>>>,
 }
 
 /// A function body evaluated by the interpreter: the fallback every consumer
@@ -99,6 +108,8 @@ pub struct InterpretedBody {
     n_out: usize,
     /// One flag per parameter; empty when no parameter is pure.
     pure: Vec<bool>,
+    /// What backends compiled of the tape (see [`ExternBundle::backend_cache`]).
+    backends: crate::extern_fn::BackendCache,
 }
 
 impl InterpretedBody {
@@ -152,6 +163,9 @@ impl ExternBundle for InterpretedBody {
     fn body(&self) -> Option<&crate::tape::Tape> {
         Some(&self.tape)
     }
+    fn backend_cache(&self) -> Option<&crate::extern_fn::BackendCache> {
+        Some(&self.backends)
+    }
 }
 
 impl Function {
@@ -169,7 +183,9 @@ impl Function {
             output_roles: Vec::new(),
             extern_body,
             compiled: Vec::new(),
+            interpreted: Default::default(),
             deriv_index: HashMap::default(),
+            support: Default::default(),
         }
     }
 
@@ -200,6 +216,23 @@ impl Function {
     /// The derivative output `d outputs[out] / d params[param]`, if there is one.
     pub fn derivative(&self, out: u32, param: u32) -> Option<u32> {
         self.deriv_index.get(&(out, param)).copied()
+    }
+
+    pub(crate) fn cached_support(&self, out: u32) -> Option<Arc<[u32]>> {
+        self.support
+            .lock()
+            .unwrap()
+            .get(out as usize)
+            .cloned()
+            .flatten()
+    }
+
+    pub(crate) fn cache_support(&self, out: u32, support: Arc<[u32]>) {
+        let mut cache = self.support.lock().unwrap();
+        if cache.len() <= out as usize {
+            cache.resize(out as usize + 1, None);
+        }
+        cache[out as usize] = Some(support);
     }
 
     pub(crate) fn compiled_mut(&mut self) -> &mut Vec<Body> {
@@ -260,14 +293,16 @@ impl Function {
         ctx: &crate::graph::Graph<K>,
         needed: &[u32],
     ) -> Body {
-        let covering = self.compiled.iter().filter(|c| {
-            needed.iter().all(|&k| {
-                !matches!(self.outputs[k as usize], Output::Expr(_))
-                    || c.slot_of.get(k as usize).is_some_and(|s| s.is_some())
-            })
-        });
+        let covering = self.compiled.iter().filter(|c| self.covers(c, needed));
         if let Some(c) = covering.min_by_key(|c| c.bundle.n_outputs()) {
             return c.clone();
+        }
+        if self.extern_body.is_none() {
+            let built = self.interpreted.lock().unwrap();
+            let covering = built.iter().filter(|c| self.covers(c, needed));
+            if let Some(c) = covering.min_by_key(|c| c.bundle.n_outputs()) {
+                return c.clone();
+            }
         }
         if let Some(b) = &self.extern_body {
             return Body {
@@ -307,14 +342,25 @@ impl Function {
                 Vec::new(),
             )
         };
-        Body {
+        let body = Body {
             bundle: Arc::new(InterpretedBody {
                 tape,
                 n_out: roots.len(),
                 pure,
+                backends: Default::default(),
             }),
             slot_of,
-        }
+        };
+        self.interpreted.lock().unwrap().push(body.clone());
+        body
+    }
+
+    /// Whether `body` carries every output of `needed` that is an expression.
+    fn covers(&self, body: &Body, needed: &[u32]) -> bool {
+        needed.iter().all(|&k| {
+            !matches!(self.outputs[k as usize], Output::Expr(_))
+                || body.slot_of.get(k as usize).is_some_and(|s| s.is_some())
+        })
     }
 
     /// Indices of the parameters carrying `role`, in argument order.

@@ -61,7 +61,7 @@ fn switch_branch_single_arm_is_constrained() {
     };
     let env_false = env_of(&mut ctx, &base(0.0));
     let env_true = env_of(&mut ctx, &base(1.0));
-    let found = dae.residuals.iter().any(|r| {
+    let found = dae.currents.iter().any(|r| {
         (eval(&ctx, &[*r], &env_false)[0].re - 1.0).abs() < 1e-9
             && eval(&ctx, &[*r], &env_true)[0].re.abs() < 1e-9
     });
@@ -100,7 +100,6 @@ fn switchable_resistor_branch() {
         ("X1.g", g),
         ("X1.on", 1.0),
         ("v1", v1),
-        ("vdot1", 0.0),
         ("i_V1", -i),
         ("t", 0.0),
     ];
@@ -112,7 +111,7 @@ fn switchable_resistor_branch() {
         }
     }
     let env = env_of(&mut ctx, &vals);
-    for (k, r) in dae.residuals.iter().enumerate() {
+    for (k, r) in dae.currents.iter().enumerate() {
         let val = eval(&ctx, &[*r], &env)[0].norm();
         assert!(
             val < 1e-9,

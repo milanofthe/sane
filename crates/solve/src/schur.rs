@@ -51,7 +51,7 @@ impl CompiledDc {
     /// gmin*I` (valid for this fixed `gmin`), the constant coupling blocks `B`,
     /// `C`, and the constant part of the Schur complement `S0 = (D_const +
     /// gmin*I_V) - C A^{-1} B`. `jac` are the current (structurally complete)
-    /// `dF/dx` nonzeros; only the constant entries are read here. Returns `None`
+    /// `G` nonzeros; only the constant entries are read here. Returns `None`
     /// if `A` is singular (caller falls back to the plain solve).
     pub(crate) fn build_lin_cache(
         &self,
@@ -137,7 +137,7 @@ impl CompiledDc {
     /// Solve `(J + gmin*I) dx = rhs` via the Schur complement using the cached
     /// linear-block factorization: only a small `|V| x |V|` dense system plus two
     /// reuses of the cached `A` factorization, instead of refactorizing the whole
-    /// matrix. `jac` are this iteration's `dF/dx` nonzeros (only the variable
+    /// matrix. `jac` are this iteration's `G` nonzeros (only the variable
     /// ones are read). Returns `dx` (length `n`).
     pub(crate) fn solve_partitioned(
         &self,

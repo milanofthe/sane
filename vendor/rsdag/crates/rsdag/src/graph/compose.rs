@@ -1,7 +1,7 @@
 //! Composition: programs built apart, called as one. A function of another
 //! graph is imported with the functions it calls; calls into it compose it
 //! into whatever this graph builds, and a program over the composition is
-//! compiled as one (see [`Graph::inline_composite`] and
+//! compiled as one, its composite functions as templates (see
 //! [`Tape::compose`](crate::Tape::compose)).
 
 use super::*;
@@ -92,26 +92,7 @@ impl<K: Field> Graph<K> {
         imported: &mut HashMap<FuncId, FuncId>,
     ) -> Vec<ExprId> {
         // the cone of `roots` in `other`, ascending: operands first
-        // (a call's list once: an instance's calls share it)
-        let mut seen: FxHashSet<ExprId> = FxHashSet::default();
-        let mut walked: FxHashSet<ArgList> = FxHashSet::default();
-        let mut stack: Vec<ExprId> = roots.to_vec();
-        let mut cone: Vec<ExprId> = Vec::new();
-        while let Some(e) = stack.pop() {
-            if !seen.insert(e) {
-                continue;
-            }
-            cone.push(e);
-            match *other.node(e) {
-                Node::Call(_, l) => {
-                    if walked.insert(l) {
-                        stack.extend_from_slice(other.args(l));
-                    }
-                }
-                _ => stack.extend_from_slice(&other.operands(e)),
-            }
-        }
-        cone.sort_unstable();
+        let cone = other.cone_sorted(roots, false);
         let mut map: HashMap<ExprId, ExprId> = HashMap::default();
         map.reserve(cone.len());
         let mut lists: HashMap<ArgList, ArgList> = HashMap::default();
@@ -133,7 +114,16 @@ impl<K: Field> Graph<K> {
                             nl
                         }
                     };
-                    self.call_list(g, k, nl)
+                    // a bound call: its context over the imported expressions
+                    let ctx = match other.context(o) {
+                        None => crate::graph::NO_CONTEXT,
+                        Some((at, exprs)) => {
+                            let pairs: Vec<(u32, ExprId)> =
+                                at.iter().zip(exprs).map(|(&p, e)| (p, map[e])).collect();
+                            self.bind(g, &pairs).ctx
+                        }
+                    };
+                    self.call_list_in(g, k, ctx, nl)
                 }
                 _ => {
                     ops.clear();

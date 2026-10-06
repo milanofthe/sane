@@ -1,16 +1,20 @@
 //! Subcircuit hierarchy: the `.subckt`/`X` structure as a tree of instances,
 //! each with its body's lines in the body's own names.
 //!
-//! An `X` instance's body is written out per instance, in the namespace of its
-//! subcircuit (`__inv__.`): element names and internal nodes carry it, ports are
-//! the body's nodes `__inv__.<port>`, and subcircuit/instance parameters are
-//! folded into a local numeric environment used to evaluate `{...}` value
-//! expressions. The placement turns each body into a `sane_dae::Instance`,
-//! which renames the namespace to the instance's path (`X1.`, `X1.X2.`).
+//! A body is written out in the namespace of its subcircuit (`__inv__.`):
+//! element names and internal nodes carry it, ports are the body's nodes
+//! `__inv__.<port>`, and subcircuit/instance parameters are folded into a
+//! local numeric environment used to evaluate `{...}` value expressions. A
+//! body depends on the subcircuit and that environment only, so it is
+//! written out once per both and shared by every instance that places it.
+//! The placement turns each body into a `sane_dae::Body`, and an instance
+//! renames the namespace to its path (`X1.`, `X1.X2.`).
 //! Subcircuit names are a global namespace (a common simplification); `.model`
 //! cards inside a subckt are collected unprefixed (global).
 
-use rustc_hash::FxHashMap as HashMap;
+use std::sync::Arc;
+
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::expr::{lex, resolve_value, value_expr, Tok};
 use crate::preprocess::Line;
@@ -52,16 +56,38 @@ pub(crate) enum Item {
     Inst(Inst),
 }
 
-/// A subcircuit instance with its body in the body's names.
+/// A subcircuit instance: where it connects, and its body.
 pub(crate) struct Inst {
     /// The instance's name in the caller's frame (`X1`, `__inv__.Xa`).
     pub name: String,
-    /// The body's namespace (`__inv__.`).
-    pub ns: String,
-    /// The body's port nodes and the caller's nodes they connect to.
-    pub ports: Vec<String>,
+    /// The caller's nodes the body's ports connect to.
     pub conn: Vec<String>,
-    pub body: Vec<Item>,
+    pub body: Arc<Body>,
+}
+
+/// A subcircuit body in its own names, its parameters folded.
+pub(crate) struct Body {
+    /// The namespace (`__inv__.`).
+    pub ns: String,
+    /// The port nodes, in the order an instance connects them.
+    pub ports: Vec<String>,
+    pub items: Vec<Item>,
+}
+
+/// The key of a body written out: the subcircuit, the caller's environment
+/// and the instance's parameters in it.
+type BodyKey = (String, u32, Vec<(String, Option<u64>)>);
+
+/// Writes bodies out, once per subcircuit and environment.
+struct Expander<'a> {
+    subckts: &'a HashMap<String, Subckt>,
+    globals: &'a HashSet<String>,
+    /// The `.model` cards the bodies declare.
+    models: Vec<Line>,
+    bodies: HashMap<BodyKey, Arc<Body>>,
+    /// The environments named so far: the top level's is `0`, every other
+    /// one a state a body's parameters and `.param` lines leave.
+    envs: u32,
 }
 
 /// The netlist as a tree of subcircuit instances, plus the `.model` cards the
@@ -73,14 +99,20 @@ pub fn hierarchy(
     let (subckts, top) = collect(lines)?;
     // `.global <node>...`: these node names keep their identity inside every
     // subcircuit instance (supply rails), instead of being instance-prefixed
-    let globals: std::collections::HashSet<String> = top
+    let globals: HashSet<String> = top
         .iter()
         .filter(|l| l.tokens[0].eq_ignore_ascii_case(".global"))
         .flat_map(|l| l.tokens[1..].iter().map(|t| t.to_ascii_lowercase()))
         .collect();
 
+    let mut ex = Expander {
+        subckts: &subckts,
+        globals: &globals,
+        models: Vec::new(),
+        bodies: HashMap::default(),
+        envs: 0,
+    };
     let mut out = Vec::new();
-    let mut models = Vec::new();
     for line in &top {
         let head = &line.tokens[0];
         if head.eq_ignore_ascii_case(".global") {
@@ -89,12 +121,12 @@ pub fn hierarchy(
         if head.starts_with('X') || head.starts_with('x') {
             let mut nmap = HashMap::default();
             let inst = parse_instance(line, &mut nmap, "", &globals)?;
-            out.push(Item::Inst(expand(&inst, global_env, &subckts, &mut models, 0, &globals)?));
+            out.push(Item::Inst(ex.expand(&inst, global_env, 0, 0)?));
         } else {
             out.push(Item::Line(line.clone()));
         }
     }
-    Ok((out, models))
+    Ok((out, ex.models))
 }
 
 /// Split lines into subcircuit definitions (global) and top-level lines.
@@ -160,7 +192,7 @@ fn parse_instance(
     line: &Line,
     nmap: &mut HashMap<String, String>,
     prefix: &str,
-    globals: &std::collections::HashSet<String>,
+    globals: &HashSet<String>,
 ) -> Result<Instance, ParseError> {
     let tok = &line.tokens;
     let kv_start = tok
@@ -195,7 +227,7 @@ fn resolve_node(
     tok: &str,
     prefix: &str,
     nmap: &mut HashMap<String, String>,
-    globals: &std::collections::HashSet<String>,
+    globals: &HashSet<String>,
 ) -> String {
     let key = tok.to_ascii_lowercase();
     if is_ground(&key) {
@@ -233,7 +265,7 @@ fn remap_behavioral(
     prefix: &str,
     nmap: &mut HashMap<String, String>,
     env: &HashMap<String, f64>,
-    globals: &std::collections::HashSet<String>,
+    globals: &HashSet<String>,
 ) -> String {
     let toks = match lex(s.trim()) {
         Ok(t) => t,
@@ -342,194 +374,231 @@ fn namespace(subname: &str) -> String {
     format!("__{id}__.")
 }
 
-/// Write out `inst`'s body in its subcircuit's namespace, its parameters
-/// folded; the `.model` cards it declares go to `models`.
-fn expand(
-    inst: &Instance,
-    env_caller: &HashMap<String, f64>,
-    subckts: &HashMap<String, Subckt>,
-    models: &mut Vec<Line>,
-    depth: u32,
-    globals: &std::collections::HashSet<String>,
-) -> Result<Inst, ParseError> {
-    if depth > 64 {
-        return Err(err(inst.line, "subcircuit nesting too deep (recursion?)"));
-    }
-    let sub = subckts
-        .get(&inst.subname)
-        .ok_or_else(|| err(inst.line, &format!("unknown subcircuit '{}'", inst.subname)))?;
-    if inst.conn.len() != sub.ports.len() {
-        return Err(err(
-            inst.line,
-            &format!(
-                "instance '{}' has {} nodes, subckt '{}' expects {}",
-                inst.inst_name,
-                inst.conn.len(),
-                inst.subname,
-                sub.ports.len()
-            ),
-        ));
-    }
-
-    // Node map: every body node in the namespace, ports included (internal
-    // nodes added lazily).
-    let new_prefix = namespace(&inst.subname);
-    let mut nmap: HashMap<String, String> = HashMap::default();
-    let ports: Vec<String> = sub
-        .ports
-        .iter()
-        .map(|p| resolve_node(p, &new_prefix, &mut nmap, globals))
-        .collect();
-    let mut out = Vec::new();
-
-    // Local env: caller env + subckt defaults + instance params (overriding).
-    let mut env = env_caller.clone();
-    for (k, vexpr) in &sub.defaults {
-        if let Some(v) = resolve_value(vexpr, &env) {
-            env.insert(k.clone(), v);
-        }
-    }
-    for (k, vexpr) in &inst.params {
-        if let Some(v) = resolve_value(vexpr, env_caller) {
-            env.insert(k.clone(), v);
-        }
-    }
-
-    for line in &sub.body {
-        let head = &line.tokens[0];
-        if head.eq_ignore_ascii_case(".param") {
-            for t in &line.tokens[1..] {
-                if let Some((k, v)) = t.split_once('=') {
-                    if let Some(val) = resolve_value(v, &env) {
-                        env.insert(k.to_ascii_lowercase(), val);
-                    }
-                }
-            }
-            continue;
-        }
-        if head.eq_ignore_ascii_case(".model") {
-            models.push(line.clone()); // global model namespace
-            continue;
-        }
-        if head.starts_with('X') || head.starts_with('x') {
-            let nested = parse_instance(line, &mut nmap, &new_prefix, globals)?;
-            // The instance is named in this body's namespace; recurse.
-            let nested = Instance {
-                inst_name: format!("{new_prefix}{}", nested.inst_name),
-                ..nested
-            };
-            out.push(Item::Inst(expand(&nested, &env, subckts, models, depth + 1, globals)?));
-            continue;
-        }
-
-        let kind = head.chars().next().unwrap().to_ascii_uppercase();
-        let mut newtoks = Vec::with_capacity(line.tokens.len());
-        newtoks.push(format!("{new_prefix}{head}"));
-        match element_layout(kind) {
-            Some((nc, name_refs)) => {
-                // An R/C/L whose value depends on a node voltage (a foundry
-                // behavioral resistor) carries node references in its value
-                // expression; remap and fold the whole expression once so they
-                // bind to the right nodes (the value parser lowers it to a
-                // behavioral element).
-                let val_join: String = line.tokens[1..]
-                    .iter()
-                    .enumerate()
-                    .filter(|(idx, _)| *idx >= nc && !name_refs.contains(idx))
-                    .map(|(_, t)| t.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                let behavioral = matches!(kind, 'R' | 'C' | 'L') && is_behavioral_value(&val_join);
-                for (idx, t) in line.tokens[1..].iter().enumerate() {
-                    if idx < nc {
-                        newtoks.push(resolve_node(t, &new_prefix, &mut nmap, globals));
-                    } else if name_refs.contains(&idx) {
-                        // Element-name reference: prefix like its target.
-                        newtoks.push(format!("{new_prefix}{t}"));
-                    } else if !behavioral {
-                        newtoks.push(subst_value(t, &env));
-                    }
-                }
-                if behavioral {
-                    // Take the value expression (keyword + balanced braces, drop
-                    // any trailing `tc1=`/`tc2=` parameters), then remap.
-                    let expr = value_expr(&val_join);
-                    let remapped = remap_behavioral(expr, &new_prefix, &mut nmap, &env, globals);
-                    newtoks.push(format!("{{{remapped}}}"));
-                }
-            }
-            None if kind == 'B' => {
-                // B name n+ n- V=expr | I=expr: remap the two terminal nodes,
-                // then remap node / element references inside the value
-                // expression so they bind through the subcircuit ports.
-                newtoks.push(resolve_node(
-                    &line.tokens[1],
-                    &new_prefix,
-                    &mut nmap,
-                    globals,
-                ));
-                newtoks.push(resolve_node(
-                    &line.tokens[2],
-                    &new_prefix,
-                    &mut nmap,
-                    globals,
-                ));
-                let rest = line.tokens[3..].join(" ");
-                let remapped = match rest.split_once('=') {
-                    Some((lhs, rhs)) => format!(
-                        "{}={}",
-                        lhs.trim(),
-                        remap_behavioral(rhs, &new_prefix, &mut nmap, &env, globals)
-                    ),
-                    None => remap_behavioral(&rest, &new_prefix, &mut nmap, &env, globals),
-                };
-                newtoks.push(remapped);
-            }
-            None if kind == 'N' => {
-                // `N` (Verilog-A instance): the bare tokens are its nodes
-                // followed by the module/model name; nodes remap through the
-                // subcircuit ports, parameter values fold in the caller's
-                // environment (so `w={w*fac}` binds the instance's params).
-                let bare_end = line.tokens[1..]
-                    .iter()
-                    .position(|t| t.contains('='))
-                    .map(|p| p + 1)
-                    .unwrap_or(line.tokens.len());
-                if bare_end < 3 {
-                    return Err(err(line.no, "N instance needs nodes and a model name"));
-                }
-                for t in &line.tokens[1..bare_end - 1] {
-                    newtoks.push(resolve_node(t, &new_prefix, &mut nmap, globals));
-                }
-                newtoks.push(line.tokens[bare_end - 1].clone());
-                for t in &line.tokens[bare_end..] {
-                    match t.split_once('=') {
-                        Some((k, v)) => match resolve_value(v, &env) {
-                            Some(x) => newtoks.push(format!("{k}={}", fmt_num(x))),
-                            None => newtoks.push(t.clone()),
-                        },
-                        None => newtoks.push(t.clone()),
-                    }
-                }
-            }
+impl Expander<'_> {
+    /// `inst` over its body: written out in its subcircuit's namespace, its
+    /// parameters folded, or the one written out before for the same
+    /// subcircuit in the same environment (`env_caller`, named `env_id`).
+    fn expand(
+        &mut self,
+        inst: &Instance,
+        env_caller: &HashMap<String, f64>,
+        env_id: u32,
+        depth: u32,
+    ) -> Result<Inst, ParseError> {
+        let key = (
+            inst.subname.clone(),
+            env_id,
+            inst.params
+                .iter()
+                .map(|(k, v)| (k.clone(), resolve_value(v, env_caller).map(f64::to_bits)))
+                .collect(),
+        );
+        let body = match self.bodies.get(&key) {
+            Some(body) => body.clone(),
             None => {
-                // Unknown element type: prefix the name, leave the rest as-is.
-                newtoks.extend(line.tokens[1..].iter().cloned());
+                let body = Arc::new(self.write(inst, env_caller, depth)?);
+                self.bodies.insert(key, body.clone());
+                body
+            }
+        };
+        if inst.conn.len() != body.ports.len() {
+            return Err(err(
+                inst.line,
+                &format!(
+                    "instance '{}' has {} nodes, subckt '{}' expects {}",
+                    inst.inst_name,
+                    inst.conn.len(),
+                    inst.subname,
+                    body.ports.len()
+                ),
+            ));
+        }
+        Ok(Inst {
+            name: inst.inst_name.clone(),
+            conn: inst.conn.clone(),
+            body,
+        })
+    }
+
+    /// Write out `inst`'s body; the `.model` cards it declares go to
+    /// `models`.
+    fn write(
+        &mut self,
+        inst: &Instance,
+        env_caller: &HashMap<String, f64>,
+        depth: u32,
+    ) -> Result<Body, ParseError> {
+        if depth > 64 {
+            return Err(err(inst.line, "subcircuit nesting too deep (recursion?)"));
+        }
+        let (subckts, globals) = (self.subckts, self.globals);
+        let sub = subckts
+            .get(&inst.subname)
+            .ok_or_else(|| err(inst.line, &format!("unknown subcircuit '{}'", inst.subname)))?;
+        // Node map: every body node in the namespace, ports included (internal
+        // nodes added lazily).
+        let new_prefix = namespace(&inst.subname);
+        let mut nmap: HashMap<String, String> = HashMap::default();
+        let ports: Vec<String> = sub
+            .ports
+            .iter()
+            .map(|p| resolve_node(p, &new_prefix, &mut nmap, globals))
+            .collect();
+        let mut out = Vec::new();
+
+        // Local env: caller env + subckt defaults + instance params (overriding).
+        let mut env = env_caller.clone();
+        for (k, vexpr) in &sub.defaults {
+            if let Some(v) = resolve_value(vexpr, &env) {
+                env.insert(k.clone(), v);
             }
         }
-        out.push(Item::Line(Line {
-            no: line.no,
-            col: line.col,
-            tokens: newtoks,
-        }));
+        for (k, vexpr) in &inst.params {
+            if let Some(v) = resolve_value(vexpr, env_caller) {
+                env.insert(k.clone(), v);
+            }
+        }
+        self.envs += 1;
+        let mut env_id = self.envs;
+
+        for line in &sub.body {
+            let head = &line.tokens[0];
+            if head.eq_ignore_ascii_case(".param") {
+                for t in &line.tokens[1..] {
+                    if let Some((k, v)) = t.split_once('=') {
+                        if let Some(val) = resolve_value(v, &env) {
+                            env.insert(k.to_ascii_lowercase(), val);
+                        }
+                    }
+                }
+                self.envs += 1;
+                env_id = self.envs;
+                continue;
+            }
+            if head.eq_ignore_ascii_case(".model") {
+                self.models.push(line.clone()); // global model namespace
+                continue;
+            }
+            if head.starts_with('X') || head.starts_with('x') {
+                let nested = parse_instance(line, &mut nmap, &new_prefix, globals)?;
+                // The instance is named in this body's namespace; recurse.
+                let nested = Instance {
+                    inst_name: format!("{new_prefix}{}", nested.inst_name),
+                    ..nested
+                };
+                out.push(Item::Inst(self.expand(&nested, &env, env_id, depth + 1)?));
+                continue;
+            }
+
+            let kind = head.chars().next().unwrap().to_ascii_uppercase();
+            let mut newtoks = Vec::with_capacity(line.tokens.len());
+            newtoks.push(format!("{new_prefix}{head}"));
+            match element_layout(kind) {
+                Some((nc, name_refs)) => {
+                    // An R/C/L whose value depends on a node voltage (a foundry
+                    // behavioral resistor) carries node references in its value
+                    // expression; remap and fold the whole expression once so they
+                    // bind to the right nodes (the value parser lowers it to a
+                    // behavioral element).
+                    let val_join: String = line.tokens[1..]
+                        .iter()
+                        .enumerate()
+                        .filter(|(idx, _)| *idx >= nc && !name_refs.contains(idx))
+                        .map(|(_, t)| t.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let behavioral =
+                        matches!(kind, 'R' | 'C' | 'L') && is_behavioral_value(&val_join);
+                    for (idx, t) in line.tokens[1..].iter().enumerate() {
+                        if idx < nc {
+                            newtoks.push(resolve_node(t, &new_prefix, &mut nmap, globals));
+                        } else if name_refs.contains(&idx) {
+                            // Element-name reference: prefix like its target.
+                            newtoks.push(format!("{new_prefix}{t}"));
+                        } else if !behavioral {
+                            newtoks.push(subst_value(t, &env));
+                        }
+                    }
+                    if behavioral {
+                        // Take the value expression (keyword + balanced braces, drop
+                        // any trailing `tc1=`/`tc2=` parameters), then remap.
+                        let expr = value_expr(&val_join);
+                        let remapped =
+                            remap_behavioral(expr, &new_prefix, &mut nmap, &env, globals);
+                        newtoks.push(format!("{{{remapped}}}"));
+                    }
+                }
+                None if kind == 'B' => {
+                    // B name n+ n- V=expr | I=expr: remap the two terminal nodes,
+                    // then remap node / element references inside the value
+                    // expression so they bind through the subcircuit ports.
+                    newtoks.push(resolve_node(
+                        &line.tokens[1],
+                        &new_prefix,
+                        &mut nmap,
+                        globals,
+                    ));
+                    newtoks.push(resolve_node(
+                        &line.tokens[2],
+                        &new_prefix,
+                        &mut nmap,
+                        globals,
+                    ));
+                    let rest = line.tokens[3..].join(" ");
+                    let remapped = match rest.split_once('=') {
+                        Some((lhs, rhs)) => format!(
+                            "{}={}",
+                            lhs.trim(),
+                            remap_behavioral(rhs, &new_prefix, &mut nmap, &env, globals)
+                        ),
+                        None => remap_behavioral(&rest, &new_prefix, &mut nmap, &env, globals),
+                    };
+                    newtoks.push(remapped);
+                }
+                None if kind == 'N' => {
+                    // `N` (Verilog-A instance): the bare tokens are its nodes
+                    // followed by the module/model name; nodes remap through the
+                    // subcircuit ports, parameter values fold in the caller's
+                    // environment (so `w={w*fac}` binds the instance's params).
+                    let bare_end = line.tokens[1..]
+                        .iter()
+                        .position(|t| t.contains('='))
+                        .map(|p| p + 1)
+                        .unwrap_or(line.tokens.len());
+                    if bare_end < 3 {
+                        return Err(err(line.no, "N instance needs nodes and a model name"));
+                    }
+                    for t in &line.tokens[1..bare_end - 1] {
+                        newtoks.push(resolve_node(t, &new_prefix, &mut nmap, globals));
+                    }
+                    newtoks.push(line.tokens[bare_end - 1].clone());
+                    for t in &line.tokens[bare_end..] {
+                        match t.split_once('=') {
+                            Some((k, v)) => match resolve_value(v, &env) {
+                                Some(x) => newtoks.push(format!("{k}={}", fmt_num(x))),
+                                None => newtoks.push(t.clone()),
+                            },
+                            None => newtoks.push(t.clone()),
+                        }
+                    }
+                }
+                None => {
+                    // Unknown element type: prefix the name, leave the rest as-is.
+                    newtoks.extend(line.tokens[1..].iter().cloned());
+                }
+            }
+            out.push(Item::Line(Line {
+                no: line.no,
+                col: line.col,
+                tokens: newtoks,
+            }));
+        }
+        Ok(Body {
+            ns: new_prefix,
+            ports,
+            items: out,
+        })
     }
-    Ok(Inst {
-        name: inst.inst_name.clone(),
-        ns: new_prefix,
-        ports,
-        conn: inst.conn.clone(),
-        body: out,
-    })
 }
 
 /// Substitute a value token: evaluate an expression wrapped in `{...}` (SPICE)

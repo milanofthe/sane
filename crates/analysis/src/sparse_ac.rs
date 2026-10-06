@@ -1,6 +1,6 @@
 //! Sparse complex small-signal system `A = G + jwC`.
 //!
-//! Assembled from the engine's sparse real Jacobians (`G = dF/dx`, `C = dF/dx'`)
+//! Assembled from the engine's sparse real Jacobians (`G = dI/dx`, `C = dQ/dx`)
 //! and factorised with rslab's complex KLU (BTF + per-block AMD + Gilbert-
 //! Peierls) -- the same backend family as the real Newton solves, lifted to the
 //! complex field, never densified. Adjoint solves run as KLU transpose solves
@@ -39,12 +39,6 @@ impl AcSystem {
         }
         let triplets: Vec<(usize, usize, Complex64)> =
             m.into_iter().map(|((i, j), v)| (i, j, v)).collect();
-        Self { n, triplets }
-    }
-
-    /// Build directly from pre-summed complex triplets (used by the entry
-    /// pruning, which masks a subset of the system's entries per candidate).
-    pub fn from_triplets(n: usize, triplets: Vec<(usize, usize, Complex64)>) -> Self {
         Self { n, triplets }
     }
 
@@ -98,11 +92,6 @@ impl AcSystem {
             y[j] += val * v[i];
         }
         y
-    }
-
-    /// The assembled nonzeros (summed), for pruning and structure inspection.
-    pub fn entries(&self) -> &[(usize, usize, Complex64)] {
-        &self.triplets
     }
 }
 

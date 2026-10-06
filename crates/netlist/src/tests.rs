@@ -171,22 +171,16 @@ fn device_terminal_current(p: &crate::ParsedCircuit, di: usize, bias: &[f64]) ->
     let mut ctx = sane_core::Graph::new();
     let n = p.devices[di].model.n_terminals();
     let term_v: Vec<_> = (0..n).map(|k| ctx.sym(&format!("tv{k}"))).collect();
-    let term_vdot: Vec<_> = (0..n).map(|k| ctx.sym(&format!("tvd{k}"))).collect();
     let mut lo = sane_device::Lowerer::new(&mut ctx);
     let frag = p.devices[di]
         .model
-        .lower_behavioral(&mut lo, &term_v, &term_vdot, &[]);
+        .lower_behavioral(&mut lo, &term_v, &[]);
     let i = frag.terminal_currents[0];
     let mut env: Map<rsdag::SymbolId, Complex64> = Map::new();
     for s in ctx.free_symbols(i) {
         let name = ctx.symbol_name(s).to_string();
         let v = if let Some(k) = name.strip_prefix("tv") {
-            if let Some(k) = k.strip_prefix('d') {
-                let _: usize = k.parse().unwrap();
-                0.0
-            } else {
-                bias[k.parse::<usize>().unwrap()]
-            }
+            bias[k.parse::<usize>().unwrap()]
         } else if name == sane_core::constants::TEMP_SYMBOL {
             sane_core::constants::TEMP_NOMINAL_K
         } else {

@@ -6,61 +6,67 @@ use rsdag::Node;
 use sane_core::log_stage;
 
 use crate::model::{Model, ModelError};
+
+/// A sparse matrix as `(rows, cols, values)`.
+type Coo = (Vec<usize>, Vec<usize>, Vec<f64>);
 use crate::{model_reduce_on_dae, state_space_on_dae, temp_sweep_on_dae};
 
 impl Model {
-    /// Residual `F(x, x', t)` as a numeric vector.
+    /// The currents `I(x, p, t)`. Every row reads `I(x, t) + d/dt Q(x)`.
+    pub fn currents(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> Vec<f64> {
+        self.cdc().currents(&x, &p, t)
+    }
+
+    /// The charges `Q(x, p)`.
+    pub fn charges(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> Vec<f64> {
+        self.cdc().charges(&x, &p, t)
+    }
+
+    /// The residual `F = I(x, t) + C(x) x'` at the state `x` moving at the
+    /// rate `xdot`.
     pub fn residual(&self, x: Vec<f64>, xdot: Vec<f64>, p: Vec<f64>, t: f64) -> Vec<f64> {
         self.cdc().residual(&x, &xdot, &p, t)
     }
 
-    /// Jacobian `dF/dx` as a dense matrix.
-    pub fn jacobian_x(&self, x: Vec<f64>, xdot: Vec<f64>, p: Vec<f64>, t: f64) -> Vec<Vec<f64>> {
-        self.cdc().jacobian_x(&x, &xdot, &p, t)
+    /// `G = dI/dx` as a dense matrix.
+    pub fn jacobian_i_x(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> Vec<Vec<f64>> {
+        self.cdc().jacobian_i_x(&x, &p, t)
     }
 
-    /// Jacobian `dF/dx'` as a dense matrix.
-    pub fn jacobian_xdot(&self, x: Vec<f64>, xdot: Vec<f64>, p: Vec<f64>, t: f64) -> Vec<Vec<f64>> {
-        self.cdc().jacobian_xdot(&x, &xdot, &p, t)
+    /// `C = dQ/dx` as a dense matrix.
+    pub fn jacobian_q_x(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> Vec<Vec<f64>> {
+        self.cdc().jacobian_q_x(&x, &p, t)
     }
 
-    /// Sparse `dF/dx` as `(rows, cols, values)` (COO).
-    pub fn jacobian_x_sparse(
-        &self,
-        x: Vec<f64>,
-        xdot: Vec<f64>,
-        p: Vec<f64>,
-        t: f64,
-    ) -> (Vec<usize>, Vec<usize>, Vec<f64>) {
-        self.cdc().jacobian_x_sparse(&x, &xdot, &p, t)
+    /// Sparse `G = dI/dx` as `(rows, cols, values)` (COO).
+    pub fn jacobian_i_x_sparse(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> Coo {
+        self.cdc().jacobian_i_x_sparse(&x, &p, t)
     }
 
-    /// Sparse `dF/dx'` as `(rows, cols, values)` (COO).
-    pub fn jacobian_xdot_sparse(
-        &self,
-        x: Vec<f64>,
-        xdot: Vec<f64>,
-        p: Vec<f64>,
-        t: f64,
-    ) -> (Vec<usize>, Vec<usize>, Vec<f64>) {
-        self.cdc().jacobian_xdot_sparse(&x, &xdot, &p, t)
+    /// Sparse `C = dQ/dx` as `(rows, cols, values)` (COO).
+    pub fn jacobian_q_x_sparse(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> Coo {
+        self.cdc().jacobian_q_x_sparse(&x, &p, t)
     }
 
-    /// Sparse `dF/dp` as `(rows, cols, values)` (COO).
-    pub fn jacobian_p_sparse(
-        &self,
-        x: Vec<f64>,
-        xdot: Vec<f64>,
-        p: Vec<f64>,
-        t: f64,
-    ) -> (Vec<usize>, Vec<usize>, Vec<f64>) {
+    /// Sparse `dI/dp` as `(rows, cols, values)` (COO).
+    pub fn jacobian_i_p_sparse(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> Coo {
+        self.jacobian_p_sparse(&x, &p, t).0
+    }
+
+    /// Sparse `dQ/dp` as `(rows, cols, values)` (COO).
+    pub fn jacobian_q_p_sparse(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> Coo {
+        self.jacobian_p_sparse(&x, &p, t).1
+    }
+
+    /// `(dI/dp, dQ/dp)`, the parameter Jacobian built on first use.
+    pub(crate) fn jacobian_p_sparse(&self, x: &[f64], p: &[f64], t: f64) -> (Coo, Coo) {
         let arc = self.context_arc();
         self.cdc()
             .ensure_param_jac(&mut arc.lock().unwrap(), self.dae());
-        self.cdc().jacobian_p_sparse(&x, &xdot, &p, t)
+        self.cdc().jacobian_p_sparse(x, p, t)
     }
 
-    /// Number of structural nonzeros in the sparse `dF/dx` pattern.
+    /// Number of structural nonzeros in the sparse `G` pattern.
     pub fn nnz(&self) -> usize {
         self.cdc().nnz()
     }
@@ -70,13 +76,12 @@ impl Model {
         self.cdc().partition_sizes()
     }
 
-    /// Exact input-coupling vector `B = dF/d(input)` for the named source, by
-    /// symbolic differentiation (autodiff), evaluated at `(x, xdot, p, t)`.
-    pub fn input_jacobian(
+    /// Exact input-coupling vector `dI/d(input)` for the named source, by
+    /// symbolic differentiation (autodiff), evaluated at `(x, p, t)`.
+    pub fn jacobian_i_input(
         &self,
         input: &str,
         x: Vec<f64>,
-        xdot: Vec<f64>,
         p: Vec<f64>,
         t: f64,
     ) -> Result<Vec<f64>, ModelError> {
@@ -88,9 +93,7 @@ impl Model {
             Node::Symbol(s) => *s,
             _ => return Err(ModelError::Numeric(format!("'{input}' is not a symbol"))),
         };
-        Ok(self
-            .cdc()
-            .input_jacobian(&mut c, dae, isym, &x, &xdot, &p, t))
+        Ok(self.cdc().jacobian_i_input(&mut c, dae, isym, &x, &p, t))
     }
 
     /// Exact first-order sensitivity `dy/dp` of `y = output` (an unknown name)

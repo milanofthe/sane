@@ -80,23 +80,17 @@ def test_idt_zero_ic_does_not_warn():
         sane.Circuit.parse(zero_ic).extract()
 
 
-def _eval_at_zero(expr):
-    """Evaluate a residual/Jacobian entry with every free symbol bound to 0
-    (x = 0, xdot = 0, t = 0). ``Expr.eval`` raises on NaN; an Inf comes back and
-    is caught by ``math.isfinite``."""
-    binding = {name: 0.0 for name in expr.free_symbols}
-    return expr.eval(**binding)
-
-
 def test_guarded_divide_finite_residual_and_jacobian_at_zero():
     dae = sane.Circuit.parse(VA_GUARDED_DIV).extract()
 
-    # Residual F(x=0) and the full state Jacobian dF/dx at x=0 must be finite.
-    for f in dae._d.residuals():
-        assert math.isfinite(_eval_at_zero(f)), "residual is non-finite at x=0"
-    for row in dae._d.jacobian_x_symbolic():
+    # The currents I(x=0) and the full state Jacobian dI/dx at x=0 must be finite.
+    zero = [0.0] * dae.dim
+    p = [float(dae.values.get(n, 0.0)) for n in dae.params]
+    for v in dae._d.currents(zero, p, 0.0):
+        assert math.isfinite(v), "current is non-finite at x=0"
+    for row in dae._d.jacobian_i_x(zero, p, 0.0):
         for entry in row:
-            assert math.isfinite(_eval_at_zero(entry)), "Jacobian entry non-finite at x=0"
+            assert math.isfinite(entry), "Jacobian entry non-finite at x=0"
 
     # And the DC solve (whose first Newton evaluation is at the x=0 guess) must
     # converge to a finite solution vector.

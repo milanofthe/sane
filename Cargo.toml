@@ -7,7 +7,6 @@ members = [
     "crates/device",
     "crates/veriloga",
     "crates/dae",
-    "crates/export",
     "crates/solve",
     "crates/analysis",
     "crates/osdi",
@@ -19,7 +18,7 @@ members = [
 exclude = ["vendor/rslab", "vendor/vectfit", "vendor/rsdag"]
 
 [workspace.package]
-version = "1.4.0"
+version = "2.0.0"
 edition = "2021"
 license = "LicenseRef-PolyForm-Noncommercial-1.0.0"
 authors = ["Milan Rother"]
@@ -71,3 +70,9 @@ sane-mna = { path = "crates/mna" }
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# Release code with line tables, for profilers and the allocation-site
+# sampler of `examples/tran_allocs` (`--profile profiling`).
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"

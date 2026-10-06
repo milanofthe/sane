@@ -32,15 +32,21 @@ fn env_of(ctx: &mut Graph, vals: &[(&str, f64)]) -> HashMap<SymbolId, Complex64>
     env
 }
 
-fn max_resid(ctx: &Graph, dae: &Dae, env: &HashMap<SymbolId, Complex64>) -> f64 {
-    dae.residuals
-        .iter()
-        .map(|&r| eval(ctx, &[r], env)[0].norm())
-        .fold(0.0, f64::max)
+/// The largest `|I + C x'|` at `env`, the state moving at `rates` (one per
+/// unknown, empty for rest).
+fn max_resid(ctx: &mut Graph, dae: &Dae, env: &HashMap<SymbolId, Complex64>, rates: &[f64]) -> f64 {
+    let (_, (rows, cols, c)) = dae.jacobian_iq_coo(ctx);
+    let mut f: Vec<Complex64> = dae.currents.iter().map(|&r| eval(ctx, &[r], env)[0]).collect();
+    for ((&r, &col), &e) in rows.iter().zip(&cols).zip(&c) {
+        if let Some(&v) = rates.get(col) {
+            f[r] += eval(ctx, &[e], env)[0] * v;
+        }
+    }
+    f.iter().map(|z| z.norm()).fold(0.0, f64::max)
 }
 
-/// A capacitor expressed through the behavioral lowering path:
-/// `i_a = C * d/dt(v_a - v_b)`, no extra unknowns. Used to prove the
+/// A capacitor expressed through the behavioral lowering path: the charge
+/// `q_a = C * (v_a - v_b)`, no current, no extra unknowns. Used to prove the
 /// `lower_behavioral` plumbing reproduces a native circuit element exactly.
 struct BehavioralCap {
     name: String,
@@ -52,20 +58,22 @@ impl sane_device::DeviceModel for BehavioralCap {
     fn lower_behavioral(
         &self,
         lo: &mut Lowerer,
-        _term_v: &[ExprId],
-        term_vdot: &[ExprId],
+        term_v: &[ExprId],
         _control_i: &[ExprId],
     ) -> sane_device::BehavioralFragment {
         let ctx = lo.ctx();
         let c = ctx.sym(&self.name);
-        let dvd = ctx.sub(term_vdot[0], term_vdot[1]);
-        let i = ctx.mul(c, dvd);
-        let ni = ctx.neg(i);
+        let zero = ctx.zero();
+        let dv = ctx.sub(term_v[0], term_v[1]);
+        let q = ctx.mul(c, dv);
+        let nq = ctx.neg(q);
         sane_device::BehavioralFragment {
             param_syms: Vec::new(),
             events: Vec::new(),
-            terminal_currents: vec![i, ni],
-            residuals: Vec::new(),
+            terminal_currents: vec![zero, zero],
+            currents: Vec::new(),
+            terminal_charges: vec![q, nq],
+            charges: Vec::new(),
             noise: Vec::new(),
             op_vars: Vec::new(),
             limits: Vec::new(),
@@ -104,23 +112,22 @@ fn behavioral_capacitor_matches_native() {
             ("C", 1e-6),
             ("v1", 1.3),
             ("v2", 0.4),
-            ("vdot1", 2.0),
-            ("vdot2", 7.0),
             ("i_V1", -0.6),
             ("t", 0.0),
         ],
     );
-    for (i, (rn, rb)) in native.residuals.iter().zip(&behav.residuals).enumerate() {
+    let rows = |d: &Dae| d.currents.iter().chain(&d.charges).copied().collect::<Vec<_>>();
+    for (i, (rn, rb)) in rows(&native).iter().zip(&rows(&behav)).enumerate() {
         let d = (eval(&ctx, &[*rn], &env)[0] - eval(&ctx, &[*rb], &env)[0]).norm();
-        assert!(d < 1e-9, "residual {i} differs by {d}");
+        assert!(d < 1e-9, "row {i} differs by {d}");
     }
 }
 
 #[test]
 fn mfactor_scales_terminal_current() {
-    // The behavioral cap from node 2 to ground contributes C*vdot2 to the
-    // node-2 KCL. With mfactor = m, that contribution scales to m*C*vdot2,
-    // while every other residual is untouched (m parallel devices).
+    // The behavioral cap from node 2 to ground contributes the charge C*v2 to
+    // the node-2 KCL. With mfactor = m, that contribution scales to m*C*v2,
+    // while every other row is untouched (m parallel devices).
     let mut ctx = Graph::new();
     let build = |ctx: &mut Graph, m: f64| {
         let mut cb = Circuit::new();
@@ -137,7 +144,7 @@ fn mfactor_scales_terminal_current() {
     assert_eq!(d1.unknowns, d2.unknowns);
     assert_eq!(d1.unknowns, vec!["v1", "v2", "i_V1"]);
 
-    let (cap, vdot2) = (1e-6, 7.0);
+    let cap = 1e-6;
     let env = env_of(
         &mut ctx,
         &[
@@ -146,25 +153,28 @@ fn mfactor_scales_terminal_current() {
             ("C", cap),
             ("v1", 1.3),
             ("v2", 0.4),
-            ("vdot1", 2.0),
-            ("vdot2", vdot2),
             ("i_V1", -0.6),
             ("t", 0.0),
         ],
     );
-    // Row 1 is the node-2 KCL: its m=2 residual exceeds m=1 by exactly C*vdot2.
-    let r1 = eval(&ctx, &[d1.residuals[1]], &env)[0];
-    let r2 = eval(&ctx, &[d2.residuals[1]], &env)[0];
+    // Row 1 is the node-2 KCL: its m=2 charge exceeds m=1 by exactly C*v2.
+    let q1 = eval(&ctx, &[d1.charges[1]], &env)[0];
+    let q2 = eval(&ctx, &[d2.charges[1]], &env)[0];
     assert!(
-        ((r2 - r1).re - cap * vdot2).abs() < 1e-12,
+        ((q2 - q1).re - cap * 0.4).abs() < 1e-12,
         "delta={}",
-        (r2 - r1).re
+        (q2 - q1).re
     );
-    // The other rows are identical (multiplicity touches only this device).
-    for i in [0usize, 2] {
-        let d = (eval(&ctx, &[d1.residuals[i]], &env)[0] - eval(&ctx, &[d2.residuals[i]], &env)[0])
-            .norm();
-        assert!(d < 1e-12, "residual {i} changed by {d}");
+    // Every current and the other charges are identical (multiplicity
+    // touches only this device's charge).
+    let rows = |d: &Dae| {
+        let mut r = d.currents.clone();
+        r.extend([d.charges[0], d.charges[2]]);
+        r
+    };
+    for (i, (a, b)) in rows(&d1).iter().zip(&rows(&d2)).enumerate() {
+        let d = (eval(&ctx, &[*a], &env)[0] - eval(&ctx, &[*b], &env)[0]).norm();
+        assert!(d < 1e-12, "row {i} changed by {d}");
     }
 }
 
@@ -191,13 +201,11 @@ fn rc_dae_consistent_point() {
             ("C", cap),
             ("v1", v1),
             ("v2", v2),
-            ("vdot1", 0.0),
-            ("vdot2", vdot2),
             ("i_V1", iv),
             ("t", 0.0),
         ],
     );
-    assert!(max_resid(&ctx, &dae, &env) < 1e-9);
+    assert!(max_resid(&mut ctx, &dae, &env, &[0.0, vdot2, 0.0]) < 1e-9);
 }
 
 #[test]
@@ -230,13 +238,11 @@ fn eliminate_resistive_node_preserves_point() {
             ("Rload", 1.0),
             ("v1", 2.0),
             ("v3", 2.0 / 3.0),
-            ("vdot1", 0.0),
-            ("vdot3", 0.0),
             ("i_V1", -(2.0 - 2.0 / 3.0) / 2.0),
             ("t", 0.0),
         ],
     );
-    assert!(max_resid(&ctx, &red, &env) < 1e-9);
+    assert!(max_resid(&mut ctx, &red, &env, &[]) < 1e-9);
 }
 
 #[test]
@@ -270,12 +276,10 @@ fn diode_rectifier_consistent_point() {
             ("v1", v1),
             ("v2", v2),
             ("i_V1", iv),
-            ("vdot1", 0.0),
-            ("vdot2", 0.0),
             ("t", 0.0),
         ],
     );
-    let m = max_resid(&ctx, &dae, &env);
+    let m = max_resid(&mut ctx, &dae, &env, &[]);
     assert!(m < 1e-9 * (1.0 + id.abs()), "residual {m}");
 }
 
@@ -309,7 +313,7 @@ fn ccvs_consistent_point() {
             ("t", 0.0),
         ],
     );
-    assert!(max_resid(&ctx, &dae, &env) < 1e-9);
+    assert!(max_resid(&mut ctx, &dae, &env, &[]) < 1e-9);
 }
 
 #[test]
@@ -320,7 +324,7 @@ fn sin_source_residual_is_time_dependent() {
     c.resistor("R1", 1, 0);
     let dae = assemble_dae(&mut ctx, &c, &[]);
     let i_v1 = dae.unknowns.iter().position(|u| u == "i_V1").unwrap();
-    let s = rsdag::to_string(&ctx, dae.residuals[i_v1]);
+    let s = rsdag::to_string(&ctx, dae.currents[i_v1]);
     assert!(
         s.contains("sin("),
         "V constraint should be a sine of t: {s}"
@@ -339,7 +343,7 @@ fn current_switch_uses_control_current() {
     let dae = assemble_dae(&mut ctx, &c, &devs);
     // node 2 KCL carries the switch conductance (a Select on I(Vc)).
     let v2 = dae.unknowns.iter().position(|u| u == "v2").unwrap();
-    let s = rsdag::to_string(&ctx, dae.residuals[v2]);
+    let s = rsdag::to_string(&ctx, dae.currents[v2]);
     assert!(s.contains("select("), "switch should use Select: {s}");
     assert!(
         s.contains("i_Vc"),
@@ -358,67 +362,8 @@ fn mutual_inductance_couples_constraints() {
         .mutual("K1", "L1", "L2");
     let dae = assemble_dae(&mut ctx, &c, &[]);
     let i_l1 = dae.unknowns.iter().position(|u| u == "i_L1").unwrap();
-    let s = rsdag::to_string(&ctx, dae.residuals[i_l1]);
-    assert!(s.contains("K1"), "L1 constraint missing mutual coeff: {s}");
-    assert!(s.contains("idot_L2"), "L1 constraint missing idot_L2: {s}");
-}
-
-#[test]
-fn small_signal_rc_matches_analytic() {
-    // The small-signal AC transfer of the RC equals 1/(1 + s R C), derived
-    // purely from the DAE Jacobians dF/dx + s dF/dx'.
-    let mut ctx = Graph::new();
-    let mut c = Circuit::new();
-    c.voltage_source("V1", 1, 0)
-        .resistor("R", 1, 2)
-        .capacitor("C", 2, 0);
-    let dae = assemble_dae(&mut ctx, &c, &[]);
-    let h = small_signal_transfer(&mut ctx, &dae, "V1", "v2").unwrap();
-
-    let s_e = ctx.sym("s");
-    let sid = match ctx.node(s_e) {
-        Node::Symbol(s) => *s,
-        _ => unreachable!(),
-    };
-    let (r, cap) = (1000.0, 1e-6);
-    for &f in &[10.0, 159.155, 1000.0, 10_000.0] {
-        let w = 2.0 * std::f64::consts::PI * f;
-        let mut env = env_of(&mut ctx, &[("R", r), ("C", cap)]);
-        env.insert(sid, Complex64::new(0.0, w));
-        let got = eval(&ctx, &[h], &env)[0];
-        let sval = Complex64::new(0.0, w);
-        let expected = Complex64::new(1.0, 0.0) / (Complex64::new(1.0, 0.0) + sval * r * cap);
-        assert!((got - expected).norm() < 1e-9, "f={f}: {got} vs {expected}");
-    }
-}
-
-#[test]
-fn jacobian_dims_and_sparsity() {
-    let mut ctx = Graph::new();
-    let mut c = Circuit::new();
-    c.voltage_source("V1", 1, 0)
-        .resistor("R", 1, 2)
-        .capacitor("C", 2, 0);
-    let dae = assemble_dae(&mut ctx, &c, &[]);
-
-    let jx = dae.jacobian_x(&mut ctx);
-    assert_eq!(jx.len(), 3);
-    assert_eq!(jx[0].len(), 3);
-
-    let jxd = dae.jacobian_xdot(&mut ctx);
-    let sp: Vec<Vec<bool>> = jxd
-        .iter()
-        .map(|row| row.iter().map(|&e| !ctx.is_zero(e)).collect())
-        .collect();
-    // Columns are [vdot1, vdot2, (branch -> None)]. Only the capacitor on
-    // node 2 makes vdot2 appear, and only in node 2's KCL (row index 1).
-    assert!(sp[1][1], "vdot2 should appear in node-2 residual");
-    assert!(
-        sp.iter().all(|row| !row[0]),
-        "vdot1 has no cap -> zero column"
-    );
-    assert!(
-        sp.iter().all(|row| !row[2]),
-        "algebraic branch -> zero column"
-    );
+    // the coupling is in the L1 row's flux
+    let s = rsdag::to_string(&ctx, dae.charges[i_l1]);
+    assert!(s.contains("K1"), "L1 flux missing mutual coeff: {s}");
+    assert!(s.contains("i_L2"), "L1 flux missing i_L2: {s}");
 }

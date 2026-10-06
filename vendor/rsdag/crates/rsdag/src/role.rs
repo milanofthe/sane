@@ -2,7 +2,8 @@
 //!
 //! A role is metadata on a parameter or an output of a [`Function`]; nothing
 //! in the graph changes. A DAE is a function with `Free`, `State` and `Time`
-//! parameters and `Residual` outputs, a block diagram block one with `Input`,
+//! parameters and `Residual` outputs (in charge form, a `Charge` output beside
+//! each, the residual its current), a block diagram block one with `Input`,
 //! `State`, `Time`, `Memory` and `Param` parameters and `Output`,
 //! `StateDeriv` and `MemoryWrite` outputs, an event a `Guard` output (with
 //! the [`Crossing`] direction that counts) plus an effect function with
@@ -153,8 +154,14 @@ pub enum OutputRole {
     Output { port: u32, elem: u32 },
     /// `dx/dt` of a continuous state.
     StateDeriv { id: u32 },
-    /// A residual `F(x, x', t) = 0`.
+    /// A residual `F(x, x', t) = 0`. In charge form, `F = i(x, t) + d/dt
+    /// q(x)`, the current `i` of row `id`, its charge the
+    /// [`Charge`](Self::Charge) output of the same `id`.
     Residual { id: u32 },
+    /// The charge `q(x)` of residual row `id` in charge form: the row reads
+    /// the [`Residual`](Self::Residual) output of the same `id` plus the time
+    /// derivative of this one. A row without one stores no charge.
+    Charge { id: u32 },
     /// A discrete state assignment (event effects).
     StateWrite { id: u32 },
     /// A memory slot assignment.

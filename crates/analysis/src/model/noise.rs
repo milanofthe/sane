@@ -30,10 +30,9 @@ impl Model {
     ) -> Result<(f64, Vec<(String, f64)>), ModelError> {
         let _g = log::scope("sens/noise_gradient");
         let n = self.dae().dim();
-        let z = vec![0.0; n];
         let w = 2.0 * PI * freq;
-        let g = self.cdc().system_matrix_dc(&x, &z, &p, 0.0);
-        let cm = self.cdc().jacobian_xdot(&x, &z, &p, 0.0);
+        let g = self.cdc().system_matrix_dc(&x, &p, 0.0);
+        let cm = self.cdc().jacobian_q_x(&x, &p, 0.0);
         let a: Vec<Vec<Complex64>> = (0..n)
             .map(|i| {
                 (0..n)
@@ -55,20 +54,16 @@ impl Model {
         self.cdc()
             .ensure_param_jac(&mut self.context_arc().lock().unwrap(), self.dae());
         let pnames = self.cdc().param_names(&self.context_arc().lock().unwrap());
-        let (prr, prc, prv) = self.cdc().jacobian_p_sparse(&x, &z, &p, 0.0);
+        let ((prr, prc, prv), _) = self.cdc().jacobian_p_sparse(&x, &p, 0.0);
 
         let arc = self.context_arc();
         let mut cg = arc.lock().unwrap();
         let c = &mut *cg;
-        let (gr, gc, ge) = self.dae().jacobian_x_coo(c);
-        let (cr, cc, ce) = self.dae().jacobian_xdot_coo(c);
+        let ((gr, gc, ge), (cr, cc, ce)) = self.dae().jacobian_iq_coo(c);
         // Operating-point environment.
         let mut env: HashMap<SymbolId, f64> = HashMap::new();
         for (i, &s) in self.dae().x.iter().enumerate() {
             env.insert(s, x.get(i).copied().unwrap_or(0.0));
-        }
-        for s in self.dae().xdot.iter().flatten() {
-            env.insert(*s, 0.0);
         }
         let mut psyms = Vec::with_capacity(pnames.len());
         for (j, name) in pnames.iter().enumerate() {
@@ -89,7 +84,8 @@ impl Model {
         let mut r = vec![Complex64::new(0.0, 0.0); n]; // r = sum_q 2 conj(T_q) S_q u_q
         let mut psd_terms: Vec<(f64, ExprId)> = Vec::new(); // (|T_q|^2 fac, psd_expr)
         let levels = self.dae().noise_levels(c, &env);
-        for (ns, level) in self.dae().noise_sources.iter().zip(levels) {
+        let flat = self.dae().observers.flatten(c);
+        for (ns, level) in flat.noise.iter().zip(levels) {
             // Tabular sources: not yet in the gradient.
             let Some((sp, fexp)) = level else {
                 continue;

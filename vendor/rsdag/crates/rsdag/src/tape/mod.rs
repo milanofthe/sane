@@ -41,6 +41,9 @@ pub const INPUT: u32 = 1 << 31;
 /// The `state` of a call that keeps none: the bundle runs whole.
 pub const NO_STATE: u32 = u32::MAX;
 
+/// [`Op::Call::reads`] of a call whose operands are its arguments in order.
+pub const ALL_ARGS: u32 = u32::MAX;
+
 /// The input index of a tagged operand.
 #[inline]
 pub fn input_index(k: u32) -> Option<u32> {
@@ -72,18 +75,26 @@ pub enum Op {
     /// Inner product of `arg_pool[start .. start+len]` and the `len` that
     /// follow.
     Dot(u32, u32),
-    /// `bundles[b]` on `n_groups` argument groups of `n_args`, laid
-    /// group-major at `arg_pool[start ..]`, group `g`'s `n_out` outputs to
-    /// `dst + g*n_out ..`; with a `state` slot (not [`NO_STATE`]), the
-    /// bundle's main phase over group `g`'s instance state at
-    /// `state + g*state_len`.
+    /// `bundles[b]` on `n_groups` argument groups of `n_args`, group `g`'s
+    /// `n_out` outputs to `dst + g*n_out ..`; with a `state` slot (not
+    /// [`NO_STATE`]), the bundle's main phase over group `g`'s instance
+    /// state at `state + g*state_len`. The operands are `n_in` per group,
+    /// group-major at `arg_pool[start ..]`: the arguments in order, or with
+    /// `reads` (not [`ALL_ARGS`]) the ones at the positions
+    /// `arg_pool[reads .. reads+n_in]`, the only ones a main phase reads
+    /// (see [`Tape::main_reads`]); the others are left unset. The
+    /// arguments are gathered at `args` in the gather area (see
+    /// [`calls`]).
     Call {
         bundle: u32,
         start: u32,
         n_groups: u32,
         n_args: u32,
+        n_in: u32,
+        reads: u32,
         n_out: u32,
         state: u32,
+        args: u32,
     },
     /// The prolog of `bundles[b]` for `n_groups` instances, their pure
     /// arguments group-major at `arg_pool[start ..]`, `n_pure` per group:
@@ -93,6 +104,7 @@ pub enum Op {
         start: u32,
         n_groups: u32,
         n_pure: u32,
+        args: u32,
     },
     /// A matrix-vector product: `m` rows of `n` in `a` against `x`, the rows
     /// to `dst .. dst+m`, each row the fold of `Dot`; with `acc`, each row
@@ -212,10 +224,12 @@ pub enum Operand<'a> {
     Slots(&'a [u32]),
 }
 
+pub mod calls;
 mod compile;
 mod specialize;
 mod topo;
 
+use calls::Shared;
 pub use specialize::SpecializedTape;
 
 /// Consecutive calls of a tape that read nothing another of them writes:
@@ -238,7 +252,7 @@ const OPAQUE_OPS: u64 = 1000;
 
 /// Ops one instance of `call` runs in its bundle's body: the prolog for a
 /// prolog, the main phase for a call over a state, all of it for a call
-/// without one. A bundle without a body counts [`OPAQUE_OPS`].
+/// without one. A bundle without a body counts 1000 ops.
 pub fn call_ops(bundle: &dyn ExternBundle, call: &Op) -> u64 {
     let Some(t) = bundle.body() else {
         return OPAQUE_OPS;
@@ -277,11 +291,12 @@ fn plan_stages(
                 bundle,
                 start,
                 n_groups,
-                n_args,
+                n_in,
                 n_out,
                 state,
+                ..
             } => {
-                let mut r = slots(start, n_groups * n_args);
+                let mut r = slots(start, n_groups * n_in);
                 if state != NO_STATE {
                     let sl = bundles[bundle as usize].state_len() as u32;
                     r.push((state, state + n_groups * sl));
@@ -293,6 +308,7 @@ fn plan_stages(
                 start,
                 n_groups,
                 n_pure,
+                ..
             } => {
                 let sl = bundles[bundle as usize].state_len() as u32;
                 (
@@ -515,24 +531,26 @@ impl Tape {
                     bundle,
                     start,
                     n_groups: 1,
-                    n_args,
+                    n_in,
                     n_out,
                     state,
+                    ..
                 } => format!(
                     "Call(b{bundle}, [{}]{}) -> {n_out}",
-                    list(start, n_args),
+                    list(start, n_in),
                     state_text(state)
                 ),
                 Op::Call {
                     bundle,
                     start,
                     n_groups,
-                    n_args,
+                    n_in,
                     n_out,
                     state,
+                    ..
                 } => format!(
                     "CallBatch(b{bundle}, {n_groups} x [{}]{}) -> {n_groups} x {n_out}",
-                    list(start, n_groups * n_args),
+                    list(start, n_groups * n_in),
                     state_text(state)
                 ),
                 Op::CallProlog {
@@ -540,6 +558,7 @@ impl Tape {
                     start,
                     n_groups,
                     n_pure,
+                    ..
                 } => format!(
                     "CallProlog(b{bundle}, {n_groups} x [{}]) -> {n_groups} x {}",
                     list(start, n_groups * n_pure),
@@ -760,7 +779,17 @@ impl Tape {
             if let Some(st) = self.stages.get(next).filter(|st| st.lo as usize == i) {
                 next += 1;
                 if st.hi as usize <= hi && crate::parallel::worth(st.ops as usize) {
-                    self.run_stage(inputs, work, st);
+                    let (slots, gather) = (
+                        Shared::new(work),
+                        Shared::new(&mut scratch[..self.max_args]),
+                    );
+                    // SAFETY: `plan_stages` admits a call to a stage only if
+                    // it reads no slot another call of the stage writes and
+                    // writes no slot another one reads or writes; their
+                    // arguments are apart in the gather area.
+                    let (lo, n) = (st.lo as usize, (st.hi - st.lo) as usize);
+                    let call = |k| self.call(lo + k);
+                    unsafe { calls::run_stage(n, call, slots, gather, inputs) };
                     skip = st.hi as usize;
                     continue;
                 }
@@ -804,63 +833,12 @@ impl Tape {
                         &scratch[len as usize..2 * len as usize],
                     )
                 }
-                Op::Call {
-                    bundle,
-                    start,
-                    n_groups,
-                    n_args,
-                    n_out,
-                    state,
-                } => {
-                    for (j, &k) in pool(start, n_groups * n_args).iter().enumerate() {
-                        scratch[j] = g(k);
-                    }
-                    let b = &*self.bundles[bundle as usize];
-                    let (n_groups, n_args, n_out) =
-                        (n_groups as usize, n_args as usize, n_out as usize);
-                    let (args, bwork) = scratch.split_at_mut(self.max_args);
-                    if state != NO_STATE {
-                        let sl = b.state_len();
-                        for gi in 0..n_groups {
-                            let (st, out) = state_and_out(
-                                work,
-                                state as usize + gi * sl,
-                                sl,
-                                d + gi * n_out,
-                                n_out,
-                            );
-                            let a = &args[gi * n_args..(gi + 1) * n_args];
-                            T::call_bundle_main(b, a, st, bwork, out);
-                        }
-                    } else if n_groups == 1 {
-                        T::call_bundle_whole(b, &args[..n_args], bwork, &mut work[d..d + n_out]);
-                    } else {
-                        T::call_bundle_batch(
-                            b,
-                            &args[..n_groups * n_args],
-                            n_groups,
-                            n_args,
-                            &mut work[d..d + n_groups * n_out],
-                        );
-                    }
-                    continue;
-                }
-                Op::CallProlog {
-                    bundle,
-                    start,
-                    n_groups,
-                    n_pure,
-                } => {
-                    for (j, &k) in pool(start, n_groups * n_pure).iter().enumerate() {
-                        scratch[j] = g(k);
-                    }
-                    let b = &*self.bundles[bundle as usize];
-                    let (args, bwork) = scratch.split_at_mut(self.max_args);
-                    let (sl, np) = (b.state_len(), n_pure as usize);
-                    for gi in 0..n_groups as usize {
-                        let st = &mut work[d + gi * sl..d + (gi + 1) * sl];
-                        T::call_bundle_prolog(b, &args[gi * np..(gi + 1) * np], bwork, st);
-                    }
+                Op::Call { .. } | Op::CallProlog { .. } => {
+                    let c = self.call(i);
+                    let (gather, lent) = scratch.split_at_mut(self.max_args);
+                    let (slots, gather) = (Shared::new(work), Shared::new(gather));
+                    // SAFETY: one call at a time, over its own regions.
+                    unsafe { calls::run_call(&c, slots, gather, inputs, 0..c.n_groups, lent) };
                     continue;
                 }
                 Op::Gemv { a, x, m, n, acc } => {
@@ -949,91 +927,67 @@ impl Tape {
         }
     }
 
-    /// The calls of `st` on the installed pool: every instance of every call
-    /// a piece of work (in blocks, see [`crate::parallel::block`]), over
-    /// scratch of the thread running it. An instance computes what the
-    /// serial loop does: its arguments, its state, its bundle's call.
-    fn run_stage<T: Scalar>(&self, inputs: &[T], work: &mut [T], st: &Stage) {
-        let bs = crate::parallel::block(st.instances as usize) as u32;
-        // (op, first instance, past the last) per piece of work.
-        let mut items: Vec<(u32, u32, u32)> = Vec::new();
-        for i in st.lo..st.hi {
-            let ng = match self.ops[i as usize] {
-                Op::Call { n_groups, .. } | Op::CallProlog { n_groups, .. } => n_groups,
-                _ => unreachable!("a stage holds calls only"),
-            };
-            items.extend(
-                (0..ng)
-                    .step_by(bs as usize)
-                    .map(|g0| (i, g0, (g0 + bs).min(ng))),
-            );
-        }
-        let base = SharedSlots(work.as_mut_ptr(), work.len());
-        let run = |item: usize| {
-            let (i, g0, g1) = items[item];
-            let d = self.dst[i as usize] as usize;
-            // SAFETY: `plan_stages` admits a call to a stage only if it reads
-            // no slot another call of the stage writes and writes no slot
-            // another one reads or writes, and an instance writes its own
-            // part of its call's block: every slice below is either read by
-            // all or written by exactly one piece of work.
-            let slot = |k: u32| match input_index(k) {
-                Some(j) => inputs.get(j as usize).copied().unwrap_or(T::nan()),
-                None => unsafe { base.get(k as usize) },
-            };
-            match self.ops[i as usize] {
-                Op::Call {
-                    bundle,
-                    start,
-                    n_args,
-                    n_out,
-                    state,
-                    ..
-                } => {
-                    let b = &*self.bundles[bundle as usize];
-                    let (na, no) = (n_args as usize, n_out as usize);
-                    let args = &self.arg_pool[start as usize..];
-                    crate::parallel::with_scratch(na + b.work_len(), T::zero(), |sc| {
-                        let (a, bwork) = sc.split_at_mut(na);
-                        for gi in g0 as usize..g1 as usize {
-                            for (j, &k) in args[gi * na..(gi + 1) * na].iter().enumerate() {
-                                a[j] = slot(k);
-                            }
-                            let out = unsafe { base.slice_mut(d + gi * no, no) };
-                            if state == NO_STATE {
-                                T::call_bundle_whole(b, a, bwork, out);
-                            } else {
-                                let sl = b.state_len();
-                                let st = unsafe { base.slice(state as usize + gi * sl, sl) };
-                                T::call_bundle_main(b, a, st, bwork, out);
-                            }
-                        }
-                    });
-                }
-                Op::CallProlog {
-                    bundle,
-                    start,
-                    n_pure,
-                    ..
-                } => {
-                    let b = &*self.bundles[bundle as usize];
-                    let (np, sl) = (n_pure as usize, b.state_len());
-                    let args = &self.arg_pool[start as usize..];
-                    crate::parallel::with_scratch(np + b.work_len(), T::zero(), |sc| {
-                        let (a, bwork) = sc.split_at_mut(np);
-                        for gi in g0 as usize..g1 as usize {
-                            for (j, &k) in args[gi * np..(gi + 1) * np].iter().enumerate() {
-                                a[j] = slot(k);
-                            }
-                            let out = unsafe { base.slice_mut(d + gi * sl, sl) };
-                            T::call_bundle_prolog(b, a, bwork, out);
-                        }
-                    });
-                }
-                _ => unreachable!("a stage holds calls only"),
+    /// Op `i`, a call, as [`calls::run_call`] runs it.
+    pub fn call(&self, i: usize) -> calls::Call<'_> {
+        let op = &self.ops[i];
+        let (bundle, start, n_groups, n_args, n_in, places, n_out, state, args, phase) = match *op {
+            Op::Call {
+                bundle,
+                start,
+                n_groups,
+                n_args,
+                n_in,
+                reads,
+                n_out,
+                state,
+                args,
+            } => {
+                let places = (reads != ALL_ARGS).then(|| self.pool(reads, n_in));
+                let phase = match state {
+                    NO_STATE => calls::Phase::Whole,
+                    _ => calls::Phase::Main,
+                };
+                (
+                    bundle, start, n_groups, n_args, n_in, places, n_out, state, args, phase,
+                )
             }
+            Op::CallProlog {
+                bundle,
+                start,
+                n_groups,
+                n_pure,
+                args,
+            } => {
+                let sl = self.bundles[bundle as usize].state_len() as u32;
+                (
+                    bundle,
+                    start,
+                    n_groups,
+                    n_pure,
+                    n_pure,
+                    None,
+                    sl,
+                    0,
+                    args,
+                    calls::Phase::Prolog,
+                )
+            }
+            _ => panic!("op {i} is not a call"),
         };
-        crate::parallel::run(items.len(), st.ops as usize, &run);
+        let b = &*self.bundles[bundle as usize];
+        calls::Call {
+            bundle: b,
+            phase,
+            n_groups: n_groups as usize,
+            n_args: n_args as usize,
+            n_out: n_out as usize,
+            operands: Some(self.pool(start, n_groups * n_in)),
+            places,
+            args: args as usize,
+            out: self.dst[i] as usize,
+            state: state as usize,
+            ops: n_groups as u64 * call_ops(b, op),
+        }
     }
 
     /// Output operands, one per root: a slot, or an input when tagged.
@@ -1055,6 +1009,35 @@ impl Tape {
     /// The destination slot of op `i` (the first of a kernel's block).
     pub fn dst(&self, i: usize) -> u32 {
         self.dst[i]
+    }
+
+    /// Where operand `j` of a call goes among its groups' arguments (see
+    /// [`Op::Call`]): group `j / n_in`, its argument at `j % n_in` or, with
+    /// `reads`, at the position the pool names.
+    pub fn call_places(&self, reads: u32, n_args: u32, n_in: u32) -> impl Fn(usize) -> usize + '_ {
+        let (na, ni) = (n_args as usize, n_in as usize);
+        let pos = (reads != ALL_ARGS).then(|| self.pool(reads, n_in));
+        move |j| match pos {
+            None => j,
+            Some(p) => (j / ni) * na + p[j % ni] as usize,
+        }
+    }
+
+    /// The inputs the main phase reads, ascending: what a call of this
+    /// tape as a body needs per evaluation once its prolog ran.
+    pub fn main_reads(&self) -> Vec<u32> {
+        let mut r: Vec<u32> = Vec::new();
+        for i in self.prolog_ops..self.ops.len() {
+            self.for_each_operand(i, |k| {
+                if let Some(j) = input_index(k) {
+                    r.push(j);
+                }
+            });
+        }
+        r.extend(self.outputs.iter().filter_map(|&o| input_index(o)));
+        r.sort_unstable();
+        r.dedup();
+        r
     }
 
     /// The operand list `start .. start + len` of the pool.
@@ -1112,11 +1095,11 @@ impl Tape {
             Op::Call {
                 start,
                 n_groups,
-                n_args,
+                n_in,
                 state,
                 ..
             } => {
-                dense(Src::Pool(start), n_groups * n_args, f);
+                dense(Src::Pool(start), n_groups * n_in, f);
                 if state != NO_STATE {
                     f(state);
                 }
@@ -1214,39 +1197,6 @@ impl<T: Scalar> Runner<'_, T> {
     /// The outputs of the last evaluation.
     pub fn outputs(&self) -> &[T] {
         &self.out
-    }
-}
-
-/// The slots of a work buffer shared by the pieces of work of a stage, which
-/// read and write disjoint parts of it (see [`Tape::run_stage`]).
-#[derive(Clone, Copy)]
-struct SharedSlots<T>(*mut T, usize);
-
-// SAFETY: the pieces of work of a stage access disjoint parts of the
-// buffer, or read the same slots; see `plan_stages`.
-unsafe impl<T: Send> Send for SharedSlots<T> {}
-unsafe impl<T: Sync> Sync for SharedSlots<T> {}
-
-impl<T: Copy> SharedSlots<T> {
-    /// # Safety
-    /// No piece of work writes slot `k` while this runs.
-    unsafe fn get(self, k: usize) -> T {
-        assert!(k < self.1);
-        unsafe { *self.0.add(k) }
-    }
-    /// # Safety
-    /// No piece of work writes `at..at + n` while the slice lives.
-    unsafe fn slice<'a>(self, at: usize, n: usize) -> &'a [T] {
-        assert!(at + n <= self.1);
-        unsafe { std::slice::from_raw_parts(self.0.add(at), n) }
-    }
-    /// # Safety
-    /// No other piece of work reads or writes `at..at + n` while the slice
-    /// lives.
-    #[allow(clippy::mut_from_ref)]
-    unsafe fn slice_mut<'a>(self, at: usize, n: usize) -> &'a mut [T] {
-        assert!(at + n <= self.1);
-        unsafe { std::slice::from_raw_parts_mut(self.0.add(at), n) }
     }
 }
 
@@ -1381,19 +1331,6 @@ fn state_text(state: u32) -> String {
         String::new()
     } else {
         format!(", state @{state}")
-    }
-}
-
-/// A call's instance state `work[s .. s+len]` and its output block
-/// `work[d .. d+n]`, which the allocator keeps apart.
-fn state_and_out<T>(work: &mut [T], s: usize, len: usize, d: usize, n: usize) -> (&[T], &mut [T]) {
-    if s + len <= d {
-        let (a, b) = work.split_at_mut(d);
-        (&a[s..s + len], &mut b[..n])
-    } else {
-        assert!(d + n <= s, "a call's state overlaps its outputs");
-        let (a, b) = work.split_at_mut(s);
-        (&b[..len], &mut a[d..d + n])
     }
 }
 

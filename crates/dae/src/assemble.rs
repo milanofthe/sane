@@ -1,17 +1,20 @@
-//! Assembly of the symbolic DAE from a parsed circuit: node KCL residuals,
+//! Assembly of the symbolic DAE from a parsed circuit: node KCL rows,
 //! branch constraints, device lowering (every device -- built-in Verilog-A,
 //! user Verilog-A, OSDI, behavioral -- through the one `lower_behavioral`
 //! fragment path), noise generators, and the companion / limit / source
 //! registries the solver reads.
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
+use std::sync::Arc;
 
 use rsdag::{CmpOp, ExprId, FuncId, ParamRole, ReduceOp, SymbolId};
 use sane_core::Graph;
 use sane_device::Lowerer;
 use sane_mna::{BExpr, BKind, Circuit, Element, Kind, SourceFn};
 
-use crate::hierarchy::Instance;
+use crate::hierarchy::{Body, Instance};
+use crate::observers::Observers;
 use crate::{sym2, Dae, DelaySpec, DeviceInstance, EventSpec, Limit, NoiseSource, UnknownKind};
 
 /// Symbol for an element's value parameter, mapped out of the reserved unknown
@@ -35,10 +38,10 @@ fn source_value(ctx: &mut Graph, e: &Element, t: ExprId) -> ExprId {
     }
 }
 
-/// Add a current `c` flowing from node `a` to node `b` into the KCL residuals.
-/// Accumulate a branch current `c` into the KCL term lists: `+c` leaves node
-/// `a`, `-c` enters node `b` (ground = 0 is skipped). The per-node lists are
-/// folded into one fused `Reduce(Sum)` at the end, instead of a binary Add-tree.
+/// Accumulate a branch current `c` (or a charge, into the charge lists) into
+/// the KCL term lists: `+c` leaves node `a`, `-c` enters node `b` (ground = 0
+/// is skipped). The per-node lists are folded into one fused `Reduce(Sum)` at
+/// the end, instead of a binary Add-tree.
 fn add_current(ctx: &mut Graph, node_terms: &mut [Vec<ExprId>], a: usize, b: usize, c: ExprId) {
     if a != 0 {
         node_terms[a - 1].push(c);
@@ -137,16 +140,14 @@ pub fn assemble_dae(ctx: &mut Graph, circuit: &Circuit, devices: &[DeviceInstanc
 }
 
 /// An unknown a body mints beyond its nodes (a branch current, a device
-/// extra), with its residual row.
+/// extra), with its row `current + d/dt charge = 0`.
 struct Unknown {
     name: String,
     kind: UnknownKind,
     x: SymbolId,
-    /// The derivative symbol: an inductor's `idot`, a device extra's (kept
-    /// only if it appears in the residuals, decided once the DAE is whole),
-    /// `None` for an algebraic branch.
-    xdot: Option<SymbolId>,
-    residual: ExprId,
+    current: ExprId,
+    /// Zero for an algebraic row.
+    charge: ExprId,
 }
 
 /// A body assembled over its own nodes: the current terms into each node and
@@ -154,15 +155,17 @@ struct Unknown {
 /// the DAE; a subcircuit body becomes a function.
 #[derive(Default)]
 struct Part {
-    /// Per node (`k - 1` for node `k`), the signed current terms leaving it.
+    /// Per node (`k - 1` for node `k`), the signed current and charge terms
+    /// leaving it.
     node_terms: Vec<Vec<ExprId>>,
+    node_charges: Vec<Vec<ExprId>>,
     branches: Vec<Unknown>,
     extras: Vec<Unknown>,
     /// `src` / `out` index `extras`.
     delays: Vec<DelaySpec>,
     events: Vec<EventSpec>,
-    noise: Vec<NoiseSource>,
-    op_vars: Vec<sane_device::OpVar>,
+    /// The noise sources and op-vars: its own, and its instances'.
+    observers: Observers,
     param_defaults: rustc_hash::FxHashMap<SymbolId, f64>,
     dc_seeds: Vec<(String, f64)>,
     /// `(row, col, g)` over node indices `k - 1`.
@@ -180,6 +183,8 @@ struct Part {
 #[derive(Default)]
 struct Bodies {
     funcs: HashMap<(Vec<ExprId>, Vec<SymbolId>), FuncId>,
+    /// The subcircuit bodies assembled so far, by the body.
+    lowered: HashMap<*const Body, Rc<Lowered>>,
     /// Time spent in device `lower_behavioral`, for the stage log.
     lower_t: std::time::Duration,
 }
@@ -212,25 +217,27 @@ pub fn assemble(
     let n = body_nodes(circuit, devices, instances);
     let zero = ctx.zero();
     let (t_e, t) = sym2(ctx, "t");
-    // Node voltage and derivative symbols (index 0 = ground = 0).
+    // Node voltage symbols (index 0 = ground = 0).
     let mut v = vec![zero; n + 1];
-    let mut vdot = vec![zero; n + 1];
     let mut x = Vec::new();
-    let mut xdot = Vec::new();
     for k in 1..=n {
         let (e, s) = sym2(ctx, &format!("v{k}"));
-        let (de, ds) = sym2(ctx, &format!("vdot{k}"));
-        (v[k], vdot[k]) = (e, de);
+        v[k] = e;
         x.push(s);
-        // Node voltages always carry a derivative slot (a capacitor onto the
-        // node is common; the mass-matrix column is simply zero otherwise).
-        xdot.push(Some(ds));
     }
 
     let dev_t0 = sane_core::time::Instant::now();
     let mut bodies = Bodies::default();
     let mut lo = Lowerer::new(ctx);
-    let part = lower_body(&mut lo, &mut bodies, circuit, devices, instances, &v, &vdot, t_e);
+    let part = lower_body(
+        &mut lo,
+        &mut bodies,
+        circuit,
+        devices,
+        instances,
+        &v,
+        t_e,
+    );
     drop(lo); // release the &mut Graph borrow before reusing `ctx` below
     sane_core::log::stage("dae/devices", dev_t0.elapsed());
     sane_core::log::stage("dae/devices_lower", bodies.lower_t);
@@ -249,19 +256,18 @@ pub fn assemble(
     ));
 
     // Layout: node KCL, then branch constraints, then device extras.
-    let mut residuals: Vec<ExprId> = part
+    let mut currents: Vec<ExprId> = part
         .node_terms
         .into_iter()
         .map(|terms| ctx.reduce(ReduceOp::Sum, terms))
         .collect();
-    residuals.extend(part.branches.iter().map(|u| u.residual));
-    residuals.extend(part.extras.iter().map(|u| u.residual));
-
-    // Unified differential-classification: an extra is a differential DOF iff
-    // its derivative symbol actually appears in the assembled residuals (a
-    // charge dq/dt, a Verilog-A ddt/idt). One rule for device-internal nodes
-    // and behavioral states alike.
-    let diff_syms = ctx.free_symbols_in(&residuals);
+    currents.extend(part.branches.iter().chain(&part.extras).map(|u| u.current));
+    let mut charges: Vec<ExprId> = part
+        .node_charges
+        .into_iter()
+        .map(|terms| ctx.reduce(ReduceOp::Sum, terms))
+        .collect();
+    charges.extend(part.branches.iter().chain(&part.extras).map(|u| u.charge));
 
     let mut unknowns: Vec<String> = (1..=n).map(|k| format!("v{k}")).collect();
     let mut kinds = vec![UnknownKind::NodeVoltage; n];
@@ -269,14 +275,14 @@ pub fn assemble(
         unknowns.push(u.name.clone());
         kinds.push(UnknownKind::BranchCurrent);
         x.push(u.x);
-        xdot.push(u.xdot);
     }
     for u in &part.extras {
         unknowns.push(u.name.clone());
         kinds.push(u.kind);
         x.push(u.x);
-        xdot.push(u.xdot.filter(|s| diff_syms.contains(s)));
     }
+    let mut events = part.events;
+    let (currents, charges) = specialized(ctx, currents, charges, &mut events);
 
     // delay indices were extra-relative; shift onto the final layout
     let extra_base = n + part.branches.len();
@@ -301,19 +307,18 @@ pub fn assemble(
         .collect();
 
     Dae {
-        residuals,
+        currents,
+        charges,
         n_nodes: n,
         param_defaults: part.param_defaults,
-        events: part.events,
+        events,
         delays,
         unknowns,
         kinds,
         x,
-        xdot,
         t,
         companion: part.companion,
-        noise_sources: part.noise,
-        op_vars: part.op_vars,
+        observers: part.observers,
         dc_seeds: part.dc_seeds,
         limits,
         sources: part.sources,
@@ -322,8 +327,29 @@ pub fn assemble(
     }
 }
 
-/// Assemble one body over node voltages `v` / derivatives `vdot` (index 0 is
-/// ground): its elements, devices and subcircuit instances.
+/// The currents, the charges and the switching surfaces with every call that
+/// passes constants (a ground terminal of a subcircuit) specialized to them,
+/// in one pass over all, so a body is specialized once.
+fn specialized(
+    ctx: &mut Graph,
+    currents: Vec<ExprId>,
+    charges: Vec<ExprId>,
+    events: &mut [EventSpec],
+) -> (Vec<ExprId>, Vec<ExprId>) {
+    let n = currents.len();
+    let roots: Vec<ExprId> = (currents.into_iter().chain(charges))
+        .chain(events.iter().map(|e| e.g))
+        .collect();
+    let mut out = ctx.specialize_calls(&roots);
+    for (ev, g) in events.iter_mut().zip(out.split_off(2 * n)) {
+        ev.g = g;
+    }
+    let charges = out.split_off(n);
+    (out, charges)
+}
+
+/// Assemble one body over node voltages `v` (index 0 is ground): its
+/// elements, devices and subcircuit instances.
 #[allow(clippy::too_many_arguments)]
 fn lower_body(
     lo: &mut Lowerer,
@@ -332,12 +358,12 @@ fn lower_body(
     devices: &[DeviceInstance],
     instances: &[Instance],
     v: &[ExprId],
-    vdot: &[ExprId],
     t_e: ExprId,
 ) -> Part {
     let n = v.len() - 1;
     let mut part = Part {
         node_terms: vec![Vec::new(); n],
+        node_charges: vec![Vec::new(); n],
         ..Part::default()
     };
     let ctx = lo.ctx();
@@ -384,9 +410,9 @@ fn lower_body(
             }
             Kind::Capacitor => {
                 let cs = value_sym(ctx, &e.name);
-                let dvd = ctx.sub(vdot[e.a], vdot[e.b]);
-                let c = ctx.mul(cs, dvd);
-                add_current(ctx, node_terms, e.a, e.b, c);
+                let dv = ctx.sub(v[e.a], v[e.b]);
+                let q = ctx.mul(cs, dv);
+                add_current(ctx, &mut part.node_charges, e.a, e.b, q);
             }
             Kind::Inductor | Kind::VoltageSource | Kind::Vcvs | Kind::Ccvs => {
                 let il = branch_i[branch_pos(idx)].0;
@@ -429,7 +455,7 @@ fn lower_body(
             let g = ctx.recip(r);
             let psd = ctx.mul(coeff, g);
             let flicker_exp = ctx.zero();
-            part.noise.push(NoiseSource {
+            part.observers.noise.push(NoiseSource {
                 hi: sym_of(ctx, v[a]),
                 lo: sym_of(ctx, v[b]),
                 psd,
@@ -441,7 +467,7 @@ fn lower_body(
 
     // Every nonlinear device lowers to a fragment that mints "extra" unknowns
     // (device-internal nodes for native models; branch currents / idt / laplace
-    // states for behavioral ones) with one residual row each.
+    // states for behavioral ones) with one row each.
     for inst in devices {
         // Companion conductance network for homotopy continuation (node-KCL
         // row x node-voltage col): each device's linear `lambda = 0` form,
@@ -473,34 +499,33 @@ fn lower_body(
                     })
             })
             .collect();
-        // Terminal node-voltage derivatives (for a device's own ddt; ground -> 0).
-        let term_vdot: Vec<ExprId> = inst.terminals.iter().map(|&nd| vdot[nd]).collect();
-
         // ONE lowering path for every device: a `BehavioralFragment` (terminal
-        // currents + one residual per minted extra unknown), so internal nodes
-        // and behavioral states are treated uniformly.
+        // currents and charges + one row per minted extra unknown), so internal
+        // nodes and behavioral states are treated uniformly.
         let lt = sane_core::time::Instant::now();
-        let mut frag = inst
-            .model
-            .lower_behavioral(lo, &term_v, &term_vdot, &ctrl_i);
+        let mut frag = inst.model.lower_behavioral(lo, &term_v, &ctrl_i);
         bodies.lower_t += lt.elapsed();
         // Parallel multiplicity (`M=` * `nf`): scale the terminal currents by m,
-        // modelling m identical devices in parallel. Internal-node residuals stay
+        // modelling m identical devices in parallel. Internal-node rows stay
         // per-device (one representative internal state). Verilog-A devices apply
         // `$mfactor` internally, so their `inst.mfactor` is 1.0 (no double count).
         if inst.mfactor != 1.0 {
             let c = lo.ctx();
             let m = c.konst_f64(inst.mfactor);
-            for ti in frag.terminal_currents.iter_mut() {
+            for ti in frag
+                .terminal_currents
+                .iter_mut()
+                .chain(frag.terminal_charges.iter_mut())
+            {
                 *ti = c.mul(m, *ti);
             }
         }
         let dev_extra_base = part.extras.len();
         let extras = std::mem::take(&mut lo.extras);
         debug_assert_eq!(
-            frag.residuals.len(),
+            frag.currents.len(),
             extras.len(),
-            "device fragment must return one residual per extra unknown"
+            "device fragment must return one row per extra unknown"
         );
         // Transport delays (`absdelay`) minted by this device: shift the
         // device-relative extras positions onto the body's extras.
@@ -512,7 +537,8 @@ fn lower_body(
                 tau: dl.tau,
             });
         }
-        for (ex, &residual) in extras.iter().zip(&frag.residuals) {
+        let zero = lo.ctx().zero();
+        for (j, (ex, &current)) in extras.iter().zip(&frag.currents).enumerate() {
             if let Some(c) = ex.dc_seed {
                 part.dc_seeds.push((ex.name.clone(), c));
             }
@@ -520,16 +546,19 @@ fn lower_body(
                 name: ex.name.clone(),
                 kind: ex.kind,
                 x: ex.value_sym,
-                xdot: Some(ex.xdot_sym),
-                residual,
+                current,
+                charge: frag.charges.get(j).copied().unwrap_or(zero),
             });
         }
         for (k, &nd) in inst.terminals.iter().enumerate() {
             if nd != 0 {
                 part.node_terms[nd - 1].push(frag.terminal_currents[k]);
+                if let Some(&q) = frag.terminal_charges.get(k) {
+                    part.node_charges[nd - 1].push(q);
+                }
             }
         }
-        part.noise.extend(frag.noise);
+        part.observers.noise.extend(frag.noise);
         for (k, ev) in frag.events.iter().enumerate() {
             let inst_name = inst
                 .model
@@ -552,11 +581,13 @@ fn lower_body(
             let calls = frag
                 .terminal_currents
                 .iter()
-                .chain(&frag.residuals)
+                .chain(&frag.currents)
+                .chain(&frag.terminal_charges)
+                .chain(&frag.charges)
                 .filter(|&&e| matches!(c.node(e), rsdag::Node::Call(..)));
             part.labels.extend(calls.map(|&e| (e, name.to_string())));
         }
-        part.op_vars.extend(frag.op_vars);
+        part.observers.op_vars.extend(frag.op_vars);
         part.limits.extend(frag.limits);
     }
 
@@ -576,25 +607,27 @@ fn lower_body(
         }
     }
 
-    // Branch constraint residuals.
-    // Inductor name -> (index in branches, its idot expression), for mutuals.
+    // Branch constraint rows.
+    // Inductor name -> (index in branches, its current), for mutuals.
     let mut inductor: HashMap<String, (usize, ExprId)> = HashMap::new();
+    let zero = ctx.zero();
     for (pos, &idx) in branch_elem_idx.iter().enumerate() {
         let e = &circuit.elements()[idx];
         let dv = ctx.sub(v[e.a], v[e.b]);
-        let mut xdot = None;
-        let residual = match e.kind {
+        let mut charge = zero;
+        let current = match e.kind {
             Kind::VoltageSource => {
                 let val = source_value(ctx, e, t_e);
                 ctx.sub(dv, val)
             }
             Kind::Inductor => {
                 let ls = value_sym(ctx, &e.name);
-                let (idote, idots) = sym2(ctx, &format!("idot_{}", e.name));
-                let lidot = ctx.mul(ls, idote);
-                inductor.insert(e.name.to_ascii_lowercase(), (pos, idote));
-                xdot = Some(idots);
-                ctx.sub(dv, lidot)
+                let il = branch_i[pos].0;
+                inductor.insert(e.name.to_ascii_lowercase(), (pos, il));
+                // the flux, as the charge of `v - d/dt (L i) = 0`
+                let flux = ctx.mul(ls, il);
+                charge = ctx.neg(flux);
+                dv
             }
             Kind::Vcvs => {
                 let gain = value_sym(ctx, &e.name);
@@ -617,26 +650,26 @@ fn lower_body(
             name: format!("i_{}", e.name),
             kind: UnknownKind::BranchCurrent,
             x: branch_i[pos].1,
-            xdot,
-            residual,
+            current,
+            charge,
         });
     }
 
-    // Mutual inductance: add M * d/dt(i_other) to each coupled inductor's
-    // constraint, where M = k * sqrt(L1*L2).
+    // Mutual inductance: add M * i_other to each coupled inductor's flux,
+    // where M = k * sqrt(L1*L2).
     for cpl in circuit.couplings() {
         let (l1, l2) = (cpl.l1.to_ascii_lowercase(), cpl.l2.to_ascii_lowercase());
-        if let (Some(&(ix, idot_x)), Some(&(iy, idot_y))) = (inductor.get(&l1), inductor.get(&l2)) {
+        if let (Some(&(ix, i_x)), Some(&(iy, i_y))) = (inductor.get(&l1), inductor.get(&l2)) {
             let k = value_sym(ctx, &cpl.name);
             let ls1 = value_sym(ctx, &cpl.l1);
             let ls2 = value_sym(ctx, &cpl.l2);
             let prod = ctx.mul(ls1, ls2);
             let sq = ctx.sqrt(prod);
             let m = ctx.mul(k, sq);
-            let m_idot_y = ctx.mul(m, idot_y);
-            part.branches[ix].residual = ctx.sub(part.branches[ix].residual, m_idot_y);
-            let m_idot_x = ctx.mul(m, idot_x);
-            part.branches[iy].residual = ctx.sub(part.branches[iy].residual, m_idot_x);
+            let m_i_y = ctx.mul(m, i_y);
+            part.branches[ix].charge = ctx.sub(part.branches[ix].charge, m_i_y);
+            let m_i_x = ctx.mul(m, i_x);
+            part.branches[iy].charge = ctx.sub(part.branches[iy].charge, m_i_x);
         }
     }
 
@@ -650,8 +683,8 @@ fn lower_body(
             name: format!("i_{}", b.name),
             kind: UnknownKind::BranchCurrent,
             x: is,
-            xdot: None,
-            residual: ctx.sub(dv, val),
+            current: ctx.sub(dv, val),
+            charge: zero,
         });
     }
 
@@ -670,79 +703,90 @@ fn lower_body(
     }
 
     for inst in instances {
-        instantiate(lo, bodies, inst, v, vdot, t_e, &mut part);
+        instantiate(lo, bodies, inst, v, t_e, &mut part);
     }
     part
 }
 
-/// A subcircuit instance into its parent's `part`: the body assembled over
-/// formal nodes, closed into a function (or found as one), called with the
-/// instance's nodes and names.
-#[allow(clippy::too_many_arguments)]
-fn instantiate(
+/// A subcircuit body assembled once, for every instance of it: its part in
+/// its own names over formal nodes, and the functions its outputs are.
+struct Lowered {
+    part: Part,
+    /// The noise sources and op-vars, with the body's namespace.
+    observers: Arc<(String, Observers)>,
+    /// The formal node voltages (`[0]` ground).
+    fv: Vec<ExprId>,
+    /// Where each kind of output starts among the outputs of the functions
+    /// in order: the unknowns' currents (the node currents before them),
+    /// the charges (the nodes', then the unknowns'), the delays, the events.
+    out_unknown: usize,
+    out_charge: usize,
+    out_tau: usize,
+    out_event: usize,
+    /// The functions, each with its parameters and its number of outputs.
+    funcs: Vec<(FuncId, Vec<SymbolId>, usize)>,
+}
+
+/// `body` assembled over formal nodes and closed into its functions: once
+/// per body, the ones before looked up. A body's labels go to the parent
+/// that assembles it first, once.
+fn lowered(
     lo: &mut Lowerer,
     bodies: &mut Bodies,
-    inst: &Instance,
-    v: &[ExprId],
-    vdot: &[ExprId],
+    body: &Arc<Body>,
     t_e: ExprId,
-    part: &mut Part,
-) {
-    let n = inst.nodes.len();
+    labels: &mut Vec<(ExprId, String)>,
+) -> Rc<Lowered> {
+    if let Some(l) = bodies.lowered.get(&Arc::as_ptr(body)) {
+        return l.clone();
+    }
+    let n = body.node_names.len();
     let ctx = lo.ctx();
     let zero = ctx.zero();
-    let (mut fv, mut fvd) = (vec![zero; n + 1], vec![zero; n + 1]);
+    let mut fv = vec![zero; n + 1];
     for k in 1..=n {
-        fv[k] = ctx.sym(&format!("{}v#{k}", inst.ns));
-        fvd[k] = ctx.sym(&format!("{}vdot#{k}", inst.ns));
+        fv[k] = ctx.sym(&format!("{}v#{k}", body.ns));
     }
-    let mut body = lower_body(
+    let mut part = lower_body(
         lo,
         bodies,
-        &inst.circuit,
-        &inst.devices,
-        &inst.instances,
+        &body.circuit,
+        &body.devices,
+        &body.instances,
         &fv,
-        &fvd,
         t_e,
     );
-    for (k, name) in inst.node_names.iter().enumerate() {
-        body.labels.push((fv[k + 1], name.clone()));
-        body.labels.push((fvd[k + 1], format!("{name}'")));
+    for (k, name) in body.node_names.iter().enumerate() {
+        part.labels.push((fv[k + 1], name.clone()));
     }
-    part.labels.append(&mut body.labels);
+    labels.append(&mut part.labels);
     let ctx = lo.ctx();
 
     // Every per-instance quantity is one output.
-    let mut outs: Vec<ExprId> = body
+    let mut outs: Vec<ExprId> = part
         .node_terms
         .iter()
         .map(|terms| ctx.reduce(ReduceOp::Sum, terms.clone()))
         .collect();
     let out_unknown = outs.len();
-    outs.extend(body.branches.iter().chain(&body.extras).map(|u| u.residual));
-    let out_noise = outs.len();
-    for ns in &body.noise {
-        outs.push(ns.psd);
-        outs.push(ns.flicker_exp);
+    outs.extend(part.branches.iter().chain(&part.extras).map(|u| u.current));
+    let out_charge = outs.len();
+    for terms in &part.node_charges {
+        outs.push(ctx.reduce(ReduceOp::Sum, terms.clone()));
     }
-    let out_opvar = outs.len();
-    outs.extend(body.op_vars.iter().map(|o| o.value));
+    outs.extend(part.branches.iter().chain(&part.extras).map(|u| u.charge));
     let out_tau = outs.len();
-    outs.extend(body.delays.iter().map(|d| d.tau));
+    outs.extend(part.delays.iter().map(|d| d.tau));
     let out_event = outs.len();
-    outs.extend(body.events.iter().map(|e| e.g));
+    outs.extend(part.events.iter().map(|e| e.g));
 
-    // The residuals and the observers (noise, op-vars, delays, events) are
-    // two functions, so a call of the residuals reads only what they read
-    // (a resistor's noise reads the temperature, its current does not).
-    let unknowns = body.branches.iter().chain(&body.extras);
+    // The rows and the observers (delays, events) are two functions, so a
+    // call of the rows reads only what they read. The noise and the op-vars
+    // stay the body's (see `Observers`).
     let firsts: Vec<SymbolId> = fv[1..]
         .iter()
-        .chain(&fvd[1..])
         .map(|&e| sym_of(ctx, e).expect("formal node"))
-        .chain(unknowns.clone().map(|u| u.x))
-        .chain(unknowns.filter_map(|u| u.xdot))
+        .chain(part.branches.iter().chain(&part.extras).map(|u| u.x))
         .collect();
     // What is neither a node, an unknown, time nor a delay history is a
     // parameter: the body's pure arguments, its work run once per parameter
@@ -751,52 +795,101 @@ fn instantiate(
         .iter()
         .copied()
         .chain(sym_of(ctx, t_e))
-        .chain(body.delays.iter().map(|d| d.hist))
+        .chain(part.delays.iter().map(|d| d.hist))
         .collect();
+    // named after the subcircuit (its namespace `__name__.`)
+    let subckt = body.ns.trim_end_matches('.').trim_matches('_');
+    let names = [subckt.to_string(), format!("{subckt}, observers")];
+    let mut funcs = Vec::new();
+    for (group, name) in [&outs[..out_tau], &outs[out_tau..]].into_iter().zip(&names) {
+        if !group.is_empty() {
+            let (f, leaves) = close(
+                ctx,
+                bodies,
+                &body.ns,
+                name,
+                group.to_vec(),
+                &firsts,
+                &impure,
+            );
+            funcs.push((f, leaves, group.len()));
+        }
+    }
+    let observers = std::mem::take(&mut part.observers);
+    let l = Rc::new(Lowered {
+        part,
+        observers: Arc::new((body.ns.clone(), observers)),
+        fv,
+        out_unknown,
+        out_charge,
+        out_tau,
+        out_event,
+        funcs,
+    });
+    bodies.lowered.insert(Arc::as_ptr(body), l.clone());
+    l
+}
+
+/// A subcircuit instance into its parent's `part`: its body's functions
+/// called with the instance's nodes and names.
+#[allow(clippy::too_many_arguments)]
+fn instantiate(
+    lo: &mut Lowerer,
+    bodies: &mut Bodies,
+    inst: &Instance,
+    v: &[ExprId],
+    t_e: ExprId,
+    part: &mut Part,
+) {
+    let low = lowered(lo, bodies, &inst.body, t_e, &mut part.labels);
+    let body = &low.part;
+    let ctx = lo.ctx();
 
     // A formal node binds to the parent's node; every other leaf to its name
     // in the parent's frame.
-    let mut map: HashMap<SymbolId, ExprId> = HashMap::new();
-    for k in 1..=n {
-        let p = inst.node(k);
-        map.insert(sym_of(ctx, fv[k]).unwrap(), v[p]);
-        map.insert(sym_of(ctx, fvd[k]).unwrap(), vdot[p]);
-    }
+    let binding: Vec<(SymbolId, ExprId)> = (1..=inst.nodes.len())
+        .map(|k| (sym_of(ctx, low.fv[k]).expect("formal node"), v[inst.node(k)]))
+        .collect();
+    let mut map: HashMap<SymbolId, ExprId> = binding.iter().copied().collect();
+    part.observers.place(&inst.name, binding, &low.observers);
     let mut actual = |ctx: &mut Graph, s: SymbolId| rebind(ctx, inst, &mut map, s);
-    let mut calls: Vec<ExprId> = Vec::with_capacity(outs.len());
-    // named after the subcircuit (its namespace `__name__.`)
-    let subckt = inst.ns.trim_end_matches('.').trim_matches('_');
-    let names = [subckt.to_string(), format!("{subckt}, observers")];
-    for (group, name) in [&outs[..out_noise], &outs[out_noise..]].into_iter().zip(&names) {
-        if group.is_empty() {
-            continue;
-        }
-        let (func, leaves) = close(ctx, bodies, name, group.to_vec(), &firsts, &impure);
+    let mut calls: Vec<ExprId> = Vec::with_capacity(low.out_event + body.events.len());
+    for (func, leaves, n_out) in &low.funcs {
         let args: Vec<ExprId> = leaves.iter().map(|&s| actual(ctx, s)).collect();
-        let outs: Vec<u32> = (0..group.len() as u32).collect();
-        calls.extend(ctx.calls(func, &outs, &args));
+        let outs: Vec<u32> = (0..*n_out as u32).collect();
+        calls.extend(ctx.calls(*func, &outs, &args));
     }
-    part.labels.extend(calls.iter().map(|&e| (e, inst.name.clone())));
+    part.labels
+        .extend(calls.iter().map(|&e| (e, inst.name.clone())));
     let mut actual_sym = |ctx: &mut Graph, s: SymbolId| {
         let e = actual(ctx, s);
         sym_of(ctx, e)
     };
 
-    for k in 1..=n {
+    let n_nodes = inst.nodes.len();
+    for k in 1..=n_nodes {
         let p = inst.node(k);
         if p != 0 && !body.node_terms[k - 1].is_empty() {
             part.node_terms[p - 1].push(calls[k - 1]);
         }
+        if p != 0 && !body.node_charges[k - 1].is_empty() {
+            part.node_charges[p - 1].push(calls[low.out_charge + k - 1]);
+        }
     }
+    let zero = ctx.zero();
     let extra_base = part.extras.len();
     let n_branch = body.branches.len();
-    for (j, u) in body.branches.into_iter().chain(body.extras).enumerate() {
+    for (j, u) in body.branches.iter().chain(&body.extras).enumerate() {
         let u = Unknown {
             name: inst.rename(&u.name),
             kind: u.kind,
             x: actual_sym(ctx, u.x).expect("an unknown is a symbol"),
-            xdot: u.xdot.and_then(|s| actual_sym(ctx, s)),
-            residual: calls[out_unknown + j],
+            current: calls[low.out_unknown + j],
+            charge: if ctx.is_zero(u.charge) {
+                zero
+            } else {
+                calls[low.out_charge + n_nodes + j]
+            },
         };
         if j < n_branch {
             part.branches.push(u);
@@ -804,74 +897,60 @@ fn instantiate(
             part.extras.push(u);
         }
     }
-    for (j, ns) in body.noise.into_iter().enumerate() {
-        part.noise.push(NoiseSource {
-            hi: ns.hi.and_then(|s| actual_sym(ctx, s)),
-            lo: ns.lo.and_then(|s| actual_sym(ctx, s)),
-            psd: calls[out_noise + 2 * j],
-            flicker_exp: calls[out_noise + 2 * j + 1],
-            table: ns.table,
-        });
-    }
-    for (j, o) in body.op_vars.into_iter().enumerate() {
-        part.op_vars.push(sane_device::OpVar {
-            name: inst.rename(&o.name),
-            value: calls[out_opvar + j],
-            ..o
-        });
-    }
-    for (j, d) in body.delays.into_iter().enumerate() {
+    for (j, d) in body.delays.iter().enumerate() {
         part.delays.push(DelaySpec {
             src: extra_base + d.src,
             out: extra_base + d.out,
             hist: actual_sym(ctx, d.hist).expect("a history is a symbol"),
-            tau: calls[out_tau + j],
+            tau: calls[low.out_tau + j],
         });
     }
-    for (j, e) in body.events.into_iter().enumerate() {
+    for (j, e) in body.events.iter().enumerate() {
         part.events.push(EventSpec {
-            g: calls[out_event + j],
+            g: calls[low.out_event + j],
             dir: e.dir,
             name: inst.rename(&e.name),
         });
     }
-    for (s, val) in body.param_defaults {
+    for (&s, &val) in &body.param_defaults {
         if let Some(a) = actual_sym(ctx, s) {
             part.param_defaults.insert(a, val);
         }
     }
     part.dc_seeds.extend(
         body.dc_seeds
-            .into_iter()
-            .map(|(name, c)| (inst.rename(&name), c)),
+            .iter()
+            .map(|(name, c)| (inst.rename(name), *c)),
     );
-    for (r, c, g) in body.companion {
+    for &(r, c, g) in &body.companion {
         let (pr, pc) = (inst.node(r + 1), inst.node(c + 1));
         if pr != 0 && pc != 0 {
             part.companion.push((pr - 1, pc - 1, g));
         }
     }
-    for l in body.limits {
+    for l in &body.limits {
         part.limits.push(sane_device::FragmentLimit {
             hi: l.hi.and_then(|s| actual_sym(ctx, s)),
             lo: l.lo.and_then(|s| actual_sym(ctx, s)),
             kind: l.kind,
         });
     }
-    part.sources.extend(
-        body.sources
-            .into_iter()
-            .map(|(name, s)| (inst.rename(&name), s)),
-    );
-    part.source_names.extend(body.source_names.iter().map(|s| inst.rename(s)));
+    part.sources
+        .extend(body.sources.iter().map(|(name, s)| (inst.rename(name), *s)));
+    part.source_names
+        .extend(body.source_names.iter().map(|s| inst.rename(s)));
 }
 
 /// `outs` as a function of their free symbols, `firsts` leading in their
 /// order, the rest by id: the one built before for the same outputs over the
-/// same parameters, else a new one. Returns it with its parameters.
+/// same parameters, else a new one. Returns it with its parameters. A symbol
+/// outside the body's namespace `ns` is the same one in every instance (a
+/// model card's parameter, the temperature): a global of the function, not
+/// a parameter.
 fn close(
     ctx: &mut Graph,
     bodies: &mut Bodies,
+    ns: &str,
     name: &str,
     outs: Vec<ExprId>,
     firsts: &[SymbolId],
@@ -879,10 +958,11 @@ fn close(
 ) -> (FuncId, Vec<SymbolId>) {
     let free = ctx.free_symbols_in(&outs);
     let mut seen: HashSet<SymbolId> = HashSet::new();
+    let own = |s: &SymbolId| ctx.symbol_name(*s).contains(ns);
     let leaves: Vec<SymbolId> = firsts
         .iter()
-        .chain(&free)
         .copied()
+        .chain(free.iter().copied().filter(own))
         .filter(|s| free.contains(s) && seen.insert(*s))
         .collect();
     let key = (outs, leaves);

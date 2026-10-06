@@ -24,6 +24,8 @@
 //! guarantees in-range brackets during normal stepping, so the clamps only
 //! fire at the boundaries.
 
+use std::borrow::Borrow;
+
 /// Growable power-of-two ring of `f64` with head/tail eviction.
 #[derive(Debug, Clone)]
 struct Ring {
@@ -59,6 +61,13 @@ impl Ring {
         let idx = (self.head + self.len) & self.mask;
         self.buf[idx] = v;
         self.len += 1;
+    }
+
+    /// Overwrite the newest entry.
+    #[inline]
+    fn set_last(&mut self, v: f64) {
+        debug_assert!(self.len > 0);
+        self.buf[(self.head + self.len - 1) & self.mask] = v;
     }
 
     /// Drop the `k` oldest entries (front).
@@ -140,42 +149,42 @@ impl DelayHistory {
     /// re-landings and the initial condition update cleanly), the delayed
     /// signals' values and their time-derivatives (seeding both one-sided
     /// slopes; refine the right limit later via [`Self::patch_last_out`]).
-    pub fn push(&mut self, t: f64, vals: &[f64], ders: &[f64]) {
-        debug_assert_eq!(vals.len(), self.vals.len());
-        debug_assert_eq!(ders.len(), self.ders_in.len());
+    pub fn push<V, D>(&mut self, t: f64, vals: V, ders: D)
+    where
+        V: IntoIterator,
+        V::Item: Borrow<f64>,
+        D: IntoIterator,
+        D::Item: Borrow<f64>,
+    {
         let n = self.times.len;
-        if n > 0 {
-            let t_last = self.times.get(n - 1);
-            if t <= t_last {
-                // replace the newest knot (same time re-land / IC refresh)
-                let idx = (self.times.head + n - 1) & self.times.mask;
-                self.times.buf[idx] = t_last.max(t);
-                for (s, v) in self.vals.iter_mut().zip(vals) {
-                    let i = (s.head + s.len - 1) & s.mask;
-                    s.buf[i] = *v;
-                }
-                for (s, d) in self.ders_in.iter_mut().zip(ders) {
-                    let i = (s.head + s.len - 1) & s.mask;
-                    s.buf[i] = *d;
-                }
-                for (s, d) in self.ders_out.iter_mut().zip(ders) {
-                    let i = (s.head + s.len - 1) & s.mask;
-                    s.buf[i] = *d;
-                }
-                return;
+        // an equal-time push replaces the newest knot (same time re-land / IC
+        // refresh)
+        let replace = n > 0 && t <= self.times.get(n - 1);
+        if replace {
+            let last = self.times.get(n - 1);
+            self.times.set_last(last.max(t));
+        } else {
+            self.times.push(t);
+        }
+        let rings = self
+            .vals
+            .iter_mut()
+            .zip(self.ders_in.iter_mut().zip(&mut self.ders_out));
+        for ((sv, (si, so)), (v, d)) in rings.zip(vals.into_iter().zip(ders)) {
+            let (v, d) = (*v.borrow(), *d.borrow());
+            if replace {
+                sv.set_last(v);
+                si.set_last(d);
+                so.set_last(d);
+            } else {
+                sv.push(v);
+                si.push(d);
+                so.push(d);
             }
         }
-        self.times.push(t);
-        for (s, v) in self.vals.iter_mut().zip(vals) {
-            s.push(*v);
+        if !replace {
+            self.evict(t);
         }
-        for (s, d) in self.ders_in.iter_mut().zip(ders) {
-            s.push(*d);
-        }
-        for (s, d) in self.ders_out.iter_mut().zip(ders) {
-            s.push(*d);
-        }
-        self.evict(t);
     }
 
     /// Overwrite the newest knot's OUTGOING (right-limit) derivatives. Called
@@ -183,14 +192,16 @@ impl DelayHistory {
     /// known: at a source kink (or the DC seed knot, whose slope is unknown at
     /// seed time) the two one-sided slopes differ, and the interval that the
     /// knot opens must interpolate with the right limit.
-    pub fn patch_last_out(&mut self, ders: &[f64]) {
-        debug_assert_eq!(ders.len(), self.ders_out.len());
+    pub fn patch_last_out<D>(&mut self, ders: D)
+    where
+        D: IntoIterator,
+        D::Item: Borrow<f64>,
+    {
         if self.times.len == 0 {
             return;
         }
         for (s, d) in self.ders_out.iter_mut().zip(ders) {
-            let i = (s.head + s.len - 1) & s.mask;
-            s.buf[i] = *d;
+            s.set_last(*d.borrow());
         }
     }
 
@@ -392,9 +403,9 @@ mod tests {
     fn one_sided_slopes_resolve_kinks() {
         let mut h = DelayHistory::new(1, f64::INFINITY);
         h.push(0.0, &[1.0], &[0.0]); // seed knot, slope unknown yet
-        h.patch_last_out(&[-1.0]); // falling branch opens here
+        h.patch_last_out([-1.0]); // falling branch opens here
         h.push(1.0, &[0.0], &[-1.0]); // kink: closes falling ...
-        h.patch_last_out(&[1.0]); // ... opens rising
+        h.patch_last_out([1.0]); // ... opens rising
         h.push(2.0, &[1.0], &[1.0]);
         for k in 0..=20 {
             let t = 2.0 * k as f64 / 20.0;
@@ -462,11 +473,15 @@ std::thread_local! {
 
 /// Publish the interpolated delay-history values for subsequent residual /
 /// Jacobian evaluations on this thread.
-pub(crate) fn set_hist_values(vals: &[f64]) {
+pub(crate) fn set_hist_values<V>(vals: V)
+where
+    V: IntoIterator,
+    V::Item: Borrow<f64>,
+{
     HIST_VALUES.with(|h| {
         let mut h = h.borrow_mut();
         h.clear();
-        h.extend_from_slice(vals);
+        h.extend(vals.into_iter().map(|v| *v.borrow()));
     });
 }
 

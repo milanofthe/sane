@@ -4,7 +4,7 @@
 //! Usage: cargo run --release -p sane-analysis --example c6288_ptc -- <deck> [mode]
 //!   mode = full (default: the stock cascade) | ptc (pseudo-transient only)
 //!
-//! The deck comes from `paper/benchmarks/bench/bench_vacask.py:c6288_deck()`
+//! The deck comes from `benchmarks/suites/vacask.py:c6288_deck()`
 //! (write it out with `--emit-deck`); passing it in keeps this example free of
 //! benchmark paths.
 

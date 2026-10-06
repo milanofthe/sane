@@ -1,45 +1,12 @@
 //! Every netlist fixture must parse and yield a non-empty DAE. This is broad
 //! regression coverage for the parser + DAE assembly across circuit topologies.
 
-use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 
-use rsdag::{ExprId, Node};
+use rsdag::ExprId;
 use sane_core::Graph;
 use sane_netlist::parse;
-
-/// Count the unique DAG nodes reachable from `roots` (shared nodes once).
-fn count_nodes(ctx: &Graph, roots: &[ExprId]) -> usize {
-    let mut seen = HashSet::new();
-    let mut stack = roots.to_vec();
-    while let Some(id) = stack.pop() {
-        if !seen.insert(id) {
-            continue;
-        }
-        match ctx.node(id) {
-            Node::Const(_) | Node::Symbol(_) => {}
-            Node::Add(a, b) | Node::Mul(a, b) => {
-                stack.push(*a);
-                stack.push(*b);
-            }
-            Node::Neg(a) | Node::Pow(a, _) | Node::Unary(_, a) => stack.push(*a),
-            Node::Cmp(_, a, b) | Node::Binary(_, a, b) => {
-                stack.push(*a);
-                stack.push(*b);
-            }
-            Node::Select(c, t, e) => {
-                stack.push(*c);
-                stack.push(*t);
-                stack.push(*e);
-            }
-            Node::Reduce(_, l) | Node::Dot(l) | Node::Call(_, l) | Node::Solve(l, _) => {
-                stack.extend_from_slice(ctx.args(*l))
-            }
-        }
-    }
-    seen.len()
-}
 
 #[test]
 fn all_fixtures_parse_and_extract() {
@@ -58,20 +25,17 @@ fn all_fixtures_parse_and_extract() {
         let dae = parsed.assemble(&mut ctx);
         assert!(dae.dim() > 0, "{name}: empty DAE");
 
-        let res_nodes = count_nodes(&ctx, &dae.residuals);
-        let jac = dae.jacobian_x(&mut ctx);
-        let flat: Vec<ExprId> = jac.iter().flatten().copied().collect();
-        let jac_nnz = flat.iter().filter(|&&e| !ctx.is_zero(e)).count();
-        let jac_nodes = count_nodes(&ctx, &flat);
+        let rows: Vec<ExprId> = dae.currents.iter().chain(&dae.charges).copied().collect();
+        let res_nodes = rsdag::dot::reachable(&ctx, &rows).len();
+        let ((_, _, g), (_, cols, _)) = dae.jacobian_iq_coo(&mut ctx);
+        let jac_nnz = g.iter().filter(|&&e| !ctx.is_zero(e)).count();
+        let jac_nodes = rsdag::dot::reachable(&ctx, &g).len();
 
-        // True dynamic states: columns of dF/dx' that are not structurally zero.
-        let jxd = dae.jacobian_xdot(&mut ctx);
-        let states = (0..dae.dim())
-            .filter(|&j| jxd.iter().any(|row| !ctx.is_zero(row[j])))
-            .count();
+        // True dynamic states: the columns of dQ/dx.
+        let states = cols.iter().collect::<std::collections::BTreeSet<_>>().len();
 
         println!(
-            "{name:24} dim={:2} states={:2} params={:2} | residual nodes={:3} | jac {}x{} nnz={:2} nodes={:3}",
+            "{name:24} dim={:2} states={:2} params={:2} | row nodes={:3} | jac {}x{} nnz={:2} nodes={:3}",
             dae.dim(),
             states,
             dae.params(&ctx).len(),

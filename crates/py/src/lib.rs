@@ -3,10 +3,8 @@
 //! SANE does not generate code. All orchestration, numeric analysis and the
 //! sensitivity/gradient machinery live in `sane_analysis::Model` (pure Rust);
 //! these bindings are thin marshalling wrappers over it (`PyModel` delegates to
-//! `Model`). Python gets a **numeric** interface (`Model.residual`,
-//! `Model.jacobian_x`, `Model.ac_response`, ... evaluated in Rust) and a
-//! **symbolic** one (`Model.residuals` as manipulable `Expr` handles into the
-//! shared graph, `Model.to_latex`, `Model.transfer_function`).
+//! `Model`): a numeric interface (`Model.currents`, `Model.jacobian_i_x`,
+//! `Model.ac_response`, ... evaluated in Rust).
 
 // The `#[pymethods]` macro expands `?`/return paths into `PyErr: From<PyErr>`
 // conversions clippy flags as useless; they are macro-generated, not our code.
@@ -18,22 +16,19 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-mod symbolic;
-
 use std::collections::HashMap;
-
-use symbolic::LockCtx;
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
-use rsdag::ExprId;
 use sane_core::Graph;
-use sane_dae::{small_signal_matrix, small_signal_transfer, DeviceInstance};
+use sane_dae::DeviceInstance;
 use sane_device::CSwitch;
-use sane_export::{export_latex, latex_expr};
 use sane_mna::{Circuit as MnaCircuit, Kind, SourceFn};
 use sane_solve::CompiledDc;
+
+/// A sparse matrix as `(rows, cols, values)`.
+type Coo = (Vec<usize>, Vec<usize>, Vec<f64>);
 
 /// A short lowercase name for an element kind, for introspection.
 fn kind_name(k: &Kind) -> &'static str {
@@ -212,14 +207,14 @@ impl Circuit {
         self.devices.len()
     }
 
-    /// Extract the symbolic DAE `F(x, x', t) = 0` (with its analytic Jacobians).
-    fn extract_dae(&self, py: Python<'_>) -> PyResult<PyModel> {
+    /// Extract the DAE `I(x, t) + d/dt Q(x) = 0` (with its analytic Jacobians).
+    fn extract_dae(&self) -> PyResult<PyModel> {
         let mut core = Graph::new();
         let inner = sane_dae::assemble(&mut core, &self.circuit, &self.devices, &self.instances);
         let (cdc, _cprof) = CompiledDc::new_profiled(&mut core, &inner);
         let arc = std::sync::Arc::new(std::sync::Mutex::new(core));
-        let symctx = Py::new(py, symbolic::Context::from_arc(arc.clone()))?;
-        let (elements, terminals) = sane_dae::topology(&self.circuit, &self.devices, &self.instances);
+        let (elements, terminals) =
+            sane_dae::topology(&self.circuit, &self.devices, &self.instances);
         let model = sane_analysis::Model::from_parts(
             arc,
             inner,
@@ -228,10 +223,7 @@ impl Circuit {
             self.node_names.clone(),
             Some((&elements, &terminals)),
         );
-        Ok(PyModel {
-            inner: model,
-            symctx,
-        })
+        Ok(PyModel { inner: model })
     }
 }
 
@@ -261,7 +253,7 @@ fn parse(netlist: &str) -> PyResult<Circuit> {
 }
 
 /// Map an element name to the symbol name under which its value parameter is
-/// bound, keeping names out of the reserved unknown namespace (`v{k}`, `vdot{k}`,
+/// bound, keeping names out of the reserved unknown namespace (`v{k}`,
 /// `i_*`, `t`, ...). Programmatic builders bind values by this name so the key
 /// matches the parameter the netlist front-end and DAE assembly produce.
 #[pyfunction]
@@ -462,20 +454,15 @@ fn overrides_vec(ov: &HashMap<String, f64>) -> Vec<(&str, f64)> {
 #[pyclass(name = "Model")]
 struct PyModel {
     inner: sane_analysis::Model,
-    /// A Python `Context` handle onto the *same* symbolic arena the model solves
-    /// on (shared `Arc<Mutex>`), so `residuals()` / `transfer_function()` / ...
-    /// return live `Expr` that can be differentiated, simplified and compiled.
-    symctx: Py<symbolic::Context>,
 }
 
 #[pymethods]
 impl PyModel {
     /// Build a `Model` from a SPICE-like netlist string.
     #[staticmethod]
-    fn from_netlist(py: Python<'_>, src: &str) -> PyResult<PyModel> {
+    fn from_netlist(src: &str) -> PyResult<PyModel> {
         let inner = sane_analysis::Model::from_netlist(src).map_err(model_err)?;
-        let symctx = Py::new(py, symbolic::Context::from_arc(inner.context_arc()))?;
-        Ok(PyModel { inner, symctx })
+        Ok(PyModel { inner })
     }
 
     /// Index-2 topologies of the deck, as `{"cv_loops": [[...]], "li_cutsets": [[...]]}`
@@ -541,19 +528,17 @@ impl PyModel {
     /// from the parameter set (no dF/dp column, no sensitivity). A path is a single
     /// parameter (`"X1.R1"`) or a group prefix (`"X1"` -> all `X1.*`). Returns the
     /// folded model; this one is unchanged.
-    fn fold(&self, py: Python<'_>, paths: Vec<String>) -> PyResult<PyModel> {
+    fn fold(&self, paths: Vec<String>) -> PyResult<PyModel> {
         let refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
         let inner = self.inner.fold(&refs).map_err(model_err)?;
-        let symctx = Py::new(py, symbolic::Context::from_arc(inner.context_arc()))?;
-        Ok(PyModel { inner, symctx })
+        Ok(PyModel { inner })
     }
     /// Fold every parameter except the ones under `paths` (the inverse of
     /// `fold`). Returns the folded model; this one is unchanged.
-    fn keep(&self, py: Python<'_>, paths: Vec<String>) -> PyResult<PyModel> {
+    fn keep(&self, paths: Vec<String>) -> PyResult<PyModel> {
         let refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
         let inner = self.inner.keep(&refs).map_err(model_err)?;
-        let symctx = Py::new(py, symbolic::Context::from_arc(inner.context_arc()))?;
-        Ok(PyModel { inner, symctx })
+        Ok(PyModel { inner })
     }
     fn resolve(&self, reference: &str) -> Option<usize> {
         self.inner.resolve(reference)
@@ -703,208 +688,6 @@ impl PyModel {
         .map_err(model_err)
     }
 
-    // --- symbolic interface (Expr handles into the shared arena) -----------
-
-    /// The shared symbolic [`Context`](symbolic::Context) this model lives in, so
-    /// the returned `Expr` graph can be manipulated, differentiated or compiled.
-    #[getter]
-    fn context(&self, py: Python<'_>) -> Py<symbolic::Context> {
-        self.symctx.clone_ref(py)
-    }
-
-    /// The residual equations `F(x, x', t)` as symbolic `Expr` (one per row),
-    /// manipulable in place: differentiate, simplify, evaluate, compile.
-    fn residuals(&self, py: Python<'_>) -> Vec<symbolic::Expr> {
-        self.inner
-            .dae()
-            .residuals
-            .iter()
-            .map(|&r| self.wrap(py, r))
-            .collect()
-    }
-
-    /// The symbolic Jacobian `dF/dx` as a dense matrix of `Expr`.
-    fn jacobian_x_symbolic(&self, py: Python<'_>) -> Vec<Vec<symbolic::Expr>> {
-        let arc = self.inner.context_arc();
-        let rows = self.inner.dae().jacobian_x(&mut arc.lock_ctx());
-        self.wrap_rows(py, rows)
-    }
-
-    /// The symbolic Jacobian `dF/dx'` as a dense matrix of `Expr`.
-    fn jacobian_xdot_symbolic(&self, py: Python<'_>) -> Vec<Vec<symbolic::Expr>> {
-        let arc = self.inner.context_arc();
-        let rows = self.inner.dae().jacobian_xdot(&mut arc.lock_ctx());
-        self.wrap_rows(py, rows)
-    }
-
-    /// The symbolic small-signal system matrix `A(s) = dF/dx + s*dF/dx'` as a
-    /// dense matrix of `Expr` (with the Laplace variable `s` as a free symbol).
-    fn small_signal_matrix(&self, py: Python<'_>) -> Vec<Vec<symbolic::Expr>> {
-        let arc = self.inner.context_arc();
-        let rows = small_signal_matrix(&mut arc.lock_ctx(), self.inner.dae());
-        self.wrap_rows(py, rows)
-    }
-
-    /// The symbolic transfer function `H(s)` from `input` to `output` as a single
-    /// `Expr` (manipulable), or `None` if the output is unknown.
-    fn transfer_function(
-        &self,
-        py: Python<'_>,
-        input: &str,
-        output: &str,
-    ) -> Option<symbolic::Expr> {
-        let arc = self.inner.context_arc();
-        let id = small_signal_transfer(&mut arc.lock_ctx(), self.inner.dae(), input, output)?;
-        Some(self.wrap(py, id))
-    }
-
-    /// The residual equations `F(x, x', t)` as a LaTeX `aligned` block.
-    fn to_latex(&self) -> String {
-        let arc = self.inner.context_arc();
-        let s = export_latex(&mut arc.lock_ctx(), self.inner.dae());
-        s
-    }
-
-    /// Small-signal transfer `H(s)` (symbolic) as LaTeX, or `None` if the
-    /// output unknown is not found.
-    fn ac_transfer_latex(&self, input: &str, output: &str) -> Option<String> {
-        let arc = self.inner.context_arc();
-        let mut c = arc.lock_ctx();
-        let h = small_signal_transfer(&mut c, self.inner.dae(), input, output)?;
-        Some(latex_expr(&c, h))
-    }
-
-    /// Symbolic sparse `dF/dx` as `(rows, cols, exprs)` (COO).
-    fn jacobian_x_coo(&self, py: Python<'_>) -> (Vec<usize>, Vec<usize>, Vec<symbolic::Expr>) {
-        let arc = self.inner.context_arc();
-        let (r, cc, ids) = self.inner.dae().jacobian_x_coo(&mut arc.lock_ctx());
-        (r, cc, ids.into_iter().map(|id| self.wrap(py, id)).collect())
-    }
-
-    /// Symbolic sparse `dF/dx'` as `(rows, cols, exprs)` (COO).
-    fn jacobian_xdot_coo(&self, py: Python<'_>) -> (Vec<usize>, Vec<usize>, Vec<symbolic::Expr>) {
-        let arc = self.inner.context_arc();
-        let (r, cc, ids) = self.inner.dae().jacobian_xdot_coo(&mut arc.lock_ctx());
-        (r, cc, ids.into_iter().map(|id| self.wrap(py, id)).collect())
-    }
-
-    /// Symbolic sparse `dF/dp` (residual rows x parameter columns) as
-    /// `(rows, cols, exprs)` (COO).
-    fn jacobian_p_coo(&self, py: Python<'_>) -> (Vec<usize>, Vec<usize>, Vec<symbolic::Expr>) {
-        let arc = self.inner.context_arc();
-        let mut c = arc.lock_ctx();
-        let params = self.inner.dae().params(&c);
-        let (r, cc, ids) = self.inner.dae().jacobian_p_coo(&mut c, &params);
-        drop(c);
-        (r, cc, ids.into_iter().map(|id| self.wrap(py, id)).collect())
-    }
-
-    /// Estimate the number of pre-cancellation terms in the symbolic transfer
-    /// function (the permanent of the small-signal matrix sparsity pattern),
-    /// capped at `cap`. Cheap and bounded; predicts closed-form blow-up.
-    fn transfer_term_estimate(&self, cap: u64) -> u64 {
-        let arc = self.inner.context_arc();
-        let mut c = arc.lock_ctx();
-        let a = small_signal_matrix(&mut c, self.inner.dae());
-        let pat: Vec<Vec<bool>> = a
-            .iter()
-            .map(|row| row.iter().map(|&e| !c.is_zero(e)).collect())
-            .collect();
-        rsdag::symbolic::count_det_terms(&pat, cap)
-    }
-
-    /// Analog-Insydes-style symbolic approximation of `H(s)`: drop transfer-function
-    /// terms below `tol` of the dominant term (ranked at the DC operating point and
-    /// frequency `freq` Hz). Returns `(H_pruned, terms_total, terms_kept)`.
-    fn transfer_approx(
-        &self,
-        py: Python<'_>,
-        input: &str,
-        output: &str,
-        tol: f64,
-        freq: f64,
-    ) -> Option<(symbolic::Expr, usize, usize)> {
-        let values = self.inner.values();
-        let arc = self.inner.context_arc();
-        let res = sane_analysis::symbolic_transfer_approx(
-            &mut arc.lock_ctx(),
-            self.inner.dae(),
-            self.inner.cdc(),
-            &values,
-            input,
-            output,
-            tol,
-            freq,
-        );
-        res.map(|(id, tot, kept)| (self.wrap(py, id), tot, kept))
-    }
-
-    /// Single-frequency symbolic approximation (Sherman-Morrison entry pruning,
-    /// then Cramer's rule on the sparse reduced matrix). Returns
-    /// `(H, kept_entries, total_entries, terms, H_re, H_im)`.
-    fn transfer_approx_at(
-        &self,
-        py: Python<'_>,
-        input: &str,
-        output: &str,
-        freq: f64,
-        tol: f64,
-        cap: usize,
-    ) -> Option<(symbolic::Expr, usize, usize, usize, f64, f64)> {
-        let values = self.inner.values();
-        let arc = self.inner.context_arc();
-        let res = sane_analysis::symbolic_transfer_approx_at(
-            &mut arc.lock_ctx(),
-            self.inner.dae(),
-            self.inner.cdc(),
-            &values,
-            input,
-            output,
-            freq,
-            tol,
-            cap,
-        );
-        res.map(|(id, kept, total, terms, re, im)| (self.wrap(py, id), kept, total, terms, re, im))
-    }
-
-    /// Named-stamp single-frequency symbolic approximation (symbolic MNA form).
-    /// Returns `(H, legend, kept_entries, total_entries, terms, H_re, H_im)`.
-    #[allow(clippy::type_complexity)]
-    fn transfer_approx_named_at(
-        &self,
-        py: Python<'_>,
-        input: &str,
-        output: &str,
-        freq: f64,
-        tol: f64,
-        cap: usize,
-    ) -> Option<(
-        symbolic::Expr,
-        Vec<(String, f64, f64)>,
-        usize,
-        usize,
-        usize,
-        f64,
-        f64,
-    )> {
-        let values = self.inner.values();
-        let arc = self.inner.context_arc();
-        let res = sane_analysis::symbolic_transfer_approx_named_at(
-            &mut arc.lock_ctx(),
-            self.inner.dae(),
-            self.inner.cdc(),
-            &values,
-            input,
-            output,
-            freq,
-            tol,
-            cap,
-        );
-        res.map(|(id, legend, stamps, total, terms, re, im)| {
-            (self.wrap(py, id), legend, stamps, total, terms, re, im)
-        })
-    }
-
     // --- parameter store (low-level; the hierarchical Python API builds on it) ---
 
     /// Build the parameter vector in column order from the bound store plus
@@ -961,44 +744,29 @@ impl PyModel {
     /// context, plus the pruned `(branch, node)` pairs.
     fn prune_graph(
         &self,
-        py: Python<'_>,
         rel_tol: f64,
         x: Vec<f64>,
         p: Vec<f64>,
         omegas: Vec<f64>,
     ) -> (PyModel, Vec<(String, String)>) {
         let (model, pruned) = self.inner.prune_graph(rel_tol, &x, &p, &omegas);
-        (
-            PyModel {
-                inner: model,
-                symctx: self.symctx.clone_ref(py),
-            },
-            pruned,
-        )
+        (PyModel { inner: model }, pruned)
     }
 
     /// Exactly eliminate internal resistive nodes (Schur/series reduction).
     /// `keep` protects node-unknown names. Returns the reduced `Model` and the
     /// eliminated node names.
-    fn eliminate_nodes(&self, py: Python<'_>, keep: Vec<String>) -> (PyModel, Vec<String>) {
+    fn eliminate_nodes(&self, keep: Vec<String>) -> (PyModel, Vec<String>) {
         let (model, gone) = self.inner.eliminate_nodes(&keep);
-        (
-            PyModel {
-                inner: model,
-                symctx: self.symctx.clone_ref(py),
-            },
-            gone,
-        )
+        (PyModel { inner: model }, gone)
     }
 
     /// Linearise about the operating point into the small-signal mass-matrix DAE
-    /// `G dx + C dx' = 0`, sharing this context. Returns the linearised `Model`.
-    fn linearize(&self, py: Python<'_>) -> PyModel {
+    /// `G dx + d/dt (C dx) = 0`, sharing this context. Returns the linearised
+    /// `Model`.
+    fn linearize(&self) -> PyModel {
         let model = self.inner.linearize();
-        PyModel {
-            inner: model,
-            symctx: self.symctx.clone_ref(py),
-        }
+        PyModel { inner: model }
     }
 
     // --- low-level whole-circuit analyses (explicit index/state forms) -----
@@ -1088,49 +856,44 @@ impl PyModel {
 
     // --- low-level numeric interface (evaluated in Rust) ------------------
 
-    /// Residual `F(x, x', t)` as a numeric vector.
+    /// The currents `I(x, p, t)`. Every row reads `I(x, t) + d/dt Q(x)`.
+    fn currents(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> Vec<f64> {
+        self.inner.currents(x, p, t)
+    }
+    /// The charges `Q(x, p)`.
+    fn charges(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> Vec<f64> {
+        self.inner.charges(x, p, t)
+    }
+    /// The residual `F = I(x, t) + C(x) x'` at the state `x` moving at the
+    /// rate `xdot`.
     fn residual(&self, x: Vec<f64>, xdot: Vec<f64>, p: Vec<f64>, t: f64) -> Vec<f64> {
         self.inner.residual(x, xdot, p, t)
     }
-    /// Jacobian `dF/dx` as a dense matrix.
-    fn jacobian_x(&self, x: Vec<f64>, xdot: Vec<f64>, p: Vec<f64>, t: f64) -> Vec<Vec<f64>> {
-        self.inner.jacobian_x(x, xdot, p, t)
+    /// `G = dI/dx` as a dense matrix.
+    fn jacobian_i_x(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> Vec<Vec<f64>> {
+        self.inner.jacobian_i_x(x, p, t)
     }
-    /// Jacobian `dF/dx'` as a dense matrix.
-    fn jacobian_xdot(&self, x: Vec<f64>, xdot: Vec<f64>, p: Vec<f64>, t: f64) -> Vec<Vec<f64>> {
-        self.inner.jacobian_xdot(x, xdot, p, t)
+    /// `C = dQ/dx` as a dense matrix.
+    fn jacobian_q_x(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> Vec<Vec<f64>> {
+        self.inner.jacobian_q_x(x, p, t)
     }
-    /// Sparse `dF/dx` as `(rows, cols, values)` (COO).
-    fn jacobian_x_sparse(
-        &self,
-        x: Vec<f64>,
-        xdot: Vec<f64>,
-        p: Vec<f64>,
-        t: f64,
-    ) -> (Vec<usize>, Vec<usize>, Vec<f64>) {
-        self.inner.jacobian_x_sparse(x, xdot, p, t)
+    /// Sparse `G = dI/dx` as `(rows, cols, values)` (COO).
+    fn jacobian_i_x_sparse(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> Coo {
+        self.inner.jacobian_i_x_sparse(x, p, t)
     }
-    /// Sparse `dF/dx'` as `(rows, cols, values)` (COO).
-    fn jacobian_xdot_sparse(
-        &self,
-        x: Vec<f64>,
-        xdot: Vec<f64>,
-        p: Vec<f64>,
-        t: f64,
-    ) -> (Vec<usize>, Vec<usize>, Vec<f64>) {
-        self.inner.jacobian_xdot_sparse(x, xdot, p, t)
+    /// Sparse `C = dQ/dx` as `(rows, cols, values)` (COO).
+    fn jacobian_q_x_sparse(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> Coo {
+        self.inner.jacobian_q_x_sparse(x, p, t)
     }
-    /// Sparse `dF/dp` as `(rows, cols, values)` (COO).
-    fn jacobian_p_sparse(
-        &self,
-        x: Vec<f64>,
-        xdot: Vec<f64>,
-        p: Vec<f64>,
-        t: f64,
-    ) -> (Vec<usize>, Vec<usize>, Vec<f64>) {
-        self.inner.jacobian_p_sparse(x, xdot, p, t)
+    /// Sparse `dI/dp` as `(rows, cols, values)` (COO).
+    fn jacobian_i_p_sparse(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> Coo {
+        self.inner.jacobian_i_p_sparse(x, p, t)
     }
-    /// Number of structural nonzeros in the sparse `dF/dx` pattern.
+    /// Sparse `dQ/dp` as `(rows, cols, values)` (COO).
+    fn jacobian_q_p_sparse(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> Coo {
+        self.inner.jacobian_q_p_sparse(x, p, t)
+    }
+    /// Number of structural nonzeros in the sparse `G` pattern.
     fn nnz(&self) -> usize {
         self.inner.nnz()
     }
@@ -1139,18 +902,17 @@ impl PyModel {
         self.inner.partition_sizes()
     }
 
-    /// Exact input-coupling vector `B = dF/d(input)` for the named source, by
-    /// symbolic differentiation (autodiff), evaluated at `(x, xdot, p, t)`.
-    fn input_jacobian(
+    /// Exact input-coupling vector `dI/d(input)` for the named source, by
+    /// symbolic differentiation (autodiff), evaluated at `(x, p, t)`.
+    fn jacobian_i_input(
         &self,
         input: &str,
         x: Vec<f64>,
-        xdot: Vec<f64>,
         p: Vec<f64>,
         t: f64,
     ) -> PyResult<Vec<f64>> {
         self.inner
-            .input_jacobian(input, x, xdot, p, t)
+            .jacobian_i_input(input, x, p, t)
             .map_err(model_err)
     }
 
@@ -1441,25 +1203,9 @@ impl PyModel {
         .map_err(model_err)
     }
 
-    /// Small-signal AC transfer `H(j2*pi*f)` from source parameter `input` to
-    /// unknown `output`, evaluated at each frequency in `freqs_hz`. `values`
-    /// binds parameters (and, for nonlinear circuits, operating-point unknowns);
-    /// unbound symbols default to 0. Returns `(re, im)` pairs, or `None` if the
-    /// output is unknown.
-    fn ac_transfer(
-        &self,
-        py: Python<'_>,
-        input: &str,
-        output: &str,
-        values: HashMap<String, f64>,
-        freqs_hz: Vec<f64>,
-    ) -> Option<Vec<(f64, f64)>> {
-        py.allow_threads(|| self.inner.ac_transfer(input, output, values, freqs_hz))
-    }
-
     /// Small-signal poles at the operating point `x` (parameters `p`): the finite
     /// generalized eigenvalues of the pencil `(G, C)` with `G = dF/dx`,
-    /// `C = dF/dx'`, computed natively (the engine's standard-reduction
+    /// `C = dQ/dx`, computed natively (the engine's standard-reduction
     /// eigensolver -- no Python-side linear algebra, so no drift). `(re, im)` in
     /// rad/s.
     fn poles(&self, py: Python<'_>, x: Vec<f64>, p: Vec<f64>) -> PyResult<Vec<(f64, f64)>> {
@@ -1701,19 +1447,6 @@ impl PyModel {
     ) -> PyResult<Vec<((f64, f64), (f64, f64))>> {
         py.allow_threads(|| self.inner.zero_sensitivity(input, out_idx, param, x, p))
             .map_err(model_err)
-    }
-}
-
-impl PyModel {
-    /// Wrap a core `ExprId` as a Python `Expr` sharing this model's context.
-    fn wrap(&self, py: Python<'_>, id: ExprId) -> symbolic::Expr {
-        symbolic::Expr::new(self.symctx.clone_ref(py), id)
-    }
-
-    fn wrap_rows(&self, py: Python<'_>, rows: Vec<Vec<ExprId>>) -> Vec<Vec<symbolic::Expr>> {
-        rows.into_iter()
-            .map(|row| row.into_iter().map(|id| self.wrap(py, id)).collect())
-            .collect()
     }
 }
 
@@ -1968,6 +1701,5 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(hb_synth_calls, m)?)?;
     m.add_function(wrap_pyfunction!(profile_begin, m)?)?;
     m.add_function(wrap_pyfunction!(profile_take, m)?)?;
-    symbolic::register(m)?;
     Ok(())
 }

@@ -7,7 +7,7 @@
 use crate::field::Field;
 use rustc_hash::FxHashMap as HashMap;
 
-use crate::graph::{Graph, Memo};
+use crate::graph::{Graph, Join, Memo, Set, Through};
 use crate::node::{BinOp, CmpOp, ExprId, Node, ReduceOp, SymbolId, UnaryOp};
 
 /// Derivative of `expr` with respect to the symbol `wrt`.
@@ -309,10 +309,9 @@ fn all_carrying<K: Field>(ctx: &Graph<K>, e: ExprId, mut test: impl FnMut(ExprId
     match *ctx.node(e) {
         Node::Call(o, l) => {
             let (f, k) = ctx.output(o);
-            let args = ctx.args(l);
             ctx.output_support(f, k)
                 .iter()
-                .all(|&p| test(args[p as usize]))
+                .all(|&p| test(ctx.call_operand(o, l, p)))
         }
         ref node => ctx.operands(e)[inert(node)..].iter().all(|&c| test(c)),
     }
@@ -328,8 +327,11 @@ pub(crate) fn carrying<K: Field>(ctx: &Graph<K>, e: ExprId, out: &mut Vec<ExprId
     match *ctx.node(e) {
         Node::Call(o, l) => {
             let (f, k) = ctx.output(o);
-            let args = ctx.args(l);
-            out.extend(ctx.output_support(f, k).iter().map(|&p| args[p as usize]));
+            out.extend(
+                ctx.output_support(f, k)
+                    .iter()
+                    .map(|&p| ctx.call_operand(o, l, p)),
+            );
         }
         ref node => out.extend_from_slice(&ctx.operands(e)[inert(node)..]),
     }
@@ -337,7 +339,9 @@ pub(crate) fn carrying<K: Field>(ctx: &Graph<K>, e: ExprId, out: &mut Vec<ExprId
 
 /// The nodes under `root` through operands that carry a derivative, marked
 /// in `seen`, in ascending id order: a topological one, a hash-consed node
-/// having a larger id than its operands.
+/// having a larger id than its operands. Through a call only the operands
+/// its output's support names, so a row of a wide body's single call walks
+/// that row's share of it, not the call's whole argument list.
 fn cone<K: Field>(ctx: &Graph<K>, root: ExprId, seen: &mut Memo) -> Vec<ExprId> {
     let mut out = Vec::new();
     let mut stack = vec![root];
@@ -504,20 +508,18 @@ fn tangent<K: Field>(ctx: &mut Graph<K>, e: ExprId, wrt: SymbolId, memo: &mut Me
         // each partial a call into the function's derivative output.
         Node::Call(o, l) => {
             let (f, out) = ctx.output(o);
-            let moving: Vec<(u32, ExprId)> = {
-                let args = ctx.args(l);
-                ctx.output_support(f, out)
-                    .iter()
-                    .map(|&i| (i, d(args[i as usize])))
-                    .filter(|&(_, da)| da != zero)
-                    .collect()
-            };
+            let moving: Vec<(u32, ExprId)> = ctx
+                .output_support(f, out)
+                .iter()
+                .map(|&i| (i, d(ctx.call_operand(o, l, i))))
+                .filter(|&(_, da)| da != zero)
+                .collect();
             let params: Vec<u32> = moving.iter().map(|&(i, _)| i).collect();
             let ks = ctx.derivative_outputs(f, out, &params);
             let mut acc = zero;
             for (&(_, dai), k) in moving.iter().zip(ks) {
                 // over the call's own list: no width to hash again
-                let partial = ctx.call_list(f, k, l);
+                let partial = ctx.call_list_in(f, k, ctx.context_of(o), l);
                 let term = ctx.mul(partial, dai);
                 acc = ctx.add(acc, term);
             }
@@ -553,20 +555,28 @@ pub fn sparse_jacobian<K: Field>(
     residuals: &[ExprId],
     wrt: &[SymbolId],
 ) -> SparseRows {
-    let col: rustc_hash::FxHashMap<SymbolId, usize> =
-        wrt.iter().enumerate().map(|(j, &s)| (s, j)).collect();
+    let col: rustc_hash::FxHashMap<SymbolId, u32> = wrt
+        .iter()
+        .enumerate()
+        .map(|(j, &s)| (s, j as u32))
+        .collect();
+    // every row's columns in one pass over the rows' cone
+    let flow = ctx.flow(residuals, Through::Carries, |n| match *n {
+        Node::Symbol(s) => col
+            .get(&s)
+            .map_or(Set::bottom(), |&j| Set::one(j, wrt.len())),
+        _ => Set::bottom(),
+    });
     let touched: Vec<Vec<(usize, SymbolId)>> = residuals
         .iter()
         .map(|&r| {
-            let mut t: Vec<(usize, SymbolId)> = ctx
-                .support_in(&[r])
-                .into_iter()
-                .filter_map(|s| col.get(&s).map(|&j| (j, s)))
-                .collect();
-            t.sort_unstable_by_key(|&(j, _)| j);
-            t
+            flow.get(r)
+                .iter()
+                .map(|j| (j as usize, wrt[j as usize]))
+                .collect()
         })
         .collect();
+    drop(flow);
     let mut rows: SparseRows = vec![Vec::new(); residuals.len()];
     // Forward rows by the columns they touch, rows in order within one.
     let mut by_col: Vec<Vec<usize>> = vec![Vec::new(); wrt.len()];
@@ -827,18 +837,16 @@ pub fn gradient<K: Field>(ctx: &mut Graph<K>, f: ExprId, wrt: &[SymbolId]) -> Ve
             // forward mode, for the arguments that move.
             Node::Call(o, l) => {
                 let (func, out) = ctx.output(o);
-                let moving: Vec<(u32, ExprId)> = {
-                    let args = ctx.args(l);
-                    ctx.output_support(func, out)
-                        .iter()
-                        .map(|&i| (i, args[i as usize]))
-                        .filter(|&(_, a)| act(a))
-                        .collect()
-                };
+                let moving: Vec<(u32, ExprId)> = ctx
+                    .output_support(func, out)
+                    .iter()
+                    .map(|&i| (i, ctx.call_operand(o, l, i)))
+                    .filter(|&(_, a)| act(a))
+                    .collect();
                 let params: Vec<u32> = moving.iter().map(|&(i, _)| i).collect();
                 let ks = ctx.derivative_outputs(func, out, &params);
                 for (&(_, arg), k) in moving.iter().zip(ks) {
-                    let partial = ctx.call_list(func, k, l);
+                    let partial = ctx.call_list_in(func, k, ctx.context_of(o), l);
                     let t = ctx.mul(a_bar, partial);
                     push(&mut adj, arg, t);
                 }

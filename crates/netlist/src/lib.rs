@@ -16,6 +16,7 @@
 
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::path::Path;
+use std::sync::Arc;
 
 use sane_dae::Instance;
 use sane_device::{DeviceInstance, ParamDefaults};
@@ -109,11 +110,15 @@ impl ParsedCircuit {
     /// Every placed device, subcircuit bodies' included, under its name in
     /// the top frame (see [`ParamDefaults`]).
     fn defaults(&self) -> ParamDefaults<'_> {
-        fn add<'a>(d: &mut ParamDefaults<'a>, instances: &'a [Instance], outer: &dyn Fn(&str) -> String) {
+        fn add<'a>(
+            d: &mut ParamDefaults<'a>,
+            instances: &'a [Instance],
+            outer: &dyn Fn(&str) -> String,
+        ) {
             for inst in instances {
                 let rename = |n: &str| outer(&inst.rename(n));
-                d.add(&inst.devices, &rename);
-                add(d, &inst.instances, &rename);
+                d.add(&inst.body.devices, &rename);
+                add(d, &inst.body.instances, &rename);
             }
         }
         let mut d = ParamDefaults::new(&self.devices);
@@ -151,10 +156,16 @@ impl ParsedCircuit {
             }
             instances.iter().find_map(|i| {
                 let r = |n: &str| rename(&i.rename(n));
-                find(&i.devices, &i.instances, &r, inst, param)
+                find(&i.body.devices, &i.body.instances, &r, inst, param)
             })
         }
-        find(&self.devices, &self.instances, &|n| n.to_string(), inst, param)
+        find(
+            &self.devices,
+            &self.instances,
+            &|n| n.to_string(),
+            inst,
+            param,
+        )
     }
 
     /// The parameter vector for `names` (the engine's column order): bound
@@ -308,6 +319,7 @@ fn parse_impl(text: &str, base_dir: Option<&Path>) -> Result<ParsedCircuit, Pars
         va_models: &va_models,
         #[cfg(not(target_arch = "wasm32"))]
         osdi_models: HashMap::default(),
+        bodies: HashMap::default(),
     };
 
     let instances = st.place_items(&items, base_dir)?;
@@ -353,6 +365,17 @@ fn parse_impl(text: &str, base_dir: Option<&Path>) -> Result<ParsedCircuit, Pars
     })
 }
 
+/// A subcircuit body placed: what every instance of it shares, in the
+/// body's names.
+pub(crate) struct Placed {
+    body: Arc<sane_dae::Body>,
+    /// The body's nodes, each by its name in the body.
+    nodes: Vec<String>,
+    values: Vec<(String, f64)>,
+    report: CompatReport,
+    ports: Vec<PortDef>,
+}
+
 impl Placer<'_> {
     /// Place `items` in order; the subcircuit instances among them are
     /// returned, placed. Stops at `.end`.
@@ -375,10 +398,70 @@ impl Placer<'_> {
         Ok(instances)
     }
 
-    /// Place a subcircuit instance's body over its own nodes and names, then
-    /// wire it into this frame: its ports onto the nodes they connect to, its
-    /// internal nodes and bound values under the instance's names.
-    fn place_instance(&mut self, inst: &Inst, base_dir: Option<&Path>) -> Result<Instance, ParseError> {
+    /// Wire a subcircuit instance into this frame: its body's ports onto the
+    /// nodes they connect to, its internal nodes and bound values under the
+    /// instance's names. The body is placed once, for every instance of it.
+    fn place_instance(
+        &mut self,
+        inst: &Inst,
+        base_dir: Option<&Path>,
+    ) -> Result<Instance, ParseError> {
+        let key = Arc::as_ptr(&inst.body);
+        let placed = match self.bodies.get(&key) {
+            Some(placed) => placed.clone(),
+            None => {
+                let placed = std::rc::Rc::new(self.place_body(&inst.body, base_dir)?);
+                self.bodies.insert(key, placed.clone());
+                placed
+            }
+        };
+        let mut instance = Instance {
+            name: inst.name.clone(),
+            nodes: Vec::new(),
+            body: placed.body.clone(),
+        };
+        instance.nodes = placed
+            .nodes
+            .iter()
+            .map(|node| {
+                match inst
+                    .body
+                    .ports
+                    .iter()
+                    .position(|p| p.eq_ignore_ascii_case(node))
+                {
+                    Some(i) => self.nodes.resolve(&inst.conn[i]),
+                    None => self.nodes.resolve(&instance.rename(node)),
+                }
+            })
+            .collect();
+        for (k, v) in &placed.values {
+            self.values.insert(instance.rename(k), *v);
+        }
+        let report = &placed.report;
+        self.report
+            .ignored_directives
+            .extend(report.ignored_directives.iter().cloned());
+        self.report
+            .unknown_params
+            .extend(report.unknown_params.iter().map(|p| instance.rename(p)));
+        self.report.notes.extend(report.notes.iter().cloned());
+        self.ports.extend(placed.ports.iter().map(|p| PortDef {
+            name: instance.rename(&p.name),
+            node: instance.rename(&p.node),
+            z0: p.z0,
+        }));
+        Ok(instance)
+    }
+
+    /// Place a subcircuit body over its own nodes and names.
+    fn place_body(
+        &mut self,
+        body: &subckt::Body,
+        base_dir: Option<&Path>,
+    ) -> Result<Placed, ParseError> {
+        let ns = body.ns.as_str();
+        let items = &body.items;
         let mut body = Placer {
             nodes: NodeMap::new(),
             circuit: Circuit::new(),
@@ -394,49 +477,32 @@ impl Placer<'_> {
             va_models: self.va_models,
             #[cfg(not(target_arch = "wasm32"))]
             osdi_models: std::mem::take(&mut self.osdi_models),
+            bodies: std::mem::take(&mut self.bodies),
         };
-        let instances = body.place_items(&inst.body, base_dir)?;
-        self.validated = body.validated;
+        let instances = body.place_items(items, base_dir);
+        self.validated = std::mem::take(&mut body.validated);
+        self.bodies = std::mem::take(&mut body.bodies);
         #[cfg(not(target_arch = "wasm32"))]
         {
-            self.osdi_models = body.osdi_models;
+            self.osdi_models = std::mem::take(&mut body.osdi_models);
         }
-        let mut placed = Instance {
-            name: inst.name.clone(),
-            ns: inst.ns.clone(),
-            nodes: Vec::new(),
-            node_names: body.nodes.names[1..]
-                .iter()
-                .map(|n| n.strip_prefix(inst.ns.as_str()).unwrap_or(n).to_string())
-                .collect(),
-            circuit: body.circuit,
-            devices: body.devices,
-            instances,
-        };
-        placed.nodes = body.nodes.names[1..]
-            .iter()
-            .map(|node| {
-                match inst.ports.iter().position(|p| p.eq_ignore_ascii_case(node)) {
-                    Some(i) => self.nodes.resolve(&inst.conn[i]),
-                    None => self.nodes.resolve(&placed.rename(node)),
-                }
-            })
-            .collect();
-        for (k, v) in body.values {
-            self.values.insert(placed.rename(&k), v);
-        }
-        let report = body.report;
-        self.report.ignored_directives.extend(report.ignored_directives);
-        self.report
-            .unknown_params
-            .extend(report.unknown_params.iter().map(|p| placed.rename(p)));
-        self.report.notes.extend(report.notes);
-        self.ports.extend(body.ports.into_iter().map(|p| PortDef {
-            name: placed.rename(&p.name),
-            node: placed.rename(&p.node),
-            z0: p.z0,
-        }));
-        Ok(placed)
+        let nodes: Vec<String> = body.nodes.names[1..].to_vec();
+        Ok(Placed {
+            body: Arc::new(sane_dae::Body {
+                ns: ns.to_string(),
+                node_names: nodes
+                    .iter()
+                    .map(|n| n.strip_prefix(ns).unwrap_or(n).to_string())
+                    .collect(),
+                circuit: body.circuit,
+                devices: body.devices,
+                instances: instances?,
+            }),
+            nodes,
+            values: body.values.into_iter().collect(),
+            report: body.report,
+            ports: body.ports,
+        })
     }
 
     /// Place one element or directive line. `false` at `.end`.

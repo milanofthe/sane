@@ -2,23 +2,22 @@
 //!
 //! Each unknown is a truncated Fourier series `x_i(t) = Σ_{k=0..K} X_{i,k}
 //! e^{jkw0 t}` (with `X_{i,-k} = conj(X_{i,k})`, so the time signal is real).
-//! The unknowns are the complex coefficients `X`. We require the residual to
-//! vanish at every harmonic, evaluated by the **alternating frequency-time**
-//! (AFT) scheme:
+//! The unknowns are the complex coefficients `X`. Every row reads
+//! `I(x, t) + d/dt Q(x)`, so the harmonic residual is `R_k = I_k + jkw0 Q_k`,
+//! evaluated by the **alternating frequency-time** (AFT) scheme:
 //!
-//! 1. synthesise the time samples `x(t_m)` and `x'(t_m)` from `X` (an inverse
-//!    real FFT per unknown; `x'` has coefficients `jkw0 X_k`),
-//! 2. evaluate the *time-domain* residual [`CompiledDc::residual`] at each
-//!    sample (the same compiled tape transient uses -- a `SIN` source enters
-//!    through the time argument `t_m`, so the drive is free),
-//! 3. forward real FFT the per-unknown sample sequence back to the harmonic
-//!    residuals `R_k`.
+//! 1. synthesise the time samples `x(t_m)` from `X` (an inverse real FFT per
+//!    unknown),
+//! 2. evaluate the currents and charges at each sample (the program the
+//!    transient runs -- a `SIN` source enters through the time argument
+//!    `t_m`, so the drive is free),
+//! 3. forward real FFT the per-row sample sequences back to `I_k` and `Q_k`.
 //!
-//! The Jacobian `dR/dX` reuses the device Jacobian tapes the same way. Its
-//! block structure is the engine's strength: a *constant* (LTI) entry of
-//! `dF/dx` is frequency-diagonal `(G + jkw0 C)` (no harmonic coupling), and
-//! only the *variable* (device) entries -- flagged by [`CompiledDc`]'s
-//! `jx_var` classification -- generate the dense Toeplitz blocks that couple
+//! The Jacobian `dR_k/dX_l = G_{k-l} + jkw0 C_{k-l}` comes from the same
+//! pass. Its block structure is the engine's strength: a *constant* (LTI)
+//! entry of `G` or `C` is frequency-diagonal (no harmonic coupling), and only
+//! the *variable* (device) entries -- flagged by [`CompiledDc`]'s `jx_var` /
+//! `jxd_var` classification -- generate the dense Toeplitz blocks that couple
 //! harmonics. The sparsity pattern of that block matrix is fixed (the DC
 //! pattern promoted to harmonic blocks), so the symbolic factorisation is
 //! built once and every Newton step only refills the value buffer.
@@ -71,12 +70,12 @@ pub fn hb_samples(nl: &rsdag::Nonlinearity, harmonics: usize, oversample: usize)
 
 /// How a single value-buffer entry of the harmonic-block Jacobian is computed.
 enum Slot {
-    /// `dR_k/dX_l` contribution from jx nonzero `nz`: harmonic `k-l` of the
-    /// `dF/dx` entry's waveform.
-    Jx { nz: usize, dk: i64 },
-    /// `dR_k/dX_l` contribution from jxd nonzero `nz`, scaled by `j*l*w0`:
-    /// harmonic `k-l` of the `dF/dx'` entry's waveform.
-    Jxd { nz: usize, dk: i64, l: i64 },
+    /// `dR_k/dX_l` contribution from `G` nonzero `nz`: harmonic `k-l` of the
+    /// entry's waveform.
+    G { nz: usize, dk: i64 },
+    /// `dR_k/dX_l` contribution from `C` nonzero `nz`: harmonic `k-l` of the
+    /// entry's waveform, scaled by the row harmonic's `j*k*w0`.
+    C { nz: usize, dk: i64, k: i64 },
     /// A `GMIN_DC` regularisation entry on a node-harmonic diagonal.
     Gmin,
 }
@@ -116,17 +115,16 @@ struct ToeplitzJacobian {
     pj_rows: Vec<usize>,
     pj_cols: Vec<usize>,
     pjs: Vec<Vec<Complex64>>,
-    /// The synthesized state / state-derivative waveforms on the AFT grid, reused
-    /// by the Hessian's second-order sampling pass.
+    /// The synthesized state waveforms on the AFT grid, reused by the
+    /// Hessian's second-order sampling pass.
     x_time: Vec<Vec<f64>>,
-    xd_time: Vec<Vec<f64>>,
 }
 
 impl<'a> CompiledHb<'a> {
-    /// One AFT pass producing the device Jacobian spectra (`dF/dx`, `dF/dx'`,
-    /// `dF/dp`), then assembly and LU-factorization of the exact two-sided
-    /// Toeplitz HB Jacobian. `None` if the AFT grid is too coarse (`m/2 < 2K`) or
-    /// the system is singular. Shared by `coeff_gradient` and `coeff_hessian`.
+    /// One AFT pass producing the spectra of `G`, `C` and `dR/dp`, then
+    /// assembly and LU-factorization of the exact two-sided Toeplitz HB
+    /// Jacobian. `None` if the AFT grid is too coarse (`m/2 < 2K`) or the
+    /// system is singular. Shared by `coeff_gradient` and `coeff_hessian`.
     fn build_toeplitz_jacobian(
         &self,
         spectra: &[Vec<Complex64>],
@@ -134,76 +132,56 @@ impl<'a> CompiledHb<'a> {
         w0: f64,
     ) -> Option<ToeplitzJacobian> {
         let n = self.n;
+        let m = self.m;
         let k = self.k as i64;
         let h2 = 2 * self.k + 1;
         let kmax = 2 * self.k;
-        if self.m / 2 < kmax {
+        if m / 2 < kmax {
             return None;
         }
         let flat = |i: usize, kk: i64| -> usize { i * h2 + (kk + k) as usize };
 
-        // dF/dx, dF/dx', dF/dp waveforms on the AFT grid (one sample loop).
-        let (x_time, xd_time) = self.synth(spectra, w0);
-        let period = 2.0 * std::f64::consts::PI / w0;
+        // G and C out to harmonic 2K from the Newton pass.
+        let x_time = self.synth(spectra);
+        let mut aft = Vec::new();
+        self.eval_aft(&x_time, p, w0, &mut aft);
         let nzx = self.cdc.jx_rows.len();
         let nzd = self.cdc.jxd_rows.len();
-        let mut jx_time = vec![vec![0.0; self.m]; nzx];
-        let mut jxd_time = vec![vec![0.0; self.m]; nzd];
-        let mut pj_rows: Vec<usize> = Vec::new();
-        let mut pj_cols: Vec<usize> = Vec::new();
-        let mut pj_time: Vec<Vec<f64>> = Vec::new();
-        let (mut xv, mut xdv) = (vec![0.0; n], vec![0.0; n]);
-        let (mut inb, mut wb, mut ob) = (Vec::new(), Vec::new(), Vec::new());
-        let cn = self.cdc.n;
-        for mm in 0..self.m {
+        let jac = &aft[2 * n * m..];
+        let gx = self.entry_spectra(&jac[..nzx * m], &self.cdc.jx_var, kmax);
+        let gxd = self.entry_spectra(&jac[nzx * m..], &self.cdc.jxd_var, kmax);
+        // dR_k/dp = (dI/dp)_k + jkw0 (dQ/dp)_k: both patterns in one list,
+        // the charges' spectra carrying their rate factor.
+        let period = 2.0 * std::f64::consts::PI / w0;
+        let (mut pj_rows, mut pj_cols, mut pj_time) = (Vec::new(), Vec::new(), Vec::new());
+        let mut ni = 0;
+        let mut xv = vec![0.0; n];
+        for mm in 0..m {
             for i in 0..n {
                 xv[i] = x_time[i][mm];
-                xdv[i] = xd_time[i][mm];
             }
-            let t = mm as f64 / self.m as f64 * period;
-            self.cdc.fill_inputs(&xv, &xdv, p, t, &mut inb);
-            self.cdc.tape_step.eval(&inb, &mut wb, &mut ob);
-            for (nz, s) in jx_time.iter_mut().enumerate() {
-                s[mm] = ob[cn + nz];
-            }
-            self.cdc.tape_jxd.eval(&inb, &mut wb, &mut ob);
-            for (nz, s) in jxd_time.iter_mut().enumerate() {
-                s[mm] = ob[nz];
-            }
-            let (pr, pc, pv) = self.cdc.jacobian_p_sparse(&xv, &xdv, p, t);
+            let t = mm as f64 / m as f64 * period;
+            let ((ir, ic, iv), (qr, qc, qv)) = self.cdc.jacobian_p_sparse(&xv, p, t);
             if mm == 0 {
-                pj_rows = pr;
-                pj_cols = pc;
-                pj_time = vec![vec![0.0; self.m]; pv.len()];
+                ni = iv.len();
+                pj_rows = ir.into_iter().chain(qr).collect();
+                pj_cols = ic.into_iter().chain(qc).collect();
+                pj_time = vec![0.0; pj_rows.len() * m];
             }
-            for (nz, &val) in pv.iter().enumerate() {
-                pj_time[nz][mm] = val;
+            for (nz, &v) in iv.iter().chain(&qv).enumerate() {
+                pj_time[nz * m + mm] = v;
             }
         }
-        let gx: Vec<Vec<Complex64>> = (0..nzx)
+        let pjs: Vec<Vec<Complex64>> = (0..pj_rows.len())
             .map(|nz| {
-                if self.cdc.jx_var[nz] {
-                    self.analyse_k(&jx_time[nz], kmax)
-                } else {
-                    let mut v = vec![Complex64::new(0.0, 0.0); kmax + 1];
-                    v[0] = Complex64::new(jx_time[nz][0], 0.0);
-                    v
+                let mut c = self.analyse(&pj_time[nz * m..(nz + 1) * m]);
+                if nz >= ni {
+                    for (kk, c) in c.iter_mut().enumerate() {
+                        *c *= Complex64::new(0.0, kk as f64 * w0);
+                    }
                 }
+                c
             })
-            .collect();
-        let gxd: Vec<Vec<Complex64>> = (0..nzd)
-            .map(|nz| {
-                if self.cdc.jxd_var[nz] {
-                    self.analyse_k(&jxd_time[nz], kmax)
-                } else {
-                    let mut v = vec![Complex64::new(0.0, 0.0); kmax + 1];
-                    v[0] = Complex64::new(jxd_time[nz][0], 0.0);
-                    v
-                }
-            })
-            .collect();
-        let pjs: Vec<Vec<Complex64>> = (0..pj_time.len())
-            .map(|nz| self.analyse_k(&pj_time[nz], self.k))
             .collect();
 
         // Assemble the exact two-sided Toeplitz Jacobian (size n*(2K+1)).
@@ -235,7 +213,7 @@ impl<'a> CompiledHb<'a> {
                     for l in -k..=k {
                         tr.push(flat(i, kk));
                         tc.push(flat(j, l));
-                        tv.push(Complex64::new(0.0, l as f64 * w0) * spec_at(&gxd[nz], kk - l));
+                        tv.push(Complex64::new(0.0, kk as f64 * w0) * spec_at(&gxd[nz], kk - l));
                     }
                 }
             } else {
@@ -264,7 +242,6 @@ impl<'a> CompiledHb<'a> {
             pj_cols,
             pjs,
             x_time,
-            xd_time,
         })
     }
 
@@ -276,8 +253,8 @@ impl<'a> CompiledHb<'a> {
 
     /// Build the harmonic-balance problem. `harmonics` is `K`; `samples` is the
     /// AFT grid size (use [`hb_samples`]). The Jacobian pattern is assembled once
-    /// here: LTI jx entries contribute only block diagonals, device entries the
-    /// full `(K+1)x(K+1)` Toeplitz block, jxd entries likewise (charge storage
+    /// here: LTI `G` entries contribute only block diagonals, device entries the
+    /// full `(K+1)x(K+1)` Toeplitz block, `C` entries likewise (charge storage
     /// can be nonlinear), plus a gmin diagonal on every node harmonic.
     pub fn new(cdc: &'a CompiledDc, harmonics: usize, samples: usize) -> Option<Self> {
         let n = cdc.n;
@@ -307,7 +284,7 @@ impl<'a> CompiledHb<'a> {
             .map(|b| b as i64)
             .unwrap_or(i64::MAX);
 
-        // dF/dx blocks.
+        // G blocks.
         for nz in 0..cdc.jx_rows.len() {
             let (i, j) = (cdc.jx_rows[nz], cdc.jx_cols[nz]);
             if cdc.jx_var[nz] {
@@ -320,7 +297,7 @@ impl<'a> CompiledHb<'a> {
                         }
                         rows.push(idx(i, kk));
                         cols.push(idx(j, l));
-                        slots.push(Slot::Jx { nz, dk });
+                        slots.push(Slot::G { nz, dk });
                     }
                 }
             } else {
@@ -328,13 +305,13 @@ impl<'a> CompiledHb<'a> {
                 for kk in 0..h {
                     rows.push(idx(i, kk));
                     cols.push(idx(j, kk));
-                    slots.push(Slot::Jx { nz, dk: 0 });
+                    slots.push(Slot::G { nz, dk: 0 });
                 }
             }
         }
-        // dF/dx' blocks, scaled per column harmonic by j*l*w0. A constant
+        // C blocks, scaled per row harmonic by j*k*w0. A constant
         // (linear-capacitor) entry has a purely DC spectrum, so it is
-        // frequency-diagonal like the LTI jx entries; only variable (nonlinear
+        // frequency-diagonal like the LTI G entries; only variable (nonlinear
         // charge) entries generate the dense Toeplitz block.
         for nz in 0..cdc.jxd_rows.len() {
             let (i, j) = (cdc.jxd_rows[nz], cdc.jxd_cols[nz]);
@@ -347,10 +324,10 @@ impl<'a> CompiledHb<'a> {
                         }
                         rows.push(idx(i, kk));
                         cols.push(idx(j, l));
-                        slots.push(Slot::Jxd {
+                        slots.push(Slot::C {
                             nz,
                             dk,
-                            l: l as i64,
+                            k: kk as i64,
                         });
                     }
                 }
@@ -358,10 +335,10 @@ impl<'a> CompiledHb<'a> {
                 for kk in 0..h {
                     rows.push(idx(i, kk));
                     cols.push(idx(j, kk));
-                    slots.push(Slot::Jxd {
+                    slots.push(Slot::C {
                         nz,
                         dk: 0,
-                        l: kk as i64,
+                        k: kk as i64,
                     });
                 }
             }
@@ -421,37 +398,35 @@ impl<'a> CompiledHb<'a> {
         })
     }
 
-    /// Synthesise the per-unknown time samples of `x` and `x'` from the spectra.
-    /// `x'` has coefficients `jkw0 X_k`. Uses the inverse real FFT, which is the
-    /// unnormalised sum `Σ_k X_k e^{jkw0 t_m}` -- exactly `x(t_m)`.
-    fn synth(&self, spectra: &[Vec<Complex64>], w0: f64) -> (Vec<Vec<f64>>, Vec<Vec<f64>>) {
+    /// Synthesise the per-unknown time samples of `x` from the spectra. Uses
+    /// the inverse real FFT, which is the unnormalised sum
+    /// `Σ_k X_k e^{jkw0 t_m}` -- exactly `x(t_m)`.
+    fn synth(&self, spectra: &[Vec<Complex64>]) -> Vec<Vec<f64>> {
         crate::HB_SYNTH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut x_time = vec![vec![0.0; self.m]; self.n];
-        let mut xd_time = vec![vec![0.0; self.m]; self.n];
         let mut spec = self.c2r.make_input_vec();
-        let mut sd = self.c2r.make_input_vec();
         for i in 0..self.n {
-            for s in spec.iter_mut() {
-                *s = Complex64::new(0.0, 0.0);
-            }
-            for s in sd.iter_mut() {
-                *s = Complex64::new(0.0, 0.0);
-            }
-            for kk in 0..self.h {
-                let xk = spectra[i][kk];
-                spec[kk] = xk;
-                sd[kk] = Complex64::new(0.0, kk as f64 * w0) * xk;
-            }
+            spec.fill(Complex64::new(0.0, 0.0));
+            spec[..self.h].copy_from_slice(&spectra[i]);
             // DC bin must be real (and so must Nyquist, which is zero here).
             spec[0].im = 0.0;
-            sd[0] = Complex64::new(0.0, 0.0);
-            // `process` consumes its input as scratch; `spec` / `sd` are fully
-            // rebuilt (zeroed + refilled) on the next unknown, so feed them
-            // directly rather than cloning a fresh input vector per unknown.
+            // `process` consumes its input as scratch; `spec` is fully
+            // rebuilt on the next unknown.
             self.c2r.process(&mut spec, &mut x_time[i]).unwrap();
-            self.c2r.process(&mut sd, &mut xd_time[i]).unwrap();
         }
-        (x_time, xd_time)
+        x_time
+    }
+
+    /// The harmonic residual `R_k = I_k + jkw0 Q_k` of one row from its
+    /// current and charge samples.
+    fn row_residual(&self, i: &[f64], q: &[f64], w0: f64) -> Vec<Complex64> {
+        let mut r = self.analyse(i);
+        if q.iter().any(|&v| v != 0.0) {
+            for (kk, (r, q)) in r.iter_mut().zip(self.analyse(q)).enumerate() {
+                *r += Complex64::new(0.0, kk as f64 * w0) * q;
+            }
+        }
+        r
     }
 
     /// Forward real FFT of a per-unknown sample sequence, normalised to the
@@ -474,25 +449,21 @@ impl<'a> CompiledHb<'a> {
     fn fill_soa<const L: usize>(
         &self,
         x_time: &[Vec<f64>],
-        xd_time: &[Vec<f64>],
         p: &[f64],
         period: f64,
         base: usize,
         lanes: usize,
         xv: &mut [f64],
-        xdv: &mut [f64],
         inbs: &mut [Vec<f64>],
         soa: &mut Vec<[f64; L]>,
     ) {
-        let n = self.n;
         for lane in 0..lanes {
             let mm = base + lane;
-            for i in 0..n {
-                xv[i] = x_time[i][mm];
-                xdv[i] = xd_time[i][mm];
+            for (i, x) in xv.iter_mut().enumerate() {
+                *x = x_time[i][mm];
             }
             let t = mm as f64 / self.m as f64 * period;
-            self.cdc.fill_inputs(xv, xdv, p, t, &mut inbs[lane]);
+            self.cdc.fill_inputs(xv, p, t, &mut inbs[lane]);
         }
         if lanes < L {
             let src = inbs[0].clone();
@@ -512,37 +483,24 @@ impl<'a> CompiledHb<'a> {
 
     /// One fused AFT evaluation pass per Newton iteration, from the
     /// already-synthesised state waveforms (see [`synth`](Self::synth)): the
-    /// step tape emits `[residual (n) | jx values (nzx)]` in a single batched
-    /// evaluation, so the residual comes for free with the Jacobian values --
-    /// there is no separate residual-tape pass. The jxd tape rides the same
-    /// `fill_soa` inputs. Results land in flat time-major buffers
-    /// (`buf[e * m + mm]`, each entry's sample sequence contiguous for the
+    /// transient's step program emits `[I (n) | Q (n) | G (nzx) | C (nzd)]`
+    /// in a single batched evaluation, so the residual comes with the
+    /// Jacobian values. The result lands in a flat time-major buffer
+    /// (`buf[o * m + mm]`, each output's sample sequence contiguous for the
     /// FFTs), reused across iterations by the caller.
     ///
     /// The M AFT samples are independent, so they parallelise over the
     /// worker pool in chunks of `L` samples, each chunk one evaluation per
-    /// sample through the step tape's current backend.
-    fn eval_aft(
-        &self,
-        x_time: &[Vec<f64>],
-        xd_time: &[Vec<f64>],
-        p: &[f64],
-        w0: f64,
-        f_time: &mut Vec<f64>,
-        jx_time: &mut Vec<f64>,
-        jxd_time: &mut Vec<f64>,
-    ) {
+    /// sample through the program's current backend.
+    fn eval_aft(&self, x_time: &[Vec<f64>], p: &[f64], w0: f64, buf: &mut Vec<f64>) {
         let period = 2.0 * std::f64::consts::PI / w0;
         let n = self.n;
-        let cn = self.cdc.n;
-        let nzx = self.cdc.jx_rows.len();
-        let nzd = self.cdc.jxd_rows.len();
         const L: usize = 4;
         let m = self.m;
-        let width = n + nzx + nzd;
+        let width = 2 * n + self.cdc.jx_rows.len() + self.cdc.jxd_rows.len();
         // Each chunk returns one flat block `v[o * lanes + lane]` over its
         // outputs; the serial scatter below transposes into the time-major
-        // buffers (disjoint strided writes, cheap at these sizes).
+        // buffer (disjoint strided writes, cheap at these sizes).
         let chunks: Vec<Vec<f64>> = sane_core::log_stage!(
             "hb/aft_eval",
             crate::parallel::install(|| {
@@ -552,33 +510,20 @@ impl<'a> CompiledHb<'a> {
                         || {
                             (
                                 vec![0.0f64; n],
-                                vec![0.0f64; n],
                                 vec![Vec::<f64>::new(); L],
                                 Vec::<[f64; L]>::new(),
                                 (Vec::<f64>::new(), Vec::<f64>::new(), Vec::<f64>::new()),
                                 Vec::<[f64; L]>::new(),
                             )
                         },
-                        |(xv, xdv, inbs, soa, (fb, wb, rb), ob), c| {
+                        |(xv, inbs, soa, (fb, wb, rb), ob), c| {
                             let base = c * L;
                             let lanes = L.min(m - base);
-                            self.fill_soa::<L>(
-                                x_time, xd_time, p, period, base, lanes, xv, xdv, inbs, soa,
-                            );
+                            self.fill_soa::<L>(x_time, p, period, base, lanes, xv, inbs, soa);
+                            self.cdc.tape_tran_step.eval_lanes::<L>(soa, fb, wb, rb, ob);
                             let mut v = vec![0.0f64; width * lanes];
-                            // Step tape: residual ++ jx values in one evaluation.
-                            self.cdc.tape_step.eval_lanes::<L>(soa, fb, wb, rb, ob);
-                            for o in 0..n + nzx {
-                                let src = if o < n { ob[o] } else { ob[cn + (o - n)] };
-                                for lane in 0..lanes {
-                                    v[o * lanes + lane] = src[lane];
-                                }
-                            }
-                            self.cdc.tape_jxd.eval_lanes::<L>(soa, fb, wb, rb, ob);
-                            for nz in 0..nzd {
-                                for lane in 0..lanes {
-                                    v[(n + nzx + nz) * lanes + lane] = ob[nz][lane];
-                                }
+                            for (o, src) in ob.iter().take(width).enumerate() {
+                                v[o * lanes..(o + 1) * lanes].copy_from_slice(&src[..lanes]);
                             }
                             v
                         },
@@ -586,24 +531,14 @@ impl<'a> CompiledHb<'a> {
                     .collect()
             })
         );
-        f_time.clear();
-        f_time.resize(n * m, 0.0);
-        jx_time.clear();
-        jx_time.resize(nzx * m, 0.0);
-        jxd_time.clear();
-        jxd_time.resize(nzd * m, 0.0);
+        buf.clear();
+        buf.resize(width * m, 0.0);
         let mut base = 0usize;
         for v in &chunks {
             let lanes = v.len() / width;
             for o in 0..width {
-                let dst = if o < n {
-                    &mut f_time[o * m + base..]
-                } else if o < n + nzx {
-                    &mut jx_time[(o - n) * m + base..]
-                } else {
-                    &mut jxd_time[(o - n - nzx) * m + base..]
-                };
-                dst[..lanes].copy_from_slice(&v[o * lanes..o * lanes + lanes]);
+                buf[o * m + base..o * m + base + lanes]
+                    .copy_from_slice(&v[o * lanes..(o + 1) * lanes]);
             }
             base += lanes;
         }
@@ -646,9 +581,11 @@ impl<'a> CompiledHb<'a> {
             values: vec![Complex64::new(0.0, 0.0); self.row_idx.len()],
         };
         let mut solver: Option<KluSolver<Complex64>> = None;
-        // Fused-pass sample buffers (time-major, entry sequences contiguous),
-        // reused across iterations.
-        let (mut f_time, mut jx_time, mut jxd_time) = (Vec::new(), Vec::new(), Vec::new());
+        // The fused pass's sample buffer (time-major, output sequences
+        // contiguous), reused across iterations.
+        let mut aft = Vec::new();
+        let (n, m) = (self.n, self.m);
+        let nzx = self.cdc.jx_rows.len();
         // the previous iterate and its step, for the retroactive backtracking
         let mut retract: Option<(Vec<Vec<Complex64>>, Vec<Complex64>)> = None;
         let mut prev_norm = f64::INFINITY;
@@ -660,21 +597,16 @@ impl<'a> CompiledHb<'a> {
             iters = it + 1;
             // Synthesise the state waveforms once per iteration (#51), then one
             // fused AFT pass evaluates residual and Jacobian values together --
-            // the step tape emits both, so the residual costs no extra tape work.
-            let (x_time, xd_time) = sane_core::log_stage!("hb/synth", self.synth(&spectra, w0));
-            self.eval_aft(
-                &x_time,
-                &xd_time,
-                p,
-                w0,
-                &mut f_time,
-                &mut jx_time,
-                &mut jxd_time,
-            );
+            // the step program emits both, so the residual costs no extra work.
+            let x_time = sane_core::log_stage!("hb/synth", self.synth(&spectra));
+            self.eval_aft(&x_time, p, w0, &mut aft);
             let r: Vec<Vec<Complex64>> = sane_core::log_stage!(
                 "hb/res_fft",
-                (0..self.n)
-                    .map(|i| self.analyse(&f_time[i * self.m..(i + 1) * self.m]))
+                (0..n)
+                    .map(|i| {
+                        let row = |o: usize| &aft[o * m..(o + 1) * m];
+                        self.row_residual(row(i), row(n + i), w0)
+                    })
                     .collect()
             );
             let rnorm = r.iter().flatten().map(|c| c.norm()).fold(0.0_f64, f64::max);
@@ -722,7 +654,13 @@ impl<'a> CompiledHb<'a> {
 
             // FFT the device Jacobian waveforms to the entry spectra used by the
             // Toeplitz blocks (LTI entries skip the FFT, DC bin only).
-            let (gx_spec, gxd_spec) = self.jacobian_spectra(&jx_time, &jxd_time);
+            let (gx_spec, gxd_spec) = sane_core::log_stage!("hb/jac_fft", {
+                let jac = &aft[2 * n * m..];
+                (
+                    self.entry_spectra(&jac[..nzx * m], &self.cdc.jx_var, self.k),
+                    self.entry_spectra(&jac[nzx * m..], &self.cdc.jxd_var, self.k),
+                )
+            });
 
             // Scatter the values straight into the CSC skeleton from the slot
             // recipe (duplicate positions sum).
@@ -732,9 +670,9 @@ impl<'a> CompiledHb<'a> {
                 }
                 for (e, slot) in self.slots.iter().enumerate() {
                     let v = match *slot {
-                        Slot::Jx { nz, dk } => spec_at(&gx_spec[nz], dk),
-                        Slot::Jxd { nz, dk, l } => {
-                            Complex64::new(0.0, l as f64 * w0) * spec_at(&gxd_spec[nz], dk)
+                        Slot::G { nz, dk } => spec_at(&gx_spec[nz], dk),
+                        Slot::C { nz, dk, k } => {
+                            Complex64::new(0.0, k as f64 * w0) * spec_at(&gxd_spec[nz], dk)
                         }
                         Slot::Gmin => Complex64::new(GMIN_DC, 0.0),
                     };
@@ -879,43 +817,23 @@ impl<'a> CompiledHb<'a> {
         }
     }
 
-    /// Reduce the fused pass's Jacobian sample sequences (see
-    /// [`eval_aft`](Self::eval_aft)) to their Fourier coefficients (`0..=K`).
-    /// An LTI `dF/dx` entry is constant in time, so we skip its FFT and keep
-    /// only the DC bin.
-    #[allow(clippy::type_complexity)]
-    fn jacobian_spectra(
-        &self,
-        jx_time: &[f64],
-        jxd_time: &[f64],
-    ) -> (Vec<Vec<Complex64>>, Vec<Vec<Complex64>>) {
-        let nzx = self.cdc.jx_rows.len();
-        let nzd = self.cdc.jxd_rows.len();
+    /// The spectra `0..=kmax` of a run of Jacobian-entry waveforms (entry
+    /// `nz` at `time[nz * m..]`, see [`eval_aft`](Self::eval_aft)). A
+    /// constant entry (`var[nz]` false) skips its FFT and keeps the DC bin.
+    fn entry_spectra(&self, time: &[f64], var: &[bool], kmax: usize) -> Vec<Vec<Complex64>> {
         let m = self.m;
-        let _fft_guard = sane_core::log::scope("hb/jac_fft");
-        let gx: Vec<Vec<Complex64>> = (0..nzx)
-            .map(|nz| {
-                if self.cdc.jx_var[nz] {
-                    self.analyse(&jx_time[nz * m..(nz + 1) * m])
+        (var.iter().enumerate())
+            .map(|(nz, &v)| {
+                let s = &time[nz * m..(nz + 1) * m];
+                if v {
+                    self.analyse_k(s, kmax)
                 } else {
-                    let mut v = vec![Complex64::new(0.0, 0.0); self.h];
-                    v[0] = Complex64::new(jx_time[nz * m], 0.0);
-                    v
+                    let mut c = vec![Complex64::new(0.0, 0.0); kmax + 1];
+                    c[0] = Complex64::new(s[0], 0.0);
+                    c
                 }
             })
-            .collect();
-        let gxd: Vec<Vec<Complex64>> = (0..nzd)
-            .map(|nz| {
-                if self.cdc.jxd_var[nz] {
-                    self.analyse(&jxd_time[nz * m..(nz + 1) * m])
-                } else {
-                    let mut v = vec![Complex64::new(0.0, 0.0); self.h];
-                    v[0] = Complex64::new(jxd_time[nz * m], 0.0);
-                    v
-                }
-            })
-            .collect();
-        (gx, gxd)
+            .collect()
     }
 
     /// Forward real FFT of a sample sequence to harmonics `0..=kmax` (physical
@@ -938,14 +856,14 @@ impl<'a> CompiledHb<'a> {
     ///
     /// At the periodic steady state `R(X, p) = 0`, so `dX/dp = -J^{-1} dR/dp`.
     /// The Newton block-Toeplitz `J` the solver assembles is only the
-    /// *holomorphic* part `dR_k/dX_l = G_{k-l}` (it folds `X_{-l} = conj X_l`,
-    /// dropping the conjugate coupling). The **exact** Jacobian is recovered in
-    /// the two-sided coefficient space `k, l in [-K, K]` -- there `X_l` are
-    /// independent and `dR_k/dX_l = G_{k-l}` is the *complete* derivative (a
-    /// pure Toeplitz, needing `dF/dx` harmonics out to `2K`). `dR_k/dp_j` is the
-    /// `k`-th Fourier coefficient of the time-sampled `dF/dp_j` -- the parameter
-    /// Jacobian routed through the same AFT. One transpose solve per output
-    /// harmonic then yields the adjoint, and a sparse contraction the gradient.
+    /// *holomorphic* part (it folds `X_{-l} = conj X_l`, dropping the
+    /// conjugate coupling). The **exact** Jacobian is recovered in the
+    /// two-sided coefficient space `k, l in [-K, K]` -- there `X_l` are
+    /// independent and `dR_k/dX_l = G_{k-l} + jkw0 C_{k-l}` is the *complete*
+    /// derivative (needing harmonics out to `2K`). `dR_k/dp_j` is
+    /// `(dI/dp_j)_k + jkw0 (dQ/dp_j)_k`, the parameter Jacobians routed through
+    /// the same AFT. One transpose solve per output harmonic then yields the
+    /// adjoint, and a sparse contraction the gradient.
     /// Requires `ensure_param_jac` on the backing `CompiledDc`.
     pub fn coeff_gradient(
         &self,
@@ -1001,14 +919,14 @@ impl<'a> CompiledHb<'a> {
     /// e_{(out,k)}` and the forward state sensitivities `J s_a = -dR/dp_a`,
     /// `H_ab = -lambda^T ( R_XX[s_a,s_b] + R_Xp_b s_a + R_Xp_a s_b + R_pa pb )`.
     /// Every second-derivative contraction reduces, through the AFT, to a
-    /// time-domain sum: the **adjoint waveform** `l_i(t) = sum_k lambda_{i,k}
-    /// e^{-jk w0 t}` weights the device second derivatives (the same
-    /// Lagrangian-Hessian blocks the DC solve uses, here sampled along the
+    /// time-domain sum: `lambda^T R = (1/M) sum_m l(t_m)·I(t_m) + mu(t_m)·Q(t_m)`
+    /// with the **adjoint waveform** `l_i(t) = sum_k lambda_{i,k} e^{-jk w0 t}`
+    /// and its rate-weighted twin `mu_i(t) = sum_k jk w0 lambda_{i,k}
+    /// e^{-jk w0 t}`. They weight the Lagrangian-Hessian blocks of
+    /// `L = l·I + mu·Q` (the ones the DC solve uses, here sampled along the
     /// waveform), contracted with the **state-sensitivity waveforms**
-    /// `sigma_a,j(t) = sum_k s_a[j,k] e^{jk w0 t}` and -- since a HB unknown
-    /// drives both `x` and `x'` -- their time derivatives `sigma'_a,j(t)`. The
-    /// `x'` Hessian blocks (`L_x'x', L_x x', L_x'p`) make this exact also for
-    /// nonlinear charge storage.
+    /// `sigma_a,j(t) = sum_k s_a[j,k] e^{jk w0 t}`. Exact also for nonlinear
+    /// charge storage.
     pub fn coeff_hessian(
         &self,
         spectra: &[Vec<Complex64>],
@@ -1034,10 +952,9 @@ impl<'a> CompiledHb<'a> {
             pj_cols,
             pjs,
             x_time,
-            xd_time,
         } = self.build_toeplitz_jacobian(spectra, p, w0)?;
         // Scratch for the per-sample Lagrangian-Hessian evaluation below.
-        let (mut xv, mut xdv) = (vec![0.0; n], vec![0.0; n]);
+        let mut xv = vec![0.0; n];
 
         // --- adjoint lambda (one transpose solve) and forward state sens s_a ---
         let mut e = vec![Complex64::new(0.0, 0.0); dim];
@@ -1057,39 +974,36 @@ impl<'a> CompiledHb<'a> {
             svec.push(lu.solve(&rhs).ok()?);
         }
 
-        // --- adjoint waveform l_i(t) and state-sensitivity waveforms sigma_a,j(t) ---
-        // `sig` is the state-sensitivity waveform (the x path of dX/dp_a);
-        // `sigd` its time derivative (the x' path, coefficient j*k*w0). A HB
-        // unknown X_l drives both x(t) and x'(t), so an exact Hessian needs both.
-        let mut ell = vec![vec![Complex64::new(0.0, 0.0); self.m]; n];
-        let mut sig = vec![vec![vec![Complex64::new(0.0, 0.0); self.m]; n]; ns];
-        let mut sigd = vec![vec![vec![Complex64::new(0.0, 0.0); self.m]; n]; ns];
+        // --- adjoint waveforms l_i(t), mu_i(t) and state-sensitivity waveforms sigma_a,j(t) ---
+        let zero = Complex64::new(0.0, 0.0);
+        let mut ell = vec![vec![zero; self.m]; n];
+        let mut mu = vec![vec![zero; self.m]; n];
+        let mut sig = vec![vec![vec![zero; self.m]; n]; ns];
         for mm in 0..self.m {
             let th = two_pi * mm as f64 / self.m as f64;
             for i in 0..n {
-                let mut acc = Complex64::new(0.0, 0.0);
+                let (mut acc, mut accd) = (zero, zero);
                 for kk in -k..=k {
-                    acc += lam[flat(i, kk)] * Complex64::from_polar(1.0, -(kk as f64) * th);
+                    let c = lam[flat(i, kk)] * Complex64::from_polar(1.0, -(kk as f64) * th);
+                    acc += c;
+                    accd += Complex64::new(0.0, kk as f64 * w0) * c;
                 }
                 ell[i][mm] = acc;
+                mu[i][mm] = accd;
             }
             for a in 0..ns {
                 for j in 0..n {
-                    let (mut acc, mut accd) = (Complex64::new(0.0, 0.0), Complex64::new(0.0, 0.0));
+                    let mut acc = zero;
                     for kk in -k..=k {
-                        let basis = Complex64::from_polar(1.0, kk as f64 * th);
-                        let xc = svec[a][flat(j, kk)] * basis;
-                        acc += xc;
-                        accd += Complex64::new(0.0, kk as f64 * w0) * xc; // d/dt
+                        acc += svec[a][flat(j, kk)] * Complex64::from_polar(1.0, kk as f64 * th);
                     }
                     sig[a][j][mm] = acc;
-                    sigd[a][j][mm] = accd;
                 }
             }
         }
 
-        // --- per-sample Lagrangian-Hessian contraction (re/im of l(t) separately) ---
-        let [xx_rc, xp_rc, pp_rc, xdxd_rc, xxd_rc, xdp_rc] = self.cdc.hessian_block_pattern()?;
+        // --- per-sample Lagrangian-Hessian contraction (re/im of the multipliers separately) ---
+        let [xx_rc, xp_rc, pp_rc] = self.cdc.hessian_block_pattern()?;
         // Map a parameter index to its position in `subset` (for the L_pp lookup).
         let np = self.cdc.param_count();
         let mut loc = vec![usize::MAX; np];
@@ -1097,22 +1011,25 @@ impl<'a> CompiledHb<'a> {
             loc[j] = a;
         }
         let inv_m = 1.0 / self.m as f64;
-        let mut h = vec![vec![Complex64::new(0.0, 0.0); ns]; ns];
-        let (mut ell_re, mut ell_im) = (vec![0.0; n], vec![0.0; n]);
+        let mut h = vec![vec![zero; ns]; ns];
+        let mut part = vec![vec![0.0; n]; 4]; // re l, im l, re mu, im mu
         for mm in 0..self.m {
             for i in 0..n {
-                ell_re[i] = ell[i][mm].re;
-                ell_im[i] = ell[i][mm].im;
+                part[0][i] = ell[i][mm].re;
+                part[1][i] = ell[i][mm].im;
+                part[2][i] = mu[i][mm].re;
+                part[3][i] = mu[i][mm].im;
                 xv[i] = x_time[i][mm];
-                xdv[i] = xd_time[i][mm];
             }
             let t = mm as f64 / self.m as f64 * period;
-            let [xxr, xpr, ppr, xdxdr, xxdr, xdpr] =
-                self.cdc.hessian_block_values(&xv, &xdv, p, t, &ell_re)?;
-            let [xxi, xpi, ppi, xdxdi, xxdi, xdpi] =
-                self.cdc.hessian_block_values(&xv, &xdv, p, t, &ell_im)?;
+            let [xxr, xpr, ppr] = self
+                .cdc
+                .hessian_block_values(&xv, p, t, &part[0], &part[2])?;
+            let [xxi, xpi, ppi] = self
+                .cdc
+                .hessian_block_values(&xv, p, t, &part[1], &part[3])?;
             // L_pp restricted to the subset (mirrors the DC dense `lpp[ja][jb]` read).
-            let mut lpp = vec![vec![Complex64::new(0.0, 0.0); ns]; ns];
+            let mut lpp = vec![vec![zero; ns]; ns];
             for kix in 0..pp_rc.0.len() {
                 let (r, col) = (pp_rc.0[kix], pp_rc.1[kix]);
                 if loc[r] != usize::MAX && loc[col] != usize::MAX {
@@ -1122,25 +1039,13 @@ impl<'a> CompiledHb<'a> {
             for a in 0..ns {
                 for b in a..ns {
                     let (ja, jb) = (subset[a], subset[b]);
-                    let mut acc = Complex64::new(0.0, 0.0);
-                    // R_XX direction (a,b) through both the x and the x' paths:
-                    // s_a^T L_xx s_b  +  L_x x'(sig_a sigd_b + sig_b sigd_a)  +  sigd_a^T L_x'x' sigd_b.
+                    let mut acc = zero;
+                    // R_XX direction (a,b): sig_a^T L_xx sig_b.
                     for kix in 0..xx_rc.0.len() {
                         let lc = Complex64::new(xxr[kix], xxi[kix]);
                         acc += lc * sig[a][xx_rc.0[kix]][mm] * sig[b][xx_rc.1[kix]][mm];
                     }
-                    for kix in 0..xxd_rc.0.len() {
-                        let lc = Complex64::new(xxdr[kix], xxdi[kix]);
-                        let (r, c) = (xxd_rc.0[kix], xxd_rc.1[kix]); // r: x index, c: x' index
-                        acc +=
-                            lc * (sig[a][r][mm] * sigd[b][c][mm] + sig[b][r][mm] * sigd[a][c][mm]);
-                    }
-                    for kix in 0..xdxd_rc.0.len() {
-                        let lc = Complex64::new(xdxdr[kix], xdxdi[kix]);
-                        acc += lc * sigd[a][xdxd_rc.0[kix]][mm] * sigd[b][xdxd_rc.1[kix]][mm];
-                    }
-                    // R_Xp: x path (L_xp) and x' path (L_x'p), each for column jb (with s_a)
-                    // and column ja (with s_b).
+                    // R_Xp: column jb with sig_a and column ja with sig_b.
                     for kix in 0..xp_rc.0.len() {
                         let lc = Complex64::new(xpr[kix], xpi[kix]);
                         let (r, col) = (xp_rc.0[kix], xp_rc.1[kix]);
@@ -1149,16 +1054,6 @@ impl<'a> CompiledHb<'a> {
                         }
                         if col == ja {
                             acc += lc * sig[b][r][mm];
-                        }
-                    }
-                    for kix in 0..xdp_rc.0.len() {
-                        let lc = Complex64::new(xdpr[kix], xdpi[kix]);
-                        let (r, col) = (xdp_rc.0[kix], xdp_rc.1[kix]); // r: x' index
-                        if col == jb {
-                            acc += lc * sigd[a][r][mm];
-                        }
-                        if col == ja {
-                            acc += lc * sigd[b][r][mm];
                         }
                     }
                     acc += lpp[a][b]; // L_pp[ja][jb]

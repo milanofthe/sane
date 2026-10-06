@@ -23,16 +23,7 @@ fn fold_in<K: Field, T: Clone>(
     free: impl Fn(&mut Graph<K>, ExprId) -> T,
     mut node: impl FnMut(&mut Graph<K>, Node, &[T]) -> Option<T>,
 ) -> Option<T> {
-    let mut cone = Vec::new();
-    let mut seen = rustc_hash::FxHashSet::default();
-    let mut stack = vec![e];
-    while let Some(x) = stack.pop() {
-        if seen.insert(x) {
-            cone.push(x);
-            stack.extend_from_slice(&g.operands(x));
-        }
-    }
-    cone.sort_unstable();
+    let cone = g.cone_sorted(&[e], false);
     // The values of the nodes that depend on `s`; `None` marks one outside
     // the algebra, which every node above it inherits.
     let mut vals: FxHashMap<ExprId, Option<T>> = FxHashMap::default();

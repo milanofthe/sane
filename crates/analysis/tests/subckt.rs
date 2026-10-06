@@ -24,8 +24,13 @@ fn instances_share_one_function_per_body() {
     let parsed = sane_netlist::parse(DECK).unwrap();
     let mut ctx = sane_core::Graph::new();
     let dae = parsed.assemble(&mut ctx);
-    // `half` (all four instances, two nested in `quarter`) and `quarter`,
-    // each its residuals and its observers (the resistors' noise)
+    // `half` (all four instances, two nested in `quarter`) and `quarter`;
+    // the resistors' noise stays the bodies' (see `Observers`). The currents
+    // and charges call their copies specialized to rest, one per body.
+    let bodies: std::collections::BTreeSet<String> = (0..ctx.n_funcs() as u32)
+        .map(|f| ctx.func(rsdag::FuncId(f)).name().to_string())
+        .collect();
+    assert_eq!(bodies.len(), 2, "{bodies:?}");
     assert_eq!(ctx.n_funcs(), 4);
     // every node of the hierarchy is a node unknown, internal nodes included
     for node in ["out", "X1.mid", "X2.mid", "X3.m", "X3.X1.mid", "X3.X2.mid"] {

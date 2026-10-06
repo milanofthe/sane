@@ -26,7 +26,6 @@ sane-core.workspace = true
 sane-mna.workspace = true
 sane-dae = { path = "../dae" }
 sane-device = { path = "../device" }
-sane-export = { path = "../export" }
 sane-netlist = { path = "../netlist" }
 sane-veriloga = { path = "../veriloga" }
 sane-solve = { path = "../solve", default-features = false }

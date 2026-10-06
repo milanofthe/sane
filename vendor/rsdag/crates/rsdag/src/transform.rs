@@ -4,15 +4,17 @@
 use crate::field::Field;
 use rustc_hash::FxHashMap as HashMap;
 
-use crate::graph::Graph;
+use crate::graph::{Graph, NO_CONTEXT};
 use crate::node::{ArgList, ExprId, Node, SymbolId};
 
 /// A node's operands, rewritten: in [`Graph::operands`] order, and for a
 /// call the argument list they make, interned once however many calls of
-/// the one instance share it.
+/// the one instance share it, and its context over its bound expressions
+/// rewritten.
 pub(crate) struct Ops<'a> {
     pub ops: &'a [ExprId],
     pub list: Option<ArgList>,
+    pub ctx: u32,
 }
 
 impl<K: Field> Graph<K> {
@@ -22,7 +24,7 @@ impl<K: Field> Graph<K> {
         match (node, ops.list) {
             (Node::Call(o, _), Some(l)) => {
                 let (f, out) = self.output(o);
-                self.call_list(f, out, l)
+                self.call_list_in(f, out, ops.ctx, l)
             }
             _ => self.build(node, ops.ops),
         }
@@ -48,6 +50,8 @@ pub(crate) fn rewrite<K: Field>(
     let mut ops: Vec<ExprId> = Vec::new();
     // per call argument list: its operands rewritten, and interned
     let mut lists: HashMap<ArgList, (Vec<ExprId>, ArgList)> = HashMap::default();
+    // per context: its bound expressions rewritten
+    let mut contexts: HashMap<u32, u32> = HashMap::default();
     for &root in roots {
         stack.push((root, false));
         while let Some((e, expanded)) = stack.pop() {
@@ -85,9 +89,26 @@ pub(crate) fn rewrite<K: Field>(
                         let nl = g.intern_args(&new);
                         (new, nl)
                     });
+                    let Node::Call(o, _) = node else {
+                        unreachable!()
+                    };
+                    let ctx = match g.context_of(o) {
+                        NO_CONTEXT => NO_CONTEXT,
+                        c => *contexts.entry(c).or_insert_with(|| {
+                            let f = g.output(o).0;
+                            let new: Vec<ExprId> = g
+                                .args(g.context_list(c))
+                                .iter()
+                                .map(|&e| memo.get(e).expect("bound expression rewritten"))
+                                .collect();
+                            g.context_over(c, f, &new)
+                        }),
+                    };
+                    let nl = *nl;
                     let ops = Ops {
                         ops: new,
-                        list: Some(*nl),
+                        list: Some(nl),
+                        ctx,
                     };
                     rule(g, e, node, &ops)
                 }
@@ -101,6 +122,7 @@ pub(crate) fn rewrite<K: Field>(
                     let ops = Ops {
                         ops: &ops,
                         list: None,
+                        ctx: NO_CONTEXT,
                     };
                     rule(g, e, node, &ops)
                 }
@@ -129,8 +151,22 @@ pub fn substitute<K: Field>(
     roots: &[ExprId],
     map: &HashMap<SymbolId, ExprId>,
 ) -> Vec<ExprId> {
-    rewrite(ctx, roots, |g, e, node, ops| match node {
-        Node::Symbol(s) => map.get(&s).copied().unwrap_or(e),
+    // per function, the copy its calls run (see `Graph::rebound`)
+    let mut copies: HashMap<crate::func::FuncId, Option<crate::func::FuncId>> = HashMap::default();
+    rewrite(ctx, roots, |g, e, node, ops| match (node, ops.list) {
+        (Node::Symbol(s), _) => map.get(&s).copied().unwrap_or(e),
+        // a call whose body reads a symbol `map` binds runs a copy bound so
+        (Node::Call(o, _), Some(l)) => {
+            let (f, k) = g.output(o);
+            let copy = *copies.entry(f).or_insert_with(|| g.rebound(f, map));
+            match copy {
+                Some(copy) => {
+                    let ctx = g.context_onto(ops.ctx, copy);
+                    g.call_list_in(copy, k, ctx, l)
+                }
+                None => g.rebuild(node, ops),
+            }
+        }
         _ => g.rebuild(node, ops),
     })
 }

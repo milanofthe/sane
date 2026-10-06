@@ -360,7 +360,7 @@ X1 d g 0 0 sky130_nfet l='2' w='WDES*1' m='1'
 .end
 "#;
     let p = parse(deck).expect("device-subckt + binning + scale + quotes parses");
-    assert_eq!(p.instances[0].devices.len(), 1, "one routed VA device");
+    assert_eq!(p.instances[0].body.devices.len(), 1, "one routed VA device");
     // scale=1u: drawn l=2 -> 2e-6 m, w=4 -> 4e-6 m (bound on the device).
     assert!(
         (p.param_value(&p.param_symbol("X1.M0", "L").unwrap())
@@ -500,7 +500,6 @@ V1 1 0 1
     let mut env = std::collections::HashMap::new();
     for (name, v) in [
         ("v1", 1.0),
-        ("vdot1", 0.0),
         ("i_V1", 0.0),
         ("t", 0.0),
         ("N1.R", 1000.0),
@@ -510,8 +509,8 @@ V1 1 0 1
             env.insert(*s, v);
         }
     }
-    let r1: f64 = rsdag::eval(&ctx, &[d1.residuals[0]], &env)[0];
-    let r2: f64 = rsdag::eval(&ctx, &[d2.residuals[0]], &env)[0];
+    let r1: f64 = rsdag::eval(&ctx, &[d1.currents[0]], &env)[0];
+    let r2: f64 = rsdag::eval(&ctx, &[d2.currents[0]], &env)[0];
     assert!(
         (r2 - 2.0 * r1).abs() < 1e-12,
         "m=2 doubles the flow: {r1} vs {r2}"

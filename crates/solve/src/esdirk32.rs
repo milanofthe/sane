@@ -1,4 +1,4 @@
-//! ESDIRK32 step for the SANE DAE `F(x, x', t) = 0` in mass-matrix form.
+//! ESDIRK32 step for the SANE DAE `I(x, t) + d/dt Q(x) = 0` in charge form.
 //!
 //! Kvaerno's four-stage, explicit-first-stage, singly diagonally implicit
 //! Runge-Kutta method (`ESDIRK32_*` in the constants module): order 3 with
@@ -35,8 +35,8 @@ pub(crate) fn a_ij(i: usize, j: usize) -> f64 {
 
 impl CompiledDc {
     /// One ESDIRK32 step from `(t, xn)` with size `h`: runs all stages, writes
-    /// the stage slopes into `ws.slopes`, and returns the new state
-    /// `x_{n+1} = X_s` (stiffly accurate) with the scaled embedded error, or
+    /// the stage slopes into `ws.slopes` and the new state `x_{n+1} = X_s`
+    /// (stiffly accurate) into `x`, and returns the scaled embedded error, or
     /// `None` if any stage Newton diverges.
     pub(crate) fn esdirk32_step(
         &self,
@@ -44,23 +44,22 @@ impl CompiledDc {
         xn: &[f64],
         t: f64,
         h: f64,
-    ) -> Option<(Vec<f64>, f64)> {
+        x: &mut [f64],
+    ) -> Option<f64> {
         let n = self.n;
-        let mut x_new = xn.to_vec();
-        // Warm start each stage from the previous stage value (close, fewer iters).
-        let mut guess = xn.to_vec();
+        // Warm start each stage from the previous stage value (close, fewer
+        // iters); the last one is the new state.
+        x.copy_from_slice(xn);
         for i in 0..ESDIRK32_STAGES {
             let ti = t + ESDIRK32_C[i] * h;
             ws.fill_hist(ti);
             if i == 0 {
                 // Explicit first stage: X_0 = xn, slope f_0 = -F̃(xn, 0, t).
-                let f0 = self.residual_slope(ws, xn, ti);
-                ws.slopes[0].copy_from_slice(&f0);
+                self.residual_slope(ws, xn, ti);
+                std::mem::swap(&mut ws.slopes[0], &mut ws.f);
                 continue;
             }
-            for r in 0..n {
-                ws.psi[r] = 0.0;
-            }
+            ws.psi.fill(0.0);
             for j in 0..i {
                 let aij = a_ij(i, j);
                 if aij != 0.0 {
@@ -69,37 +68,31 @@ impl CompiledDc {
                     }
                 }
             }
-            let (xi, fi, ok) = self.stage_newton(ws, xn, &guess, ti, h, ESDIRK32_GAMMA);
-            if !ok {
+            if !self.stage_newton(ws, x, ti, h, ESDIRK32_GAMMA) {
                 return None;
             }
-            ws.slopes[i].copy_from_slice(&fi);
-            guess = xi.clone();
-            if i == ESDIRK32_STAGES - 1 {
-                x_new = xi; // stiffly accurate: x_{n+1} = X_s
-            }
+            std::mem::swap(&mut ws.slopes[i], &mut ws.f);
         }
 
         // Stabilized (Hairer-Wanner) embedded error estimate. The raw embedded
         // error `h·Σ_i tr_i·f_i` is in residual (current) units; mapping it through
-        // the stage iteration matrix `A = dF/dx + C/(hγ) + gmin` (the frozen
+        // the stage iteration matrix `A = G + C/(hγ) + gmin` (the frozen
         // factorization) gives a solution-space estimate that DAMPS the stiff
         // fast modes -- a tiny-capacitance node's huge raw error is attenuated
         // by its large conductance -- where the naive `1/C[j,j]` scaling instead
         // exploded and stalled the step to underflow on stiff BSIM4 circuits. The
         // `A⁻¹` factor also vanishes with `h`, so a small step is never spuriously
         // rejected (the IC-inconsistency transient at t=0 no longer dead-locks).
-        let mut err_raw = vec![0.0; n];
         for r in 0..n {
             let mut s = 0.0;
             for i in 0..ESDIRK32_STAGES {
                 s += ESDIRK32_TR[i] * ws.slopes[i][r];
             }
-            err_raw[r] = h * s;
+            ws.rhs[r] = h * s;
         }
         // A factorization is needed to filter the error; a stalled final stage may
         // have invalidated it, so rebuild it at the step endpoint when stale.
-        if !ws.fac_fresh && !self.refactor_at(ws, &x_new, t + h, h, ESDIRK32_GAMMA) {
+        if !ws.fac_fresh && !self.refactor_at(ws, x, t + h, h, ESDIRK32_GAMMA) {
             return None; // singular at the endpoint -> treat as a failed step
         }
         // `factorize_stage` builds `A/(hγ)`, so the solve returns `hγ·A⁻¹·b`;
@@ -107,24 +100,26 @@ impl CompiledDc {
         // (the voltage LTE) on slow nodes, while on a stiff node `A ≈ hγ·G` makes the
         // `h` cancel, so the estimate stays bounded as the step shrinks.
         let hg = h * ESDIRK32_GAMMA;
-        let e_filt = ws.fac.solve(&err_raw)?;
+        if !ws.fac.solve_into(&ws.rhs, &mut ws.step) {
+            return None;
+        }
         // WRMS norm (Hairer II.4 / SUNDIALS): `err = sqrt(mean((e_r/sc_r)^2))`.
         // A max norm let a single switching node dictate the step for the whole
         // system, systematically over-restricting circuits whose error is
         // concentrated in a few active nodes (a ring oscillator: 2 of 47).
-        let (err, worst) = ws_error_norm(ws, &x_new, &e_filt, hg);
+        let (err, worst) = ws_error_norm(ws, x, &ws.step, hg);
         if ws.trace && err > 1.0 {
             eprintln!(
                 "tran:     error worst=x[{worst}] e={:.3e} raw={:.3e} x={:.6e} slopes={:?}",
-                e_filt[worst] / hg,
-                err_raw[worst],
-                x_new[worst],
+                ws.step[worst] / hg,
+                ws.rhs[worst],
+                x[worst],
                 (0..ESDIRK32_STAGES)
                     .map(|i| ws.slopes[i][worst])
                     .collect::<Vec<_>>()
             );
         }
-        Some((x_new, err.max(IRK_ERR_FLOOR)))
+        Some(err.max(IRK_ERR_FLOOR))
     }
 }
 

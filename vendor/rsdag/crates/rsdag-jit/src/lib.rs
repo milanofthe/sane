@@ -34,6 +34,21 @@ pub enum Batch {
     Parallel { min_ops: usize },
 }
 
+/// Whether the function bodies a program calls get lane code, running
+/// several instances of a batch side by side in every register. The
+/// results are the scalar code's, bit for bit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Lanes {
+    /// Where it pays for the body, by its ops against the values moved
+    /// into and out of the lanes.
+    #[default]
+    Auto,
+    /// Wherever the body compiles so.
+    Always,
+    /// Never.
+    Never,
+}
+
 /// What [`NativeTape::compile_opts`] builds.
 #[derive(Clone, Copy, Debug)]
 pub struct Options {
@@ -41,6 +56,8 @@ pub struct Options {
     pub chunk_ops: usize,
     /// How the function bodies it calls run their batches.
     pub batch: Batch,
+    /// Lane code for the function bodies.
+    pub lanes: Lanes,
 }
 
 impl Default for Options {
@@ -48,6 +65,7 @@ impl Default for Options {
         Options {
             chunk_ops: CHUNK_OPS,
             batch: Batch::Serial,
+            lanes: Lanes::Auto,
         }
     }
 }

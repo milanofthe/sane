@@ -4,7 +4,7 @@
 //!   cargo run --release -p sane-analysis --example ring_bench -- osdi <psp103.osdi> <models.inc> [t_end] [rtol] [atol] [method]
 //!   cargo run --release -p sane-analysis --example ring_bench -- va   <psp103.va>   <models.inc> [t_end] [rtol] [atol] [method]
 //!
-//! Methodology mirrors `paper/benchmarks/bench/bench_vacask.py` (`ring` case):
+//! Methodology mirrors `benchmarks/suites/vacask.py` (`ring` case):
 //! rtol 1e-4, atol 1e-7, forced dt_max 5e-11, DC start, swing check on n1.
 //! `t_end` (seconds, default 1e-6) scales the span for quick probes.
 

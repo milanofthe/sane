@@ -9,7 +9,7 @@ use sane_core::constants::{PENCIL_INF_TOL, PENCIL_ROOT_MAX};
 /// and return `-lambda` (the pole/zero `s`), dropping the infinite ones that a
 /// singular N produces.
 ///
-/// The reactive matrix N (= C = dF/dx') is heavily rank-deficient (only
+/// The reactive matrix N (= C = dQ/dx) is heavily rank-deficient (only
 /// charge/flux states are dynamic), which makes a dense QZ iteration both slow
 /// and ill-conditioned (catastrophically so in faer -- minutes on a ~100x100
 /// pencil). `M` is invertible at a valid operating point (the small-signal
@@ -237,9 +237,7 @@ pub fn dominant_subset(roots: &[[f64; 2]], order: usize) -> Vec<[f64; 2]> {
 }
 
 #[cfg(test)]
-use crate::symbolic_poly::{poly_in_s, prune_poly};
-#[cfg(test)]
-use crate::{op_env, parse_ic, resolve_out_idx, IcTarget, Model};
+use crate::{parse_ic, resolve_out_idx, IcTarget, Model};
 #[cfg(test)]
 use rsdag::Node;
 #[cfg(test)]
@@ -250,8 +248,6 @@ use sane_core::Graph;
 use sane_netlist::parse;
 #[cfg(test)]
 use sane_solve::CompiledDc;
-#[cfg(test)]
-use std::f64::consts::PI;
 
 /// `A = M^{-1} N` as a dense matrix, one factorization of `M` against the
 /// columns of `N` through the reference dense solve; `None` when `M` is
@@ -284,61 +280,6 @@ mod pz_tests {
             .iter()
             .map(|p| (p[0] - target).abs() + p[1].abs())
             .fold(f64::INFINITY, f64::min)
-    }
-
-    /// Faithful re-implementation of the deleted `symbolic_reduce` façade over the
-    /// `Model` surface plus the kept symbolic-pruning kernels: extract `H = N/D`,
-    /// rank each polynomial's terms at the band reference frequency, prune below
-    /// `tol`, and report `(ok, terms_full, terms_kept, max_err_db)` over the band.
-    fn symbolic_reduce(
-        net: &str,
-        input: &str,
-        output: &str,
-        tol: f64,
-        fstart: f64,
-        fstop: f64,
-        points: usize,
-    ) -> (bool, usize, usize, f64) {
-        use crate::symbolic_poly::{eval_coeffs, poly_eval_c};
-        let m = Model::from_netlist(net).expect("model");
-        let out_idx = m.resolve(output).expect("output");
-        let target = m.unknowns()[out_idx].clone();
-        let op = m.operating_point(&[]).expect("operating point");
-        let x = op.vector().to_vec();
-        let p = m.pvec(&[]);
-        let arc = m.context_arc();
-        let mut ctx = arc.lock().unwrap();
-        let dae = m.dae();
-        let (n_expr, d_expr) =
-            sane_dae::small_signal_transfer_nd(&mut ctx, dae, input, &target).expect("transfer");
-        let s_e = ctx.sym("s");
-        let s_sym = match ctx.node(s_e) {
-            Node::Symbol(x) => *x,
-            _ => panic!("s is not a symbol"),
-        };
-        let n_poly = poly_in_s(&mut ctx, n_expr, s_sym).expect("numerator polynomial");
-        let d_poly = poly_in_s(&mut ctx, d_expr, s_sym).expect("denominator polynomial");
-        let pnames = m.cdc().param_names(&ctx);
-        let env = op_env(&mut ctx, dae, &pnames, &x, &[], &p, 0.0);
-        let w0 = 2.0 * PI * (fstart * fstop).sqrt();
-        let (n_pruned, n_tot, n_kept) = prune_poly(&mut ctx, &n_poly, &env, w0, tol);
-        let (d_pruned, d_tot, d_kept) = prune_poly(&mut ctx, &d_poly, &env, w0, tol);
-        let nf = eval_coeffs(&ctx, &env, &n_poly);
-        let df = eval_coeffs(&ctx, &env, &d_poly);
-        let nr = eval_coeffs(&ctx, &env, &n_pruned);
-        let dr = eval_coeffs(&ctx, &env, &d_pruned);
-        let (l0, l1) = (fstart.log10(), fstop.log10());
-        let mut max_err_db = 0.0_f64;
-        for i in 0..points {
-            let fi = 10f64.powf(l0 + (l1 - l0) * i as f64 / (points - 1) as f64);
-            let jw = Complex64::new(0.0, 2.0 * PI * fi);
-            let hf = poly_eval_c(&nf, jw) / poly_eval_c(&df, jw);
-            let hr = poly_eval_c(&nr, jw) / poly_eval_c(&dr, jw);
-            let fdb = 20.0 * hf.norm().max(1e-30).log10();
-            let rdb = 20.0 * hr.norm().max(1e-30).log10();
-            max_err_db = max_err_db.max((fdb - rdb).abs());
-        }
-        (true, n_tot + d_tot, n_kept + d_kept, max_err_db)
     }
 
     /// Relative magnitude AC sensitivity `d ln|H| / d ln param` at `freq`,
@@ -471,35 +412,6 @@ mod pz_tests {
             "expected a pole near -1000, got {:?} (err {d})",
             pz.poles
         );
-    }
-
-    #[test]
-    fn symbolic_reduce_tol0_is_exact() {
-        // tol = 0 prunes nothing -> reconstructed H must equal the full H exactly.
-        let net = "V1 in 0 1\nR1 in a 10\nL1 a out 1m\nC1 out 0 1u\n";
-        let (ok, terms_full, terms_kept, max_err_db) =
-            symbolic_reduce(net, "V1", "out", 0.0, 1.0, 1e6, 30);
-        assert!(ok, "symbolic_reduce failed");
-        assert_eq!(terms_kept, terms_full, "tol=0 should keep all terms");
-        assert!(
-            max_err_db < 1e-6,
-            "tol=0 reconstruction err {max_err_db} dB"
-        );
-    }
-
-    #[test]
-    fn symbolic_reduce_drops_negligible_term() {
-        // A 1-pF cap in parallel with a 1-uF cap is ~1e6 smaller; its term in the
-        // s^1 coefficient must be pruned, leaving the response essentially unchanged.
-        let net = "V1 in 0 1\nR1 in out 1k\nC1 out 0 1u\nC2 out 0 1p\n";
-        let (ok, terms_full, terms_kept, max_err_db) =
-            symbolic_reduce(net, "V1", "out", 1e-3, 1.0, 1e6, 30);
-        assert!(ok, "symbolic_reduce failed");
-        assert!(
-            terms_kept < terms_full,
-            "expected pruning: {terms_kept}/{terms_full}"
-        );
-        assert!(max_err_db < 1.0, "pruned response drifted {max_err_db} dB");
     }
 
     #[test]

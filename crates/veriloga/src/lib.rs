@@ -297,11 +297,10 @@ mod tests {
         let em = elab(src);
         let np = em.ports.len();
         let tv: Vec<rsdag::ExprId> = (1..=np).map(|k| ctx.sym(&format!("v{k}"))).collect();
-        let tvd: Vec<rsdag::ExprId> = (1..=np).map(|k| ctx.sym(&format!("vdot{k}"))).collect();
         let mut lo = sane_device::Lowerer::new(ctx);
         let pv = std::collections::HashMap::default();
         let given = std::collections::HashSet::default();
-        super::lower::lower_analog(&em, "X1", &pv, &given, 1.0, &mut lo, &tv, &tvd).expect("lower")
+        super::lower::lower_analog(&em, "X1", &pv, &given, 1.0, &mut lo, &tv).expect("lower")
     }
 
     #[test]
@@ -474,7 +473,6 @@ mod tests {
                 ("R1.R", 1000.0),
                 ("R1.sw", 1.0),
                 ("v1", 2.0),
-                ("vdot1", 0.0),
                 ("i_V1", -0.002),
                 ("t", 0.0),
             ],
@@ -575,15 +573,13 @@ mod tests {
         let mut ctx = Graph::new();
         let va = ctx.sym("v1");
         let vc = ctx.sym("v2");
-        let vad = ctx.sym("vdot1");
-        let vcd = ctx.sym("vdot2");
         let sym = |ctx: &Graph, e| match ctx.node(e) {
             rsdag::Node::Symbol(s) => *s,
             _ => unreachable!(),
         };
         let (sa, sc) = (sym(&ctx, va), sym(&ctx, vc));
         let mut lo = sane_device::Lowerer::new(&mut ctx);
-        let frag = dev.lower_behavioral(&mut lo, &[va, vc], &[vad, vcd], &[]);
+        let frag = dev.lower_behavioral(&mut lo, &[va, vc], &[]);
         assert_eq!(frag.limits.len(), 1, "one recorded limit");
         assert_eq!(frag.limits[0].hi, Some(sa));
         assert_eq!(frag.limits[0].lo, Some(sc));
@@ -738,8 +734,8 @@ mod tests {
         env
     }
 
-    /// Assert two DAEs have the same unknown layout and identical residual values
-    /// at the given environment point.
+    /// Assert two DAEs have the same unknown layout and identical currents and
+    /// charges at the given environment point.
     fn assert_dae_match(
         ctx: &Graph,
         a: &Dae,
@@ -747,9 +743,10 @@ mod tests {
         env: &std::collections::HashMap<SymbolId, Complex64>,
     ) {
         assert_eq!(a.unknowns, b.unknowns, "unknown layout differs");
-        for (i, (ra, rb)) in a.residuals.iter().zip(&b.residuals).enumerate() {
+        let rows = |d: &Dae| d.currents.iter().chain(&d.charges).copied().collect::<Vec<_>>();
+        for (i, (ra, rb)) in rows(a).iter().zip(&rows(b)).enumerate() {
             let d = (eval(ctx, &[*ra], env)[0] - eval(ctx, &[*rb], env)[0]).norm();
-            assert!(d < 1e-9, "residual {i} differs by {d}");
+            assert!(d < 1e-9, "row {i} differs by {d}");
         }
     }
 
@@ -775,7 +772,6 @@ mod tests {
                 ("R1", 1000.0),
                 ("R1.R", 1000.0),
                 ("v1", 2.0),
-                ("vdot1", 0.0),
                 ("i_V1", -0.002),
                 ("t", 0.0),
             ],
@@ -816,8 +812,6 @@ mod tests {
                 ("D1.N", 1.0),
                 ("v1", 0.7),
                 ("v2", 0.55),
-                ("vdot1", 0.0),
-                ("vdot2", 0.0),
                 ("i_V1", -1.5e-4),
                 ("t", 0.0),
             ],
@@ -833,7 +827,6 @@ mod tests {
                 ("R1", 1000.0),
                 ("R1.R", 1000.0),
                 ("v1", 2.0),
-                ("vdot1", 0.0),
                 ("i_V1", -0.002),
                 ("t", 0.0),
             ],
@@ -1139,15 +1132,14 @@ mod tests {
             let np = em.ports.len();
             let mut ctx = Graph::new();
             let term_v: Vec<ExprId> = (1..=np).map(|k| ctx.sym(&format!("v{k}"))).collect();
-            let term_vdot: Vec<ExprId> = (1..=np).map(|k| ctx.sym(&format!("vdot{k}"))).collect();
             let mut lo = Lowerer::new(&mut ctx);
             let pv = std::collections::HashMap::default();
             let given = std::collections::HashSet::default();
-            match lower_analog(&em, "X1", &pv, &given, 1.0, &mut lo, &term_v, &term_vdot) {
+            match lower_analog(&em, "X1", &pv, &given, 1.0, &mut lo, &term_v) {
                 Ok(frag) => println!(
-                    "{label}: LOWERED ok ({} terminals, {} residuals, {} extras)",
+                    "{label}: LOWERED ok ({} terminals, {} rows, {} extras)",
                     frag.terminal_currents.len(),
-                    frag.residuals.len(),
+                    frag.currents.len(),
                     lo.extras.len()
                 ),
                 Err(e) => println!("{label}: LOWER GAP: {e}"),
@@ -1239,11 +1231,10 @@ mod tests {
             let np = em.ports.len();
             let mut ctx = Graph::new();
             let tv: Vec<ExprId> = (1..=np).map(|k| ctx.sym(&format!("v{k}"))).collect();
-            let tvd: Vec<ExprId> = (1..=np).map(|k| ctx.sym(&format!("vdot{k}"))).collect();
             let mut lo = Lowerer::new(&mut ctx);
             let pv = std::collections::HashMap::default();
             let given = std::collections::HashSet::default();
-            let _ = lower_analog(&em, "X1", &pv, &given, 1.0, &mut lo, &tv, &tvd);
+            let _ = lower_analog(&em, "X1", &pv, &given, 1.0, &mut lo, &tv);
             println!("{label}: lowered (see VA non-finite const warnings above)");
         }
     }
@@ -1289,15 +1280,14 @@ mod tests {
         let np = em.ports.len();
         let mut ctx = Graph::new();
         let tv: Vec<ExprId> = (1..=np).map(|k| ctx.sym(&format!("v{k}"))).collect();
-        let tvd: Vec<ExprId> = (1..=np).map(|k| ctx.sym(&format!("vdot{k}"))).collect();
         let mut lo = Lowerer::new(&mut ctx);
         let pv = std::collections::HashMap::default();
         let given = std::collections::HashSet::default();
-        let frag = lower_analog(&em, "X1", &pv, &given, 1.0, &mut lo, &tv, &tvd).expect("lower");
-        let resids = frag.residuals.clone();
+        let frag = lower_analog(&em, "X1", &pv, &given, 1.0, &mut lo, &tv).expect("lower");
+        let resids = frag.currents.clone();
         drop(lo);
 
-        // Bind every symbol: param -> default, vdot -> 0, everything else -> 0.3.
+        // Bind every symbol: param -> default, everything else -> 0.
         let mut env = std::collections::HashMap::default();
         for i in 0..ctx.len() {
             if let Node::Symbol(s) = ctx.node(ExprId(i as u32)) {
@@ -1308,8 +1298,6 @@ mod tests {
                     sane_core::constants::TEMP_NOMINAL_K
                 } else if pnames.contains(suffix) {
                     pdefault[suffix]
-                } else if name.starts_with("vdot") {
-                    0.0
                 } else {
                     0.0
                 };

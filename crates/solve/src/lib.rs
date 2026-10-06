@@ -26,7 +26,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// Process-global count of sparse `dF/dx` factorizations run by `factor_fx` (the
+/// Process-global count of sparse `G` factorizations run by `factor_fx` (the
 /// adjoint / sensitivity path). Used to assert the "factor once, K right-hand
 /// sides" contract of [`CompiledDc::hessian`] (#48) rather than one factorization
 /// per parameter. Relaxed; exact only when a single analysis runs at a time.
@@ -92,6 +92,7 @@ mod tests;
 mod transient;
 mod transient_adjoint;
 
+pub use eval::Evaluator;
 pub(crate) use eval::{PrologToken, StepEval};
 use schur::{LinCache, Partition};
 use sens::{CompiledHessian, HistJac, ParamJac};
@@ -253,7 +254,6 @@ pub fn set_parallelism(threads: usize) {
 /// Where an input slot of the tape draws its value from.
 enum InputSrc {
     X(usize),
-    Xdot(usize),
     P(usize),
     T,
     /// Delay-history input `k`: the integrator-provided interpolated value of
@@ -307,7 +307,7 @@ impl TransientMethod {
 
 /// Integration counters (logged at debug level), shared by the transient
 /// integrators: steps taken / rejected, total inner Newton iterations, and
-/// Jacobian (re)factorizations (= full `dF/dx` tape evals).
+/// Jacobian (re)factorizations (= full `G` tape evals).
 #[derive(Default)]
 pub(crate) struct Stats {
     pub steps: usize,
@@ -343,26 +343,26 @@ pub struct CompiledDc {
     diag_idx: Vec<Option<usize>>,
     jxd_rows: Vec<usize>,
     jxd_cols: Vec<usize>,
-    /// residuals ++ jacobian-x nonzeros (one pass for a Newton step).
-    tape_step: StepEval,
-    /// residuals only (cheap line-search evaluations).
-    tape_res: StepEval,
-    /// `tape_step` and `tape_res` at `x' = 0`, every device call specialized
-    /// to it: the DC residual, which the transient stages evaluate too (their
-    /// derivative term enters through the mass matrix). The hot loops run
-    /// these, and the charge model drops out of the bodies they call.
+    /// The DC programs: the currents `I` (cheap line-search evaluations) and
+    /// `I ++ G` (a Newton step), `G = dI/dx` in the jacobian-x pattern. A
+    /// device body's charge model is not in them.
     tape_step_dc: StepEval,
     tape_res_dc: StepEval,
-    /// jacobian-x' nonzeros.
-    tape_jxd: StepEval,
-    /// Compiled `dF/dp` (parameter Jacobian) for exact adjoint sensitivity, built
-    /// lazily on first sensitivity / Hessian call (it is ~O(n^2)-ish to build at
-    /// scale and only needed for sensitivity), via [`ensure_param_jac`].
+    /// The transient's (and harmonic balance's) programs: `I ++ Q` (the
+    /// currents and the charges), and `I ++ Q ++ G ++ C` with `C = dQ/dx` in
+    /// the jacobian-x' pattern.
+    tape_tran_res: StepEval,
+    tape_tran_step: StepEval,
+    /// `C` alone (the state rates `x' = C⁻¹ f`).
+    tape_c: StepEval,
+    /// Compiled `dI/dp` and `dQ/dp` (parameter Jacobians) for exact adjoint
+    /// sensitivity, built lazily on first sensitivity / Hessian call (they are
+    /// ~O(n^2)-ish to build at scale and only needed for sensitivity), via
+    /// [`ensure_param_jac`].
     pjac: std::sync::OnceLock<ParamJac>,
     input_src: Vec<InputSrc>,
     /// Precomputed (buffer slot, source index) lists for [`Self::patch_inputs`].
     input_x_slots: Vec<(u32, u32)>,
-    input_xdot_slots: Vec<(u32, u32)>,
     input_t_slots: Vec<u32>,
     input_hist_slots: Vec<(u32, u32)>,
     param_syms: Vec<SymbolId>,
@@ -407,18 +407,18 @@ pub struct CompiledDc {
     /// lazily on first `hessian()` call (it is the heaviest, ~O(n^2) extract stage
     /// and is only needed for second-order sensitivity), via [`ensure_hessian`].
     chess: std::sync::OnceLock<CompiledHessian>,
-    /// Compiled `dF/d(input)` per input symbol (an independent source's value,
+    /// Compiled `dI/d(input)` per input symbol (an independent source's value,
     /// the AC and pole-zero excitation), built on the first query for that
     /// input by [`input_jacobian`](Self::input_jacobian).
     input_jacs: std::sync::Mutex<HashMap<SymbolId, std::sync::Arc<StepEval>>>,
-    /// Base input symbols (x, differential xdot, params, t), kept so the lazy
+    /// Base input symbols (x, params, t, delay histories), kept so the lazy
     /// parameter-Jacobian and Hessian tapes can be compiled on demand.
     base_inputs: Vec<SymbolId>,
     /// Companion conductance network `(row, col, value)` from the device models
     /// (their linear `lambda = 0` form) -- the per-device homotopy continuation.
     companion: Vec<(usize, usize, f64)>,
     /// Reused symbolic factorization for the companion-augmented homotopy matrix
-    /// `dF/dx + (1-lambda)*G_comp + gmin*I` (#52). Its pattern is the `dF/dx`
+    /// `G + (1-lambda)*G_comp + gmin*I` (#52). Its pattern is the `G`
     /// nonzeros plus the companion `(row, col)` positions plus the full diagonal --
     /// fixed across the continuation, only the values change with `lambda`. Built
     /// lazily on first `companion_solve` (the fallback path most circuits never
@@ -488,7 +488,7 @@ impl CompiledDc {
     pub fn nnz(&self) -> usize {
         self.nnz_x
     }
-    /// Number of parameters (columns of `dF/dp`), in `param_names` order.
+    /// Number of parameters (columns of `dI/dp` and `dQ/dp`), in `param_names` order.
     pub fn param_count(&self) -> usize {
         self.param_syms.len()
     }
@@ -503,12 +503,11 @@ impl CompiledDc {
             .collect()
     }
 
-    fn fill_inputs(&self, x: &[f64], xdot: &[f64], p: &[f64], t: f64, inputs: &mut Vec<f64>) {
+    fn fill_inputs(&self, x: &[f64], p: &[f64], t: f64, inputs: &mut Vec<f64>) {
         inputs.clear();
         for src in &self.input_src {
             inputs.push(match *src {
                 InputSrc::X(i) => x.get(i).copied().unwrap_or(0.0),
-                InputSrc::Xdot(i) => xdot.get(i).copied().unwrap_or(0.0),
                 InputSrc::P(j) => p.get(j).copied().unwrap_or(0.0),
                 InputSrc::T => t,
                 InputSrc::Hist(k) => crate::delay::hist_value(k),
@@ -516,18 +515,15 @@ impl CompiledDc {
         }
     }
 
-    /// Patch only the state-dependent entries (x / xdot / t / history) of an
+    /// Patch only the state-dependent entries (x / t / history) of an
     /// input buffer a prior [`fill_inputs`](Self::fill_inputs) prepared. The
     /// parameter entries -- the bulk of a compact-model input vector (PSP103:
     /// ~800 of ~900) -- are constant over an integration, so the inner Newton
     /// loops skip re-copying them on every evaluation.
-    fn patch_inputs(&self, x: &[f64], xdot: &[f64], t: f64, inputs: &mut [f64]) {
+    fn patch_inputs(&self, x: &[f64], t: f64, inputs: &mut [f64]) {
         debug_assert_eq!(inputs.len(), self.input_src.len(), "buffer not prepared");
         for &(dst, i) in &self.input_x_slots {
             inputs[dst as usize] = x.get(i as usize).copied().unwrap_or(0.0);
-        }
-        for &(dst, i) in &self.input_xdot_slots {
-            inputs[dst as usize] = xdot.get(i as usize).copied().unwrap_or(0.0);
         }
         for &dst in &self.input_t_slots {
             inputs[dst as usize] = t;
@@ -537,12 +533,37 @@ impl CompiledDc {
         }
     }
 
-    /// Residual `F(x, xdot, p, t)`.
-    pub fn residual(&self, x: &[f64], xdot: &[f64], p: &[f64], t: f64) -> Vec<f64> {
+    /// The currents `I(x, p, t)`: the residual at rest.
+    pub fn currents(&self, x: &[f64], p: &[f64], t: f64) -> Vec<f64> {
         let (mut inputs, mut work, mut out) = (Vec::new(), Vec::new(), Vec::new());
-        self.fill_inputs(x, xdot, p, t, &mut inputs);
-        self.tape_res.eval(&inputs, &mut work, &mut out);
+        self.fill_inputs(x, p, t, &mut inputs);
+        self.tape_res_dc.eval(&inputs, &mut work, &mut out);
         out
+    }
+
+    /// The charges `Q(x, p)`.
+    pub fn charges(&self, x: &[f64], p: &[f64], t: f64) -> Vec<f64> {
+        self.currents_charges(x, p, t).1
+    }
+
+    /// The currents and the charges in one evaluation.
+    pub(crate) fn currents_charges(&self, x: &[f64], p: &[f64], t: f64) -> (Vec<f64>, Vec<f64>) {
+        let (mut inputs, mut work, mut out) = (Vec::new(), Vec::new(), Vec::new());
+        self.fill_inputs(x, p, t, &mut inputs);
+        self.tape_tran_res.eval(&inputs, &mut work, &mut out);
+        let q = out.split_off(self.n);
+        (out, q)
+    }
+
+    /// The residual `F = I(x, t) + C(x) x'` at the state `x` moving at the
+    /// rate `xdot` (every row is affine in the rate).
+    pub fn residual(&self, x: &[f64], xdot: &[f64], p: &[f64], t: f64) -> Vec<f64> {
+        let mut f = self.currents(x, p, t);
+        let (r, c, v) = self.jacobian_q_x_sparse(x, p, t);
+        for k in 0..v.len() {
+            f[r[k]] += v[k] * xdot.get(c[k]).copied().unwrap_or(0.0);
+        }
+        f
     }
 
     fn dense(rows: &[usize], cols: &[usize], data: &[f64], n: usize) -> Vec<Vec<f64>> {
@@ -553,71 +574,83 @@ impl CompiledDc {
         m
     }
 
-    /// Dense `dF/dx`.
-    pub fn jacobian_x(&self, x: &[f64], xdot: &[f64], p: &[f64], t: f64) -> Vec<Vec<f64>> {
-        let (_, _, data) = self.jacobian_x_sparse(x, xdot, p, t);
+    /// Dense `G = dI/dx`.
+    pub fn jacobian_i_x(&self, x: &[f64], p: &[f64], t: f64) -> Vec<Vec<f64>> {
+        let (_, _, data) = self.jacobian_i_x_sparse(x, p, t);
         Self::dense(&self.jx_rows, &self.jx_cols, &data, self.n)
     }
-    /// Dense small-signal system matrix `dF/dx + GMIN_DC*I`: the Jacobian
+    /// Dense small-signal system matrix `G + GMIN_DC*I`: the Jacobian
     /// regularized with the same node-to-ground shunt the DC / transient solves
     /// carry, so a small-signal linearization (poles, zeros, AC, noise, MOR) is
     /// consistent with the operating point that was actually solved. It also
     /// keeps the pencil `G + sC` non-singular when an unknown is structurally
     /// decoupled at the bias (e.g. the branch current of a grounded thermal
-    /// node in a self-heating compact model), which would make the raw `dF/dx`
+    /// node in a self-heating compact model), which would make the raw `G`
     /// singular and the eigen/solve fail.
-    pub fn system_matrix_dc(&self, x: &[f64], xdot: &[f64], p: &[f64], t: f64) -> Vec<Vec<f64>> {
-        let mut g = self.jacobian_x(x, xdot, p, t);
+    pub fn system_matrix_dc(&self, x: &[f64], p: &[f64], t: f64) -> Vec<Vec<f64>> {
+        let mut g = self.jacobian_i_x(x, p, t);
         for i in 0..self.n {
             g[i][i] += GMIN_DC;
         }
         g
     }
-    /// Dense `dF/dx'`.
-    pub fn jacobian_xdot(&self, x: &[f64], xdot: &[f64], p: &[f64], t: f64) -> Vec<Vec<f64>> {
-        let (_, _, data) = self.jacobian_xdot_sparse(x, xdot, p, t);
+    /// Dense `C = dQ/dx`.
+    pub fn jacobian_q_x(&self, x: &[f64], p: &[f64], t: f64) -> Vec<Vec<f64>> {
+        let (_, _, data) = self.jacobian_q_x_sparse(x, p, t);
         Self::dense(&self.jxd_rows, &self.jxd_cols, &data, self.n)
     }
-    /// Sparse `dF/dx` as `(rows, cols, values)`.
-    pub fn jacobian_x_sparse(
+    /// Sparse `G = dI/dx` as `(rows, cols, values)`.
+    pub fn jacobian_i_x_sparse(
         &self,
         x: &[f64],
-        xdot: &[f64],
         p: &[f64],
         t: f64,
     ) -> (Vec<usize>, Vec<usize>, Vec<f64>) {
         let (mut inputs, mut work, mut out) = (Vec::new(), Vec::new(), Vec::new());
-        self.fill_inputs(x, xdot, p, t, &mut inputs);
-        self.tape_step.eval(&inputs, &mut work, &mut out);
+        self.fill_inputs(x, p, t, &mut inputs);
+        self.tape_step_dc.eval(&inputs, &mut work, &mut out);
         (
             self.jx_rows.clone(),
             self.jx_cols.clone(),
             out[self.n..].to_vec(),
         )
     }
-    /// Sparse `dF/dx'` as `(rows, cols, values)`.
-    pub fn jacobian_xdot_sparse(
+    /// `G` at `(x, p)` and `t = 0`, its values in the compiled order of
+    /// `jx_rows`/`jx_cols`, through the prolog-split path the Newton loops
+    /// run (warm, native).
+    pub(crate) fn jacobian_dc(&self, x: &[f64], p: &[f64]) -> Vec<f64> {
+        let (mut inputs, mut work, mut out) = (Vec::new(), Vec::new(), Vec::new());
+        self.fill_inputs(x, p, 0.0, &mut inputs);
+        let mut tok = self.tape_step_dc.eval_prolog(&inputs, &mut work);
+        self.tape_step_dc
+            .eval_main(&mut tok, &inputs, &mut work, &mut out);
+        out.split_off(self.n)
+    }
+    /// Sparse `C = dQ/dx` as `(rows, cols, values)`.
+    pub fn jacobian_q_x_sparse(
         &self,
         x: &[f64],
-        xdot: &[f64],
         p: &[f64],
         t: f64,
     ) -> (Vec<usize>, Vec<usize>, Vec<f64>) {
         let (mut inputs, mut work, mut out) = (Vec::new(), Vec::new(), Vec::new());
-        self.fill_inputs(x, xdot, p, t, &mut inputs);
-        self.tape_jxd.eval(&inputs, &mut work, &mut out);
+        self.fill_inputs(x, p, t, &mut inputs);
+        self.tape_c.eval(&inputs, &mut work, &mut out);
         (self.jxd_rows.clone(), self.jxd_cols.clone(), out)
     }
 
-    /// Sparse regularized small-signal conductance `G = dF/dx + GMIN_DC*I` at
-    /// the operating point `(x, p)` (`xdot = 0`, `t = 0`), as triplets with the
+    /// Sparse regularized small-signal conductance `G + GMIN_DC*I` at the
+    /// operating point `(x, p)` (`t = 0`), as triplets with the
     /// gmin shunt appended on every diagonal -- the same regularization the DC
     /// solve carried, so every small-signal analysis (AC, noise, symbolic
     /// reduction) linearizes the system that was actually solved. The single
     /// assembly point for the `A = G + jwC` builders.
     pub fn system_triplets_dc(&self, x: &[f64], p: &[f64]) -> (Vec<usize>, Vec<usize>, Vec<f64>) {
-        let xdot = vec![0.0; self.n];
-        let (mut r, mut c, mut v) = self.jacobian_x_sparse(x, &xdot, p, 0.0);
+        let (mut r, mut c, mut v) = (
+            self.jx_rows.clone(),
+            self.jx_cols.clone(),
+            self.jacobian_dc(x, p),
+        );
         for i in 0..self.n {
             r.push(i);
             c.push(i);
@@ -627,8 +660,8 @@ impl CompiledDc {
     }
 
     /// Reusable symbolic factorization for the **implicit-RK stage** linear system
-    /// `J_stage = dF/dx + α·C` (`C = dF/dx'`, constant). The pattern is the union of
-    /// the `dF/dx` and `dF/dx'` nonzeros plus the full diagonal (so a `gmin` shunt is
+    /// `J_stage = G + α·C`. The pattern is the union of
+    /// the `G` and `C` nonzeros plus the full diagonal (so a `gmin` shunt is
     /// free). `build_symbolic` sums duplicate `(i, j)` entries via the argsort, so the
     /// two blocks overlap freely and the value layout is simply the two blocks then
     /// the diagonal. Built once and reused across every stage and step (the pattern
@@ -641,7 +674,7 @@ impl CompiledDc {
         Self::build_symbolic(self.n, &rows, &cols)
     }
 
-    /// Factorize the stage matrix `dF/dx + α·C + gmin·I` into the transient's
+    /// Factorize the stage matrix `G + α·C + gmin·I` into the transient's
     /// stage factorization cache `fac` (a [`sparse::Refactorable`] over the
     /// combined [`stage_symbolic`](Self::stage_symbolic) pattern). The
     /// modified-Newton integrator refreshes once per step and on convergence
@@ -763,10 +796,12 @@ impl CompiledDc {
         })
     }
 
-    /// Transient solve of the DAE `F(x, x', t) = 0` over `t_eval` with the
+    /// Transient solve of the DAE `I(x, t) + d/dt Q(x) = 0` over `t_eval` with the
     /// selected implicit-RK method (adaptive ESDIRK32; see [`TransientMethod`]).
-    /// The mass matrix `C = dF/dx'` is constant (charge and flux enter linearly);
-    /// every stage solve reuses the engine's device-limiting Newton machinery.
+    /// The methods integrate the charges `dQ/dt = -I(x, t)` (every row of the
+    /// DAE reads `I + d/dt Q`), so a nonlinear capacitance is exact at every
+    /// stage; every stage solve reuses the engine's device-limiting Newton
+    /// machinery.
     ///
     /// `x0` is the initial state; if it does not match the system dimension a
     /// consistent DC operating point is computed and used instead. Returns the
@@ -782,7 +817,9 @@ impl CompiledDc {
         atol: f64,
         dt_max: Option<f64>,
     ) -> Result<Vec<Vec<f64>>, String> {
-        crate::parallel::solve(|| self.solve_transient_here(method, p, x0, t_eval, rtol, atol, dt_max))
+        crate::parallel::solve(|| {
+            self.solve_transient_here(method, p, x0, t_eval, rtol, atol, dt_max)
+        })
     }
 
     /// [`solve_transient`](Self::solve_transient) on this thread.

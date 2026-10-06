@@ -828,10 +828,9 @@ impl Model {
         let mut task = sane_core::log::task("PZ", "pz", &format!("(dim: {})", self.dim()));
         let (x, p) = self.inner.solve_dc(overrides)?;
         let n = self.dim();
-        let xdot0 = vec![0.0; n];
         let mut ctx = self.inner.ctx.lock().unwrap();
-        let g = self.inner.cdc.system_matrix_dc(&x, &xdot0, &p, 0.0);
-        let c = self.inner.cdc.jacobian_xdot(&x, &xdot0, &p, 0.0);
+        let g = self.inner.cdc.system_matrix_dc(&x, &p, 0.0);
+        let c = self.inner.cdc.jacobian_q_x(&x, &p, 0.0);
         let poles = crate::finite_pencil_roots(&g, &c).map_err(ModelError::Numeric)?;
         let mut zeros = Vec::new();
         if !input.trim().is_empty() && !output.trim().is_empty() {
@@ -1010,7 +1009,8 @@ impl Model {
     }
 
     /// Linearise about the operating point into the small-signal mass-matrix DAE
-    /// `G dx + C dx' = 0`, sharing this context. Returns the linearised `Model`.
+    /// `G dx + d/dt (C dx) = 0`, sharing this context. Returns the linearised
+    /// `Model`.
     pub fn linearize(&self) -> Model {
         let mut c = self.inner.ctx.lock().unwrap();
         let lin = linearize(&mut c, &self.inner.dae);
@@ -1324,20 +1324,21 @@ impl OperatingPoint {
 
     /// Every operating-point variable the circuit's behavioral devices export
     /// (`(* desc *)`-annotated Verilog-A variables: gm, vth, ids, ...), evaluated
-    /// at this solved point (xdot = 0). Empty when no device declares any.
+    /// at this solved point. Empty when no device declares any.
     pub fn op_vars(&self) -> Vec<OpVarValue> {
         let dae = &self.sim.dae;
-        if dae.op_vars.is_empty() {
+        if dae.observers.is_empty() {
             return Vec::new();
         }
         let mut ctx = self.sim.ctx.lock().unwrap();
+        let flat = dae.observers.flatten(&mut ctx);
         let pnames = self.sim.cdc.param_names(&ctx);
-        let env = crate::op_env(&mut ctx, dae, &pnames, &self.x, &[], &self.p, 0.0);
+        let env = crate::op_env(&mut ctx, dae, &pnames, &self.x, &self.p, 0.0);
         // One arena sweep: an op-var is a call into its device's template
         // function (evaluated once per instance) or a plain expression.
-        let roots: Vec<_> = dae.op_vars.iter().map(|v| v.value).collect();
+        let roots: Vec<_> = flat.op_vars.iter().map(|v| v.value).collect();
         let vals = rsdag::eval(&ctx, &roots, &env);
-        dae.op_vars
+        flat.op_vars
             .iter()
             .zip(vals)
             .map(|(v, value)| OpVarValue {

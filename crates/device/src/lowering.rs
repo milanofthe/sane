@@ -10,8 +10,7 @@ use sane_core::Graph;
 
 /// An extra DAE unknown a behavioral device mints beyond its terminals (a branch
 /// current for a voltage contribution, or an `idt`/laplace state variable), with
-/// its minted value and derivative symbols and whether it is differential (its
-/// time derivative appears in a residual, so the integrator must advance it).
+/// its minted value symbol.
 pub struct LoweredUnknown {
     pub name: String,
     /// What the unknown physically is (a device-internal node potential, a
@@ -22,10 +21,7 @@ pub struct LoweredUnknown {
     /// template re-mints it for a clone without parsing the qualified name.
     pub suffix: String,
     pub value: ExprId,
-    pub xdot: ExprId,
     pub value_sym: SymbolId,
-    pub xdot_sym: SymbolId,
-    pub differential: bool,
     /// DC Newton seed (`idt(u, ic)`: the ic routed as a `.nodeset`-style
     /// starting value, not a constraint -- DC still enforces `u = 0`).
     pub dc_seed: Option<f64>,
@@ -48,9 +44,9 @@ pub struct LoweredDelay {
 
 /// Builder handed to a behavioral device during DAE assembly. It mints extra
 /// unknowns into the shared `Graph` and records them so the assembler can
-/// append them to the unknown vector and wire their derivative symbols. The
-/// device builds its residual expressions over the returned value/derivative
-/// exprs. See [`DeviceModel::lower_behavioral`].
+/// append them to the unknown vector. The device builds its currents and
+/// charges over the returned value exprs. See
+/// [`DeviceModel::lower_behavioral`].
 pub struct Lowerer<'a> {
     ctx: &'a mut Graph,
     pub extras: Vec<LoweredUnknown>,
@@ -95,74 +91,51 @@ impl<'a> Lowerer<'a> {
     }
 
     /// Mint an extra unknown by its fully-qualified `name` (the device scopes it
-    /// with its instance name, e.g. `"U1.br0"`) and its derivative symbol.
-    /// Returns `(value_expr, xdot_expr)`. `differential = true` marks it as a
-    /// state the integrator advances (its `xdot` appears in a residual).
-    pub fn unknown(&mut self, name: &str, differential: bool) -> (ExprId, ExprId) {
-        self.unknown_with_suffix(name, name, crate::UnknownKind::DeviceState, differential)
+    /// with its instance name, e.g. `"U1.br0"`). Returns its value expr.
+    pub fn unknown(&mut self, name: &str) -> ExprId {
+        self.unknown_with_suffix(name, name, crate::UnknownKind::DeviceState)
     }
 
     /// Mint a device state scoped by `inst`: named `{inst}.{suffix}`, with the
     /// suffix recorded (see `LoweredUnknown::suffix`).
-    pub fn unknown_of(&mut self, inst: &str, suffix: &str, differential: bool) -> (ExprId, ExprId) {
-        self.unknown_kind_of(inst, suffix, crate::UnknownKind::DeviceState, differential)
+    pub fn unknown_of(&mut self, inst: &str, suffix: &str) -> ExprId {
+        self.unknown_kind_of(inst, suffix, crate::UnknownKind::DeviceState)
     }
 
-    /// Mint a device-internal node potential `{inst}.{suffix}` (its residual
-    /// is a KCL row).
-    pub fn internal_node_of(&mut self, inst: &str, suffix: &str) -> (ExprId, ExprId) {
-        self.unknown_kind_of(inst, suffix, crate::UnknownKind::NodeVoltage, false)
+    /// Mint a device-internal node potential `{inst}.{suffix}` (its row is a
+    /// KCL row).
+    pub fn internal_node_of(&mut self, inst: &str, suffix: &str) -> ExprId {
+        self.unknown_kind_of(inst, suffix, crate::UnknownKind::NodeVoltage)
     }
 
-    /// Mint a branch current `{inst}.{suffix}` (its residual is a KVL or a
+    /// Mint a branch current `{inst}.{suffix}` (its row is a KVL or a
     /// flow-definition row).
-    pub fn branch_current_of(&mut self, inst: &str, suffix: &str) -> (ExprId, ExprId) {
-        self.unknown_kind_of(inst, suffix, crate::UnknownKind::BranchCurrent, false)
+    pub fn branch_current_of(&mut self, inst: &str, suffix: &str) -> ExprId {
+        self.unknown_kind_of(inst, suffix, crate::UnknownKind::BranchCurrent)
     }
 
     /// Mint an extra unknown `{inst}.{suffix}` of an explicit kind.
-    pub fn unknown_kind_of(
-        &mut self,
-        inst: &str,
-        suffix: &str,
-        kind: crate::UnknownKind,
-        differential: bool,
-    ) -> (ExprId, ExprId) {
+    pub fn unknown_kind_of(&mut self, inst: &str, suffix: &str, kind: crate::UnknownKind) -> ExprId {
         let name = format!("{inst}.{suffix}");
-        self.unknown_with_suffix(&name, suffix, kind, differential)
+        self.unknown_with_suffix(&name, suffix, kind)
     }
 
     /// Mint an extra unknown by full name and explicit kind.
-    pub fn unknown_kind(
-        &mut self,
-        name: &str,
-        kind: crate::UnknownKind,
-        differential: bool,
-    ) -> (ExprId, ExprId) {
-        self.unknown_with_suffix(name, name, kind, differential)
+    pub fn unknown_kind(&mut self, name: &str, kind: crate::UnknownKind) -> ExprId {
+        self.unknown_with_suffix(name, name, kind)
     }
 
-    fn unknown_with_suffix(
-        &mut self,
-        name: &str,
-        suffix: &str,
-        kind: crate::UnknownKind,
-        differential: bool,
-    ) -> (ExprId, ExprId) {
+    fn unknown_with_suffix(&mut self, name: &str, suffix: &str, kind: crate::UnknownKind) -> ExprId {
         let (value, value_sym) = mint(self.ctx, name);
-        let (xdot, xdot_sym) = mint(self.ctx, &format!("vdot_{name}"));
         self.extras.push(LoweredUnknown {
             name: name.to_string(),
             kind,
             suffix: suffix.to_string(),
             value,
-            xdot,
             value_sym,
-            xdot_sym,
-            differential,
             dc_seed: None,
         });
-        (value, xdot)
+        value
     }
 }
 

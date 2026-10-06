@@ -1,21 +1,20 @@
 //! Time-domain nonlinear DAE assembly and extraction.
 //!
-//! Builds the implicit residual system `F(x, x', t) = 0` for a circuit, where
-//! `x = [node voltages; branch currents]` and `x'` are companion time-derivative
-//! symbols. Dynamics enter through derivative symbols: a capacitor contributes
-//! `C*(v'_a - v'_b)`, an inductor adds a branch current with the constraint
-//! `v_a - v_b - L*i' = 0`. Nonlinear devices contribute their large-signal
-//! terminal currents. Nothing is solved here; the output is the symbolic DAE
-//! plus its analytic Jacobians, ready for export.
+//! Builds the system `I(x, t) + d/dt Q(x) = 0` for a circuit, where
+//! `x = [node voltages; branch currents; device states]`: every row is a
+//! current `I` and the time derivative of a charge `Q`. A capacitor stores
+//! the charge `C*(v_a - v_b)` on its nodes, an inductor adds a branch current
+//! with the current `v_a - v_b` and the charge (flux) `-L*i` on its row.
+//! Nonlinear devices contribute their large-signal terminal currents and
+//! charges. Nothing is solved here; the output is the expression graph the
+//! analyses compile.
 //!
-//! Naming convention for the minted symbols: node voltages `v{n}`, their
-//! derivatives `vdot{n}`, branch currents `i_{name}`, inductor current
-//! derivatives `idot_{name}`, and time `t`.
+//! Naming convention for the minted symbols: node voltages `v{n}`, branch
+//! currents `i_{name}`, and time `t`.
 
 use std::collections::HashMap;
 
-use rsdag::determinant;
-use rsdag::{differentiate, sparse_jacobian, Crossing, ExprId, Node, SymbolId};
+use rsdag::{sparse_jacobian, Crossing, ExprId, Node, SymbolId};
 use sane_core::Graph;
 use sane_mna::SourceFn;
 
@@ -24,6 +23,7 @@ mod assemble;
 // Subcircuit instances: placed bodies, their renaming and topology.
 mod hierarchy;
 pub mod linearize;
+mod observers;
 // Sensitivity machinery: directional derivatives, augmentation, Hessian blocks.
 mod sens;
 // Graph transformations (shorts / opens / exact node elimination).
@@ -32,9 +32,10 @@ mod tests;
 mod transform;
 
 pub use assemble::{assemble, assemble_dae};
-pub use hierarchy::{topology, Instance};
+pub use hierarchy::{topology, Body, Instance};
+pub use observers::{Flat, Observers};
 pub use sens::{
-    ac_param_derivatives, augment_with_scaled_sensitivities, augment_with_sensitivities, hessian,
+    ac_param_derivatives, augment_with_scaled_sensitivities, augment_with_sensitivities,
     lagrangian_hessian, HessianSym,
 };
 pub use transform::{eliminate_nodes, reduce_graph};
@@ -52,7 +53,6 @@ pub struct Limit {
     pub kind: LimitKind,
 }
 
-/// An extracted differential-algebraic system `F(x, x', t) = 0`.
 /// One transport delay: the engine integrates the SOURCE unknown `src`
 /// (an auxiliary algebraic signal, e.g. the Branin wave `v + Z0*i` or an
 /// `absdelay` operand), and the OUTPUT unknown `out` is pinned to the
@@ -86,21 +86,24 @@ pub struct EventSpec {
     pub name: String,
 }
 
+/// An extracted differential-algebraic system `I(x, t) + d/dt Q(x) = 0`.
 pub struct Dae {
-    /// Residual expressions, one per unknown (`F_i = 0`).
-    pub residuals: Vec<ExprId>,
-    /// Names of the unknowns `x`, aligned with `x` / `xdot`.
+    /// Every row `i` as `I_i(x, t) + d/dt Q_i(x) = 0`: the current `I_i` and
+    /// the charge `Q_i` (zero for an algebraic row), one per unknown. A
+    /// device body's charge model is not in its current and its current
+    /// model not in its charge.
+    pub currents: Vec<ExprId>,
+    pub charges: Vec<ExprId>,
+    /// Names of the unknowns `x`, aligned with `x`.
     pub unknowns: Vec<String>,
     /// What each unknown physically is, parallel to `unknowns` (see
     /// [`UnknownKind`]); the solver's tolerances and shunts are taken per kind.
     pub kinds: Vec<UnknownKind>,
     /// Unknown symbols `x`.
     pub x: Vec<SymbolId>,
-    /// Derivative symbol per unknown (`None` for purely algebraic unknowns).
-    pub xdot: Vec<Option<SymbolId>>,
     /// The time symbol.
     pub t: SymbolId,
-    /// Number of leading node-voltage unknowns (their KCL rows lead `residuals`).
+    /// Number of leading node-voltage unknowns (their KCL rows lead).
     pub n_nodes: usize,
     /// Module default of every device parameter symbol the residuals
     /// reference, by symbol: the value an unstated parameter takes.
@@ -116,13 +119,12 @@ pub struct Dae {
     /// homotopy continuation: each device's linear `lambda = 0` form (see
     /// [`sane_device::DeviceModel::companion`]). Empty for transformed DAEs.
     pub companion: Vec<(usize, usize, f64)>,
-    /// Small-signal noise sources emitted by behavioral / Verilog-A devices
-    /// (current noise generators with a PSD expression). Empty otherwise.
-    pub noise_sources: Vec<NoiseSource>,
-    /// Operating-point variables exported by behavioral devices (`(* desc *)`
-    /// annotations): named expressions evaluated at a solved point for OP
-    /// reporting. They are read-only observers -- no residual references them.
-    pub op_vars: Vec<sane_device::OpVar>,
+    /// The small-signal noise sources (current noise generators with a PSD
+    /// expression) and the operating-point variables (`(* desc *)`
+    /// annotations, named expressions for OP reporting) the devices export:
+    /// read-only observers, no residual references them. See
+    /// [`Observers::flatten`].
+    pub observers: Observers,
     /// DC Newton seeds by unknown name (`idt(u, ic)` states with constant ic):
     /// `.nodeset`-style starting values, not constraints. Keyed by name so the
     /// registry survives unknown reordering; entries whose unknown no longer
@@ -159,18 +161,19 @@ impl Dae {
     /// and calls they read. `None` for a tabular source.
     pub fn noise_levels(
         &self,
-        ctx: &Graph,
+        ctx: &mut Graph,
         env: &HashMap<SymbolId, f64>,
     ) -> Vec<Option<(f64, f64)>> {
-        let roots: Vec<ExprId> = self
-            .noise_sources
+        let flat = self.observers.flatten(ctx);
+        let roots: Vec<ExprId> = flat
+            .noise
             .iter()
             .filter(|ns| ns.table.is_empty())
             .flat_map(|ns| [ns.psd, ns.flicker_exp])
             .collect();
         let vals = rsdag::eval(ctx, &roots, env);
         let mut pairs = vals.as_chunks::<2>().0.iter();
-        self.noise_sources
+        flat.noise
             .iter()
             .map(|ns| {
                 let &[psd, fexp] = ns.table.is_empty().then(|| pairs.next())??;
@@ -180,10 +183,10 @@ impl Dae {
     }
 
     /// Register the system as an rsdag function carrying its roles: the
-    /// unknowns as `State`, their derivatives as `StateDot`, time as `Time`,
-    /// every parameter as `Param`, the residuals as `Residual` outputs and
-    /// every switching surface as a `Guard` output with its crossing
-    /// direction.
+    /// unknowns as `State`, time as `Time`, every parameter as `Param`, the
+    /// currents as `Residual` outputs, the charges a row stores as `Charge`
+    /// outputs of the same row, and every switching surface as a `Guard`
+    /// output with its crossing direction.
     ///
     /// Nothing calls this function; it is how the system layer states what it
     /// is, so a consumer (SANE's own solver, an exporter, another backend)
@@ -194,12 +197,6 @@ impl Dae {
         for (i, &s) in self.x.iter().enumerate() {
             params.push(s);
             roles.push(rsdag::ParamRole::State { id: i as u32 });
-        }
-        for (i, sd) in self.xdot.iter().enumerate() {
-            if let Some(s) = *sd {
-                params.push(s);
-                roles.push(rsdag::ParamRole::StateDot { id: i as u32 });
-            }
         }
         // The parameter vector's order (`params`), then time and the delay
         // histories: the signature the solver's programs take their inputs
@@ -215,10 +212,16 @@ impl Dae {
             roles.push(rsdag::ParamRole::History { id: k as u32 });
         }
 
-        let mut outputs: Vec<ExprId> = self.residuals.clone();
-        let mut out_roles: Vec<rsdag::OutputRole> = (0..self.residuals.len())
+        let mut outputs: Vec<ExprId> = self.currents.clone();
+        let mut out_roles: Vec<rsdag::OutputRole> = (0..self.currents.len())
             .map(|i| rsdag::OutputRole::Residual { id: i as u32 })
             .collect();
+        for (i, &q) in self.charges.iter().enumerate() {
+            if !ctx.is_zero(q) {
+                outputs.push(q);
+                out_roles.push(rsdag::OutputRole::Charge { id: i as u32 });
+            }
+        }
         for (i, ev) in self.events.iter().enumerate() {
             outputs.push(ev.g);
             out_roles.push(rsdag::OutputRole::Guard {
@@ -268,103 +271,57 @@ impl Dae {
     }
 
     pub fn dim(&self) -> usize {
-        self.residuals.len()
+        self.currents.len()
     }
 
-    /// Classify the residual system's nonlinearity in the unknowns `x` and their
-    /// derivatives `xdot` -- the graph fact a harmonic-balance solve reads to
-    /// pick its harmonic count and time sampling (degree, transcendental /
-    /// piecewise / opaque flags; see [`rsdag::nonlinearity_of`]). `x` and
-    /// `xdot` share the same bandwidth `K` (differentiation only scales each
-    /// harmonic by `jkw0`), so a term like `x*xdot` is a degree-2 nonlinearity
-    /// over the combined variable set, exactly the harmonic-generating order.
+    /// Classify the currents' and charges' nonlinearity in the unknowns `x`
+    /// -- the graph fact a harmonic-balance solve reads to pick its harmonic
+    /// count and time sampling (degree, transcendental / piecewise / opaque
+    /// flags; see [`rsdag::nonlinearity_of`]). Differentiating a charge in
+    /// time only scales each harmonic by `jkw0`, so the charges' degree is
+    /// the harmonic-generating order of their rates.
     pub fn nonlinearity(&self, ctx: &Graph) -> rsdag::Nonlinearity {
-        let vars: std::collections::BTreeSet<SymbolId> = self
-            .x
-            .iter()
-            .copied()
-            .chain(self.xdot.iter().flatten().copied())
-            .collect();
-        rsdag::nonlinearity_of(ctx, &self.residuals, &vars)
+        let vars: std::collections::BTreeSet<SymbolId> = self.x.iter().copied().collect();
+        let roots: Vec<ExprId> = self.currents.iter().chain(&self.charges).copied().collect();
+        rsdag::nonlinearity_of(ctx, &roots, &vars)
     }
 
-    /// Jacobian `∂F/∂x`, dense (zero where a residual does not depend on
-    /// an unknown).
-    pub fn jacobian_x(&self, ctx: &mut Graph) -> Vec<Vec<ExprId>> {
-        let rows = sparse_jacobian(ctx, &self.residuals, &self.x);
-        let zero = ctx.zero();
-        rows.into_iter()
-            .map(|row| {
-                let mut dense = vec![zero; self.x.len()];
-                for (j, e) in row {
-                    dense[j] = e;
-                }
-                dense
-            })
-            .collect()
+    /// `G = dI/dx` and `C = dQ/dx` as sparse `(rows, cols, exprs)`, from one
+    /// sparse Jacobian over the currents and charges together.
+    pub fn jacobian_iq_coo(&self, ctx: &mut Graph) -> (Coo, Coo) {
+        self.split_coo(ctx, &self.x_cols())
     }
 
-    /// Jacobian `∂F/∂x'`, dense (zero columns for algebraic unknowns).
-    pub fn jacobian_xdot(&self, ctx: &mut Graph) -> Vec<Vec<ExprId>> {
-        let (rows, cols, exprs) = self.jacobian_xdot_coo(ctx);
-        let zero = ctx.zero();
-        let mut dense = vec![vec![zero; self.xdot.len()]; self.residuals.len()];
-        for ((r, c), e) in rows.into_iter().zip(cols).zip(exprs) {
-            dense[r][c] = e;
-        }
-        dense
+    /// `dI/dp` and `dQ/dp` as sparse `(rows, cols, exprs)`, columns indexed
+    /// like `params`.
+    pub fn jacobian_p_iq_coo(&self, ctx: &mut Graph, params: &[SymbolId]) -> (Coo, Coo) {
+        self.split_coo(ctx, &params.iter().copied().enumerate().collect::<Vec<_>>())
     }
 
-    /// The columns of `∂F/∂x`: `(index in x, unknown)`.
-    fn x_cols(&self) -> Vec<(usize, SymbolId)> {
-        self.x.iter().copied().enumerate().collect()
-    }
-
-    /// The columns of `∂F/∂x'`: `(index in x, derivative)`, the
-    /// differential unknowns only.
-    fn xdot_cols(&self) -> Vec<(usize, SymbolId)> {
-        self.xdot
-            .iter()
-            .enumerate()
-            .filter_map(|(i, o)| o.map(|s| (i, s)))
-            .collect()
-    }
-
-    /// Sparse `∂F/∂x` as `(rows, cols, exprs)`, columns indexed like `x`.
-    pub fn jacobian_x_coo(&self, ctx: &mut Graph) -> Coo {
-        coo(ctx, &self.residuals, &self.x_cols())
-    }
-
-    /// Sparse `∂F/∂x'` as `(rows, cols, exprs)`, columns indexed like `x`
-    /// (only differential unknowns contribute).
-    pub fn jacobian_xdot_coo(&self, ctx: &mut Graph) -> Coo {
-        coo(ctx, &self.residuals, &self.xdot_cols())
-    }
-
-    /// [`jacobian_x_coo`](Self::jacobian_x_coo) and
-    /// [`jacobian_xdot_coo`](Self::jacobian_xdot_coo) from one sparse Jacobian
-    /// over the unknowns and their derivatives together.
-    pub fn jacobian_x_xdot_coo(&self, ctx: &mut Graph) -> (Coo, Coo) {
-        let mut cols = self.x_cols();
-        let nx = cols.len();
-        cols.extend(self.xdot_cols());
+    /// The sparse Jacobian of the currents and charges together over `cols`,
+    /// split into the currents' rows and the charges'.
+    fn split_coo(&self, ctx: &mut Graph, cols: &[(usize, SymbolId)]) -> (Coo, Coo) {
+        let n = self.currents.len();
+        let roots: Vec<ExprId> = self.currents.iter().chain(&self.charges).copied().collect();
         let wrt: Vec<SymbolId> = cols.iter().map(|&(_, s)| s).collect();
-        let (mut x, mut xd) = (Coo::default(), Coo::default());
-        for (i, row) in sparse_jacobian(ctx, &self.residuals, &wrt)
-            .into_iter()
-            .enumerate()
-        {
+        let (mut i, mut q) = (Coo::default(), Coo::default());
+        for (r, row) in sparse_jacobian(ctx, &roots, &wrt).into_iter().enumerate() {
             for (j, e) in row {
-                let block = if j < nx { &mut x } else { &mut xd };
-                block.0.push(i);
+                let (block, row) = if r < n { (&mut i, r) } else { (&mut q, r - n) };
+                block.0.push(row);
                 block.1.push(cols[j].0);
                 block.2.push(e);
             }
         }
-        (x, xd)
+        (i, q)
     }
 
-    /// Sparse `∂F/∂hist` as `(rows, cols, exprs)`, columns indexed like
+    /// The state columns: `(index in x, unknown)`.
+    fn x_cols(&self) -> Vec<(usize, SymbolId)> {
+        self.x.iter().copied().enumerate().collect()
+    }
+
+    /// Sparse `∂I/∂hist` as `(rows, cols, exprs)`, columns indexed like
     /// `delays`. In the frequency domain a delayed source contributes
     /// `Hist_k = e^{-jωτ_k} X_{src_k}`, so these entries move to column
     /// `delays[k].src` scaled by `e^{-jωτ_k}` (see the AC path).
@@ -375,38 +332,25 @@ impl Dae {
             .enumerate()
             .map(|(c, d)| (c, d.hist))
             .collect();
-        coo(ctx, &self.residuals, &cols)
+        coo(ctx, &self.currents, &cols)
     }
 
-    /// Sparse `∂F/∂p` as `(rows, cols, exprs)`, columns indexed like
-    /// `params` (a subset of the parameters builds only those columns). The
-    /// basis for exact (adjoint) component sensitivity analysis.
-    pub fn jacobian_p_coo(&self, ctx: &mut Graph, params: &[SymbolId]) -> Coo {
-        coo(
-            ctx,
-            &self.residuals,
-            &params.iter().copied().enumerate().collect::<Vec<_>>(),
-        )
-    }
-
-    /// Parameter symbols: free symbols in the residuals that are neither
-    /// unknowns nor derivatives nor time, sorted by id.
+    /// Parameter symbols: free symbols in the currents and charges that are
+    /// neither unknowns nor time, sorted by id.
     pub fn params(&self, ctx: &Graph) -> Vec<SymbolId> {
-        // The residuals, the delay times (parameters even though they appear
+        // The currents and charges, the delay times (parameters even though they appear
         // only in the delay registry) and the switching surfaces (which may
         // reference a parameter nothing else does), in one walk.
         let roots: Vec<ExprId> = self
-            .residuals
+            .currents
             .iter()
+            .chain(&self.charges)
             .copied()
             .chain(self.delays.iter().map(|dl| dl.tau))
             .chain(self.events.iter().map(|ev| ev.g))
             .collect();
         let mut all = ctx.free_symbols_in(&roots);
         for s in &self.x {
-            all.remove(s);
-        }
-        for s in self.xdot.iter().flatten() {
             all.remove(s);
         }
         all.remove(&self.t);
@@ -418,10 +362,10 @@ impl Dae {
     }
 
     /// Derive a new DAE with `fold` (parameter symbol -> constant) substituted into
-    /// every residual, stamp and noise PSD. Because substitution rebuilds through
+    /// every current, charge, stamp and noise PSD. Because substitution rebuilds through
     /// the smart constructors, the now-constant subexpressions collapse; the folded
     /// symbols are no longer free, so they drop out of [`params`](Self::params).
-    /// The unknown structure (`x`/`xdot`/`t`/`unknowns`) and the numeric companion
+    /// The unknown structure (`x`/`t`/`unknowns`) and the numeric companion
     /// and limit tables are unchanged -- folding a coefficient preserves the
     /// topology and sparsity. This is the graph-transform core of parameter fold,
     /// in the same family as `linearize` / `eliminate_nodes`.
@@ -432,13 +376,11 @@ impl Dae {
         let map: rustc_hash::FxHashMap<SymbolId, ExprId> =
             fold.iter().map(|&(s, v)| (s, ctx.konst_f64(v))).collect();
         let fold = &map;
-        let residuals = self
-            .residuals
-            .iter()
-            .map(|&r| rsdag::substitute(ctx, &[r], fold)[0])
-            .collect();
-        let noise_sources = self
-            .noise_sources
+        let currents = rsdag::substitute(ctx, &self.currents, fold);
+        let charges = rsdag::substitute(ctx, &self.charges, fold);
+        let flat = self.observers.flatten(ctx);
+        let noise = flat
+            .noise
             .iter()
             .map(|n| NoiseSource {
                 hi: n.hi,
@@ -448,7 +390,7 @@ impl Dae {
                 table: n.table.clone(),
             })
             .collect();
-        let op_vars = self
+        let op_vars = flat
             .op_vars
             .iter()
             .map(|v| sane_device::OpVar {
@@ -457,7 +399,8 @@ impl Dae {
             })
             .collect();
         Dae {
-            residuals,
+            currents,
+            charges,
             n_nodes: self.n_nodes,
             param_defaults: self.param_defaults.clone(),
             events: self
@@ -479,11 +422,9 @@ impl Dae {
             unknowns: self.unknowns.clone(),
             kinds: self.kinds.clone(),
             x: self.x.clone(),
-            xdot: self.xdot.clone(),
             t: self.t,
             companion: self.companion.clone(),
-            noise_sources,
-            op_vars,
+            observers: Observers::flat(noise, op_vars),
             dc_seeds: self.dc_seeds.clone(),
             limits: self.limits.clone(),
             sources: self.sources.clone(),
@@ -493,79 +434,15 @@ impl Dae {
     }
 }
 
-/// Small-signal AC system matrix `A(s) = dF/dx + s * dF/dx'` -- the Laplace-domain
-/// linearisation of the DAE at its operating point. For a linear circuit this is
-/// the usual `G + sC` MNA matrix; for a nonlinear one the entries are the
-/// symbolic small-signal stamps (gm, gds, junction caps) in terms of the
-/// operating-point unknowns and device parameters.
-pub fn small_signal_matrix(ctx: &mut Graph, dae: &Dae) -> Vec<Vec<ExprId>> {
-    let s = ctx.sym("s");
-    let jx = dae.jacobian_x(ctx);
-    let jxd = dae.jacobian_xdot(ctx);
-    let n = dae.dim();
-    let zero = ctx.zero();
-    let mut a = vec![vec![zero; n]; n];
-    for i in 0..n {
-        for j in 0..n {
-            let s_jxd = ctx.mul(s, jxd[i][j]);
-            a[i][j] = ctx.add(jx[i][j], s_jxd);
-        }
-    }
-    a
-}
-
-/// Small-signal transfer function `H(s) = X(output) / In`, where `input` is the
-/// name of an independent-source parameter (the AC excitation) and `output` is
-/// an unknown name (e.g. `"v2"`). Solved by Cramer's rule on `A(s)`. Returns
-/// `None` if the output unknown is not found.
-pub fn small_signal_transfer(
-    ctx: &mut Graph,
-    dae: &Dae,
-    input: &str,
-    output: &str,
-) -> Option<ExprId> {
-    let (num, den) = small_signal_transfer_nd(ctx, dae, input, output)?;
-    Some(ctx.div(num, den))
-}
-
-/// Like [`small_signal_transfer`] but returns the numerator and denominator
-/// determinants `(N(s), D(s))` separately (both polynomials in `s` with symbolic
-/// coefficients), for symbolic term-pruning model reduction.
-pub fn small_signal_transfer_nd(
-    ctx: &mut Graph,
-    dae: &Dae,
-    input: &str,
-    output: &str,
-) -> Option<(ExprId, ExprId)> {
-    let col = dae.unknowns.iter().position(|u| u == output)?;
-    let (_, input_sym) = sym2(ctx, input);
-
-    // Excitation vector b = -dF/d(input): the source moved to the RHS.
-    let mut b = Vec::with_capacity(dae.dim());
-    for &r in &dae.residuals {
-        let d = differentiate(ctx, r, input_sym);
-        b.push(ctx.neg(d));
-    }
-
-    let a = small_signal_matrix(ctx, dae);
-    let det_a = determinant(ctx, &a);
-    let mut a_b = a.clone();
-    for (row, b_row) in b.iter().enumerate() {
-        a_b[row][col] = *b_row;
-    }
-    let det_b = determinant(ctx, &a_b);
-    Some((det_b, det_a))
-}
-
 /// A sparse block as `(rows, cols, exprs)`.
 pub type Coo = (Vec<usize>, Vec<usize>, Vec<ExprId>);
 
-/// `rsdag::sparse_jacobian` of `residuals` over the symbols of `cols`, each
+/// `rsdag::sparse_jacobian` of `rows` over the symbols of `cols`, each
 /// column labelled with its paired index.
-pub(crate) fn coo(ctx: &mut Graph, residuals: &[ExprId], cols: &[(usize, SymbolId)]) -> Coo {
+pub(crate) fn coo(ctx: &mut Graph, rows: &[ExprId], cols: &[(usize, SymbolId)]) -> Coo {
     let wrt: Vec<SymbolId> = cols.iter().map(|&(_, s)| s).collect();
     let mut out = Coo::default();
-    for (i, row) in sparse_jacobian(ctx, residuals, &wrt)
+    for (i, row) in sparse_jacobian(ctx, rows, &wrt)
         .into_iter()
         .enumerate()
     {

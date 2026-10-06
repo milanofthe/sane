@@ -64,7 +64,7 @@ fn analyggym_specs() -> Vec<(String, String, String)> {
         .iter()
         .map(|a| {
             (
-                format!("paper/figures/data/_sane_{a}.cir"),
+                format!("benchmarks/.scratch/sane_{a}.cir"),
                 "Vin".to_string(),
                 "vout".to_string(),
             )

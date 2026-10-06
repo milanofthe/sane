@@ -82,14 +82,14 @@ pub(crate) struct CallSite {
     pub(crate) dst: u32,
     pub(crate) bundle: u32,
     pub(crate) args: Vec<u32>,
+    /// The argument each of an instance's operands is, when the call
+    /// gathers only some (see [`rsdag::tape::Op::Call`]).
+    pub(crate) positions: Option<Vec<u32>>,
     pub(crate) n_groups: u32,
     pub(crate) n_args: u32,
     pub(crate) n_out: u32,
     pub(crate) kind: CallKind,
     pub(crate) state: u32,
-    pub(crate) state_len: u32,
-    /// Several instances through the bundle's own batch entry.
-    pub(crate) batch: bool,
     /// Where in the gather area its arguments go: apart from the other
     /// calls of its stage.
     pub(crate) gather_at: usize,
@@ -107,6 +107,15 @@ pub(crate) enum StageRole {
     Alone,
     Deferred,
     Last(u32),
+}
+
+/// Integer powers up to this exponent are emitted as their products.
+pub(crate) const POWI_INLINE: u32 = 64;
+
+/// Whether `x^n` is emitted inline (as `semantics::powi_t` multiplies,
+/// product for product) rather than through the host.
+pub(crate) fn powi_inline(n: i32) -> bool {
+    n != 0 && n.unsigned_abs() <= POWI_INLINE
 }
 
 /// A dense operand: a run of inputs or of work slots read in place, or
@@ -211,7 +220,7 @@ impl ROp {
                 _ => crate::host::unary_addr(*op).0,
             },
             ROp::Binary(..) => crate::host::h_binary as *const (),
-            ROp::Powi(_, _, n) if *n != -1 && *n != 2 => crate::host::h_powi as *const (),
+            ROp::Powi(_, _, n) if !powi_inline(*n) => crate::host::h_powi as *const (),
             ROp::Reduce(_, ReduceOp::Min | ReduceOp::Max, _) => crate::host::h_reduce as *const (),
             ROp::Call(..) => crate::host::h_call as *const (),
             ROp::Kernel(..) => crate::host::h_kernel as *const (),
@@ -223,7 +232,7 @@ impl ROp {
     pub(crate) fn gather_len(&self) -> usize {
         match self {
             ROp::Reduce(_, ReduceOp::Min | ReduceOp::Max, args) => args.len(),
-            ROp::Call(c) => c.gather_at + c.args.len(),
+            ROp::Call(c) => c.gather_at + (c.n_groups * c.n_args) as usize,
             ROp::Kernel(k) => k.operands.iter().map(|(d, _)| d.gathered()).sum(),
             _ => 0,
         }
@@ -314,26 +323,19 @@ pub(crate) fn record(tape: &Tape) -> (Vec<ROp>, usize) {
     };
     let mut ops = Vec::with_capacity(tape.n_ops());
     let mut split = 0;
-    // The stage op `i` is in, and the gather offset of its next call.
+    // The stage op `i` is in.
     let stages = tape.stages();
     let mut si = 0;
-    let mut stage_at = 0usize;
-    let mut role = |i: usize, n_args: usize| -> (StageRole, usize) {
+    let mut role = |i: usize| -> StageRole {
         while si < stages.len() && stages[si].hi as usize <= i {
             si += 1;
         }
         match stages.get(si) {
-            Some(st) if st.lo as usize <= i => {
-                let at = stage_at;
-                stage_at += n_args;
-                if i + 1 == st.hi as usize {
-                    stage_at = 0;
-                    (StageRole::Last(st.hi - st.lo), at)
-                } else {
-                    (StageRole::Deferred, at)
-                }
+            Some(st) if st.lo as usize <= i && i + 1 == st.hi as usize => {
+                StageRole::Last(st.hi - st.lo)
             }
-            _ => (StageRole::Alone, 0),
+            Some(st) if st.lo as usize <= i => StageRole::Deferred,
+            _ => StageRole::Alone,
         }
     };
     let body_ops = |i: usize, b: u32, ng: u32| {
@@ -363,14 +365,19 @@ pub(crate) fn record(tape: &Tape) -> (Vec<ROp>, usize) {
                 start,
                 n_groups,
                 n_args,
+                n_in,
+                reads,
                 n_out,
                 state,
+                args,
             } => {
-                let (stage, gather_at) = role(i, (n_groups * n_args) as usize);
+                let stage = role(i);
                 ROp::Call(CallSite {
                     dst,
                     bundle,
-                    args: tape.pool(start, n_groups * n_args).to_vec(),
+                    args: tape.pool(start, n_groups * n_in).to_vec(),
+                    positions: (reads != rsdag::tape::ALL_ARGS)
+                        .then(|| tape.pool(reads, n_in).to_vec()),
                     n_groups,
                     n_args,
                     n_out,
@@ -380,9 +387,7 @@ pub(crate) fn record(tape: &Tape) -> (Vec<ROp>, usize) {
                         CallKind::Main
                     },
                     state: if state == NO_STATE { 0 } else { state },
-                    state_len: tape.bundles()[bundle as usize].state_len() as u32,
-                    batch: n_groups > 1,
-                    gather_at,
+                    gather_at: args as usize,
                     stage,
                     ops: body_ops(i, bundle, n_groups),
                 })
@@ -392,21 +397,21 @@ pub(crate) fn record(tape: &Tape) -> (Vec<ROp>, usize) {
                 start,
                 n_groups,
                 n_pure,
+                args,
             } => {
                 let state_len = tape.bundles()[bundle as usize].state_len() as u32;
-                let (stage, gather_at) = role(i, (n_groups * n_pure) as usize);
+                let stage = role(i);
                 ROp::Call(CallSite {
                     dst,
                     bundle,
                     args: tape.pool(start, n_groups * n_pure).to_vec(),
+                    positions: None,
                     n_groups,
                     n_args: n_pure,
                     n_out: state_len,
                     kind: CallKind::Prolog,
                     state: dst,
-                    state_len,
-                    batch: n_groups > 1,
-                    gather_at,
+                    gather_at: args as usize,
                     stage,
                     ops: body_ops(i, bundle, n_groups),
                 })

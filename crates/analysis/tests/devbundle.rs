@@ -45,15 +45,15 @@ fn instances_call_one_function() {
     // which nothing calls; what matters here is that the three instances call
     // one and the same device function.
     let called: std::collections::BTreeSet<_> = ctx
-        .free_calls_in(&dae.residuals)
+        .free_calls_in(&dae.currents)
         .into_iter()
         .map(|o| ctx.output(o).0)
         .collect();
     assert_eq!(called.len(), 1, "one template function");
-    let calls = ctx.free_calls_in(&dae.residuals);
-    assert!(!calls.is_empty(), "residuals call the function");
+    let calls = ctx.free_calls_in(&dae.currents);
+    assert!(!calls.is_empty(), "the currents call the function");
     let mut arg_lists = std::collections::BTreeSet::new();
-    let mut stack = dae.residuals.clone();
+    let mut stack = dae.currents.clone();
     let mut seen = std::collections::HashSet::new();
     while let Some(e) = stack.pop() {
         if !seen.insert(e) {
@@ -81,7 +81,7 @@ fn dc_scalar_vs_bundled_branches_agree() {
 }
 
 /// Transient: the bundled branches track the scalar branch through a sine
-/// drive (charge storage included, so the Jacobian xdot path is exercised).
+/// drive (charge storage included, so the charge Jacobian is exercised).
 #[test]
 fn transient_scalar_vs_bundled_branches_agree() {
     let model = Model::from_netlist(&three_branch_deck("SIN(0.6 0.3 1Meg)")).expect("model");
@@ -161,7 +161,7 @@ fn called_functions(model: &Model) -> usize {
     let dae = model.dae();
     let ctx = model.context_arc();
     let ctx = ctx.lock().unwrap();
-    ctx.free_calls_in(&dae.residuals)
+    ctx.free_calls_in(&dae.currents)
         .into_iter()
         .map(|o| ctx.output(o).0)
         .collect::<std::collections::BTreeSet<_>>()

@@ -27,9 +27,9 @@ use crate::field::Field;
 use std::sync::Arc;
 
 use crate::extern_fn::ExternBundle;
-use crate::func::{FuncId, Function, Output};
+use crate::func::{FuncId, Function, Output, OutputId};
 use crate::graph::Graph;
-use crate::node::{ExprId, Node, SymbolId};
+use crate::node::{ArgList, ExprId, Node, SymbolId};
 use crate::role::{OutputRole, ParamRole};
 
 /// A function as data: no body binding, no derivative memo.
@@ -66,12 +66,16 @@ pub struct Module<K> {
     pub funcs: Vec<FunctionData>,
     /// The `(function, output)` pairs the `Call` nodes name, in id order.
     pub call_outputs: Vec<(FuncId, u32)>,
+    /// Per entry of `call_outputs`, the context its calls run in (see
+    /// [`Graph::bind`]): the bound parameters and the list of their
+    /// expressions; `None` for none.
+    pub call_contexts: Vec<Option<(Vec<u32>, ArgList)>>,
 }
 
 /// The current [`Module::version`]. Bump it when the meaning of an existing
 /// node changes; adding a variant at the end of an enum does not need it,
 /// because an older reader fails on the unknown discriminant anyway.
-pub const MODULE_VERSION: u32 = 1;
+pub const MODULE_VERSION: u32 = 2;
 
 /// Why a module cannot be loaded. A module is data from outside (a file, a
 /// cache, another process), so the loader checks it whole before it builds
@@ -111,6 +115,21 @@ impl std::fmt::Display for ModuleError {
 impl std::error::Error for ModuleError {}
 
 impl<K> Module<K> {
+    /// The module with its constants in another field: the graph in exact
+    /// rationals, the doubles every execution type starts from.
+    pub fn map_consts<L>(self, f: impl FnMut(&K) -> L) -> Module<L> {
+        Module {
+            version: self.version,
+            nodes: self.nodes,
+            consts: self.consts.iter().map(f).collect(),
+            arg_pool: self.arg_pool,
+            symbols: self.symbols,
+            funcs: self.funcs,
+            call_outputs: self.call_outputs,
+            call_contexts: self.call_contexts,
+        }
+    }
+
     /// Check that every id the module holds names something that is there
     /// and, for a node's operands, precedes it; and that every operand list
     /// has a length its node can have. A module that passes loads without
@@ -160,9 +179,28 @@ impl<K> Module<K> {
             }
             ready.push(at);
         }
-        for &(f, k) in &self.call_outputs {
+        if self.call_contexts.len() != self.call_outputs.len() {
+            return Err(ModuleError::Function {
+                func: 0,
+                what: "the call contexts do not match the call outputs",
+            });
+        }
+        for (&(f, k), c) in self.call_outputs.iter().zip(&self.call_contexts) {
             match self.funcs.get(f.0 as usize) {
-                Some(data) if (k as usize) < data.outputs.len() => {}
+                Some(data) if (k as usize) < data.outputs.len() => {
+                    let fits = c.as_ref().is_none_or(|(at, l)| {
+                        at.len() == l.len as usize
+                            && at.windows(2).all(|w| w[0] < w[1])
+                            && at.iter().all(|&p| (p as usize) < data.params.len())
+                            && (l.start + l.len) as usize <= self.arg_pool.len()
+                    });
+                    if !fits {
+                        return Err(ModuleError::Function {
+                            func: f.0 as usize,
+                            what: "a call context binds parameters that are not there",
+                        });
+                    }
+                }
                 _ => {
                     return Err(ModuleError::Function {
                         func: f.0 as usize,
@@ -220,7 +258,10 @@ impl<K> Module<K> {
                                 return dangling("call output");
                             };
                             let data = &self.funcs[f.0 as usize];
-                            if data.params.len() != n {
+                            let bound = self.call_contexts[o.0 as usize]
+                                .as_ref()
+                                .map_or(0, |(at, _)| at.len());
+                            if data.params.len() != n + bound {
                                 return shape("call with another argument count than its function");
                             }
                             // The loader defines the callee here with the
@@ -284,6 +325,14 @@ impl<K: Field> Graph<K> {
                 })
                 .collect(),
             call_outputs: self.call_outputs_slice().to_vec(),
+            call_contexts: (0..self.call_outputs_slice().len())
+                .map(|o| {
+                    self.context(OutputId(o as u32)).map(|(at, _)| {
+                        let c = self.context_of(OutputId(o as u32));
+                        (at.to_vec(), self.context_list(c))
+                    })
+                })
+                .collect(),
         }
     }
 
@@ -376,7 +425,20 @@ impl<K: Field> Graph<K> {
                 Node::Call(o, _) => {
                     let (f, k) = module.call_outputs[o.0 as usize];
                     let id = self.sync_loaded(module, f, &mut map, &bodies);
-                    self.call(id, k, &ops)
+                    match &module.call_contexts[o.0 as usize] {
+                        None => self.call(id, k, &ops),
+                        Some((at, l)) => {
+                            let exprs =
+                                &module.arg_pool[l.start as usize..(l.start + l.len) as usize];
+                            let pairs: Vec<(u32, ExprId)> = at
+                                .iter()
+                                .zip(exprs)
+                                .map(|(&p, x)| (p, map.exprs[x.0 as usize]))
+                                .collect();
+                            let b = self.bind(id, &pairs);
+                            self.call_bound(b, k, &ops)
+                        }
+                    }
                 }
                 _ => self.intern_over(*node, &ops),
             };

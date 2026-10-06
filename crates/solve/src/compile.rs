@@ -31,15 +31,17 @@ impl CompiledDc {
         // ~3x slower at n=1e4). The `set_parallelism` knob remains for opt-in
         // experimentation; real throughput parallelism belongs at the outer
         // loop (frequency / tolerance sweeps), not the inner LU.
-        // The symbolic Jacobians in x and x', one sparse Jacobian over both.
+        // Every row reads `I(x, t) + d/dt Q(x)`: the currents and charges,
+        // and their Jacobians `G = dI/dx` and `C = dQ/dx`, one sparse
+        // Jacobian over both.
         let ((jr, jc, je), (xr, xc, xe)) =
-            time_stage!(prof, "jac_x_xdot_coo", dae.jacobian_x_xdot_coo(ctx));
+            time_stage!(prof, "jac_iq_coo", dae.jacobian_iq_coo(ctx));
         let param_syms = time_stage!(prof, "params", dae.params(ctx));
 
         // The system as a function with roles; every program over it takes
-        // its inputs in the function's signature: x, the differential xdot,
-        // the parameters, t, the delay histories. The solver also reads what
-        // a guard is, and which way it has to cross, off the roles.
+        // its inputs in the function's signature: x, the parameters, t, the
+        // delay histories. The solver also reads what a guard is, and which
+        // way it has to cross, off the roles.
         let sys = time_stage!(prof, "register", dae.register_function(ctx, "dae"));
         let sig = rsdag::Signature::of(ctx.func(sys));
         let input_syms = sig.syms.clone();
@@ -49,7 +51,6 @@ impl CompiledDc {
             .iter()
             .map(|r| match *r {
                 rsdag::ParamRole::State { id } => InputSrc::X(id as usize),
-                rsdag::ParamRole::StateDot { id } => InputSrc::Xdot(id as usize),
                 rsdag::ParamRole::Param => {
                     n_param += 1;
                     InputSrc::P(n_param - 1)
@@ -70,11 +71,9 @@ impl CompiledDc {
         let kinds = dae.unknown_kinds();
         debug_assert_eq!(kinds.len(), dae.dim());
 
-        let mut step_roots = dae.residuals.clone();
-        step_roots.extend(je.iter().copied());
         // Tape compilation is the biggest extraction stage on large circuits, and
-        // the three passes are independent (`Tape::compile` only reads `&Graph`),
-        // so they are embarrassingly parallel. They are kept *sequential* on
+        // the passes are independent (`Tape::compile` only reads `&Graph`), so
+        // they are embarrassingly parallel. They are kept *sequential* on
         // purpose: the pass is allocation-bound, and parallelising it under the OS
         // allocator's global lock measured ~4.5x *slower* on the IBM grids. The
         // robust extraction speedup is the allocator itself (the SANE Python module
@@ -86,10 +85,6 @@ impl CompiledDc {
         // preprocessing, bin interpolation, temperature scalings) hoists into a
         // prefix the Newton loops evaluate once per parameter binding.
         let pure_inputs = sig.pure_mask();
-        // Instance batching, phase 2: rebind the union (outputs + partial
-        // markers) for the Jacobian-bearing tapes. `tape_res` above keeps the
-        // residual-only body it interned; both bodies compute identical bits
-        // for the shared outputs (same DAG nodes, per-op deterministic).
         let guards = ctx
             .func(sys)
             .outputs_with_role(|r| matches!(r, rsdag::OutputRole::Guard { .. }));
@@ -107,90 +102,45 @@ impl CompiledDc {
                 _ => unreachable!("selected by role"),
             })
             .collect();
-        // The hot loops -- every DC Newton and the transient stages -- run at
-        // x' = 0: their tapes take the derivatives as zero and every call
-        // specialized to that, one pass over the residuals and the Jacobian
-        // entries so each constant pattern gets one copy of its body.
-        let zero = ctx.zero();
-        let at_rest: rustc_hash::FxHashMap<rsdag::SymbolId, ExprId> = input_syms
-            .iter()
-            .zip(&sig.roles)
-            .filter(|(_, r)| matches!(r, rsdag::ParamRole::StateDot { .. }))
-            .map(|(&s, _)| (s, zero))
+        // The programs, one per way an analysis evaluates the system: the DC
+        // Newton `I` and `I ++ G`, the transient (and harmonic balance) `I ++ Q`
+        // and `I ++ Q ++ G ++ C`, and `C` alone for the state rates. They
+        // compile the hierarchy as it stands: a subcircuit body is a template
+        // appended per instance, and the device calls of every instance run as
+        // one batch, as in a flat circuit; everything symbolic stays on the
+        // hierarchy.
+        let n_rows = dae.currents.len();
+        let tran: Vec<ExprId> = (dae.currents.iter().chain(&dae.charges))
+            .chain(&je)
+            .chain(&xe)
+            .copied()
             .collect();
-        let step_dc = time_stage!(prof, "specialize_dc", {
-            let rest = rsdag::substitute(ctx, &step_roots, &at_rest);
-            ctx.specialize_calls(&rest)
-        });
-        // The programs see no boundary but the device bodies: the composite
-        // functions (subcircuit bodies) inlined, so the device calls of every
-        // instance batch together, as in a flat circuit; everything symbolic
-        // above stays on the hierarchy.
+        let step_dc: Vec<ExprId> = dae.currents.iter().chain(&je).copied().collect();
         let taus: Vec<ExprId> = dae.delays.iter().map(|dl| dl.tau).collect();
-        let flat = time_stage!(prof, "inline", {
-            let roots: Vec<ExprId> = step_roots
-                .iter()
-                .chain(&step_dc)
-                .chain(&xe)
-                .chain(&event_roots)
-                .chain(&taus)
-                .copied()
-                .collect();
-            ctx.inline_composite(&roots)
-        });
-        let (step_roots, flat) = flat.split_at(step_roots.len());
-        let (step_dc, flat) = flat.split_at(step_dc.len());
-        let (xe_flat, flat) = flat.split_at(xe.len());
-        let (event_roots, taus) = flat.split_at(event_roots.len());
-        let residuals = &step_roots[..dae.residuals.len()];
-        let tape_tau = (!taus.is_empty()).then(|| Tape::compile(ctx, taus, &param_syms));
-        let tape_res = time_stage!(
+        let compile = |ctx: &mut Graph, roots: &[ExprId]| {
+            crate::eval::step_eval(Tape::compile_split(ctx, roots, &input_syms, &pure_inputs))
+        };
+        let tape_tau = (!taus.is_empty()).then(|| Tape::compile(ctx, &taus, &param_syms));
+        let tape_res_dc = time_stage!(prof, "tape_res_dc", compile(ctx, &dae.currents));
+        let tape_step_dc = time_stage!(prof, "tape_step_dc", compile(ctx, &step_dc));
+        let tape_tran_res = time_stage!(prof, "tape_tran_res", compile(ctx, &tran[..2 * n_rows]));
+        let tape_tran_step = time_stage!(prof, "tape_tran_step", compile(ctx, &tran));
+        let tape_c = time_stage!(
             prof,
-            "tape_res",
-            crate::eval::step_eval(Tape::compile_split(ctx, residuals, &input_syms, &pure_inputs))
-        );
-        let tape_step = time_stage!(
-            prof,
-            "tape_step",
-            crate::eval::step_eval(Tape::compile_split(
-                ctx,
-                step_roots,
-                &input_syms,
-                &pure_inputs
-            ))
-        );
-        let res_dc = &step_dc[..dae.residuals.len()];
-        let tape_res_dc = time_stage!(
-            prof,
-            "tape_res_dc",
-            crate::eval::step_eval(Tape::compile_split(ctx, res_dc, &input_syms, &pure_inputs))
-        );
-        let tape_step_dc = time_stage!(
-            prof,
-            "tape_step_dc",
-            crate::eval::step_eval(Tape::compile_split(
-                ctx,
-                step_dc,
-                &input_syms,
-                &pure_inputs
-            ))
-        );
-        let tape_jxd = time_stage!(
-            prof,
-            "tape_jxd",
-            crate::eval::step_eval(Tape::compile(ctx, xe_flat, &input_syms))
+            "tape_c",
+            crate::eval::step_eval(Tape::compile(ctx, &xe, &input_syms))
         );
         // The switching surfaces, evaluated once per candidate transient step.
         let tape_event = (!event_roots.is_empty()).then(|| {
             time_stage!(
                 prof,
                 "tape_event",
-                Tape::compile(ctx, event_roots, &input_syms)
+                Tape::compile(ctx, &event_roots, &input_syms)
             )
         });
         let event_names: Vec<String> = dae.events.iter().map(|e| e.name.clone()).collect();
 
-        // The parameter Jacobian dF/dp and the Lagrangian-Hessian are only needed
+        // The parameter Jacobians and the Lagrangian-Hessian are only needed
         // for sensitivity / second-order sensitivity, and both are heavy at scale,
         // so they are built lazily (see `ensure_param_jac` / `ensure_hessian`).
         // Keep the base input symbols so they can be compiled on demand.
@@ -206,8 +156,8 @@ impl CompiledDc {
         // form the nonlinear block V; the rest are the linear block L.
         // Classify every jx nonzero as constant (LTI) or variable (device) once;
         // both the Schur partition below and harmonic balance read this.
-        // "Variable" = not constant along a waveform: depends on x, x', or t
-        // (an entry depending only on parameters is solve-constant). Harmonic
+        // "Variable" = not constant along a waveform: depends on x or t (an
+        // entry depending only on parameters is solve-constant). Harmonic
         // balance keeps constant entries frequency-diagonal instead of dense
         // Toeplitz blocks; the Schur partition treats variable entries as the
         // nonlinear block.
@@ -215,11 +165,10 @@ impl CompiledDc {
             .x
             .iter()
             .copied()
-            .chain(dae.xdot.iter().flatten().copied())
             .chain(std::iter::once(dae.t))
             .collect();
-        // Same classification for the jxd nonzeros (charge storage): a linear
-        // capacitor's dC entry is constant, so its harmonic block stays diagonal.
+        // Same classification for the C nonzeros (charge storage): a linear
+        // capacitor's entry is constant, so its harmonic block stays diagonal.
         let (jx_var, jxd_var): (Vec<bool>, Vec<bool>) = time_stage!(
             prof,
             "variable_entries",
@@ -236,7 +185,7 @@ impl CompiledDc {
             if jx_var.iter().any(|&v| v) {
                 let mut terms: Vec<ExprId> = Vec::new();
                 let mut rows: Vec<(usize, usize)> = Vec::with_capacity(n_nodes);
-                for &r in residuals.iter().take(n_nodes) {
+                for &r in dae.currents.iter().take(n_nodes) {
                     let start = terms.len();
                     match ctx.node(r) {
                         Node::Reduce(ReduceOp::Sum, l) => terms.extend_from_slice(ctx.args(*l)),
@@ -343,25 +292,17 @@ impl CompiledDc {
             diag_idx,
             jxd_rows: xr,
             jxd_cols: xc,
-            tape_step,
-            tape_res,
             tape_step_dc,
             tape_res_dc,
-            tape_jxd,
+            tape_tran_res,
+            tape_tran_step,
+            tape_c,
             pjac: std::sync::OnceLock::new(),
             input_x_slots: input_src
                 .iter()
                 .enumerate()
                 .filter_map(|(d, s)| match s {
                     InputSrc::X(i) => Some((d as u32, *i as u32)),
-                    _ => None,
-                })
-                .collect(),
-            input_xdot_slots: input_src
-                .iter()
-                .enumerate()
-                .filter_map(|(d, s)| match s {
-                    InputSrc::Xdot(i) => Some((d as u32, *i as u32)),
                     _ => None,
                 })
                 .collect(),

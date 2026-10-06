@@ -12,7 +12,6 @@ rustc-hash.workspace = true
 sane-core.workspace = true
 sane-mna.workspace = true
 sane-dae = { path = "../dae" }
-sane-export = { path = "../export" }
 sane-netlist = { path = "../netlist" }
 sane-solve = { path = "../solve", default-features = false }
 num-complex.workspace = true

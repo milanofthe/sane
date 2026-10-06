@@ -88,14 +88,15 @@ impl DeviceModel for CSwitch {
         &self,
         lo: &mut Lowerer,
         terminal_v: &[ExprId],
-        _terminal_vdot: &[ExprId],
         control_i: &[ExprId],
     ) -> BehavioralFragment {
         let (terminal_currents, events) = self.lower(lo.ctx(), terminal_v, control_i);
         BehavioralFragment {
             param_syms: Vec::new(),
             terminal_currents,
-            residuals: Vec::new(),
+            currents: Vec::new(),
+            terminal_charges: Vec::new(),
+            charges: Vec::new(),
             noise: Vec::new(),
             events,
             op_vars: Vec::new(),

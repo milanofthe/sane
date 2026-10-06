@@ -458,13 +458,13 @@ mod bsim4_validation {
             .unwrap_or_default()
     }
 
-    // The relaxed BSIM4 .va bundled with the paper corpus (a test asset, not
+    // The relaxed BSIM4 .va bundled with the benchmark corpus (a test asset, not
     // shipped with the engine). Used to validate that a raw, level=54 SPICE
     // `.model` card -- the form PDKs actually ship -- imports natively via the
     // `M` element + `.model_alias`, with no external Python flattener.
     fn bundled_va() -> String {
         format!(
-            "{}/../../paper/benchmarks/models/bsim4/bsim4.va",
+            "{}/../../benchmarks/corpus/models/bsim4/bsim4.va",
             env!("CARGO_MANIFEST_DIR")
         )
     }
@@ -613,7 +613,7 @@ mod bsim4_validation {
     #[ignore]
     fn ekv_native_level_routing_conducts() {
         let va = format!(
-            "{}/../../paper/benchmarks/models/ekv/vacode/ekv26.va",
+            "{}/../../benchmarks/corpus/models/ekv/vacode/ekv26.va",
             env!("CARGO_MANIFEST_DIR")
         );
         if !std::path::Path::new(&va).exists() {
@@ -665,7 +665,7 @@ mod bsim4_validation {
 
     fn analoggym_dir() -> String {
         format!(
-            "{}/../../paper/benchmarks/circuits/analoggym",
+            "{}/../../benchmarks/corpus/circuits/analoggym",
             env!("CARGO_MANIFEST_DIR")
         )
     }

@@ -21,9 +21,8 @@ fn currents(
 ) -> Vec<ExprId> {
     let dev = builtin_device(module, inst, fold_params);
     let term_v: Vec<ExprId> = terms.iter().map(|n| ctx.sym(n)).collect();
-    let term_vdot: Vec<ExprId> = terms.iter().map(|n| ctx.sym(&format!("{n}_dot"))).collect();
     let mut lo = Lowerer::new(ctx);
-    dev.lower_behavioral(&mut lo, &term_v, &term_vdot, &[])
+    dev.lower_behavioral(&mut lo, &term_v, &[])
         .terminal_currents
 }
 

@@ -143,7 +143,8 @@ pub(crate) fn limit_step(limits: &[Limit], x: &[f64], step: &mut [f64]) -> f64 {
 /// below `fnorm`; when every probe fails the last, smallest fraction is taken
 /// anyway (the direction is still a descent direction of the linear model).
 /// Real or complex iterates and steps; `trial` is the caller's scratch of
-/// `x`'s length.
+/// `x`'s length. The last probe `eval_norm` sees is the returned iterate,
+/// so what it leaves behind (a residual) is the new iterate's.
 pub(crate) fn backtrack<T>(
     x: &mut [T],
     step: &[T],

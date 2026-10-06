@@ -95,7 +95,17 @@ fn copy<K: Field>(
             Node::Const(c) => out.konst(g.const_val(c).clone()),
             Node::Call(o, _) => {
                 let (f, k) = g.output(o);
-                out.call(f, k, &ops)
+                match g.context(o) {
+                    None => out.call(f, k, &ops),
+                    // the arguments, then the bound expressions copied
+                    Some((at, _)) => {
+                        let (args, bound) = ops.split_at(ops.len() - at.len());
+                        let pairs: Vec<(u32, ExprId)> =
+                            at.iter().copied().zip(bound.iter().copied()).collect();
+                        let b = out.bind(f, &pairs);
+                        out.call_bound(b, k, args)
+                    }
+                }
             }
             // Symbol ids are carried over unchanged.
             node => out.build(node, &ops),

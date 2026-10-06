@@ -563,12 +563,6 @@ impl Refactorable<'_> {
         }
         .is_some_and(|r| r.is_ok())
     }
-
-    /// [`solve_into`](Self::solve_into) a fresh vector.
-    pub fn solve(&mut self, rhs: &[f64]) -> Option<Vec<f64>> {
-        let mut x = vec![0.0; rhs.len()];
-        self.solve_into(rhs, &mut x).then_some(x)
-    }
 }
 
 /// A matrix entry [`dump_system`] can write in Matrix Market.
@@ -660,6 +654,11 @@ pub fn dump_system<T: DumpValue>(csc: &GeneralCsc<T>, rhs: &[T]) {
 mod tests {
     use super::*;
 
+    fn solved(fac: &mut Refactorable<'_>, b: &[f64]) -> Option<Vec<f64>> {
+        let mut x = vec![0.0; b.len()];
+        fac.solve_into(b, &mut x).then_some(x)
+    }
+
     #[test]
     fn pattern_sums_duplicates_and_solves() {
         // 2x2 with a duplicated (0,0) entry: values 1.5 + 0.5 must sum to 2.
@@ -669,7 +668,7 @@ mod tests {
         let pat = SparsePattern::new(2, &rows, &cols).expect("pattern");
         let mut fac = pat.factorizer();
         assert!(fac.factor(&[1.5, 0.5, 1.0, 3.0], true));
-        let x = fac.solve(&[5.0, 6.0]).expect("solve");
+        let x = solved(&mut fac, &[5.0, 6.0]).expect("solve");
         assert!(
             (x[0] - 1.5).abs() < 1e-14 && (x[1] - 2.0).abs() < 1e-14,
             "{x:?}"
@@ -683,14 +682,14 @@ mod tests {
         let pat = SparsePattern::new(2, &rows, &cols).expect("pattern");
         let mut fac = pat.factorizer();
         assert!(fac.factor(&[2.0, 1.0, 0.0, 3.0], true));
-        let x = fac.solve(&[5.0, 6.0]).expect("solve");
+        let x = solved(&mut fac, &[5.0, 6.0]).expect("solve");
         assert!(
             (x[0] - 1.5).abs() < 1e-14 && (x[1] - 2.0).abs() < 1e-14,
             "{x:?}"
         );
         // Same pattern, new values: the (refactored) solve must track them.
         assert!(fac.factor(&[4.0, 2.0, 0.0, 6.0], true));
-        let x = fac.solve(&[10.0, 12.0]).expect("solve2");
+        let x = solved(&mut fac, &[10.0, 12.0]).expect("solve2");
         assert!(
             (x[0] - 1.5).abs() < 1e-14 && (x[1] - 2.0).abs() < 1e-14,
             "{x:?}"
@@ -752,7 +751,7 @@ mod tests {
         let mut fac = pat.factorizer();
         assert!(fac.factor(&sym_vals, true));
         assert_eq!(fac.active, Backend::Ldlt);
-        let x = fac.solve(&b).expect("solve");
+        let x = solved(&mut fac, &b).expect("solve");
         let err = x.iter().map(|v| (v - 1.0).abs()).fold(0.0f64, f64::max);
         assert!(err < 1e-10, "max err {err:e}");
 
@@ -769,7 +768,7 @@ mod tests {
             Backend::Ldlt,
             "asymmetric values must not use LDLT"
         );
-        let x2 = fac.solve(&b2).expect("solve asym");
+        let x2 = solved(&mut fac, &b2).expect("solve asym");
         let err2 = x2.iter().map(|v| (v - 1.0).abs()).fold(0.0f64, f64::max);
         assert!(err2 < 1e-10, "max err {err2:e}");
 

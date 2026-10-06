@@ -1,32 +1,29 @@
 //! Discrete transient adjoint of a fixed-grid ESDIRK32 transient.
 //!
 //! Forward pass: one ESDIRK32 step per `t_eval` interval (no substepping, no
-//! error control), storing every implicit stage state. Writing the stage
-//! equations with the regularized residual `Φ(x, x', t) = F(x, x', p, t) +
-//! gmin·x`,
+//! error control), storing every implicit stage state. Every row reads
+//! `I(x, t) + d/dt Q(x)`; with the regularized currents `Ĩ = I + gmin·x` the
+//! stages integrate the charges,
 //!
-//!   Gᵢ = h·γ·Φ(Xᵢ, (Xᵢ − xₙ)/(hγ), tᵢ) − h·Σ_{j<i} aᵢⱼ·fⱼ = 0,  fⱼ = −Φ(Xⱼ, 0, tⱼ),
+//!   Gᵢ = (Q(Xᵢ) − Q(xₙ))/(hγ) + Ĩ(Xᵢ, tᵢ) + (1/γ)·Σ_{j<i} aᵢⱼ·Ĩ(Xⱼ, tⱼ) = 0,
 //!
 //! with `xₙ₊₁ = X_{S−1}` (stiffly accurate) and `X₀ = xₙ` (the explicit first
-//! stage). The slopes `f` live in residual space, the only form that survives
-//! the singular mass matrix of a genuine DAE. Every quantity is evaluated at
-//! its own stage point, so a state-dependent `dF/dx'` stays exact -- unlike
-//! [`crate::transient`], which freezes the mass matrix at the operating point.
+//! stage). The slopes `−Ĩ` live in residual space, the only form that
+//! survives the singular `C` of a genuine DAE, and the charge difference
+//! conserves charge exactly whatever `C(x)` does.
 //!
 //! Backward pass: the Lagrangian `L + Σₙ Σᵢ λᵢᵀ Gᵢ` is stationary, which runs
 //! the stages in REVERSE order -- a DIRK transposed is again triangular, so no
-//! coupled stage system appears. With `λ̃ᵢ = hγ·λᵢ`, `Mᵢ = dΦ/dx|(Xᵢ,wᵢ) +
-//! C(Xᵢ)/(hγ)` the stage matrix the forward Newton already factors, `Jⱼ =
-//! dΦ/dx|(Xⱼ,0)` and `σ̃ⱼ = Σ_{m>j} a_{mj}·λ̃ₘ`:
+//! coupled stage system appears. With `Mᵢ = C(Xᵢ)/(hγ) + J(Xᵢ)` the stage
+//! matrix the forward Newton already factors, `J = G + gmin` and
+//! `σⱼ = Σ_{m>j} a_{mj}·λₘ`:
 //!
-//!   Mᵢᵀ λ̃ᵢ = −[gₙ₊₁ + carry]·δ_{i,S−1} − Jᵢᵀ σ̃ᵢ / γ,        i = S−1 … 1
-//!   carry  = −Σᵢ C(Xᵢ)ᵀ λ̃ᵢ / (hγ) + J₀ᵀ σ̃₀ / γ              (→ step n−1)
-//!   dL/dp += Σᵢ (dΦ/dp)|(Xᵢ,wᵢ)ᵀ λ̃ᵢ + Σⱼ (dΦ/dp)|(Xⱼ,0)ᵀ σ̃ⱼ / γ
+//!   Mᵢᵀ λᵢ = −[gₙ₊₁ + carry]·δ_{i,S−1} − J(Xᵢ)ᵀ σᵢ / γ,        i = S−1 … 1
+//!   carry  = −C(xₙ)ᵀ Σᵢ λᵢ / (hγ) + J(xₙ)ᵀ σ₀ / γ              (→ step n−1)
+//!   dL/dp += Σᵢ λᵢᵀ [(dQ/dp(Xᵢ) − dQ/dp(xₙ))/(hγ) + dI/dp(Xᵢ)] + Σⱼ σⱼᵀ dI/dp(Xⱼ) / γ
 //!
-//! plus the operating-point shift through one DC transpose solve. For a single
-//! implicit stage (`γ = 1`, `S = 2`) this reduces term by term to the
-//! backward-Euler adjoint it replaces. The gradient is EXACT for this discrete
-//! trajectory -- the one
+//! plus the operating-point shift through one DC transpose solve. The
+//! gradient is EXACT for this discrete trajectory -- the one
 //! [`solve_transient_grid`](CompiledDc::solve_transient_grid) returns -- which
 //! is what a gradient-based optimizer differentiates.
 //!
@@ -105,7 +102,6 @@ impl CompiledDc {
             }
             x
         };
-        let zeros = vec![0.0; n];
         let mut states = Vec::with_capacity(t_eval.len());
         let mut traces = Vec::with_capacity(t_eval.len() - 1);
         states.push(x_init);
@@ -117,8 +113,9 @@ impl CompiledDc {
             let tn = t_eval[k - 1];
             let hg = h * ESDIRK32_GAMMA;
             let xn = states[k - 1].clone();
+            let qn = self.charges(&xn, p, tn);
             let mut slopes = vec![vec![0.0; n]; ESDIRK32_STAGES];
-            slopes[0] = self.neg_phi(&xn, &zeros, p, tn);
+            slopes[0] = self.neg_currents(&xn, p, tn);
             let mut stages: StepStages = Vec::with_capacity(ESDIRK32_STAGES - 1);
             let mut guess = xn.clone();
             for i in 1..ESDIRK32_STAGES {
@@ -133,8 +130,8 @@ impl CompiledDc {
                         }
                     }
                 }
-                let xi = self.grid_stage_newton(p, &xn, &guess, &psi, ti, hg)?;
-                slopes[i] = self.neg_phi(&xi, &zeros, p, ti);
+                let xi = self.grid_stage_newton(p, &qn, &guess, &psi, ti, hg)?;
+                slopes[i] = self.neg_currents(&xi, p, ti);
                 guess = xi.clone();
                 stages.push(xi);
             }
@@ -144,7 +141,7 @@ impl CompiledDc {
         Ok((states, traces))
     }
 
-    /// One implicit stage: `Φ(X, (X − xₙ)/(hγ), tᵢ) − ψ/(hγ) = 0` by full
+    /// One implicit stage: `(Q(X) − Q(xₙ) − ψ)/(hγ) + Ĩ(X, tᵢ) = 0` by full
     /// Newton (a fresh factorization per iterate).
     ///
     /// The tolerance is far tighter than the production stage tolerance: the
@@ -157,7 +154,7 @@ impl CompiledDc {
     fn grid_stage_newton(
         &self,
         p: &[f64],
-        xn: &[f64],
+        qn: &[f64],
         guess: &[f64],
         psi: &[f64],
         ti: f64,
@@ -166,13 +163,12 @@ impl CompiledDc {
         let n = self.n;
         let mut x = guess.to_vec();
         for _ in 0..IRK_STAGE_MAX_ITER {
-            let w: Vec<f64> = (0..n).map(|i| (x[i] - xn[i]) / hg).collect();
-            let mut r = self.phi(&x, &w, p, ti);
+            let (mut r, q) = self.currents_charges(&x, p, ti);
             for i in 0..n {
-                r[i] -= psi[i] / hg;
+                r[i] += GMIN_DC * x[i] + (q[i] - qn[i] - psi[i]) / hg;
             }
             let lu = self
-                .factor_stage(&x, &w, p, ti, hg)
+                .factor_stage(&x, p, ti, hg)
                 .ok_or_else(|| format!("solve_transient_grid: singular system at t={ti:.3e}"))?;
             let delta = lu
                 .solve(&r)
@@ -258,16 +254,11 @@ impl CompiledDc {
                 }
             };
             let stage_t = |i: usize| tn + ESDIRK32_C[i] * h;
-            // wᵢ = (Xᵢ − xₙ)/(hγ), the derivative argument the stage was solved at
-            let stage_w = |i: usize| -> Vec<f64> {
-                let xi = stage_x(i);
-                (0..n).map(|r| (xi[r] - xn[r]) / hg).collect()
-            };
 
             let mut lam = vec![vec![0.0; n]; s];
             let mut sig = vec![vec![0.0; n]; s];
             for i in (1..s).rev() {
-                // σ̃ᵢ = Σ_{m>i} a_{mi}·λ̃ₘ -- the explicit coupling, transposed
+                // σᵢ = Σ_{m>i} a_{mi}·λₘ -- the explicit coupling, transposed
                 for m in (i + 1)..s {
                     let a = a_ij(m, i);
                     if a != 0.0 {
@@ -283,86 +274,58 @@ impl CompiledDc {
                         rhs[r] = -(cotangent[k][r] + carry[r]);
                     }
                 }
-                if sig[i].iter().any(|v| *v != 0.0) {
-                    let jt = self.phi_x_transpose_mul(stage_x(i), &zeros, p, stage_t(i), &sig[i]);
-                    for r in 0..n {
-                        rhs[r] -= jt[r] / ESDIRK32_GAMMA;
-                    }
-                }
                 let ti = stage_t(i);
+                let sg: Vec<f64> = sig[i].iter().map(|v| v / ESDIRK32_GAMMA).collect();
+                let jt = self.transpose_mul(stage_x(i), p, ti, &sg, &zeros);
+                for r in 0..n {
+                    rhs[r] -= jt[r];
+                }
                 let lu = self
-                    .factor_stage(stage_x(i), &stage_w(i), p, ti, hg)
+                    .factor_stage(stage_x(i), p, ti, hg)
                     .ok_or_else(|| format!("transient_adjoint: singular system at t={ti:.3e}"))?;
                 lam[i] = lu.solve_transpose(&rhs).ok_or_else(|| {
                     format!("transient_adjoint: transpose solve failed at t={ti:.3e}")
                 })?;
             }
+            // xₙ enters every stage through its charge and the explicit first
+            // stage through its currents.
+            let mut lam_sum = vec![0.0; n];
             for m in 1..s {
                 let a = a_ij(m, 0);
-                if a != 0.0 {
-                    for r in 0..n {
-                        sig[0][r] += a * lam[m][r];
-                    }
-                }
-            }
-
-            // dL/dp: the implicit stage term (evaluated with the stage's own x',
-            // so the tape carries the reactive parameters) plus the explicit
-            // coupling term through the slopes.
-            for i in 1..s {
-                self.accumulate_phi_p(
-                    &mut dldp,
-                    stage_x(i),
-                    &stage_w(i),
-                    p,
-                    stage_t(i),
-                    &lam[i],
-                    1.0,
-                );
-            }
-            for j in 0..(s - 1) {
-                if sig[j].iter().any(|v| *v != 0.0) {
-                    let sc = 1.0 / ESDIRK32_GAMMA;
-                    self.accumulate_phi_p(
-                        &mut dldp,
-                        stage_x(j),
-                        &zeros,
-                        p,
-                        stage_t(j),
-                        &sig[j],
-                        sc,
-                    );
-                }
-            }
-
-            // carry to step k−1: every stage depends on xₙ both through the mass
-            // term and through the explicit first stage f₀.
-            for c in carry.iter_mut() {
-                *c = 0.0;
-            }
-            for m in 1..s {
-                let (cr, cc, cv) =
-                    self.jacobian_xdot_sparse(stage_x(m), &stage_w(m), p, stage_t(m));
-                for i in 0..cv.len() {
-                    carry[cc[i]] -= cv[i] * lam[m][cr[i]] / hg;
-                }
-            }
-            if sig[0].iter().any(|v| *v != 0.0) {
-                let jt = self.phi_x_transpose_mul(xn, &zeros, p, tn, &sig[0]);
                 for r in 0..n {
-                    carry[r] += jt[r] / ESDIRK32_GAMMA;
+                    sig[0][r] += a * lam[m][r];
+                    lam_sum[r] -= lam[m][r] / hg;
                 }
             }
+
+            // dL/dp at every stage point: the currents weighted by the stage's
+            // own multiplier and the explicit coupling, the charges by the
+            // charge difference's.
+            for (i, sig) in sig.iter().enumerate().take(s) {
+                let ui: Vec<f64> = (0..n)
+                    .map(|r| lam[i][r] + sig[r] / ESDIRK32_GAMMA)
+                    .collect();
+                let uq: Vec<f64> = if i == 0 {
+                    lam_sum.clone()
+                } else {
+                    lam[i].iter().map(|v| v / hg).collect()
+                };
+                self.accumulate_p(&mut dldp, stage_x(i), p, stage_t(i), &ui, &uq);
+            }
+
+            // carry to step k−1
+            let sg: Vec<f64> = sig[0].iter().map(|v| v / ESDIRK32_GAMMA).collect();
+            carry = self.transpose_mul(xn, p, tn, &sg, &lam_sum);
         }
 
         // Operating-point shift: what is left on dL/dx₀ lands on dx₀/dp; with
-        // G_dcᵀ μ = −g₀ the contribution is μᵀ (dΦ/dp)|(x₀, x'=0, t₀).
+        // G_dcᵀ μ = −g₀ the contribution is μᵀ dI/dp(x₀, t₀).
         if !user_ic {
             let x_init = &states[0];
             let t0 = t_eval[0];
             let g0: Vec<f64> = (0..n).map(|i| cotangent[0][i] + carry[i]).collect();
             if g0.iter().any(|v| *v != 0.0) {
-                let (mut jr, mut jc, mut jv) = self.jacobian_x_sparse(x_init, &zeros, p, t0);
+                let (mut jr, mut jc, mut jv) = self.jacobian_i_x_sparse(x_init, p, t0);
                 for i in 0..n {
                     jr.push(i);
                     jc.push(i);
@@ -374,82 +337,61 @@ impl CompiledDc {
                 let mu = lu
                     .solve_transpose(&rhs)
                     .ok_or_else(|| "transient_adjoint: DC transpose solve failed".to_string())?;
-                self.accumulate_phi_p(&mut dldp, x_init, &zeros, p, t0, &mu, 1.0);
+                self.accumulate_p(&mut dldp, x_init, p, t0, &mu, &zeros);
             }
         }
         Ok(dldp)
     }
 
-    /// Regularized residual `Φ = F(x, x', p, t) + gmin·x`, the quantity every
-    /// equation on this path is written in.
-    fn phi(&self, x: &[f64], xdot: &[f64], p: &[f64], t: f64) -> Vec<f64> {
-        let mut r = self.residual(x, xdot, p, t);
-        for i in 0..self.n {
-            r[i] += GMIN_DC * x[i];
+    /// `−Ĩ`: a stage slope in residual space.
+    fn neg_currents(&self, x: &[f64], p: &[f64], t: f64) -> Vec<f64> {
+        let mut r = self.currents(x, p, t);
+        for (r, x) in r.iter_mut().zip(x) {
+            *r = -(*r + GMIN_DC * x);
         }
         r
     }
 
-    /// `−Φ`: a stage slope in residual space.
-    fn neg_phi(&self, x: &[f64], xdot: &[f64], p: &[f64], t: f64) -> Vec<f64> {
-        let mut r = self.phi(x, xdot, p, t);
-        for v in r.iter_mut() {
-            *v = -*v;
+    /// `Jᵀ·ui + Cᵀ·uq` at the point (`J = G + gmin`), without forming the
+    /// matrices; a zero `uq` skips `C`.
+    fn transpose_mul(&self, x: &[f64], p: &[f64], t: f64, ui: &[f64], uq: &[f64]) -> Vec<f64> {
+        let mut out: Vec<f64> = ui.iter().map(|u| GMIN_DC * u).collect();
+        if ui.iter().any(|v| *v != 0.0) {
+            let (jr, jc, jv) = self.jacobian_i_x_sparse(x, p, t);
+            for i in 0..jv.len() {
+                out[jc[i]] += jv[i] * ui[jr[i]];
+            }
         }
-        r
-    }
-
-    /// `(dΦ/dx)ᵀ·u` at the point, without forming the matrix.
-    fn phi_x_transpose_mul(
-        &self,
-        x: &[f64],
-        xdot: &[f64],
-        p: &[f64],
-        t: f64,
-        u: &[f64],
-    ) -> Vec<f64> {
-        let (jr, jc, jv) = self.jacobian_x_sparse(x, xdot, p, t);
-        let mut out = vec![0.0; self.n];
-        for i in 0..jv.len() {
-            out[jc[i]] += jv[i] * u[jr[i]];
-        }
-        for i in 0..self.n {
-            out[i] += GMIN_DC * u[i];
+        if uq.iter().any(|v| *v != 0.0) {
+            let (cr, cc, cv) = self.jacobian_q_x_sparse(x, p, t);
+            for i in 0..cv.len() {
+                out[cc[i]] += cv[i] * uq[cr[i]];
+            }
         }
         out
     }
 
-    /// `dldp += scale · (dΦ/dp)ᵀ·u` at the point (the `gmin·x` shunt carries no
-    /// parameter dependence, so `dΦ/dp = dF/dp`).
-    fn accumulate_phi_p(
-        &self,
-        dldp: &mut [f64],
-        x: &[f64],
-        xdot: &[f64],
-        p: &[f64],
-        t: f64,
-        u: &[f64],
-        scale: f64,
-    ) {
-        let (pr, pc, pv) = self.jacobian_p_sparse(x, xdot, p, t);
-        for i in 0..pv.len() {
-            dldp[pc[i]] += scale * pv[i] * u[pr[i]];
+    /// `dldp += (dI/dp)ᵀ·ui + (dQ/dp)ᵀ·uq` at the point (the `gmin·x` shunt
+    /// carries no parameter dependence).
+    fn accumulate_p(&self, dldp: &mut [f64], x: &[f64], p: &[f64], t: f64, ui: &[f64], uq: &[f64]) {
+        if ui.iter().chain(uq).all(|v| *v == 0.0) {
+            return;
+        }
+        let ((ir, ic, iv), (qr, qc, qv)) = self.jacobian_p_sparse(x, p, t);
+        for i in 0..iv.len() {
+            dldp[ic[i]] += iv[i] * ui[ir[i]];
+        }
+        for i in 0..qv.len() {
+            dldp[qc[i]] += qv[i] * uq[qr[i]];
         }
     }
 
-    /// Factor the stage matrix `dΦ/dx + dF/dx'/(hγ)` at the point, through the
+    /// Factor the stage matrix `G + gmin + C/(hγ)` at the point, through the
     /// KLU backend (the adjoint needs its transpose solve).
-    fn factor_stage(
-        &self,
-        x: &[f64],
-        xdot: &[f64],
-        p: &[f64],
-        t: f64,
-        hg: f64,
-    ) -> Option<sparse::TripletLu> {
+    fn factor_stage(&self, x: &[f64], p: &[f64], t: f64, hg: f64) -> Option<sparse::TripletLu> {
         let n = self.n;
-        let (mut jr, mut jc, mut jv) = self.jacobian_x_sparse(x, xdot, p, t);
-        let (cr, cc, cv) = self.jacobian_xdot_sparse(x, xdot, p, t);
+        let (mut jr, mut jc, mut jv) = self.jacobian_i_x_sparse(x, p, t);
+        let (cr, cc, cv) = self.jacobian_q_x_sparse(x, p, t);
         jr.extend_from_slice(&cr);
         jc.extend_from_slice(&cc);
         jv.extend(cv.iter().map(|v| v / hg));

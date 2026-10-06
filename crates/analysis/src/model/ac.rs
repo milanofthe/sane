@@ -7,10 +7,10 @@ use std::f64::consts::PI;
 
 use num_complex::Complex64;
 use rayon::prelude::*;
-use rsdag::{differentiate, eval, ExprId, Node, SymbolId};
+use rsdag::{differentiate, ExprId, Node, SymbolId};
 use sane_core::log;
 use sane_core::Graph;
-use sane_dae::{ac_param_derivatives, small_signal_transfer, Dae as CoreDae};
+use sane_dae::{ac_param_derivatives, Dae as CoreDae};
 use sane_solve::CompiledDc;
 
 use crate::model::{Model, ModelError};
@@ -92,45 +92,10 @@ impl Model {
             .ok_or_else(|| ModelError::Numeric(format!("'{input}' is not a symbol")))?;
         let p_sym = sym_of(&mut c, param)
             .ok_or_else(|| ModelError::Numeric(format!("'{param}' is not a symbol")))?;
-        let env = op_env(&mut c, dae, &pnames, &x, &[], &p, t);
+        let env = op_env(&mut c, dae, &pnames, &x, &p, t);
         Ok(ac_param_derivatives(
             &mut c, dae, input_sym, p_sym, &s, &env,
         ))
-    }
-
-    /// Small-signal AC transfer `H(j2*pi*f)` from source parameter `input` to
-    /// unknown `output`, evaluated at each frequency in `freqs_hz`. `values`
-    /// binds parameters (and, for nonlinear circuits, operating-point unknowns);
-    /// unbound symbols default to 0. Returns `(re, im)` pairs, or `None` if the
-    /// output is unknown.
-    pub fn ac_transfer(
-        &self,
-        input: &str,
-        output: &str,
-        values: HashMap<String, f64>,
-        freqs_hz: Vec<f64>,
-    ) -> Option<Vec<(f64, f64)>> {
-        let arc = self.context_arc();
-        let mut cg = arc.lock().unwrap();
-        let c = &mut *cg;
-        let h = small_signal_transfer(c, self.dae(), input, output)?;
-        let syms: Vec<SymbolId> = c.free_symbols(h).into_iter().collect();
-        let mut out = Vec::with_capacity(freqs_hz.len());
-        for f in freqs_hz {
-            let mut env: HashMap<SymbolId, Complex64> = HashMap::new();
-            for &s in &syms {
-                let name = c.symbol_name(s);
-                let v = if name == "s" {
-                    Complex64::new(0.0, 2.0 * PI * f)
-                } else {
-                    Complex64::new(values.get(name).copied().unwrap_or(0.0), 0.0)
-                };
-                env.insert(s, v);
-            }
-            let z = eval(c, &[h], &env)[0];
-            out.push((z.re, z.im));
-        }
-        Some(out)
     }
 
     /// Small-signal AC response `H(j2*pi*f)` from source `input` to the unknown at
@@ -164,12 +129,11 @@ impl Model {
             ),
         );
         let n = self.dae().dim();
-        let z = vec![0.0; n];
         // Sparse A = G(+gmin) + jwC over the fixed pattern: symbolic analysis
         // once, numeric refactor per frequency (never densified).
         let (gr, gc, gv) = self.cdc().system_triplets_dc(&x, &p);
-        let (cr, cc, cv) = self.cdc().jacobian_xdot_sparse(&x, &z, &p, 0.0);
-        let bin = self.input_jacobian(input, x.clone(), z.clone(), p.clone(), 0.0)?;
+        let (cr, cc, cv) = self.cdc().jacobian_q_x_sparse(&x, &p, 0.0);
+        let bin = self.jacobian_i_input(input, x.clone(), p.clone(), 0.0)?;
         let b: Vec<Complex64> = bin.iter().map(|v| Complex64::new(-v, 0.0)).collect();
         let (dr, dc, dv, dtau) = self.delay_ac_entries(&x, &p);
         let sym = crate::sparse_ac::SymbolicAc::new_with_delays(
@@ -244,7 +208,10 @@ impl Model {
             .iter()
             .map(|&(re, im)| 20.0 * re.hypot(im).max(1e-30).log10())
             .collect();
-        let phase_deg = h.iter().map(|&(re, im)| im.atan2(re).to_degrees()).collect();
+        let phase_deg = h
+            .iter()
+            .map(|&(re, im)| im.atan2(re).to_degrees())
+            .collect();
         Ok((freqs, mag_db, phase_deg))
     }
 
@@ -261,12 +228,10 @@ impl Model {
         freqs_hz: Vec<f64>,
     ) -> Result<Vec<(f64, f64)>, ModelError> {
         self.ensure_no_delays("ac_sensitivity")?;
-        let n = self.dae().dim();
-        let z = vec![0.0; n];
-        let g = self.cdc().system_matrix_dc(&x, &z, &p, 0.0);
-        let c = self.cdc().jacobian_xdot(&x, &z, &p, 0.0);
+        let g = self.cdc().system_matrix_dc(&x, &p, 0.0);
+        let c = self.cdc().jacobian_q_x(&x, &p, 0.0);
         // B = -dF/d(input); dB from the total small-signal derivatives.
-        let bin = self.input_jacobian(input, x.clone(), z.clone(), p.clone(), 0.0)?;
+        let bin = self.jacobian_i_input(input, x.clone(), p.clone(), 0.0)?;
         let b: Vec<f64> = bin.iter().map(|v| -v).collect();
         let (dg, dc, db) = self.ac_derivatives(input, param, x.clone(), p.clone(), 0.0)?;
         Ok(
@@ -296,7 +261,11 @@ impl Model {
     ) -> Result<Vec<(String, f64, f64)>, ModelError> {
         let (names, mut rows) = self.ac_gradient_sweep(input, out_idx, x, p, &[freq])?;
         let (_, d) = rows.pop().unwrap_or_default();
-        Ok(names.into_iter().zip(d).map(|(nm, (re, im))| (nm, re, im)).collect())
+        Ok(names
+            .into_iter()
+            .zip(d)
+            .map(|(nm, (re, im))| (nm, re, im))
+            .collect())
     }
 
     /// [`Model::ac_gradient`] over a sweep: per frequency the transfer `H`
@@ -545,15 +514,14 @@ impl Model {
         p: &[f64],
     ) -> Result<AcAdjointSetup, ModelError> {
         let n = self.dae().dim();
-        let z = vec![0.0; n];
         let (gr_s, gc_s, gv_s) = self.cdc().system_triplets_dc(x, p);
-        let (cr_s, cc_s, cv_s) = self.cdc().jacobian_xdot_sparse(x, &z, p, 0.0);
-        let bin = self.input_jacobian(input, x.to_vec(), z.clone(), p.to_vec(), 0.0)?;
+        let (cr_s, cc_s, cv_s) = self.cdc().jacobian_q_x_sparse(x, p, 0.0);
+        let bin = self.jacobian_i_input(input, x.to_vec(), p.to_vec(), 0.0)?;
         let b: Vec<Complex64> = bin.iter().map(|&val| Complex64::new(-val, 0.0)).collect();
         self.cdc()
             .ensure_param_jac(&mut self.context_arc().lock().unwrap(), self.dae());
         let pnames = self.cdc().param_names(&self.context_arc().lock().unwrap());
-        let (prr, prc, prv) = self.cdc().jacobian_p_sparse(x, &z, p, 0.0);
+        let ((prr, prc, prv), _) = self.cdc().jacobian_p_sparse(x, p, 0.0);
         let empty: (Vec<usize>, Vec<usize>, Vec<f64>) = (Vec::new(), Vec::new(), Vec::new());
         let gsys = crate::sparse_ac::AcSystem::assemble(
             n,
@@ -569,9 +537,6 @@ impl Model {
         let mut env: HashMap<SymbolId, f64> = HashMap::new();
         for (i, &sy) in self.dae().x.iter().enumerate() {
             env.insert(sy, x.get(i).copied().unwrap_or(0.0));
-        }
-        for sy in self.dae().xdot.iter().flatten() {
-            env.insert(*sy, 0.0);
         }
         for (j, name) in pnames.iter().enumerate() {
             let e = c.sym(name);
@@ -662,15 +627,14 @@ impl Model {
         let c = &mut *cg;
         let dae = self.dae();
         let n = dae.dim();
-        let (gr, gc, ge) = dae.jacobian_x_coo(c);
-        let (cr, cc, ce) = dae.jacobian_xdot_coo(c);
+        let ((gr, gc, ge), (cr, cc, ce)) = dae.jacobian_iq_coo(c);
         let ie = c.sym(input);
         let isym = match c.node(ie) {
             Node::Symbol(sy) => *sy,
             _ => return Err(ModelError::Numeric(format!("'{input}' is not a symbol"))),
         };
         let bsym: Vec<ExprId> = dae
-            .residuals
+            .currents
             .iter()
             .map(|&r| {
                 let d = differentiate(c, r, isym);
@@ -741,7 +705,7 @@ impl Model {
 
     /// Exact analytic AC Hessian via the **second-order adjoint** -- no finite
     /// differences. The trick: AC analysis at one frequency is itself an algebraic
-    /// system, so build the combined system `[F(x,0,p)=0; Re(Av-b)=0; Im(Av-b)=0]`
+    /// system, so build the combined system `[I(x,p)=0; Re(Av-b)=0; Im(Av-b)=0]`
     /// in the unknowns `(x, v_re, v_im)`, then run the *existing* DC second-order
     /// adjoint (`hessian`) on it. The operating-point shift falls out for free
     /// because `x` is part of the combined solution. Returns, for the output node,
@@ -759,13 +723,12 @@ impl Model {
     ) -> Result<(f64, f64, Vec<f64>, Vec<f64>, Vec<Vec<f64>>, Vec<Vec<f64>>), ModelError> {
         let _g = log::scope("sens/ac_hessian");
         let n = self.dae().dim();
-        let z = vec![0.0; n];
         let w = 2.0 * PI * freq;
         // Numeric forward solve A v = b (sparse, KLU) to assemble the combined
         // solution y*.
         let (gr_s, gc_s, gv_s) = self.cdc().system_triplets_dc(&x, &p);
-        let (cr_s, cc_s, cv_s) = self.cdc().jacobian_xdot_sparse(&x, &z, &p, 0.0);
-        let bin = self.input_jacobian(input, x.clone(), z.clone(), p.clone(), 0.0)?;
+        let (cr_s, cc_s, cv_s) = self.cdc().jacobian_q_x_sparse(&x, &p, 0.0);
+        let bin = self.jacobian_i_input(input, x.clone(), p.clone(), 0.0)?;
         let bvec: Vec<Complex64> = bin.iter().map(|&val| Complex64::new(-val, 0.0)).collect();
         let v = crate::sparse_ac::AcSystem::assemble(
             n,
@@ -799,13 +762,12 @@ impl Model {
             vre_e.push(c.sym(&nr));
             vim_e.push(c.sym(&ni));
         }
-        // Symbolic G, C (sparse) and b_i = -dF/d(input).
-        let (gr, gc, ge) = self.dae().jacobian_x_coo(c);
-        let (cr, cc, ce) = self.dae().jacobian_xdot_coo(c);
+        // Symbolic G, C (sparse) and b_i = -dI/d(input).
+        let ((gr, gc, ge), (cr, cc, ce)) = self.dae().jacobian_iq_coo(c);
         let isym = sym_id(c, input);
         let bsym: Vec<ExprId> = self
             .dae()
-            .residuals
+            .currents
             .iter()
             .map(|&r| {
                 let d = differentiate(c, r, isym);
@@ -814,15 +776,6 @@ impl Model {
             .collect();
         let zero = c.zero();
         let wexpr = c.konst_f64(w);
-        // DC residuals F(x, 0, p): every derivative symbol read as zero.
-        let at_rest: rustc_hash::FxHashMap<SymbolId, ExprId> = self
-            .dae()
-            .xdot
-            .iter()
-            .flatten()
-            .map(|&s| (s, zero))
-            .collect();
-        let dc_res: Vec<ExprId> = rsdag::substitute(c, &self.dae().residuals, &at_rest);
         // AC rows: Re(Av-b) and Im(Av-b), A = G + jwC, b real.
         let mut ac_re = vec![zero; n];
         let mut ac_im = vec![zero; n];
@@ -844,22 +797,25 @@ impl Model {
         for i in 0..n {
             ac_re[i] = c.sub(ac_re[i], bsym[i]); // - b
         }
-        // Combined algebraic DAE in (x, v_re, v_im).
-        let mut residuals = dc_res;
-        residuals.extend(ac_re);
-        residuals.extend(ac_im);
+        // Combined algebraic DAE in (x, v_re, v_im): the DC currents, then the
+        // AC rows.
+        let mut currents = self.dae().currents.clone();
+        currents.extend(ac_re);
+        currents.extend(ac_im);
         let mut xs = self.dae().x.clone();
         xs.extend(vre_s);
         xs.extend(vim_s);
         let mut names = self.dae().unknowns.clone();
         names.extend((0..n).map(|i| format!("vre{i}")));
         names.extend((0..n).map(|i| format!("vim{i}")));
+        let zero = c.zero();
         let combined = CoreDae {
+            charges: vec![zero; currents.len()],
+            currents,
             n_nodes: self.dae().n_nodes,
             param_defaults: self.dae().param_defaults.clone(),
             events: Vec::new(),
             delays: Vec::new(),
-            residuals,
             kinds: self
                 .dae()
                 .kinds
@@ -870,11 +826,9 @@ impl Model {
                 .collect(),
             unknowns: names,
             x: xs,
-            xdot: vec![None; 3 * n],
             t: self.dae().t,
             companion: Vec::new(),
-            noise_sources: Vec::new(),
-            op_vars: Vec::new(),
+            observers: Default::default(),
             dc_seeds: Vec::new(),
             limits: Vec::new(),
             sources: Vec::new(),

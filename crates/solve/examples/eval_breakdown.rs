@@ -83,7 +83,7 @@ fn main() {
     let reps = 5000;
     let t = Instant::now();
     for _ in 0..reps {
-        let _ = cdc.jacobian_x_sparse(&x, &xdot, &p, 0.0);
+        let _ = cdc.jacobian_i_x_sparse(&x, &p, 0.0);
         let _ = cdc.residual(&x, &xdot, &p, 0.0);
     }
     let eval_us = t.elapsed().as_secs_f64() * 1e6 / reps as f64;

@@ -137,13 +137,13 @@ def _flat_paths(paths):
 
 
 class Model:
-    """A circuit as an analyzable symbolic graph: the differential-algebraic
-    system ``F(x, x', t) = 0`` with its analytic Jacobians, and the front-end to
-    every analysis on it.
+    """A circuit as an analyzable expression graph: the differential-algebraic
+    system ``I(x, t) + d/dt Q(x) = 0`` with its analytic Jacobians, and the
+    front-end to every analysis on it.
 
     Build one from :meth:`sane.circuit.Circuit.extract` or
-    :meth:`Model.from_netlist`. It owns (shares) the symbolic context and the
-    precomputed analytic Jacobians, and binds the element/parameter values from
+    :meth:`Model.from_netlist`. It owns (shares) the graph and the precomputed
+    analytic Jacobians, and binds the element/parameter values from
     the circuit, so every analysis takes and returns names, never raw vectors:
 
     - :meth:`operating_point` -- DC bias, a labeled :class:`~sane.analysis.OperatingPoint`
@@ -764,10 +764,9 @@ class Model:
         """
         p = self._pvec(values)
         x = self._dc(p, x0)
-        z = [0.0] * self.dim
-        G = np.array(self._d.jacobian_x(x, z, p, 0.0))
-        C = np.array(self._d.jacobian_xdot(x, z, p, 0.0))
-        B = -np.array(self._d.input_jacobian(input, x, z, p, 0.0))
+        G = np.array(self._d.jacobian_i_x(x, p, 0.0))
+        C = np.array(self._d.jacobian_q_x(x, p, 0.0))
+        B = -np.array(self._d.jacobian_i_input(input, x, p, 0.0))
         # The poles / zeros / response are computed by the native engine (passing
         # the compiled model, the bias `x` and the parameter vector `p`); the G/C/B
         # matrices are handed out only for inspection, never re-analyzed in Python.
@@ -775,43 +774,11 @@ class Model:
                            self._names, input, output,
                            core=self._d, x=list(x), p=p)
 
-    def ac_transfer(self, input, output, freqs_hz, values=None):
-        """Symbolic small-signal transfer ``H(j2*pi*f)`` from ``input`` to
-        ``output`` via Cramer's rule on the symbolic system (exact for linear
-        circuits, no operating-point solve).
-
-        Parameters
-        ----------
-        input : str
-            source parameter name
-        output : str
-            output node / unknown
-        freqs_hz : array_like
-            frequencies in Hz
-        values : dict[str, float], optional
-            parameter (and, for nonlinear circuits, operating-point) bindings;
-            defaults to the values bound from the circuit
-
-        Returns
-        -------
-        numpy.ndarray
-            the complex transfer function, or ``None`` if the output is unknown
-        """
-        merged = self.values
-        if values:
-            merged.update(values)
-        out_u = self._unknowns[self._idx(output)]
-        pairs = self._d.ac_transfer(input, out_u, merged, list(np.atleast_1d(freqs_hz)))
-        if pairs is None:
-            return None
-        return np.array([re + 1j * im for re, im in pairs])
-
     def ac(self, input, output, freqs_hz, values=None, x0=None):
         """Small-signal AC response as a result object, linearised at the DC
         operating point.
 
-        Unlike :meth:`ac_transfer` (which returns the raw complex array), this
-        returns an :class:`~sane.analysis.AcResponse` whose ``.value`` is the
+        Returns an :class:`~sane.analysis.AcResponse` whose ``.value`` is the
         transfer over ``freqs_hz`` and which carries the unified derivative API:
         ``.sensitivity(f, metric)`` (gradient over every parameter, one AC adjoint
         solve) and ``.hessian(f, subset, metric)`` (sparse, over the knob subset).
@@ -1704,223 +1671,18 @@ class Model:
         mass-matrix DAE** :math:`G\\,\\delta x + C\\,\\delta\\dot x = 0`, sharing
         this context.
 
-        The residuals become linear forms; the operating-point bias is frozen into
-        constant ``name#op`` symbols, so the coefficients :math:`G=\\partial
-        F/\\partial x` and :math:`C=\\partial F/\\partial\\dot x` are constant and
-        the matrix assembly :math:`A(s)=G+sC` lives in the graph exactly as the
-        nonlinear residual assembly does. :meth:`system_matrix` on the result
-        reproduces this model's :math:`A(s)` exactly.
+        The currents and charges become linear forms; the operating-point bias
+        is frozen into constant ``name#op`` symbols, so the coefficients
+        :math:`G=\\partial I/\\partial x` and :math:`C=\\partial Q/\\partial x`
+        are constant.
 
         Returns
         -------
         Model
-            the linear small-signal system, in the same context (render it with
-            :meth:`to_dot`, read :meth:`system_matrix` / :meth:`transfer_function`).
+            the linear small-signal system, in the same context
         """
         raw = self._d.linearize()
         return Model(raw, self._names, self.values)
-
-    # --- symbolic graph access --------------------------------------------
-
-    @property
-    def symbolic_context(self):
-        """The shared symbolic :class:`~sane.symbolic.Context` of this model, so
-        the residual / Jacobian :class:`~sane.symbolic.Expr` graph can be
-        manipulated, differentiated and compiled."""
-        return self._d.context
-
-    @property
-    def residuals(self):
-        """The residual equations ``F(x, x', t)`` as manipulable
-        :class:`~sane.symbolic.Expr` (one per row)."""
-        return self._d.residuals()
-
-    def to_dot(self, labels=None, highlight=None):
-        """Render the **whole** model -- every residual :math:`F_i(x,\\dot x,t)=0`
-        -- as one Graphviz DOT graph of the shared hash-consed expression DAG.
-
-        Each residual becomes a red endpoint box (named by its unknown); a
-        subexpression shared across equations (a node voltage that appears in
-        several KCL rows, the global ``$temp``) is drawn once with several
-        parents, so hash-consing is visible across the system, not just within
-        one row. This is the honest picture of the system: a reactive circuit
-        shows both its derivative terms (a capacitor's ``vdot`` and an
-        inductor's ``idot`` live in different residuals), not the apparent order
-        of any single row. Feed the string to ``dot -Tpdf``.
-
-        Parameters
-        ----------
-        labels : list[str], optional
-            one label per residual; defaults to ``F[<unknown>]``.
-        highlight : list[Expr], optional
-            keep only the nodes reachable from these expressions at full
-            opacity; fade the rest to alpha ~0.2.
-
-        Returns
-        -------
-        str
-            the Graphviz DOT source (an empty ``"digraph G {}"`` if the system
-            has no residuals)
-        """
-        res = self.residuals
-        if not res:
-            return "digraph G {}\n"
-        names = labels if labels is not None else [f"F[{u}]" for u in self.unknowns]
-        return res[0].to_dot(label=names[0], others=list(res[1:]),
-                             labels=list(names[1:]), highlight=highlight)
-
-    def jacobian_x_symbolic(self):
-        """The symbolic Jacobian ``dF/dx``.
-
-        Returns
-        -------
-        list[list[Expr]]
-            the dense matrix of :class:`~sane.symbolic.Expr` on the shared
-            context (row ``i`` is the gradient of residual ``i`` w.r.t. ``x``)
-        """
-        return self._d.jacobian_x_symbolic()
-
-    def jacobian_xdot_symbolic(self):
-        """The symbolic Jacobian ``dF/dx'`` (the reactive / mass matrix).
-
-        Returns
-        -------
-        list[list[Expr]]
-            the dense matrix of :class:`~sane.symbolic.Expr` on the shared
-            context (row ``i`` is the gradient of residual ``i`` w.r.t. ``x'``)
-        """
-        return self._d.jacobian_xdot_symbolic()
-
-    def system_matrix(self):
-        """The symbolic small-signal system matrix ``A(s) = dF/dx + s*dF/dx'``.
-
-        Returns
-        -------
-        list[list[Expr]]
-            the dense matrix of :class:`~sane.symbolic.Expr` on the shared
-            context, with ``s`` a free Laplace symbol
-        """
-        return self._d.small_signal_matrix()
-
-    #: closed-form symbolic transfer functions above this estimated term count
-    #: are refused; the determinant expansion scales up to ``n!`` and a large
-    #: expression is neither computable in reasonable time nor useful.
-    SYMBOLIC_TERM_BUDGET = 200_000
-
-    def term_estimate(self, cap=None):
-        """Estimate the number of pre-cancellation terms in the symbolic transfer
-        function (the permanent of the small-signal matrix pattern, capped).
-
-        Cheap and bounded; the closed-form transfer function scales up to
-        ``n!``, so check this before requesting it on a large circuit.
-
-        Parameters
-        ----------
-        cap : int, optional
-            stop counting once this many terms are reached; defaults to
-            :attr:`SYMBOLIC_TERM_BUDGET`
-
-        Returns
-        -------
-        int
-            the estimated term count, clamped to ``cap``
-        """
-        return self._d.transfer_term_estimate(int(cap or self.SYMBOLIC_TERM_BUDGET))
-
-    def _guard_symbolic(self):
-        est = self._d.transfer_term_estimate(self.SYMBOLIC_TERM_BUDGET)
-        if est >= self.SYMBOLIC_TERM_BUDGET:
-            raise ValueError(
-                f"symbolic transfer function would have >= {self.SYMBOLIC_TERM_BUDGET} "
-                f"terms (the determinant expansion scales up to n!); this circuit is "
-                f"too large for a closed form. Use the numeric AC response instead, or "
-                f"transfer_approx with a coarse tolerance once during-generation "
-                f"pruning is available.")
-
-    def transfer_function(self, input, output):
-        """The symbolic transfer function ``H(s)`` from ``input`` to ``output``
-        as a single manipulable :class:`~sane.symbolic.Expr` (or ``None``).
-
-        Raises ``ValueError`` if the estimated term count exceeds
-        :attr:`SYMBOLIC_TERM_BUDGET` (the closed form scales up to ``n!``); call
-        :meth:`term_estimate` first on larger circuits.
-
-        Parameters
-        ----------
-        input : str
-            source parameter name
-        output : str
-            output node / unknown
-
-        Returns
-        -------
-        sane.symbolic.Expr | None
-            ``H(s)``; ``.simplify()`` reduces it to canonical rational form
-        """
-        self._guard_symbolic()
-        return self._d.transfer_function(input, self._unknowns[self._idx(output)])
-
-    def transfer_approx(self, input, output, tol=1e-3, freq=1e3):
-        """Analog-Insydes-style symbolic approximation of ``H(s)``.
-
-        Collects the transfer function as polynomials in ``s``, ranks every
-        monomial by its magnitude at the DC operating point and ``freq`` (Hz),
-        drops those below ``tol`` of the dominant term, and rebuilds a compact
-        symbolic ``H(s)``. Returns ``(H_pruned, terms_total, terms_kept)`` or
-        ``None``; call ``.simplify()`` on the expression for a compact form.
-
-        Raises ``ValueError`` if the *full* transfer function (which is built
-        before pruning) would exceed :attr:`SYMBOLIC_TERM_BUDGET` terms.
-        """
-        self._guard_symbolic()
-        out_u = self._unknowns[self._idx(output)]
-        return self._d.transfer_approx(input, out_u, tol, freq)
-
-    def transfer_approx_at(self, input, output, freq=0.0, tol=1e-3, cap=4000):
-        """Single-frequency symbolic approximation of ``H(s)`` (Analog-Insydes
-        "simplification before/during generation").
-
-        Solves ``H`` numerically at the operating point and ``freq`` (Hz; ``0``
-        for the DC gain), drops the tableau entries whose removal (a
-        Sherman-Morrison rank-1 update) keeps the relative error in ``H`` below
-        ``tol``, then generates the closed form by symbolic Gaussian elimination
-        with numeric pivoting and a relative drop tolerance, so the determinant
-        comes out in compact factored form, free of cancellation. ``cap`` is
-        accepted for API compatibility but unused. Returns
-        ``(H, kept_entries, total_entries, expr_nodes, H_value)`` or ``None``,
-        where ``expr_nodes`` is the DAG size of ``H`` (its readability) and
-        ``H_value`` is the reduced transfer at ``freq`` (a ``complex``) for
-        self-checking against the full numeric response.
-        """
-        out_u = self._unknowns[self._idx(output)]
-        res = self._d.transfer_approx_at(input, out_u, freq, tol, cap)
-        if res is None:
-            return None
-        h, kept, total, terms, re, im = res
-        return h, kept, total, terms, complex(re, im)
-
-    def transfer_approx_named_at(self, input, output, freq=0.0, tol=1e-3, cap=4000):
-        """Named-stamp single-frequency symbolic approximation of ``H(s)`` (the
-        SLiCAP / Analog-Insydes "symbolic MNA" form).
-
-        Like :meth:`transfer_approx_at`, but the surviving tableau entries are
-        replaced by named admittance stamps (``y{row}_{col}``, excitation column
-        ``b{row}``), so ``H`` is a compact rational function in those named
-        symbols, human-readable no matter how complicated each transistor's
-        expanded contribution is. Returns
-        ``(H, legend, stamps, total_entries, expr_nodes, H_value)`` or ``None``,
-        where ``legend`` is a ``dict`` mapping each stamp name appearing in ``H``
-        to its complex value, ``stamps`` is the number of distinct stamps used,
-        ``expr_nodes`` is the DAG size of ``H``, and ``H_value`` is the reduced
-        transfer at ``freq`` (a ``complex``) for self-checking.
-        """
-        out_u = self._unknowns[self._idx(output)]
-        res = self._d.transfer_approx_named_at(input, out_u, freq, tol, cap)
-        if res is None:
-            return None
-        h, legend, stamps, total, terms, re, im = res
-        leg = {name: complex(lre, lim) for name, lre, lim in legend}
-        return h, leg, stamps, total, terms, complex(re, im)
 
     @property
     def nnz(self):
@@ -1932,26 +1694,6 @@ class Model:
         solver partitioned the Jacobian (large mostly-linear systems), else
         ``None``."""
         return self._d.partition_sizes()
-
-    # --- symbolic strings -------------------------------------------------
-
-    def latex(self):
-        """The residual equations as a LaTeX ``aligned`` block.
-
-        Returns
-        -------
-        str
-            a LaTeX string, one ``F_i(x, x', t) = 0`` row per residual
-        """
-        return self._d.to_latex()
-
-    def transfer_latex(self, input, output):
-        """Symbolic small-signal transfer ``H(s)`` as LaTeX, or ``None`` if the
-        output unknown is not found. Raises ``ValueError`` if the estimated term
-        count exceeds :attr:`SYMBOLIC_TERM_BUDGET`."""
-        self._guard_symbolic()
-        out_u = self._unknowns[self._idx(output)]
-        return self._d.ac_transfer_latex(input, out_u)
 
     # --- escape hatch ------------------------------------------------------
 

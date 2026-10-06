@@ -27,6 +27,7 @@ pub mod parallel;
 pub mod role;
 pub mod scalar;
 pub mod scope;
+pub mod scratch;
 pub mod semantics;
 mod simd;
 pub mod simplify;
@@ -50,7 +51,7 @@ pub use extern_fn::{BackendCache, ExternBundle};
 pub use field::ratio_powi;
 pub use field::{Field, F64};
 pub use func::{Body, FuncId, Function, Output, OutputId};
-pub use graph::Graph;
+pub use graph::{Bound, Graph};
 pub use mathfn::lower_call;
 pub use module::{IdMap, Module, ModuleError, MODULE_VERSION};
 pub use node::{

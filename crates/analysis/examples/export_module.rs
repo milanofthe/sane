@@ -46,16 +46,7 @@ fn main() {
         values.insert(name, v);
     }
     // The constants as the doubles every execution type starts from.
-    let m = ctx.to_module();
-    let module = Module::<F64> {
-        version: m.version,
-        nodes: m.nodes,
-        consts: m.consts.iter().map(|c| F64::new(c.to_f64())).collect(),
-        arg_pool: m.arg_pool,
-        symbols: m.symbols,
-        funcs: m.funcs,
-        call_outputs: m.call_outputs,
-    };
+    let module: Module<F64> = ctx.to_module().map_consts(|c| F64::new(c.to_f64()));
     let json = serde_json::json!({
         "module": module,
         "circuit": circuit.0,

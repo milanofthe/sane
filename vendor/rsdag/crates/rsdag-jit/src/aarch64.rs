@@ -108,6 +108,7 @@ impl A64 {
 }
 
 impl Isa for A64 {
+    const LANES: usize = 1;
     const CACHE: &'static [u8] = &[
         8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
         31,
@@ -165,6 +166,12 @@ impl Isa for A64 {
     }
     fn store(&mut self, r: u8, base: Base, off: usize) {
         self.mem(0xFD00_0000, 0xFC20_6800, r as u32, Self::base(base), off);
+    }
+    fn load_lane(&mut self, r: u8, base: Base, off: usize) {
+        self.load(r, base, off);
+    }
+    fn store_lane(&mut self, r: u8, base: Base, off: usize) {
+        self.store(r, base, off);
     }
     fn fconst(&mut self, r: u8, v: f64) {
         if v.to_bits() == 0 {

@@ -3,15 +3,15 @@
 ##                                      SANE
 ##                                  (__init__.py)
 ##
-##            Symbolic + numeric circuit analysis: exact component sensitivity
-##         (DC / transient / AC / pole-zero / noise / harmonic balance) and
-##          nonlinear DAE extraction, on a hash-consed symbolic engine in Rust.
+##          Circuit analysis with exact component sensitivity (DC /
+##       transient / AC / pole-zero / noise / harmonic balance), on a
+##              hash-consed expression graph in Rust.
 ##
 #########################################################################################
-"""SANE: symbolic and numeric circuit analysis.
+"""SANE: circuit analysis with exact sensitivities.
 
-SANE extracts the symbolic differential-algebraic system ``F(x, x', t) = 0``
-from a circuit and analyzes it exactly: DC operating point, transient response,
+SANE extracts the differential-algebraic system ``I(x, t) + d/dt Q(x) = 0``
+from a circuit as an expression graph and analyzes it exactly: DC operating point, transient response,
 small-signal AC transfer, poles / zeros, noise PSD and harmonic balance, and --
 its distinguishing capability -- exact component sensitivity (which component
 matters how much, to first and second order, hierarchically) for every one of
@@ -58,13 +58,6 @@ Example
     traj = model.transient(np.linspace(0, 5e-3, 200))
     print(traj["out"][-1])
 
-SANE's hash-consed symbolic core is also exposed directly: :func:`symbols`
-builds :class:`~sane.symbolic.Expr` that support the Python operators,
-``.diff`` / ``.simplify`` / ``.eval`` and :func:`compile_tape`. The extracted
-:class:`~sane.model.Model` shares that context, so ``model.residuals``,
-``model.system_matrix()`` and ``model.transfer_function(...)`` come back as
-manipulable expressions.
-
 The raw, positional compiled API remains available as :mod:`sane._core`.
 """
 
@@ -93,15 +86,6 @@ from .analysis import (
 from .differentiable import ParamFunction, TransientFunction, DcFunction, AcFunction, HbFunction, PzFunction, SpFunction
 from .rf import SParams, read_touchstone, write_touchstone, s_to_y, y_to_s, fit_verilog_a
 from . import interop
-from .symbolic import (
-    Context,
-    Expr,
-    Tape,
-    symbols,
-    jacobian,
-    sparsity,
-    compile_tape,
-)
 from .warnings import (
     SaneWarning,
     SaneConvergenceWarning,
@@ -236,13 +220,5 @@ __all__ = [
     "SaneWarning",
     "SaneConvergenceWarning",
     "SaneNumericalWarning",
-    # symbolic engine
-    "Context",
-    "Expr",
-    "Tape",
-    "symbols",
-    "jacobian",
-    "sparsity",
-    "compile_tape",
     "_core",
 ]

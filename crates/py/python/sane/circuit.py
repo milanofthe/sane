@@ -33,7 +33,7 @@ GROUND_ALIASES = frozenset({"0", "gnd", "GND", "Gnd", "ground"})
 
 class Circuit:
     """A circuit, built either from a SPICE-like netlist or programmatically, and
-    the entry point to SANE's symbolic analysis.
+    the entry point to SANE's analyses.
 
     Nodes are referenced by **name** (any string; the ground aliases in
     ``GROUND_ALIASES`` all map to the reference node). Element values are bound
@@ -51,8 +51,8 @@ class Circuit:
        linear networks; programmatic semiconductor models need their parameters
        passed explicitly (the netlist front-end is what supplies model defaults).
 
-    Calling :meth:`extract` lowers the topology to the symbolic differential
-    algebraic system ``F(x, x', t) = 0`` and returns a :class:`~sane.model.Model`,
+    Calling :meth:`extract` lowers the topology to the differential-algebraic
+    system ``I(x, t) + d/dt Q(x) = 0`` and returns a :class:`~sane.model.Model`,
     which carries every analysis (DC, transient, small-signal, sensitivity).
 
     Example
@@ -760,7 +760,7 @@ class Circuit:
 
     def extract(self, fold=None, keep=None):
         """Extract the circuit as an analyzable :class:`~sane.model.Model`
-        (the symbolic differential-algebraic system ``F(x, x', t) = 0`` with its
+        (the differential-algebraic system ``I(x, t) + d/dt Q(x) = 0`` with its
         analytic Jacobians).
 
         The returned object carries every analysis (DC operating point,

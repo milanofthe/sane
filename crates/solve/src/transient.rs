@@ -1,11 +1,11 @@
 //! Implicit-RK transient integration for the SANE DAE: the shared adaptive outer
-//! loop, and the dispatch over the pluggable [`TransientMethod`] (the
-//! `C·ẋ = f(x,t)` mass-matrix form, `C = dF/dx'` constant).
+//! loop, and the dispatch over the pluggable [`TransientMethod`], integrating
+//! the charges `dQ/dt = −I(x, t)` (see [`crate::stage`]).
 //!
 //! Each method owns one step ([`esdirk32`](crate::esdirk32)'s
 //! `esdirk32_step`, [`trap`](crate::trap)'s `trap_step`) over the shared
 //! [`StageWorkspace`](crate::stage::StageWorkspace) and returns `(x_{n+1},
-//! err)`; everything else -- the consistent IC, the constant mass matrix, the
+//! err)`; everything else -- the consistent IC, the charge at the step start, the
 //! PI step-size control, the discontinuity schedule (source breakpoints,
 //! delayed arrivals, switching surfaces), the consistent restart after a
 //! landing and the dense output at `t_eval` -- is shared here.
@@ -14,7 +14,7 @@ use sane_core::log_stage;
 
 use crate::events::Discontinuities;
 use crate::stage::StageWorkspace;
-use crate::{sparse, CompiledDc, TransientMethod};
+use crate::{CompiledDc, TransientMethod};
 use sane_core::constants::*;
 
 /// Step controller factor, clamped. With an accepted previous error the PI
@@ -39,14 +39,22 @@ struct DenseOutput<'a> {
     t_eval: &'a [f64],
     cursor: usize,
     rows: Vec<Vec<f64>>,
+    /// The state rates `x'` at both ends of the current step, through which
+    /// the cubic Hermite runs, and whether the end rate of the step before
+    /// is this step's start rate (no reinitialisation in between).
+    rates: [Vec<f64>; 2],
+    carry: bool,
 }
 
 impl<'a> DenseOutput<'a> {
     fn new(t_eval: &'a [f64], t0: f64, x0: &[f64]) -> Self {
+        let n = x0.len();
         let mut d = DenseOutput {
             t_eval,
             cursor: 0,
             rows: Vec::with_capacity(t_eval.len()),
+            rates: [vec![0.0; n], vec![0.0; n]],
+            carry: false,
         };
         // Any requested points at or before the start clamp to the initial state.
         while d.cursor < t_eval.len() && t_eval[d.cursor] <= t0 {
@@ -56,11 +64,14 @@ impl<'a> DenseOutput<'a> {
         d
     }
 
-    /// Emit every requested point in `(t_prev, t]` through `interp(te)`.
-    fn emit(&mut self, t: f64, mut interp: impl FnMut(f64) -> Vec<f64>) {
-        while self.cursor < self.t_eval.len() && self.t_eval[self.cursor] <= t {
+    /// Emit every requested point in the step `(ta, tb]` from `xa` to `xb`.
+    fn emit(&mut self, xa: &[f64], xb: &[f64], ta: f64, tb: f64) {
+        let [ma, mb] = &self.rates;
+        while self.cursor < self.t_eval.len() && self.t_eval[self.cursor] <= tb {
             let te = self.t_eval[self.cursor];
-            self.rows.push(interp(te));
+            let n = xa.len();
+            self.rows
+                .push(hermite_point(xa, xb, ma, mb, ta, tb - ta, te, n));
             self.cursor += 1;
         }
     }
@@ -136,12 +147,52 @@ impl CompiledDc {
         // The stage workspace: tapes with their prolog run once (the parameter
         // vector is fixed over the integration), the transient-wide stage
         // factorization (the first factor pays full pivoting, every refresh
-        // is a numeric-only refactor), the constant mass matrix, scratch.
+        // is a numeric-only refactor), the mass matrix, scratch.
         let sym = self
             .stage_symbolic()
             .ok_or("irk: stage symbolic build failed")?;
-        let mut ws = StageWorkspace::new(self, &sym, &x, p, t0, taus.clone(), dhist, rtol, atol);
+        let mass_sym = Self::build_symbolic(n, &self.jxd_rows, &self.jxd_cols);
+        let mut ws = StageWorkspace::new(
+            self,
+            &sym,
+            mass_sym.as_ref(),
+            &x,
+            p,
+            t0,
+            taus.clone(),
+            dhist,
+            rtol,
+            atol,
+        );
         let trace = ws.trace;
+        let span = (final_time - t0).max(f64::MIN_POSITIVE);
+        let h_first = dt_max
+            .filter(|c| c.is_finite() && *c > 0.0)
+            .unwrap_or(span / 100.0)
+            .min(span);
+        // A caller's initial state need not be consistent (SPICE's `uic`:
+        // every node at zero, the sources not yet applied), and the method's
+        // first stage reads the slope there. One backward-Euler step of a
+        // sliver of the first step, the time held, makes it so: the
+        // algebraic unknowns take their values, the charges barely move.
+        // The state, the step candidate and the step start live in three
+        // buffers that trade places as steps are accepted.
+        let mut x_new = x.clone();
+        if x0.len() == n {
+            ws.psi.fill(0.0);
+            ws.fill_hist(t0);
+            ws.fac_fresh = false;
+            let h_ic = h_first * TRANSIENT_IC_STEP_FRAC;
+            x_new.copy_from_slice(&x);
+            let ok = self.stage_newton(&mut ws, &mut x_new, t0, h_ic, 1.0);
+            ws.fac_fresh = false;
+            if !ok {
+                return Err("transient: no consistent state from the initial one".into());
+            }
+            std::mem::swap(&mut x, &mut x_new);
+            ws.advance();
+        }
+        let mut x_prev = x.clone();
 
         // Adaptive by default; the fixed-step switch forces steps at the cap or
         // a span division. `dt_max` is a step *cap* (e.g. to resolve a fast
@@ -157,7 +208,6 @@ impl CompiledDc {
         } else {
             hcap
         };
-        let span = (final_time - t0).max(f64::MIN_POSITIVE);
         let h_min = span * TRANSIENT_SPAN_EPS_FRAC;
         let h_init = hcap.unwrap_or(span / 100.0).min(span);
         let mut h = h_init;
@@ -200,12 +250,7 @@ impl CompiledDc {
         // Streaming dense output: only the previous and current state are kept,
         // the requested points inside each accepted step are emitted as it
         // lands (peak memory O(n x |t_eval|), independent of the step count).
-        // Cubic Hermite through the endpoint states and the state-space rates
-        // `x' = C⁻¹ slope` recovers the method order at output points; a
-        // singular `C` (a genuine DAE) falls back to the linear blend, exact for
-        // the algebraic constraint at the endpoints.
         let mut dense = DenseOutput::new(t_eval, t0, &x);
-        let c_lu: Option<sparse::TripletLu> = ws.mass.factor(n);
 
         // PI controller history: the error of the last ACCEPTED step (cleared on
         // rejects and landings, where the local smoothness assumption breaks).
@@ -223,9 +268,9 @@ impl CompiledDc {
                 htry = htry.min(c);
             }
             htry = disc.clamp(t, htry);
-            // Pre-step state, for the dense-output interval [t_prev, t] once accepted.
+            // Pre-step time, for the dense-output interval [t_prev, t] once
+            // accepted (the state moves to `x_prev` then).
             let t_prev = t;
-            let x_prev = x.clone();
             // The controller's step, before any event retake shortens it.
             let h_before = htry;
             let mut ev_rounds = 0usize;
@@ -241,22 +286,24 @@ impl CompiledDc {
                 let stepped = log_stage!(
                     "tran/irk_step",
                     match method {
-                        TransientMethod::Esdirk32 => self.esdirk32_step(&mut ws, &x, t, htry),
+                        TransientMethod::Esdirk32 => {
+                            self.esdirk32_step(&mut ws, &x, t, htry, &mut x_new)
+                        }
                         TransientMethod::Trap => {
-                            self.trap_step(&mut ws, c_lu.as_ref(), &trap_hist, &x, t, htry)
+                            self.trap_step(&mut ws, &mut trap_hist, &x, t, htry, &mut x_new)
                         }
                     }
                 );
                 if trace {
                     match &stepped {
                         None => eprintln!("tran: t={t:.9e} h={htry:.3e} stage Newton diverged"),
-                        Some((_, err)) => eprintln!(
+                        Some(err) => eprintln!(
                             "tran: t={t:.9e} h={htry:.3e} err={err:.3e} {}",
                             if *err <= 1.0 { "ok" } else { "reject" }
                         ),
                     }
                 }
-                let Some((x_new, err)) = stepped else {
+                let Some(err) = stepped else {
                     // A stage Newton diverged: shrink and retry (a too-large step
                     // through a fast region; smaller `h` recovers convergence).
                     ws.stats.rejects += 1;
@@ -288,7 +335,9 @@ impl CompiledDc {
                             let last = ws.slopes.len() - 1;
                             trap_hist.accept(t, &x, &ws.slopes[last]);
                         }
-                        x = x_new;
+                        std::mem::swap(&mut x_prev, &mut x);
+                        std::mem::swap(&mut x, &mut x_new);
+                        ws.advance();
                         t += htry;
                         ws.stats.steps += 1;
                         tracker.update(((t - t0) / span).clamp(0.0, 1.0), true);
@@ -304,7 +353,8 @@ impl CompiledDc {
                 // what inflates the error, and shrinking blindly would only
                 // creep up to it.
                 if ev_rounds < EVENT_RESTEP_MAX {
-                    let crossing = disc.locate(&x, &x_new, t, htry, c_lu.as_ref(), &ws.slopes);
+                    let mut rates = || self.end_rates(&mut ws, &x, &x_new, t, t + htry);
+                    let crossing = disc.locate(&x, &x_new, t, htry, &mut rates);
                     if let Some(te) = crossing.filter(|te| te - t > h_min) {
                         if trace {
                             eprintln!(
@@ -348,18 +398,16 @@ impl CompiledDc {
                     err_prev = None;
                     trap_hist.breakpoint();
                     let delta = (h_before * EVENT_REINIT_FRAC).max(h_min);
-                    match self.reinit_step(&mut ws, &x, t, delta) {
-                        Some(xr) => {
-                            x = xr;
-                            t += delta;
-                            if trace {
-                                eprintln!("tran:   reinitialised at t={t:.9e}");
-                            }
+                    if self.reinit_step(&mut ws, &x, t, delta, &mut x_new) {
+                        std::mem::swap(&mut x, &mut x_new);
+                        ws.advance();
+                        dense.carry = false;
+                        t += delta;
+                        if trace {
+                            eprintln!("tran:   reinitialised at t={t:.9e}");
                         }
-                        None if trace => {
-                            eprintln!("tran:   reinitialisation Newton failed at t={t:.9e}")
-                        }
-                        None => {}
+                    } else if trace {
+                        eprintln!("tran:   reinitialisation Newton failed at t={t:.9e}")
                     }
                     fac_h = f64::NAN;
                 }
@@ -376,7 +424,7 @@ impl CompiledDc {
 
             // Accepted step: the dense output over [t_prev, t] and the delay
             // history knot at t.
-            self.emit_step(&mut ws, c_lu.as_ref(), &mut dense, &x_prev, &x, t_prev, t);
+            self.emit_step(&mut ws, &mut dense, &x_prev, &x, t_prev, t);
         }
 
         let res = dense.finish(&x);
@@ -407,65 +455,68 @@ impl CompiledDc {
         Ok(res)
     }
 
-    /// After an accepted step `[t_prev, t]`: emit the requested output points
-    /// inside it and append the delay-history knot at `t`. With a factorable
-    /// mass matrix the endpoint rates `x' = C⁻¹ slope` give the cubic Hermite
-    /// dense output and the knot's two one-sided slopes (the step-start rate
-    /// is the previous knot's right limit, patched in now); with a singular
-    /// mass matrix both are the linear blend.
-    #[allow(clippy::too_many_arguments)]
+    /// After an accepted step `[t_prev, t]`: the state rates at both ends,
+    /// the requested output points inside it, and the delay-history knot at
+    /// `t`. With a factorable mass matrix the rates are `x' = C⁻¹ slope`,
+    /// which recovers the method order at output points and gives the knot
+    /// its two one-sided slopes (the step-start rate is the previous knot's
+    /// right limit, patched in now). With a singular mass matrix (a genuine
+    /// DAE) both are the secant, on which the cubic Hermite is the linear
+    /// blend, exact for the algebraic constraint at the endpoints.
     fn emit_step(
         &self,
         ws: &mut StageWorkspace<'_>,
-        c_lu: Option<&sparse::TripletLu>,
         dense: &mut DenseOutput<'_>,
         x_prev: &[f64],
         x: &[f64],
         t_prev: f64,
         t: f64,
     ) {
-        let n = self.n;
-        let hstep = t - t_prev;
-        match c_lu {
-            Some(lu) => {
-                let m0 = solve_mass(lu, &ws.slopes[0], n);
-                let m1 = solve_mass(lu, &ws.slopes[ESDIRK32_STAGES - 1], n);
-                if let Some(h) = ws.dhist.as_mut() {
-                    let out: Vec<f64> = self.delay_src.iter().map(|&s| m0[s]).collect();
-                    h.patch_last_out(&out);
-                    let vals: Vec<f64> = self.delay_src.iter().map(|&s| x[s]).collect();
-                    let ders: Vec<f64> = self.delay_src.iter().map(|&s| m1[s]).collect();
-                    h.push(t, &vals, &ders);
-                }
-                dense.emit(t, |te| {
-                    hermite_point(x_prev, x, &m0, &m1, t_prev, hstep, te, n)
-                });
+        let [m0, m1] = &mut dense.rates;
+        let last = ws.slopes.len() - 1;
+        // the start rate is the end rate of the step before, when it is
+        let start = if dense.carry {
+            std::mem::swap(m0, m1);
+            true
+        } else {
+            ws.mass.rate_at(self, x_prev, t_prev, &ws.slopes[0], m0)
+        };
+        dense.carry = start && ws.mass.rate_at(self, x, t, &ws.slopes[last], m1);
+        if !dense.carry {
+            let hstep = (t - t_prev).max(f64::MIN_POSITIVE);
+            for k in 0..self.n {
+                m0[k] = (x[k] - x_prev[k]) / hstep;
             }
-            None => {
-                if let Some(h) = ws.dhist.as_mut() {
-                    // singular mass: secant slopes on both interval ends, so
-                    // the history interpolates linearly -- consistent with the
-                    // linear dense output
-                    let vals: Vec<f64> = self.delay_src.iter().map(|&s| x[s]).collect();
-                    let ders: Vec<f64> = self
-                        .delay_src
-                        .iter()
-                        .map(|&s| (x[s] - x_prev[s]) / hstep.max(f64::MIN_POSITIVE))
-                        .collect();
-                    h.patch_last_out(&ders);
-                    h.push(t, &vals, &ders);
-                }
-                dense.emit(t, |te| linear_point(x_prev, x, t_prev, t, te, n));
-            }
+            m1.copy_from_slice(m0);
         }
+        if let Some(h) = ws.dhist.as_mut() {
+            let src = &self.delay_src;
+            h.patch_last_out(src.iter().map(|&s| m0[s]));
+            h.push(t, src.iter().map(|&s| x[s]), src.iter().map(|&s| m1[s]));
+        }
+        dense.emit(x_prev, x, t_prev, t);
     }
 }
 
-/// Solve `C m = rhs` for the state-space rate `m = x'` using the pre-factored
-/// (constant) mass matrix. Zeros on a solve failure (cannot happen for a
-/// successfully factored `C` of matching dimension).
-pub(crate) fn solve_mass(lu: &sparse::TripletLu, rhs: &[f64], n: usize) -> Vec<f64> {
-    lu.solve(rhs).unwrap_or_else(|| vec![0.0; n])
+impl CompiledDc {
+    /// The state rates at both ends of the candidate step `[ta, tb]` from
+    /// `xa` to `xb` (`None` when the mass matrix is singular), for locating
+    /// a crossing on the step's Hermite interpolant.
+    fn end_rates(
+        &self,
+        ws: &mut StageWorkspace<'_>,
+        xa: &[f64],
+        xb: &[f64],
+        ta: f64,
+        tb: f64,
+    ) -> Option<(Vec<f64>, Vec<f64>)> {
+        let n = self.n;
+        let (mut ma, mut mb) = (vec![0.0; n], vec![0.0; n]);
+        let last = ws.slopes.len() - 1;
+        let ok = ws.mass.rate_at(self, xa, ta, &ws.slopes[0], &mut ma)
+            && ws.mass.rate_at(self, xb, tb, &ws.slopes[last], &mut mb);
+        ok.then_some((ma, mb))
+    }
 }
 
 /// Cubic-Hermite dense output at `te` in the interval `[t_prev, t_prev + h]` from

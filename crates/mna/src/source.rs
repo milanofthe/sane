@@ -76,6 +76,17 @@ impl SourceFn {
                         push(s, v);
                     }
                 }
+                // SPICE's defaults: the fall as long as the rise, the pulse
+                // held and not repeated (SPICE takes the end of the run)
+                if let (None, Some(tr)) = (at(4), at(3)) {
+                    push("pulse_tf", tr);
+                }
+                if at(5).is_none() {
+                    push("pulse_pw", PULSE_FOREVER);
+                }
+                if at(6).is_none() {
+                    push("pulse_per", PULSE_FOREVER);
+                }
             }
             SourceFn::Exp => {
                 for (i, s) in EXP_SUFFIX.iter().enumerate() {
@@ -306,6 +317,10 @@ impl SourceFn {
         }
     }
 }
+
+/// The width and the period of a pulse that does not say: longer than any
+/// run, finite so the lowered waveform computes with it.
+const PULSE_FOREVER: f64 = 1e30;
 
 const PULSE_SUFFIX: [&str; 7] = [
     "pulse_v1",

@@ -38,10 +38,10 @@ pub struct Graph<K: Field = F64> {
     f64_cache: HashMap<u64, ExprId>,
     arg_pool: Vec<ExprId>,
     arg_dedup: HashMap<Box<[ExprId]>, ArgList>,
-    /// The fingerprint of each interned list's operands, once per list: a
-    /// call's fingerprint is its callee's and this, so the calls of one
-    /// instance of a wide body cost its width once.
-    list_shape: HashMap<ArgList, u64>,
+    /// The fingerprint of each interned list's operands, once per list and
+    /// context it is called in: a call's fingerprint is its callee's and
+    /// this, so the calls of one instance of a wide body cost its width once.
+    list_shape: HashMap<(u32, ArgList), u64>,
     /// The interned constants `0` and `1` (created in `new`), so identity
     /// folding is an id compare and `zero()`/`one()` never hash.
     zero: ExprId,
@@ -52,11 +52,55 @@ pub struct Graph<K: Field = F64> {
     /// pairs the `Call` nodes name.
     funcs: Vec<Function>,
     outputs: Vec<(FuncId, u32)>,
-    output_dedup: HashMap<(FuncId, u32), OutputId>,
+    /// Per output id, the context it is called in (see [`bind`](Self::bind));
+    /// `NO_CONTEXT` for none.
+    output_ctx: Vec<u32>,
+    output_dedup: HashMap<(FuncId, u32, u32), OutputId>,
+    /// The bindings of parameters of functions (see [`bind`](Self::bind)).
+    contexts: Vec<Context>,
+    context_dedup: HashMap<(FuncId, Box<[u32]>, ArgList), u32>,
     /// Reusable per-node memos for the graph traversals (differentiation,
     /// substitution), a stack so a traversal nested in another reuses one
     /// too; see [`Memo`].
     memos: Vec<Memo>,
+    /// The copies of functions with globals bound (see
+    /// [`rebound`](Self::rebound)), by function and binding.
+    rebound: HashMap<(FuncId, Vec<(SymbolId, ExprId)>), FuncId>,
+    /// The templates the tape compiler made of composite functions, by
+    /// function, output set and operand purity: shared by every program
+    /// compiled over this graph (see [`Tape::compile`](crate::Tape::compile)).
+    pub(crate) templates: std::sync::Mutex<TemplateCache>,
+}
+
+/// The templates of [`Graph::templates`]: what the tape compiler keeps,
+/// its type its own.
+pub(crate) type TemplateCache =
+    HashMap<(u32, Vec<u32>, Option<Vec<bool>>), Arc<dyn std::any::Any + Send + Sync>>;
+
+/// No context: a call passes every parameter.
+pub(crate) const NO_CONTEXT: u32 = u32::MAX;
+
+/// Parameters of a function bound once for every call through it (see
+/// [`Graph::bind`]).
+pub(crate) struct Context {
+    pub(crate) f: FuncId,
+    /// The bound parameters, ascending, and their expressions.
+    pub(crate) at: Box<[u32]>,
+    pub(crate) exprs: ArgList,
+    /// Per parameter: `BOUND | j` for the `j`th bound expression, else the
+    /// index of the call argument that passes it.
+    pub(crate) slot: Box<[u32]>,
+}
+
+/// Marks a bound parameter in [`Context::slot`].
+pub(crate) const BOUND: u32 = 1 << 31;
+
+/// A function with parameters bound (see [`Graph::bind`]): what a call
+/// through it runs, its arguments the parameters left.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Bound {
+    pub func: FuncId,
+    pub(crate) ctx: u32,
 }
 
 /// A per-node memo table over the arena, cleared in O(1) by bumping an epoch:
@@ -110,6 +154,9 @@ impl Memo {
 
 mod calls;
 mod compose;
+mod flow;
+
+pub(crate) use flow::{Join, Set, Through};
 
 impl<K: Field> Default for Graph<K> {
     fn default() -> Self {
@@ -135,8 +182,13 @@ impl<K: Field> Graph<K> {
             symbol_ids: HashMap::default(),
             funcs: Vec::new(),
             outputs: Vec::new(),
+            output_ctx: Vec::new(),
             output_dedup: HashMap::default(),
+            contexts: Vec::new(),
+            context_dedup: HashMap::default(),
             memos: Vec::new(),
+            rebound: HashMap::default(),
+            templates: Default::default(),
         };
         ctx.zero = ctx.konst(K::zero());
         ctx.one = ctx.konst(K::one());
@@ -197,7 +249,13 @@ impl<K: Field> Graph<K> {
     /// The operands a node reads, without allocation (leaves have none).
     #[inline]
     pub fn operands(&self, id: ExprId) -> Operands<'_> {
-        self.node(id).operands(&self.arg_pool)
+        match *self.node(id) {
+            Node::Call(o, l) if self.output_ctx[o.0 as usize] != NO_CONTEXT => {
+                let c = &self.contexts[self.output_ctx[o.0 as usize] as usize];
+                Operands::Owned([self.args(l), self.args(c.exprs)].concat())
+            }
+            ref node => node.operands(&self.arg_pool),
+        }
     }
 
     /// Intern a node, reusing an existing id if structurally identical.
@@ -263,10 +321,8 @@ impl<K: Field> Graph<K> {
             Node::Call(o, l) => {
                 let (func, k) = self.output(o);
                 let callee = of_hash(self.func(func).name());
-                mix(
-                    mix(Tag::Call as u64, mix(callee, k as u64)),
-                    self.list_shape[&l],
-                )
+                let operands = self.list_shape[&(self.output_ctx[o.0 as usize], l)];
+                mix(mix(Tag::Call as u64, mix(callee, k as u64)), operands)
             }
         }
     }
@@ -285,7 +341,7 @@ impl<K: Field> Graph<K> {
         let shape = args.iter().fold(0, |h, &a| {
             crate::node::shape::mix(h, self.shape[a.0 as usize])
         });
-        self.list_shape.insert(l, shape);
+        self.list_shape.insert((NO_CONTEXT, l), shape);
         l
     }
 
@@ -801,7 +857,7 @@ impl<K: Field> Graph<K> {
                 self.dot(a.to_vec(), b.to_vec())
             }
             Node::Solve(_, i) => self.solve_component(ops, i),
-            Node::Call(o, _) => self.call_output(o, ops),
+            Node::Call(o, _) => self.call_over_operands(o, ops),
         }
     }
 

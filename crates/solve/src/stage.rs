@@ -1,37 +1,85 @@
 //! The stage machinery every transient method shares: the workspace one
 //! integration carries from step to step, and the implicit stage solve.
 //!
-//! An implicit Runge-Kutta stage (ESDIRK32's γ-stages, the trapezoidal
-//! corrector as a γ = 1/2 stage, the consistent restart after a
-//! discontinuity as a γ = 1 stage) is the same problem,
+//! Every row of the DAE reads `I(x, t) + d/dt Q(x)`: `I` the residual at
+//! rest, `Q` the charge it stores. The methods integrate the charges,
+//! `dQ/dt = −Ĩ` with `Ĩ = I + gmin·x`, and an implicit Runge-Kutta stage
+//! (ESDIRK32's γ-stages, the trapezoidal corrector as a γ = 1/2 stage, the
+//! consistent start and the restart after a discontinuity as γ = 1 stages)
+//! is the same problem,
 //!
-//! `r(X) = C·(X − xₙ) − ψ + h·γ·F̃(X, tᵢ) = 0`,   `F̃ = F + gmin·x`,
+//! `r(X) = Q(X) − Q(xₙ) − ψ + h·γ·Ĩ(X, tᵢ) = 0`,
 //!
-//! solved by the modified Newton of [`CompiledDc::stage_newton`] against a
-//! factorization frozen across the step and refreshed on a stall. What the
-//! stages need beyond `(xₙ, ψ, tᵢ, h, γ)` -- the two prolog-split tapes, the
-//! stage factorization and whether it is fresh, the constant mass matrix, the
-//! scratch buffers, the iteration statistics, the transport-delay history and
-//! the integration tolerances -- lives in one [`StageWorkspace`] instead of
-//! two dozen parameters per call.
+//! with the slopes `f = −Ĩ` in charge space. A nonlinear capacitance is
+//! exact at every stage, and the integration conserves charge. The stage is
+//! solved by the modified Newton of [`CompiledDc::stage_newton`] against the
+//! stage matrix `C(X)/(hγ) + G(X) + gmin`, `G = dI/dx` and `C = dQ/dx`,
+//! factorized once and refreshed on a stall. What the stages need beyond
+//! `(ψ, tᵢ, h, γ)` -- the two prolog-split tapes, the stage factorization
+//! and whether it is fresh, the charge at the step start, the mass matrix,
+//! the scratch buffers, the iteration statistics, the transport-delay
+//! history and the integration tolerances -- lives in one
+//! [`StageWorkspace`] instead of two dozen parameters per call.
 
 use sane_core::constants::*;
 
 use crate::{newton, sparse, CompiledDc, Convergence, PrologToken, Stats, Symbolic};
 
-/// The constant mass matrix `C = dF/dx'` in triplet form.
-pub(crate) struct MassMatrix {
+/// The mass matrix `C = dQ/dx` in triplet form, in the jacobian-x' pattern: its
+/// values where the stage matrix was last factorized, and, when `C` is
+/// regular, its factorization at any state for the state rates
+/// `x' = C⁻¹ f`.
+pub(crate) struct MassMatrix<'a> {
     pub rows: Vec<usize>,
     pub cols: Vec<usize>,
+    /// `C` where the stage matrix was last factorized.
     pub vals: Vec<f64>,
+    /// `None` when `C` is singular (a genuine DAE with algebraic unknowns).
+    lu: Option<sparse::Refactorable<'a>>,
+    n: usize,
+    valbuf: Vec<f64>,
+    /// The inputs, work and values of `C` evaluated for a rate.
+    inputs: Vec<f64>,
+    work: Vec<f64>,
+    at: Vec<f64>,
 }
 
-impl MassMatrix {
+impl<'a> MassMatrix<'a> {
+    /// `C` at the state `inputs` holds, factorized on `sym` when regular.
+    fn new(cdc: &CompiledDc, sym: Option<&'a Symbolic>, inputs: &[f64]) -> Self {
+        let mut m = MassMatrix {
+            rows: cdc.jxd_rows.clone(),
+            cols: cdc.jxd_cols.clone(),
+            vals: Vec::new(),
+            lu: sym.map(|s| s.pattern.factorizer()),
+            n: cdc.n,
+            valbuf: Vec::new(),
+            inputs: inputs.to_vec(),
+            work: Vec::new(),
+            at: Vec::new(),
+        };
+        cdc.tape_c.eval(&m.inputs, &mut m.work, &mut m.at);
+        m.vals = m.at.clone();
+        if !m.factor() {
+            m.lu = None;
+        }
+        m
+    }
+
+    /// Factorize `C` at the values `at` holds.
+    fn factor(&mut self) -> bool {
+        let Some(lu) = self.lu.as_mut() else {
+            return false;
+        };
+        self.valbuf.clear();
+        self.valbuf.extend_from_slice(&self.at);
+        self.valbuf.resize(self.at.len() + self.n, 0.0);
+        lu.factor(&self.valbuf, false)
+    }
+
     /// `out = C v`.
     pub fn matvec(&self, v: &[f64], out: &mut [f64]) {
-        for o in out.iter_mut() {
-            *o = 0.0;
-        }
+        out.fill(0.0);
         for k in 0..self.vals.len() {
             out[self.rows[k]] += self.vals[k] * v[self.cols[k]];
         }
@@ -42,18 +90,31 @@ impl MassMatrix {
         self.vals.iter().all(|v| *v == 0.0)
     }
 
-    /// A factorization of `C` for the state-space rate `x' = C⁻¹ slope`,
-    /// `None` when `C` is singular (a genuine DAE with algebraic unknowns).
-    pub fn factor(&self, n: usize) -> Option<sparse::TripletLu> {
-        sparse::factor_triplets(n, &self.rows, &self.cols, &self.vals)
+    /// The state rate `x' = C(x)⁻¹ slope` into `out`, `C` evaluated at
+    /// `(x, t)`; `false` when `C` is singular.
+    pub fn rate_at(
+        &mut self,
+        cdc: &CompiledDc,
+        x: &[f64],
+        t: f64,
+        slope: &[f64],
+        out: &mut [f64],
+    ) -> bool {
+        if self.lu.is_none() {
+            return false;
+        }
+        cdc.patch_inputs(x, t, &mut self.inputs);
+        cdc.tape_c.eval(&self.inputs, &mut self.work, &mut self.at);
+        self.factor() && self.lu.as_mut().is_some_and(|lu| lu.solve_into(slope, out))
     }
 }
 
 /// Everything one transient integration carries into every stage solve.
 pub(crate) struct StageWorkspace<'a> {
-    /// Prolog tokens of the step (residual + Jacobian) and residual-only
-    /// tapes: the parameter-pure prefix ran once, every stage evaluation runs
-    /// the main phase over the persistent `work` / `res_work` buffers.
+    /// Prolog tokens of the step (`I`, `Q`, `G`, `C`) and residual-only
+    /// (`I`, `Q`) tapes: the parameter-pure prefix ran once, every stage
+    /// evaluation runs the main phase over the persistent `work` /
+    /// `res_work` buffers.
     pub step_tok: PrologToken,
     pub res_tok: PrologToken,
     /// The transient-wide stage factorization (numeric-only refactors after
@@ -61,23 +122,32 @@ pub(crate) struct StageWorkspace<'a> {
     /// step size.
     pub fac: sparse::Refactorable<'a>,
     pub fac_fresh: bool,
-    pub mass: MassMatrix,
-    /// Zero derivative vector: stage residuals are evaluated at `xdot = 0`,
-    /// the derivative entering through `C`.
-    pub zc: Vec<f64>,
+    pub mass: MassMatrix<'a>,
     pub inputs: Vec<f64>,
     pub work: Vec<f64>,
-    /// Own buffer for `tape_res_dc` (its layout differs; sharing `work` would
-    /// clobber `tape_step_dc`'s prolog slots).
+    /// Own buffer for the residual tape (its layout differs; sharing `work`
+    /// would clobber the step tape's prolog slots).
     pub res_work: Vec<f64>,
     pub out: Vec<f64>,
     pub valbuf: Vec<f64>,
     pub cdx: Vec<f64>,
-    /// The stage Newton's per-iteration scratch: `x - xn` and the scaled
-    /// right-hand side.
-    pub dxn: Vec<f64>,
+    /// The charge at the step start, and at the latest evaluation.
+    pub qn: Vec<f64>,
+    pub q: Vec<f64>,
+    /// `|G|` then `|C|` at the latest stage factorization, and per row the
+    /// magnitude `|G| |x| + |C| |x| / hγ` its residual is computed from (the
+    /// residual's rounding floor).
+    pub jmag: Vec<f64>,
+    pub rowmag: Vec<f64>,
+    /// The stage Newton's scratch: the scaled right-hand side and the
+    /// Newton step. The error estimates reuse both once the stages are
+    /// solved.
     pub rhs: Vec<f64>,
-    /// Stage slopes `fᵢ = −F̃(Xᵢ)`; `slopes[0]` is the rate at the step start
+    pub step: Vec<f64>,
+    /// The slope `f = −Ĩ(x)` of the last stage solve or residual slope; a
+    /// method swaps it into its `slopes` entry.
+    pub f: Vec<f64>,
+    /// Stage slopes `fᵢ = −Ĩ(Xᵢ)`; `slopes[0]` is the rate at the step start
     /// and the last entry the rate at the step end (the dense-output contract
     /// every method honours).
     pub slopes: Vec<Vec<f64>>,
@@ -92,10 +162,14 @@ pub(crate) struct StageWorkspace<'a> {
 }
 
 impl<'a> StageWorkspace<'a> {
+    /// The workspace of an integration from `(t0, x0)`: the stage
+    /// factorization on `sym`, the mass matrix's on `mass_sym`, and the
+    /// charge at `x0` as the first step's start.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         cdc: &CompiledDc,
         sym: &'a Symbolic,
+        mass_sym: Option<&'a Symbolic>,
         x0: &[f64],
         p: &[f64],
         t0: f64,
@@ -105,28 +179,30 @@ impl<'a> StageWorkspace<'a> {
         atol: f64,
     ) -> Self {
         let n = cdc.n;
-        let zc = vec![0.0; n];
-        let (rows, cols, vals) = cdc.jacobian_xdot_sparse(x0, &zc, p, t0);
         let mut inputs = Vec::new();
         let (mut work, mut res_work) = (Vec::new(), Vec::new());
-        cdc.fill_inputs(x0, &zc, p, t0, &mut inputs);
-        let step_tok = cdc.tape_step_dc.eval_prolog(&inputs, &mut work);
-        let res_tok = cdc.tape_res_dc.eval_prolog(&inputs, &mut res_work);
-        StageWorkspace {
+        cdc.fill_inputs(x0, p, t0, &mut inputs);
+        let step_tok = cdc.tape_tran_step.eval_prolog(&inputs, &mut work);
+        let res_tok = cdc.tape_tran_res.eval_prolog(&inputs, &mut res_work);
+        let mut ws = StageWorkspace {
             step_tok,
             res_tok,
             fac: sym.pattern.factorizer(),
             fac_fresh: false,
-            mass: MassMatrix { rows, cols, vals },
-            zc,
+            mass: MassMatrix::new(cdc, mass_sym, &inputs),
             inputs,
             work,
             res_work,
             out: Vec::new(),
             valbuf: Vec::new(),
             cdx: vec![0.0; n],
-            dxn: vec![0.0; n],
+            qn: vec![0.0; n],
+            q: vec![0.0; n],
+            jmag: Vec::new(),
+            rowmag: vec![0.0; n],
             rhs: vec![0.0; n],
+            step: vec![0.0; n],
+            f: vec![0.0; n],
             slopes: vec![vec![0.0; n]; ESDIRK32_STAGES],
             psi: vec![0.0; n],
             stats: Stats::default(),
@@ -135,7 +211,17 @@ impl<'a> StageWorkspace<'a> {
             rtol,
             atol,
             trace: sane_core::config().tran_trace,
-        }
+        };
+        ws.fill_hist(t0);
+        cdc.residual_slope(&mut ws, x0, t0);
+        ws.advance();
+        ws
+    }
+
+    /// The state moved to where the latest evaluation was: its charge is
+    /// the next step's start.
+    pub fn advance(&mut self) {
+        self.qn.copy_from_slice(&self.q);
     }
 
     /// The integration tolerances as the shared convergence contract (one
@@ -152,101 +238,121 @@ impl<'a> StageWorkspace<'a> {
     /// every residual / Jacobian evaluation at that time.
     pub fn fill_hist(&mut self, ti: f64) {
         if let Some(h) = self.dhist.as_mut() {
-            let vals: Vec<f64> = self
-                .taus
-                .iter()
-                .enumerate()
-                .map(|(k, tau)| h.eval(k, ti - tau))
-                .collect();
-            crate::delay::set_hist_values(&vals);
+            let taus = self.taus.iter().enumerate();
+            crate::delay::set_hist_values(taus.map(|(k, tau)| h.eval(k, ti - tau)));
         }
     }
 }
 
 impl CompiledDc {
-    /// The shunted residual slope `f = −F̃(x, 0, t)` at `(x, t)`, through the
-    /// residual-only tape (an explicit stage needs no Jacobian).
-    pub(crate) fn residual_slope(
-        &self,
-        ws: &mut StageWorkspace<'_>,
-        x: &[f64],
-        t: f64,
-    ) -> Vec<f64> {
-        self.patch_inputs(x, &ws.zc, t, &mut ws.inputs);
-        self.tape_res_dc
+    /// The shunted slope `f = −Ĩ(x, t)` at `(x, t)` into `ws.f` and the
+    /// charge `Q(x)` into `ws.q`, through the residual-only tape (an
+    /// explicit stage needs no Jacobian).
+    pub(crate) fn residual_slope(&self, ws: &mut StageWorkspace<'_>, x: &[f64], t: f64) {
+        let n = self.n;
+        self.patch_inputs(x, t, &mut ws.inputs);
+        self.tape_tran_res
             .eval_main(&mut ws.res_tok, &ws.inputs, &mut ws.res_work, &mut ws.out);
-        (0..self.n).map(|k| -(ws.out[k] + GMIN_DC * x[k])).collect()
+        for k in 0..n {
+            ws.f[k] = -(ws.out[k] + GMIN_DC * x[k]);
+        }
+        ws.q.copy_from_slice(&ws.out[n..2 * n]);
     }
 
-    /// Solve one implicit stage `r(X) = C·(X − xₙ) − ψ + h·γ·F̃(X) = 0` by the
-    /// limiting *modified* Newton: reuse the frozen factorization (evaluating
-    /// only `F` via the cheap residual tape), refactorizing -- and
-    /// re-evaluating `dF/dx` -- only when a stale Jacobian converges too
-    /// slowly. `ws.psi` is the stage's history term. Returns
-    /// `(X, f = −F̃(X, 0, tᵢ), converged)`.
+    /// Evaluate the step tape at the state `ws.inputs` holds and factorize
+    /// the stage matrix `C/(hγ) + G + gmin` there; `C` is kept as the mass
+    /// matrix's values. `false` when singular.
+    fn refactor_stage(&self, ws: &mut StageWorkspace<'_>, hg: f64) -> bool {
+        let n = self.n;
+        self.tape_tran_step
+            .eval_main(&mut ws.step_tok, &ws.inputs, &mut ws.work, &mut ws.out);
+        let (g, c) = ws.out[2 * n..].split_at(self.nnz_x);
+        ws.mass.vals.copy_from_slice(c);
+        ws.jmag.clear();
+        ws.jmag.extend(g.iter().chain(c).map(|v| v.abs()));
+        ws.q.copy_from_slice(&ws.out[n..2 * n]);
+        let ok = self.factorize_stage(&mut ws.fac, g, c, 1.0 / hg, GMIN_DC, &mut ws.valbuf);
+        ws.fac_fresh = ok;
+        ok
+    }
+
+    /// Per row, `|G| |x| + |C| |x| / hγ` over the latest factorization's
+    /// Jacobians: the size of the terms the row's residual sums.
+    fn row_magnitudes(&self, ws: &mut StageWorkspace<'_>, x: &[f64], hg: f64) {
+        ws.rowmag.fill(0.0);
+        let (g, c) = ws.jmag.split_at(self.nnz_x.min(ws.jmag.len()));
+        for (e, &v) in g.iter().enumerate() {
+            ws.rowmag[self.jx_rows[e]] += v * x[self.jx_cols[e]].abs();
+        }
+        for (e, &v) in c.iter().enumerate() {
+            ws.rowmag[self.jxd_rows[e]] += v * x[self.jxd_cols[e]].abs() / hg;
+        }
+    }
+
+    /// Solve one implicit stage `r(X) = Q(X) − Q(xₙ) − ψ + h·γ·Ĩ(X) = 0`
+    /// (`Q(xₙ)` is `ws.qn`, `ψ` is `ws.psi`) by the limiting *modified*
+    /// Newton: reuse the frozen factorization (evaluating only `I` and `Q`
+    /// via the cheap residual tape), refactorizing -- and re-evaluating the
+    /// Jacobians -- only when a stale one converges too slowly. `x` is the
+    /// guess on entry and the stage value `X` on return. Converged: `true`,
+    /// with `f = −Ĩ(X, tᵢ)` in `ws.f` and `Q(X)` in `ws.q`.
     pub(crate) fn stage_newton(
         &self,
         ws: &mut StageWorkspace<'_>,
-        xn: &[f64],
-        guess: &[f64],
+        x: &mut [f64],
         ti: f64,
         h: f64,
         gamma: f64,
-    ) -> (Vec<f64>, Vec<f64>, bool) {
+    ) -> bool {
         let n = self.n;
-        let mut x = guess.to_vec();
-        let alpha = 1.0 / (h * gamma);
         let hg = h * gamma;
-        let mut step = vec![0.0; n];
         let mut prev_wn = f64::INFINITY;
         let crit = self.criterion(&ws.tolerances());
-        let slope = |out: &[f64], x: &[f64]| -> Vec<f64> {
-            (0..n).map(|k| -(out[k] + GMIN_DC * x[k])).collect()
-        };
+        let tol = (10.0 * f64::EPSILON / ws.rtol).max(IRK_STAGE_TOL_MAX.min(ws.rtol.sqrt()));
 
         for it in 0..IRK_STAGE_MAX_ITER {
             ws.stats.iters += 1;
-            // Building/refreshing the factorization needs dF/dx (full `tape_step_dc`);
-            // a reused factorization needs only F (the cheaper `tape_res_dc`).
+            // Building/refreshing the factorization needs the Jacobians (the
+            // step tape); a reused factorization needs only `I` and `Q`.
             let refresh = !ws.fac_fresh;
-            self.patch_inputs(&x, &ws.zc, ti, &mut ws.inputs);
+            self.patch_inputs(x, ti, &mut ws.inputs);
             if refresh {
                 ws.stats.refacs += 1;
-                self.tape_step_dc.eval_main(
-                    &mut ws.step_tok,
-                    &ws.inputs,
-                    &mut ws.work,
-                    &mut ws.out,
-                );
-                let (jac, valbuf) = (&ws.out[n..], &mut ws.valbuf);
-                if !self.factorize_stage(&mut ws.fac, jac, &ws.mass.vals, alpha, GMIN_DC, valbuf) {
-                    return (x.clone(), slope(&ws.out, &x), false);
+                if !self.refactor_stage(ws, hg) {
+                    return false;
                 }
-                ws.fac_fresh = true;
             } else {
-                self.tape_res_dc.eval_main(
+                self.tape_tran_res.eval_main(
                     &mut ws.res_tok,
                     &ws.inputs,
                     &mut ws.res_work,
                     &mut ws.out,
                 );
             }
-            // r = C(x - xn) - psi + hγ·F̃,  F̃ = F + gmin·x  (F = out[..n]),
-            // solved for the Newton step against r / hγ.
+            // r = Q(x) - Q(xn) - psi + hγ·Ĩ,  Ĩ = I + gmin·x  (I = out[..n],
+            // Q = out[n..2n]), solved for the Newton step against r / hγ;
+            // within the rounding of what it is computed from in every row,
+            // it is solved.
+            self.row_magnitudes(ws, x, hg);
+            let mut rounded = true;
             for k in 0..n {
-                ws.dxn[k] = x[k] - xn[k];
+                let (i, q) = (ws.out[k] + GMIN_DC * x[k], ws.out[n + k]);
+                let r = (q - ws.qn[k] - ws.psi[k]) / hg + i;
+                ws.rhs[k] = r;
+                let terms = (q.abs() + ws.qn[k].abs() + ws.psi[k].abs()) / hg + ws.rowmag[k];
+                rounded &= r.abs() <= IRK_STAGE_ROUNDOFF * f64::EPSILON * terms;
             }
-            ws.mass.matvec(&ws.dxn, &mut ws.cdx);
-            for k in 0..n {
-                let r = ws.cdx[k] - ws.psi[k] + hg * (ws.out[k] + GMIN_DC * x[k]);
-                ws.rhs[k] = r / hg;
+            if rounded {
+                self.residual_slope(ws, x, ti);
+                return true;
             }
-            if !ws.fac.solve_into(&ws.rhs, &mut step) {
-                return (x.clone(), slope(&ws.out, &x), false);
+            if !ws.fac.solve_into(&ws.rhs, &mut ws.step) {
+                return false;
             }
+            let step = &mut ws.step;
 
             // Scaled update norm (convergence + stall detection).
-            let (wn, worst) = crit.update_norm(&step, &x);
+            let (wn, worst) = crit.update_norm(step, x);
             if ws.trace {
                 eprintln!(
                     "tran:     stage t={ti:.9e} it={it} wn={wn:.3e} worst=x[{worst}] delta={:.3e} x={:.6e}{}",
@@ -267,7 +373,7 @@ impl CompiledDc {
                 } else {
                     Vec::new()
                 };
-                newton::limit_step(&self.limits, &x, &mut step[..n]);
+                newton::limit_step(&self.limits, x, &mut step[..n]);
                 if ws.trace {
                     let x_lim: Vec<f64> = (0..n).map(|k| x[k] - step[k]).collect();
                     for (k, lim) in self.limits.iter().enumerate() {
@@ -278,7 +384,7 @@ impl CompiledDc {
                             eprintln!(
                                 "tran:       limit[{k}] {:?}: v_old={:.4e} v_newton={:.4e} v_limited={:.4e}",
                                 lim.kind,
-                                v(&x),
+                                v(x),
                                 v(&x_new),
                                 v(&x_lim)
                             );
@@ -290,12 +396,12 @@ impl CompiledDc {
                 x[k] -= step[k];
             }
 
-            if wn < IRK_STAGE_TOL {
-                let f = self.residual_slope(ws, &x, ti);
-                return (x, f, true);
+            if wn < tol {
+                self.residual_slope(ws, x, ti);
+                return true;
             }
             // A reused (stale) Jacobian that is not contracting fast enough: mark it
-            // stale so the next iterate re-evaluates dF/dx and refactorizes here.
+            // stale so the next iterate re-evaluates G and refactorizes here.
             // Two tests: the contraction ratio itself, and (Hairer-Wanner IV.8)
             // whether the iteration at this ratio would still reach the tolerance
             // within the remaining budget -- a junction commutating from reverse
@@ -309,14 +415,13 @@ impl CompiledDc {
                 } else {
                     f64::INFINITY
                 };
-                if theta > IRK_STALL_THETA || predicted > IRK_STAGE_TOL {
+                if theta > IRK_STALL_THETA || predicted > tol {
                     ws.fac_fresh = false;
                 }
             }
             prev_wn = wn;
         }
-        let f = slope(&ws.out, &x);
-        (x, f, false)
+        false
     }
 
     /// Refresh the stage factorization at `(x, t)` for step size `h` and
@@ -330,22 +435,9 @@ impl CompiledDc {
         h: f64,
         gamma: f64,
     ) -> bool {
-        let n = self.n;
         ws.fill_hist(t);
-        self.patch_inputs(x, &ws.zc, t, &mut ws.inputs);
-        self.tape_step_dc
-            .eval_main(&mut ws.step_tok, &ws.inputs, &mut ws.work, &mut ws.out);
-        let (jac, valbuf) = (&ws.out[n..], &mut ws.valbuf);
-        let ok = self.factorize_stage(
-            &mut ws.fac,
-            jac,
-            &ws.mass.vals,
-            1.0 / (h * gamma),
-            GMIN_DC,
-            valbuf,
-        );
-        ws.fac_fresh = ok;
-        ok
+        self.patch_inputs(x, t, &mut ws.inputs);
+        self.refactor_stage(ws, h * gamma)
     }
 
     /// Consistent restart after a discontinuity at `(t, x)`: one implicit-Euler
@@ -355,21 +447,22 @@ impl CompiledDc {
     /// state is the right-limit state the next step's explicit first stage
     /// needs -- evaluated at the landing itself it would carry the old
     /// region's slope and degrade the embedded estimate to first order.
-    /// `None` when the Newton fails (the caller then restarts unreinitialised).
+    /// `ws.qn` is the charge at `x`. The state goes to `out`; `false` when
+    /// the Newton fails (the caller then restarts unreinitialised).
     pub(crate) fn reinit_step(
         &self,
         ws: &mut StageWorkspace<'_>,
         x: &[f64],
         t: f64,
         delta: f64,
-    ) -> Option<Vec<f64>> {
-        for v in ws.psi.iter_mut() {
-            *v = 0.0;
-        }
+        out: &mut [f64],
+    ) -> bool {
+        ws.psi.fill(0.0);
         ws.fac_fresh = false;
-        let (xr, _f, ok) = self.stage_newton(ws, x, x, t + delta, delta, 1.0);
+        out.copy_from_slice(x);
+        let ok = self.stage_newton(ws, out, t + delta, delta, 1.0);
         // the factorization now belongs to `delta`, not to any step size
         ws.fac_fresh = false;
-        ok.then_some(xr)
+        ok
     }
 }

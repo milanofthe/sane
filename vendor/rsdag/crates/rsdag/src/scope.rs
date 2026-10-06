@@ -36,6 +36,8 @@ pub struct Scope<'g, K: Field = F64> {
     name: String,
     params: Vec<SymbolId>,
     roles: Vec<ParamRole>,
+    /// Symbols the body reads as globals, not parameters.
+    globals: Vec<SymbolId>,
 }
 
 impl<'g, K: Field> Scope<'g, K> {
@@ -45,6 +47,7 @@ impl<'g, K: Field> Scope<'g, K> {
             name: name.to_string(),
             params: Vec::new(),
             roles: Vec::new(),
+            globals: Vec::new(),
         }
     }
 
@@ -72,6 +75,18 @@ impl<'g, K: Field> Scope<'g, K> {
         e
     }
 
+    /// A global the body reads: a symbol every call sees the same (a model
+    /// card's parameter), not a parameter (see [`Graph::globals`]).
+    pub fn global(&mut self, name: &str) -> ExprId {
+        let e = self.graph.sym(name);
+        if let Node::Symbol(s) = *self.graph.node(e) {
+            if !self.globals.contains(&s) {
+                self.globals.push(s);
+            }
+        }
+        e
+    }
+
     /// The parameters asked for so far, in order.
     pub fn params(&self) -> &[SymbolId] {
         &self.params
@@ -79,9 +94,11 @@ impl<'g, K: Field> Scope<'g, K> {
 
     /// Close the scope over `outputs`.
     ///
-    /// Free symbols the outputs depend on that were never asked for as
-    /// parameters become trailing parameters, so closing over an expression
-    /// built outside the scope is total rather than silently wrong.
+    /// Free symbols the outputs mention that were never asked for as
+    /// parameters nor declared [`global`](Self::global) become trailing
+    /// parameters, so closing over an expression built outside the scope is
+    /// total rather than silently wrong. A called function's globals stay
+    /// globals.
     pub fn close(self, outputs: Vec<ExprId>) -> FuncId {
         self.close_with_roles(
             outputs
@@ -94,8 +111,8 @@ impl<'g, K: Field> Scope<'g, K> {
     /// As [`Scope::close`], giving each output its role.
     pub fn close_with_roles(mut self, outputs: Vec<(OutputRole, ExprId)>) -> FuncId {
         let exprs: Vec<ExprId> = outputs.iter().map(|&(_, e)| e).collect();
-        for s in self.graph.free_symbols_in(&exprs) {
-            if !self.params.contains(&s) {
+        for s in self.graph.mentioned_symbols_in(&exprs) {
+            if !self.params.contains(&s) && !self.globals.contains(&s) {
                 self.params.push(s);
                 self.roles.push(ParamRole::Free);
             }

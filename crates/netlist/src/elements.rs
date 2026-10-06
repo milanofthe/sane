@@ -70,6 +70,8 @@ pub(crate) struct Placer<'a> {
     /// OSDI compiled modules (`.osdi "lib.osdi"`), by lowercased module name.
     #[cfg(not(target_arch = "wasm32"))]
     pub osdi_models: HashMap<String, (Arc<sane_osdi::OsdiLib>, Arc<sane_osdi::OsdiModule>)>,
+    /// The subcircuit bodies placed so far, by the body they place.
+    pub bodies: HashMap<*const crate::subckt::Body, std::rc::Rc<crate::Placed>>,
 }
 
 impl Placer<'_> {

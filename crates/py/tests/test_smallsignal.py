@@ -1,15 +1,15 @@
-"""Small-signal linearisation and the AC round-trip.
+"""Small-signal linearisation round trip.
 
-`DAE.linearize()` turns the nonlinear DAE into the linear mass-matrix DAE
-`G dx + C dx' = 0`, with the operating-point bias frozen into `name#op` symbols.
-The contract: the linearised DAE's `A(s)` equals the original's, evaluated at
-the same operating point.
+`Model.linearize()` turns the nonlinear DAE into the linear DAE
+`G dx + d/dt (C dx) = 0`, with the operating-point bias frozen into `name#op`
+parameters. The contract: bound to the operating point, the linearised model's
+`G` and `C` equal the original's there, whatever its own state.
 
 Run after `maturin develop -m crates/py/Cargo.toml`:
     python -m pytest crates/py/tests/test_smallsignal.py
 """
 
-import random
+import numpy as np
 
 import sane
 
@@ -20,78 +20,34 @@ MOSFET = (
 )
 
 
-def _free_symbols(expr):
-    fs = expr.free_symbols
-    return fs() if callable(fs) else fs
+def _pvec(model, values):
+    return [float(values.get(n, 0.0)) for n in model.params]
 
 
-def _aligned_env(matrices, seed):
-    """A numeric binding for every symbol of the matrices, with each `X#op`
-    operating-point symbol pinned to the same value as its base `X` -- so the
-    frozen and unfrozen matrices are evaluated at the same point. Symbols are kept
-    on the thermal-voltage scale so device exponentials stay finite; `$temp` is
-    physical and `s = j*omega`."""
-    rng = random.Random(seed)
-    names = set()
-    for a in matrices:
-        for row in a:
-            for e in row:
-                names |= set(_free_symbols(e))
-    base_val = {}
-
-    def val_for(base):
-        if base == "$temp" or base.lower().endswith("tnom"):
-            return 300.15
-        if base == "s":
-            return 1j * 2 * 3.14159 * 1e3
-        if base not in base_val:
-            base_val[base] = 0.02 + 0.03 * rng.random()
-        return base_val[base]
-
-    env = {}
-    for nm in names:
-        base = nm[:-3] if nm.endswith("#op") else nm
-        env[nm] = val_for(base)
-    return env
+def _gc(model, x, p):
+    d = model.core
+    return np.array(d.jacobian_i_x(list(x), p, 0.0)), np.array(d.jacobian_q_x(list(x), p, 0.0))
 
 
-def _max_matrix_diff(dae):
-    lin = dae.linearize()
-    a0, a1 = dae.system_matrix(), lin.system_matrix()
-    assert len(a0) == len(a1) == dae.dim
-    worst = 0.0
-    for seed in (1, 7, 31):
-        env = _aligned_env([a0, a1], seed)
-        for r0, r1 in zip(a0, a1):
-            for e0, e1 in zip(r0, r1):
-                worst = max(worst, abs(e0.eval_complex(**env) - e1.eval_complex(**env)))
-    return worst
+def _roundtrip(deck):
+    model = sane.Circuit.parse(deck).extract()
+    x = np.asarray(model.operating_point().vector)
+    g0, c0 = _gc(model, x, _pvec(model, model.values))
+    lin = model.linearize()
+    assert lin.dim == model.dim and lin.unknowns == model.unknowns
+    values = dict(model.values)
+    values.update({f"{u}#op": x[k] for k, u in enumerate(model.unknowns)})
+    p = _pvec(lin, values)
+    # linear: the same matrices at the operating point and anywhere else
+    for state in (np.zeros_like(x), x + 0.37):
+        g1, c1 = _gc(lin, state, p)
+        np.testing.assert_allclose(g1, g0, rtol=1e-12, atol=1e-15)
+        np.testing.assert_allclose(c1, c0, rtol=1e-12, atol=1e-21)
 
 
 def test_rlc_roundtrip():
-    dae = sane.Circuit.parse(RLC).extract()
-    assert _max_matrix_diff(dae) < 1e-9
+    _roundtrip(RLC)
 
 
 def test_mosfet_roundtrip():
-    dae = sane.Circuit.parse(MOSFET).extract()
-    assert _max_matrix_diff(dae) < 1e-9
-
-
-def test_linearized_residuals_are_linear():
-    """Every residual of the small-signal DAE is linear: its second
-    derivative w.r.t. each unknown vanishes."""
-    dae = sane.Circuit.parse(MOSFET).extract()
-    lin = dae.linearize()
-    ctx = lin.symbolic_context
-    res = lin.residuals
-    xs = [ctx.sym(u) for u in lin.unknowns]
-    for f in res:
-        for x in xs:
-            assert f.diff(x).diff(x).is_zero()
-
-
-def test_linearize_preserves_dimension():
-    dae = sane.Circuit.parse(MOSFET).extract()
-    assert dae.linearize().dim == dae.dim
-    assert dae.linearize().unknowns == dae.unknowns
+    _roundtrip(MOSFET)

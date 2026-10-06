@@ -61,9 +61,9 @@ fn divider_dc() {
 
 #[test]
 fn stage_solve_matches_dense() {
-    // The implicit-RK stage system `(dF/dx + alpha*C + gmin*I) dx = rhs` solved
+    // The implicit-RK stage system `(G + alpha*C + gmin*I) dx = rhs` solved
     // over the combined pattern must match a dense assembly. RC circuit so both
-    // dF/dx (resistor) and C = dF/dx' (capacitor) are non-empty.
+    // G (resistor) and C (capacitor) are non-empty.
     let mut ctx = Graph::new();
     let mut c = Circuit::new();
     c.voltage_source("V1", 1, 0)
@@ -74,16 +74,15 @@ fn stage_solve_matches_dense() {
     let n = cdc.dim();
     let p = params_vec(&ctx, &dae, &[("V1", 5.0), ("R1", 1000.0), ("C1", 1e-6)]);
     let x = vec![0.3; n];
-    let xdot = vec![0.0; n];
 
-    let (jr, jc, dfdx) = cdc.jacobian_x_sparse(&x, &xdot, &p, 0.0);
-    let (cr, cc, cvals) = cdc.jacobian_xdot_sparse(&x, &xdot, &p, 0.0);
+    let (jr, jc, dfdx) = cdc.jacobian_i_x_sparse(&x, &p, 0.0);
+    let (cr, cc, cvals) = cdc.jacobian_q_x_sparse(&x, &p, 0.0);
     assert!(
         !cvals.is_empty(),
         "RC circuit must have a non-empty mass matrix C"
     );
 
-    // Dense J_stage = dF/dx + alpha*C + gmin*I; pick dx_true, form rhs = J*dx_true.
+    // Dense J_stage = G + alpha*C + gmin*I; pick dx_true, form rhs = J*dx_true.
     let (alpha, gmin) = (2000.0, 1e-12);
     let mut jd = vec![vec![0.0; n]; n];
     for k in 0..dfdx.len() {
@@ -104,7 +103,8 @@ fn stage_solve_matches_dense() {
     let mut fac = sym.pattern.factorizer();
     let mut valbuf = Vec::new();
     assert!(cdc.factorize_stage(&mut fac, &dfdx, &cvals, alpha, gmin, &mut valbuf));
-    let dx = fac.solve(&rhs).expect("stage solve");
+    let mut dx = vec![0.0; n];
+    assert!(fac.solve_into(&rhs, &mut dx), "stage solve");
     for i in 0..n {
         assert!(
             (dx[i] - dx_true[i]).abs() < 1e-9,
@@ -314,7 +314,7 @@ fn relative_kcl_criterion_scales_with_node_current() {
         .as_ref()
         .expect("nonlinear circuit has the iscale tape");
     let mut inputs = Vec::new();
-    cdc.fill_inputs(&x, &vec![0.0; n], &p, 0.0, &mut inputs);
+    cdc.fill_inputs(&x, &p, 0.0, &mut inputs);
     let (mut terms, mut work) = (Vec::new(), Vec::new());
     tape.eval(&inputs, &mut work, &mut terms);
     let (off, len) = cdc.iscale_rows[node];
@@ -470,7 +470,7 @@ fn partitioned_solve_matches_residual() {
     let p = params_vec(&ctx, &dae, &vals);
     let (x, conv, _) = cdc.solve_dc(&p, &[], 1e-10, 100);
     assert!(conv, "partitioned DC did not converge");
-    // Residual at the solution must be ~zero (DC: xdot = 0).
+    // The currents at the solution must be ~zero (DC).
     let r = cdc.residual(&x, &vec![0.0; cdc.dim()], &p, 0.0);
     let rnorm = r.iter().map(|v| v * v).sum::<f64>().sqrt();
     assert!(

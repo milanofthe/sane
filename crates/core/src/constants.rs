@@ -116,7 +116,7 @@ pub const NEWTON_STALL_WINDOW: usize = 24;
 /// See [`NEWTON_STALL_WINDOW`].
 pub const NEWTON_STALL_FACTOR: f64 = 0.95;
 /// Stage-Newton tolerance (WRMS update norm) of the adjoint's fixed-grid
-/// forward solve. Far tighter than the production `IRK_STAGE_TOL`: the
+/// forward solve. Far tighter than the production stage tolerance: the
 /// discrete adjoint assumes the stage residuals vanish EXACTLY, and whatever
 /// Newton leaves behind leaks first-order error into the gradient.
 pub const ADJOINT_STAGE_TOL: f64 = 1e-9;
@@ -330,6 +330,11 @@ pub const TRANSIENT_ATOL: f64 = 1e-7;
 /// for spans from picoseconds to seconds.
 pub const TRANSIENT_SPAN_EPS_FRAC: f64 = 1e-12;
 
+/// The backward-Euler step that makes a caller's initial state consistent,
+/// as a fraction of the first step (see `solve_transient`): short enough
+/// that the charges stay where the state put them.
+pub const TRANSIENT_IC_STEP_FRAC: f64 = 1e-3;
+
 // ===========================================================================
 // Transient: ESDIRK32 implicit Runge-Kutta integrator
 // ===========================================================================
@@ -363,8 +368,19 @@ pub const ESDIRK32_TR: [f64; ESDIRK32_STAGES] = [
 
 /// IRK inner stage Newton: per-stage iteration budget.
 pub const IRK_STAGE_MAX_ITER: usize = 25;
-/// IRK inner stage Newton: WRMS update tolerance for convergence.
-pub const IRK_STAGE_TOL: f64 = 1e-3;
+/// IRK inner stage Newton: the update tolerance, as a fraction of the
+/// integration tolerance (`wn` is scaled by it), is Hairer-Wanner's (RADAU5
+/// `fnewt`) `max(10 eps / rtol, min(IRK_STAGE_TOL_MAX, sqrt(rtol)))`: a
+/// Newton error far below the local error buys nothing, and a stage solved
+/// to the rounding of its charges cannot get below it.
+pub const IRK_STAGE_TOL_MAX: f64 = 0.03;
+/// IRK inner stage Newton: a stage whose every residual row is within this
+/// many rounding units of the magnitudes it is computed from (`|J| |x|` and
+/// the charge terms) is solved to machine precision, whatever the update (a
+/// charge difference `Q(X) - Q(xn)` of a large capacitor rounds at
+/// `ulp(Q)`, which a weakly determined direction turns into a visible,
+/// meaningless update).
+pub const IRK_STAGE_ROUNDOFF: f64 = 64.0;
 /// IRK modified-Newton: refresh the frozen Jacobian when the update fails to
 /// contract by at least this factor (convergence rate θ = ‖Δₖ‖/‖Δₖ₋₁‖ too high).
 /// Loose, so the frozen factorization is genuinely reused on stiff stages (a few

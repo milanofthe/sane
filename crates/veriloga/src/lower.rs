@@ -4,7 +4,9 @@
 //! Contributions are assembled MNA-style: current contributions stamp into
 //! per-node current accumulators (ports -> terminal currents, internal nodes ->
 //! KCL residuals); voltage contributions mint a branch-current unknown plus a
-//! KVL residual. `ddt` becomes a symbolic time derivative.
+//! KVL residual. Every row leaves as a current `i` and a charge `q` (`i +
+//! d/dt q = 0`): `ddt(q)` puts `q` into the charge and reads zero in the
+//! current.
 //!
 //! Procedural control flow is flattened to dataflow: the mutable lowering
 //! [`State`] (variable values + node-current accumulators) is cloned across an
@@ -16,7 +18,7 @@
 
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
-use rsdag::{differentiate, time_derivative, CmpOp, Crossing, ExprId, Node, SymbolId};
+use rsdag::{differentiate, CmpOp, Crossing, ExprId, Node, SymbolId};
 use sane_core::constants::{MAX_UNROLL, VERILOGA_K_OVER_Q, WHILE_MAX_UNROLL};
 use sane_core::Graph;
 use sane_device::{
@@ -35,19 +37,9 @@ pub fn lower_analog(
     mfactor: f64,
     lo: &mut Lowerer,
     terminal_v: &[ExprId],
-    terminal_vdot: &[ExprId],
 ) -> Result<BehavioralFragment, String> {
-    lower_analog_structural(
-        em,
-        inst,
-        param_values,
-        given,
-        mfactor,
-        lo,
-        terminal_v,
-        terminal_vdot,
-    )
-    .map(|(frag, _)| frag)
+    lower_analog_structural(em, inst, param_values, given, mfactor, lo, terminal_v)
+        .map(|(frag, _)| frag)
 }
 
 /// [`lower_analog`], and the parameters whose values fixed the fragment's
@@ -62,7 +54,6 @@ pub fn lower_analog_structural(
     mfactor: f64,
     lo: &mut Lowerer,
     terminal_v: &[ExprId],
-    terminal_vdot: &[ExprId],
 ) -> Result<(BehavioralFragment, std::collections::BTreeSet<String>), String> {
     // Compile-time environment for structural decisions (switch branches,
     // loop bounds): module defaults overridden by the instance's bound values.
@@ -83,7 +74,6 @@ pub fn lower_analog_structural(
         lo,
         node_alias,
         node_v: HashMap::default(),
-        deriv_of: HashMap::default(),
         param_env,
         structural: std::cell::RefCell::new(collapse_reads),
         collect: std::cell::RefCell::new(None),
@@ -105,11 +95,12 @@ pub fn lower_analog_structural(
         switch_order: Vec::new(),
         switch_potential: std::collections::HashSet::default(),
         mfactor,
+        ddts: Vec::new(),
         journal: Vec::new(),
         facts: Vec::new(),
         flag_budget: HashMap::default(),
     };
-    l.setup(terminal_v, terminal_vdot);
+    l.setup(terminal_v);
     // Verilog-A variables default to 0 (LRM 2.4.0 §3.3.1). Seed every declared
     // variable with that default so a read before its first assignment -- or on a
     // path where its guarding branch was not taken -- yields 0 and folds
@@ -132,7 +123,7 @@ pub fn lower_analog_structural(
         l.journal.clear();
     }
     let structural = l.structural.take();
-    Ok((l.finish(), structural))
+    Ok((l.finish()?, structural))
 }
 
 /// The parameters a compile-time value was folded from.
@@ -201,7 +192,6 @@ struct Lower<'a, 'b> {
     /// `V(a,b) <+ 0` pre-scan; applied by [`Self::resolve_pair`].
     node_alias: HashMap<String, String>,
     node_v: HashMap<String, ExprId>,
-    deriv_of: HashMap<SymbolId, ExprId>,
     /// Compile-time parameter environment (defaults + instance overrides) for
     /// folding structural conditions and loop bounds.
     param_env: HashMap<String, f64>,
@@ -218,6 +208,8 @@ struct Lower<'a, 'b> {
     given: HashSet<String>,
     internal_resid_nodes: Vec<String>,
     branch_resid: Vec<ExprId>,
+    /// The `ddt` placeholders and their charges (see [`Lower::ddt`]).
+    ddts: Vec<(SymbolId, ExprId)>,
     /// >0 while lowering inside a conditional / loop / function (minting an
     /// > unknown is then forbidden).
     cond_depth: usize,
@@ -284,24 +276,61 @@ impl<'a, 'b> Lower<'a, 'b> {
         self.lo.ctx()
     }
 
-    fn setup(&mut self, terminal_v: &[ExprId], terminal_vdot: &[ExprId]) {
+    /// `ddt(q)`: a placeholder for the time derivative of the charge `q`,
+    /// resolved row by row once the rows are whole (see
+    /// [`Self::resolve_ddt`]).
+    fn ddt(&mut self, q: ExprId) -> ExprId {
+        let name = format!("{}ddt#{}", self.inst, self.ddts.len());
+        let m = self.ctx().sym(&name);
+        let s = sym_of(self.lo.ctx(), m).expect("sym() yields a Symbol");
+        self.ddts.push((s, q));
+        m
+    }
+
+    /// `rows` as `i + d/dt q`: per row its current `i`, the placeholders
+    /// read as zero, and its charge `q = sum_m (d row / d m) q_m` (empty
+    /// without any `ddt`). A row must be affine in the placeholders; `ddt`
+    /// inside a nonlinear function has no charge.
+    fn resolve_ddt(&mut self, rows: &[ExprId]) -> Result<(Vec<ExprId>, Vec<ExprId>), String> {
+        if self.ddts.is_empty() {
+            return Ok((rows.to_vec(), Vec::new()));
+        }
+        let ddts = self.ddts.clone();
+        let ctx = self.lo.ctx();
+        let zero = ctx.zero();
+        let rest: HashMap<SymbolId, ExprId> = ddts.iter().map(|&(m, _)| (m, zero)).collect();
+        let markers: HashSet<SymbolId> = ddts.iter().map(|&(m, _)| m).collect();
+        let mut charges = Vec::with_capacity(rows.len());
+        for &r in rows {
+            let free = ctx.free_symbols(r);
+            let mut terms = Vec::new();
+            for &(m, q) in ddts.iter().filter(|(m, _)| free.contains(m)) {
+                let c = differentiate(ctx, r, m);
+                if ctx.free_symbols(c).iter().any(|s| markers.contains(s)) {
+                    return Err(format!(
+                        "module {}: ddt in a nonlinear expression has no charge",
+                        self.em.name
+                    ));
+                }
+                terms.push(ctx.mul(c, q));
+            }
+            charges.push(ctx.reduce(rsdag::ReduceOp::Sum, terms));
+        }
+        Ok((rsdag::substitute(ctx, rows, &rest), charges))
+    }
+
+    fn setup(&mut self, terminal_v: &[ExprId]) {
         let zero = self.ctx().zero();
         self.node_v.insert("0".to_string(), zero);
         for (k, port) in self.em.ports.iter().enumerate() {
             self.node_v.insert(port.clone(), terminal_v[k]);
-            if let Some(sym) = sym_of(self.lo.ctx(), terminal_v[k]) {
-                self.deriv_of.insert(sym, terminal_vdot[k]);
-            }
         }
         for node in &self.em.internal_nodes {
             if self.node_alias.contains_key(node) {
                 continue; // collapsed onto its representative: no unknown
             }
-            let (v, vdot) = self.lo.internal_node_of(&self.inst, node);
+            let v = self.lo.internal_node_of(&self.inst, node);
             self.node_v.insert(node.clone(), v);
-            if let Some(sym) = sym_of(self.lo.ctx(), v) {
-                self.deriv_of.insert(sym, vdot);
-            }
             self.internal_resid_nodes.push(node.clone());
         }
         // Pre-scan the analog block for probed branch currents `I(a,b)`; promote
@@ -314,7 +343,7 @@ impl<'a, 'b> Lower<'a, 'b> {
             collect_probe_keys(self, s, &mut keys);
         }
         for key in keys {
-            let (i, _) = self
+            let i = self
                 .lo
                 .branch_current_of(&self.inst, &format!("flow_{}_{}", key.0, key.1));
             self.probe_of.insert(key.clone(), i);
@@ -331,7 +360,7 @@ impl<'a, 'b> Lower<'a, 'b> {
             if self.probe_of.contains_key(&key) {
                 continue;
             }
-            let (i, _) = self
+            let i = self
                 .lo
                 .branch_current_of(&self.inst, &format!("sw_{}_{}", key.0, key.1));
             self.switch_of.insert(key.clone(), i);
@@ -344,7 +373,7 @@ impl<'a, 'b> Lower<'a, 'b> {
         }
     }
 
-    fn finish(mut self) -> BehavioralFragment {
+    fn finish(mut self) -> Result<BehavioralFragment, String> {
         // Stamp each promoted branch current into the node balances first (it is
         // part of KCL, so it must be present before terminal currents are read).
         for key in self.probe_order.clone() {
@@ -379,10 +408,10 @@ impl<'a, 'b> Lower<'a, 'b> {
             .collect();
         // Residuals in extras' mint order: internal-node KCL, then promoted
         // branch-current constraints (I - sum_flow = 0), then walk-minted (V /
-        // idt) residuals.
-        let mut residuals = Vec::new();
+        // idt) currents.
+        let mut currents = Vec::new();
         for node in &self.internal_resid_nodes.clone() {
-            residuals.push(self.st.node_cur.get(node).copied().unwrap_or(zero));
+            currents.push(self.st.node_cur.get(node).copied().unwrap_or(zero));
         }
         for key in &self.probe_order.clone() {
             let i = self.probe_of[key];
@@ -398,7 +427,7 @@ impl<'a, 'b> Lower<'a, 'b> {
             } else {
                 self.ctx().sub(i, f)
             };
-            residuals.push(r);
+            currents.push(r);
         }
         // Switch-branch constraints follow the probes in mint order.
         for key in &self.switch_order.clone() {
@@ -410,9 +439,9 @@ impl<'a, 'b> Lower<'a, 'b> {
                 .get(&switch_resid_key(key))
                 .copied()
                 .unwrap_or_else(|| self.switch_of[key]);
-            residuals.push(r);
+            currents.push(r);
         }
-        residuals.extend(self.branch_resid.iter().copied());
+        currents.extend(self.branch_resid.iter().copied());
         // Operating-point variables: the final (post-analog-block) value of each
         // `(* desc *)`-annotated module variable, exported for OP readout.
         let mut op_vars = Vec::new();
@@ -428,17 +457,51 @@ impl<'a, 'b> Lower<'a, 'b> {
                 value,
             });
         }
+        // The rows as currents and charges; whatever else reads a `ddt` (an
+        // op-var, a noise PSD, a switching surface) is read at rest, where
+        // every time derivative is zero.
+        let n_cur = terminal_currents.len();
+        let rows: Vec<ExprId> = terminal_currents.into_iter().chain(currents).collect();
+        let (rows, mut charges) = self.resolve_ddt(&rows)?;
+        let (terminal_currents, currents) = (rows[..n_cur].to_vec(), rows[n_cur..].to_vec());
+        let terminal_charges = if charges.is_empty() {
+            Vec::new()
+        } else {
+            charges.drain(..n_cur).collect()
+        };
+        let mut noise = std::mem::take(&mut self.noise);
+        let mut events = std::mem::take(&mut self.events);
+        let observed: Vec<ExprId> = op_vars
+            .iter()
+            .map(|v| v.value)
+            .chain(noise.iter().flat_map(|n| [n.psd, n.flicker_exp]))
+            .chain(events.iter().map(|e| e.g))
+            .collect();
+        let zero = self.ctx().zero();
+        let rest: HashMap<SymbolId, ExprId> = self.ddts.iter().map(|&(m, _)| (m, zero)).collect();
+        let mut observed = rsdag::substitute(self.ctx(), &observed, &rest).into_iter();
+        for v in &mut op_vars {
+            v.value = observed.next().expect("one per op-var");
+        }
+        for n in &mut noise {
+            (n.psd, n.flicker_exp) = (observed.next().unwrap(), observed.next().unwrap());
+        }
+        for e in &mut events {
+            e.g = observed.next().expect("one per event");
+        }
         let mut param_syms: Vec<(String, SymbolId)> = self.param_syms.into_iter().collect();
         param_syms.sort();
-        BehavioralFragment {
+        Ok(BehavioralFragment {
             terminal_currents,
-            residuals,
-            noise: self.noise,
-            events: self.events,
+            currents,
+            terminal_charges,
+            charges,
+            noise,
+            events,
             param_syms,
             op_vars,
             limits: self.limits,
-        }
+        })
     }
 
     // --- node helpers ------------------------------------------------------
@@ -1767,7 +1830,7 @@ impl<'a, 'b> Lower<'a, 'b> {
                 self.probe_potential.insert(key, sum);
                 return Ok(());
             }
-            let (i, _) = self
+            let i = self
                 .lo
                 .branch_current_of(&self.inst, &format!("flow_{hn}_{ln}"));
             self.add_cur(&hn, i);
@@ -1825,7 +1888,7 @@ impl<'a, 'b> Lower<'a, 'b> {
         // this branch's flow unknown so residual order matches mint order.
         let l = self.expr(lhs)?;
         let r = self.expr(rhs)?;
-        let (i, _) = self
+        let i = self
             .lo
             .branch_current_of(&self.inst, &format!("ind_{hn}_{ln}"));
         self.add_cur(&hn, i);
@@ -2117,8 +2180,7 @@ impl<'a, 'b> Lower<'a, 'b> {
                 return Err("ddt expects one argument".into());
             }
             let q = self.expr(&args[0])?;
-            let deriv = self.deriv_of.clone();
-            return Ok(time_derivative(self.ctx(), q, &deriv));
+            return Ok(self.ddt(q));
         }
         if name == "white_noise" || name == "flicker_noise" {
             // Record a noise source on the enclosing contribution's branch; the
@@ -2206,9 +2268,9 @@ impl<'a, 'b> Lower<'a, 'b> {
             return Err("ddx second argument must be a node access like V(n)".into());
         }
         if name == "idt" || name == "idtmod" {
-            // idt(u[,ic]) -> state s with ds/dt = u (residual `sdot - u = 0`); the
-            // integral value is s. At DC (xdot = 0) this enforces u = 0, the
-            // steady-state condition for the usual NQS-charge integrand.
+            // idt(u[,ic]) -> state s with ds/dt = u (current `-u`, charge `s`);
+            // the integral value is s. At DC (at rest) this enforces u = 0,
+            // the steady-state condition for the usual NQS-charge integrand.
             // idtmod(u, ic, modulus[, offset]) additionally wraps the output.
             if self.cond_depth > 0 {
                 return Err(format!("{name} inside a conditional is not supported"));
@@ -2238,11 +2300,12 @@ impl<'a, 'b> Lower<'a, 'b> {
             }
             let u = self.expr(&args[0])?;
             let sname = format!("idt{}", self.lo.extras.len());
-            let (s, sdot) = self.lo.unknown_of(&self.inst, &sname, true);
+            let s = self.lo.unknown_of(&self.inst, &sname);
             if let Some(c) = dc_seed {
                 self.lo.extras.last_mut().expect("just minted").dc_seed = Some(c);
             }
-            let r = self.ctx().sub(sdot, u);
+            let ds = self.ddt(s);
+            let r = self.ctx().sub(ds, u);
             self.branch_resid.push(r);
             if name == "idtmod" && args.len() >= 3 {
                 // offset + ((s - offset) mod modulus)
@@ -2280,13 +2343,11 @@ impl<'a, 'b> Lower<'a, 'b> {
             let hist_suffix = format!("dly{k}_hist");
             let hname = format!("{}.{hist_suffix}", self.inst);
             let src_extra = self.lo.extras.len();
-            let (y, _) = self
-                .lo
-                .unknown_of(&self.inst, &format!("dly{k}_src"), false);
+            let y = self.lo.unknown_of(&self.inst, &format!("dly{k}_src"));
             let r = self.ctx().sub(y, u);
             self.branch_resid.push(r);
             let out_extra = self.lo.extras.len();
-            let (d, _) = self.lo.unknown_of(&self.inst, &format!("dly{k}"), false);
+            let d = self.lo.unknown_of(&self.inst, &format!("dly{k}"));
             let hexpr = self.ctx().sym(&hname);
             let hist = sym_of(self.lo.ctx(), hexpr).expect("sym() yields a Symbol node");
             let r = self.ctx().sub(d, hexpr);
@@ -2439,11 +2500,10 @@ impl<'a, 'b> Lower<'a, 'b> {
         let mut s = Vec::with_capacity(k);
         let mut sdot = Vec::with_capacity(k);
         for i in 0..k {
-            let (si, sdi) = self
-                .lo
-                .unknown_of(&self.inst, &format!("lap{base}_{i}"), true);
+            let si = self.lo.unknown_of(&self.inst, &format!("lap{base}_{i}"));
             s.push(si);
-            sdot.push(sdi);
+            let dsi = self.ddt(si);
+            sdot.push(dsi);
         }
         for i in 0..k - 1 {
             let r = self.ctx().sub(sdot[i], s[i + 1]);

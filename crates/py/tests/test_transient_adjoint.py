@@ -12,6 +12,12 @@ CLIPPER = (
     ".model Dmod D(Is=1e-12 N=1)\n"
     "V1 in 0 0.3 SIN(0.3 1 1k)\nR1 in out 1k\nD1 out 0 Dmod\nC1 out 0 200n"
 )
+# junction and diffusion charge: a state-dependent C and parameters that
+# enter only through the charge (Cjo, Tt)
+VARACTOR = (
+    ".model Dmod D(Is=1e-12 N=1 Cjo=50n Vj=0.7 M=0.5 Tt=20u)\n"
+    "V1 in 0 0.3 SIN(0.3 1 1k)\nR1 in out 1k\nD1 out 0 Dmod\nC1 out 0 20n"
+)
 CE = (
     ".model QN NPN(Is=1e-15 betaF=100)\n"
     "V1 in 0 0 SIN(0 10m 1k)\nV2 vcc 0 12\n"
@@ -40,8 +46,8 @@ def _weights(npts):
 
 @pytest.mark.parametrize(
     "deck,t_end",
-    [(RC, 2e-3), (CLIPPER, 2e-3), (CE, 1e-3), (OTA, 2e-4)],
-    ids=["rc", "clipper", "ce", "ota"],
+    [(RC, 2e-3), (CLIPPER, 2e-3), (VARACTOR, 2e-3), (CE, 1e-3), (OTA, 2e-4)],
+    ids=["rc", "clipper", "varactor", "ce", "ota"],
 )
 def test_adjoint_matches_fd(deck, t_end):
     model = sane.Circuit.parse(deck).extract()
@@ -54,15 +60,13 @@ def test_adjoint_matches_fd(deck, t_end):
         return float(w @ model.transient_grid(t, values=values)["out"])
 
     bound = model.values
-    # near-zero gradients sit below what central FD can resolve against the
-    # Newton termination noise of the forward solves: skip them relative to
-    # the dominant gradient instead of asserting into noise
-    gmax = max(abs(v) for v in grad.values())
+    # the discrete solve resolves a gradient only down to its stage Newton
+    # tolerance, near 1e-5 of the dominant one on each parameter's own scale
+    # (dL/dlog p, not the raw dL/dp an Is spans): the tolerance below is
+    # floored there instead of asserting into noise
+    gmax = max(abs(v * bound.get(k, 0.0)) for k, v in grad.items())
     for name, g in grad.items():
         base = bound.get(name, 0.0)
-        # 1e-3 relative: large enough that the FD difference clears the Newton
-        # termination noise of the two forward solves, small enough that the
-        # O(h^2) truncation stays inside the assertion tolerance
         if base == 0.0:
             # No finite difference can reference a parameter that defaults to
             # zero: there is no step that is both small on the parameter's own
@@ -73,23 +77,36 @@ def test_adjoint_matches_fd(deck, t_end):
             # branch jump whose numerator does not shrink with h. Forward-mode
             # AD covers these instead (test below); it needs no perturbation.
             continue
-        h = abs(base) * 1e-3
-        try:
-            fd = (objective({name: base + h}) - objective({name: base - h})) / (2 * h)
-        except ValueError:
-            # the perturbation left the physical domain (e.g. a negative
-            # saturation current from a zero-defaulted leakage parameter)
-            continue
-        if max(abs(g), abs(fd)) < 1e-6 * gmax:
-            continue
-        scale = max(abs(fd), abs(g), 1e-9)
-        assert abs(g - fd) <= 2e-4 * scale + 1e-12, f"{name}: adjoint {g} vs FD {fd}"
+        # Two relative steps, the closer one counts: a perturbed forward solve
+        # can take a different Newton path than the base one, and the central
+        # difference then jumps at that one step (measured on the OTA's $temp:
+        # FD 2.47e-5 at 1e-4, 2.91e-5 to 2.93e-5 at 1e-2, 1e-3, 1e-5, 1e-6).
+        # Both are small enough that the O(h^2) truncation stays inside the
+        # tolerance.
+        errs = []
+        for rel in (1e-3, 1e-5):
+            h = abs(base) * rel
+            try:
+                fd = (objective({name: base + h}) - objective({name: base - h})) / (2 * h)
+            except ValueError:
+                # the perturbation left the physical domain (e.g. a negative
+                # saturation current from a zero-defaulted leakage parameter)
+                continue
+            # relative agreement, floored on the dL/dlog p scale where the
+            # discrete solve's own resolution ends
+            tol = 2e-4 * max(abs(g), abs(fd)) + 1e-6 * gmax / abs(base)
+            errs.append((abs(g - fd) / tol, fd))
+            if errs[-1][0] <= 1.0:
+                break
+        if errs:
+            err, fd = min(errs)
+            assert err <= 1.0, f"{name}: adjoint {g} vs FD {fd}"
 
 
 @pytest.mark.parametrize(
     "deck,t_end,npts",
-    [(RC, 2e-3, 80), (CE, 1e-3, 80), (OTA, 2e-4, 640)],
-    ids=["rc", "ce", "ota"],
+    [(RC, 2e-3, 80), (VARACTOR, 2e-3, 80), (CE, 1e-3, 80), (OTA, 2e-4, 640)],
+    ids=["rc", "varactor", "ce", "ota"],
 )
 def test_adjoint_matches_forward_mode(deck, t_end, npts):
     """Cross-check the two AD modes against each other.

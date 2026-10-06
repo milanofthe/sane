@@ -4,12 +4,12 @@
 
 # SANE
 
-**Symbolic Analog Network Engine** — symbolic and numeric circuit analysis. A
+**Symbolic Analog Network Engine** — circuit analysis on a symbolic graph. A
 Rust core (hash-consed symbolic DAG, autodiff, native sparse solver) with a
 Python binding. No C backend.
 
-SANE extracts the differential-algebraic system `F(x, x', t) = 0` from a circuit
-and analyzes it: DC operating point, transient, small-signal AC, poles/zeros,
+SANE extracts the differential-algebraic system `I(x, t) + d/dt Q(x) = 0` from a
+circuit and analyzes it: DC operating point, transient, small-signal AC, poles/zeros,
 noise, harmonic balance, and exact parameter sensitivity (first and second order)
 for each of those — all by automatic differentiation of one symbolic DAG.
 Inspired by Analog Insydes (Fraunhofer ITWM).
@@ -116,7 +116,7 @@ thermal, semiconductor shot/flicker, MOSFET channel-thermal, Verilog-A
 # Python API
 
 `import sane`. The package exposes two classes — `Circuit` (build) and `Model`
-(analyze) — plus labeled result objects and the symbolic engine. The Python layer
+(analyze) — plus labeled result objects. The Python layer
 is a thin wrapper; orchestration, parameter store and analyses are in Rust
 (`sane_analysis::Model`, raw handles at `sane._core`).
 
@@ -129,13 +129,9 @@ is a thin wrapper; orchestration, parameter store and analyses are in Rust
 | `set_log_level(level="info")` | `None` | native logging: `"debug"`/`"info"`/`"warning"`/`"error"`/`"off"` |
 | `profile_begin()` / `profile_take()` | `None` / `list[(stage, ms)]` | collect per-stage timings |
 | `reduced_netlist(netlist, transforms)` | `str` | apply graph transforms, emit a smaller netlist |
-| `symbols(names)` | `Expr \| tuple[Expr]` | create symbols (space-separated) in a fresh `Context` |
-| `jacobian(residuals, wrt)` | `list[list[Expr]]` | symbolic Jacobian |
-| `sparsity(jac)` | `list[list[bool]]` | structural nonzero pattern |
-| `compile_tape(roots, inputs)` | `Tape` | compile expressions to a flat evaluator |
 
-Exported types: `Circuit`, `Model`, the result objects, `Context`, `Expr`,
-`Tape`, and `GROUND_ALIASES` (`{"0","gnd","GND","Gnd","ground"}`).
+Exported types: `Circuit`, `Model`, the result objects and `GROUND_ALIASES`
+(`{"0","gnd","GND","Gnd","ground"}`).
 
 ## `Circuit`
 
@@ -197,7 +193,6 @@ resolve in order: unknown name → node name → source branch current.
 | `transient_events()` | `list[(name, t, dir)]` | the switching events of the last transient: surface `instance#k`, crossing time, `+1` rising / `-1` falling |
 | `small_signal(input, output, values=None, x0=None)` | `SmallSignal` | linearize at the bias; poles/zeros/AC/sensitivity |
 | `ac(input, output, freqs_hz, values=None, x0=None)` | `AcResponse` | AC response with the full derivative API |
-| `ac_transfer(input, output, freqs_hz, values=None)` | `ndarray \| None` | symbolic transfer; exact for linear, no OP solve |
 | `harmonic_balance(f0=0.0, harmonics=8, values=None, x0=None, continuation=None, tol=1e-10, max_iter=60, oversample=16, samples=None)` | `HarmonicBalance` | periodic steady state; `f0<=0` infers from a `SIN` source |
 | `noise(output, fstart, fstop, points=50, values=None, x0=None)` | `NoiseSpectrum` | output-referred PSD [V/√Hz] |
 | `temp_sweep(output, tstart, tstop, points=50, values=None)` | `TempSweep` | output vs temperature [°C], warm-started |
@@ -227,29 +222,17 @@ resolve in order: unknown name → node name → source branch current.
 - `name in model` / `len(model)` / `iter(model)` — membership / count / names
 
 **Introspection** (properties)
-- `unknowns: list[str]`, `dim: int`, `nnz: int`
+- `unknowns: list[str]`, `dim: int`, `nnz: int`, `partition_sizes() -> (int, int) | None`
 - `params: list[str]`, `values: dict[str, float]`
 - `node_names: list[str]`
 - `unknown_index(ref) -> int`, `unknown_name(ref) -> str`
 - `profile: list[(stage, ms)]`, `transforms`, `eliminated`
-- `symbolic_context: Context`, `core` *(raw `_core.Model`)*
+- `core` *(raw `_core.Model`)*
 
-## `Model` — symbolic graph & transforms
-
-The model shares the symbolic `Context`, so its equations come back as `Expr`.
-
-**Symbolic access**
-- `residuals: list[Expr]` — the equations `F(x, x', t)`, one per row
-- `jacobian_x_symbolic() -> list[list[Expr]]` — `dF/dx`
-- `jacobian_xdot_symbolic() -> list[list[Expr]]` — `dF/dx'`
-- `system_matrix() -> list[list[Expr]]` — `A(s) = dF/dx + s·dF/dx'`
-- `transfer_function(input, output) -> Expr | None` — closed-form `H(s)`
-- `transfer_approx(input, output, tol=1e-3, freq=1e3)` / `transfer_approx_at(...)` / `transfer_approx_named_at(...)` — pruned transfer (Analog-Insydes / Sherman-Morrison)
-- `term_estimate(cap=None) -> int`, `partition_sizes() -> (int, int) | None`
-- `latex() -> str`, `transfer_latex(input, output) -> str`, `to_dot(...) -> str`
+## `Model` — transforms
 
 **Transforms** (return a new `Model` on the same context)
-- `linearize()` — small-signal mass-matrix DAE `G·dx + C·dx' = 0`
+- `linearize()` — small-signal linear DAE `G·dx + d/dt (C·dx) = 0`
 - `reduce(rel_tol=1e-3, freqs=None, values=None, x0=None)` — OP-guided branch pruning; sets `.transforms`
 - `eliminate(keep=None)` — exact resistive-node elimination; sets `.eliminated`
 - `fold(*paths)` — bind parameters/groups to their current value (constant-fold, drop from the sensitivity set)
@@ -301,31 +284,6 @@ Model: `E·x' = A·x + B·u`, `y = C·x + D·u`.
 `dc(ref) -> float`, `magnitude(ref)`, `phase(ref, deg=True)`, `thd(ref) -> float`,
 `plot(*refs, db=False)`; `sensitivity(ref, k, metric="coeff") -> Sensitivity`,
 `hessian(ref, k, wrt, metric="coeff") -> ndarray`.
-
-## Symbolic engine
-
-The hash-consed core is exposed directly. `symbols("x y")` returns `Expr` that
-support the Python operators and:
-`.exp() .ln() .sqrt() .sin() .cos() .sinh() .cosh() .tanh() .floor()`,
-`.diff(sym)`, `.grad([syms])`, `.hess([syms])`, `.simplify()`,
-`.eval(**vals) -> float`, `.eval_complex(**vals) -> complex`, `.free_symbols`,
-`.context`.
-
-Derivatives are symbolic expressions in the same graph, so they compose to any
-order and with respect to any leaves: `.diff` is forward-mode (one symbol),
-`.grad` is a single reverse-mode (adjoint) sweep over all requested leaves,
-`.hess` is forward-over-reverse.
-
-```python
-x, y = sane.symbols("x y")
-f = 2 * x + (y ** 2).exp()
-f.diff(x)                       # 2
-f.grad([x, y])                  # [2, 2*y*exp(y^2)]
-f.grad([y])[0].diff(y)          # second derivative, any order by repetition
-f.eval(x=1.0, y=0.5)            # 2 + exp(0.25)
-((x + 1) / (x + 1)).simplify()  # 1
-sane.compile_tape([x * y], [x, y]).eval([3.0, 4.0])   # [12.0]
-```
 
 ---
 
@@ -467,14 +425,13 @@ benchmarking and debugging; the log level (`SANE_LOG`) and the test-corpus locat
 |---|---|
 | `sane-core` | SANE's constants, configuration, logging, profiling and the lowering of named math calls; the graph itself is rsdag |
 | `vendor/rsdag` | the expression graph, differentiation, tape, native backend and the sparse solve programs (vendored, see `vendor/rsdag/VENDOR.md`) |
-| `sane-mna` | MNA stamps, symbolic determinant, Cramer → `H(s)` |
+| `sane-mna` | the circuit IR: elements, sources, couplings, index-2 topology checks |
 | `sane-netlist` | SPICE parser (preprocessor, expressions, subckt hierarchy) |
 | `sane-veriloga` | native Verilog-A frontend (parse → elaborate → lower to DAG); ships the built-in device models as Verilog-A source (`builtin/*.va`) |
 | `sane-device` | the device contract (`lower_behavioral` → DAE fragment) and lowering support types |
-| `sane-dae` | DAE assembly + small-signal matrix |
+| `sane-dae` | DAE assembly (currents and charges) and graph transforms |
 | `sane-solve` | native sparse Newton DC + homotopy + ESDIRK32 transient |
 | `sane-analysis` | high-level analyses (OP/transient/AC/sweeps/PZ/noise/MOR/opt) |
-| `sane-export` | export to LaTeX and Python/NumPy |
 | `sane-py` | PyO3 binding |
 
 ## Performance
@@ -483,30 +440,169 @@ Against ngspice-41 and Xyce 7.10 on an AMD Ryzen 9 9900X (Windows 11), every
 tool on one thread. SANE runs each analysis once untimed, then five times, and
 records the best; ngspice the mean of 20 runs in one session, Xyce the best of
 three solver run times. Every tool starts from the same node set and, in
-transient, runs with the same step bound and relative tolerance (1e-4).
+transient, runs with the same step bound and relative tolerance (1e-4). The
+tables are generated from the recorded results; times in milliseconds unless
+noted.
 
-The fifteen SKY130 AnalogGym amplifiers (BSIM4, 148 to 252 unknowns): the
-operating point about as fast as ngspice (faster on 9 of 15) and ten times
-faster than Xyce; the AC sweep at half ngspice's speed and 3.4 times faster
-than Xyce.
+### AnalogGym amplifiers
+
+The fifteen SKY130 AnalogGym amplifiers (BSIM4): the operating point (OP) and
+the AC sweep over 801 points.
 
 ![AnalogGym amplifiers against ngspice and Xyce](assets/bench/amplifiers.svg)
 
-The textbook corpus (30 circuits up to the uA741): the AC sweep at 0.8 times
-ngspice's speed and 6.7 times faster than Xyce, the transient at 0.4 times
-ngspice's speed and 2.6 times faster than Xyce (geometric means).
+<!-- bench:amplifiers -->
+| Amplifier | Unknowns | OP SANE | OP ngspice | OP Xyce | AC SANE | AC ngspice | AC Xyce |
+|---|---|---|---|---|---|---|---|
+| Yan_AZ | 148 | 1.35 | 0.500 | 58.7 | 6.43 | 3.75 | 21.0 |
+| Alfio_RAFFC | 166 | 1.46 | 0.250 | 6.10 | 6.86 | 3.90 | 24.0 |
+| Fan_SMC | 166 | 1.58 | 2.60 | 31.0 | 7.68 | 3.75 | 24.0 |
+| Leung_NMCF | 166 | 1.84 | 8.80 | 41.8 | 7.15 | 3.75 | 22.2 |
+| Ramos_PFC | 166 | 4.59 | 14.0 | 56.4 | 7.62 | 3.60 | 23.4 |
+| Sau_CFCC | 166 | 1.55 | 0.400 | 50.8 | 7.18 | 3.80 | 23.2 |
+| Leung_NMCNR | 167 | 3.75 | 12.2 | 89.3 | 7.11 | 4.10 | 24.5 |
+| Qu2017_AZC | 175 | 11.8 | 9.25 | 82.9 | 7.44 | 4.40 | 23.0 |
+| Leung_DFCFC1 | 179 | 2.65 | 8.95 | 58.6 | 7.72 | 4.00 | 24.6 |
+| Leung_DFCFC2 | 179 | 2.04 | 6.95 | 43.8 | 7.45 | 3.90 | 25.8 |
+| Peng_ACBC | 185 | 2.42 | 9.90 | 44.6 | 7.87 | 4.15 | 27.3 |
+| HoiLee_AFFC | 205 | 2.74 | 6.65 | 54.7 | 8.64 | 4.40 | 29.7 |
+| Peng_TCFC | 221 | 22.2 | 9.70 | 149 | 10.1 | 5.15 | 32.3 |
+| Peng_IAC | 235 | 32.5 | 12.4 | 102 | 10.5 | 5.55 | 35.1 |
+| Song_DACFC | 252 | 2.21 | 16.2 | 36.2 | 11.2 | 6.05 | 39.0 |
+| **geometric mean** |  | **3.42** | **4.76** | **50.4** | **7.96** | **4.23** | **26.2** |
+<!-- /bench:amplifiers -->
+
+### Textbook corpus
+
+The textbook circuits up to the uA741: the AC sweep and the transient. Their
+DC solves take microseconds, under ngspice's timer resolution.
 
 ![Corpus against ngspice and Xyce](assets/bench/corpus.svg)
+
+<!-- bench:corpus -->
+| Analysis | vs ngspice | faster on | vs Xyce | faster on |
+|---|---|---|---|---|
+| AC sweep, 801 points | 0.832x | 2 of 30 | 6.60x | 29 of 29 |
+| Transient, 400 points | 0.455x | 6 of 30 | 2.80x | 25 of 29 |
+
+Speed: the reference's time over SANE's, above 1 SANE is faster.
+
+<details><summary>Every circuit, milliseconds</summary>
+
+| Circuit | Unknowns | AC SANE | AC ngspice | AC Xyce | Tran SANE | Tran ngspice | Tran Xyce |
+|---|---|---|---|---|---|---|---|
+| diode_clipper | 3 | 0.322 | 0.350 | 2.25 | 2.90 | 0.800 | 4.56 |
+| parallel_tank | 3 | 0.386 | 0.350 | 2.33 | 0.368 | 0.800 | 25.5 |
+| rc_lowpass | 3 | 0.292 | 0.250 | 2.28 | 0.408 | 0.800 | 4.32 |
+| rc_timeconst | 3 | 0.315 | 0.250 | 2.37 | 0.402 | 0.600 | 4.38 |
+| voltage_divider | 3 | 0.301 | 0.300 | 2.39 | 1.29 | 0.600 | 4.11 |
+| zener_regulator | 3 | 0.295 | 0.300 | 2.26 | 2.41 | 0.800 | 4.35 |
+| bjt_current_mirror | 4 | 0.342 | 0.300 | 2.33 | 3.25 | 1.00 | 4.61 |
+| bridge_rectifier | 4 | 0.351 | 0.350 | 2.48 | 3.81 | 0.800 | 4.64 |
+| mesfet_cs | 4 | 0.325 | 0.250 | 2.52 | 2.22 | 0.800 | 4.43 |
+| mos_current_mirror | 4 | 0.330 | 0.300 | 2.41 | 2.46 | 1.00 | 4.62 |
+| nmos_curve | 4 | 0.406 | 0.350 | 2.55 | 2.51 | 0.800 | 4.45 |
+| subckt_divider | 4 | 0.319 | 0.300 | 2.60 | 1.77 | 0.600 | 4.32 |
+| zener_clipper | 4 | 0.315 | 0.300 | 2.55 | 2.41 | 1.00 | 4.61 |
+| bjt_emitter_follower | 5 | 0.370 | 0.350 | 2.54 | 3.06 | 0.800 | 4.52 |
+| cmos_inverter | 5 | 0.389 | 0.300 | 2.63 | 1.13 | 0.600 | 4.55 |
+| jfet_cs | 5 | 0.370 | 0.350 | 2.71 | 0.704 | 0.600 | 5.46 |
+| op_inverting | 5 | 0.384 | 0.300 | 2.70 | 1.55 | 0.800 | 4.28 |
+| series_rlc | 5 | 0.362 | 0.350 | 2.62 | 0.476 | 0.800 | 4.73 |
+| symcirc_simple_lc | 5 | 0.374 | 0.350 | 2.61 | 0.744 | 0.600 | 14.5 |
+| colpitts_oscillator | 6 | 0.415 | 0.300 | 2.67 | 0.745 | 1.00 | 4.74 |
+| sallen_key_lp | 6 | 0.392 | 0.350 | 2.79 | 0.518 | 0.800 | 4.62 |
+| vswitch_divider | 6 | 0.356 | 0.350 | - | 2.09 | 0.600 | - |
+| biased_clipper | 7 | 0.512 | 0.400 | 2.80 | 3.56 | 0.800 | 4.43 |
+| cswitch_load | 7 | 0.404 | 0.350 | - | 1.86 | 0.800 | - |
+| bjt_ce_min | 8 | 0.477 | 0.350 | 2.98 | 3.74 | 1.00 | 4.63 |
+| symcirc_mos_amp | 10 | 0.496 | - | - | 1.25 | - | - |
+| symcirc_emitteramp | 12 | 0.603 | 0.450 | 3.24 | 1.47 | 0.800 | 5.08 |
+| cmos_diffpair_ota | 16 | 0.724 | 0.600 | 5.31 | 7.49 | 1.40 | 6.10 |
+| symcirc_conrad2st | 20 | 0.892 | - | 4.38 | 2.61 | - | 6.42 |
+| multistage_bjt_opamp | 21 | 0.973 | 0.750 | 6.54 | 11.3 | 1.60 | 6.54 |
+| ua741_inverting | 180 | 7.06 | 2.90 | 25.3 | 28.0 | 4.80 | 15.8 |
+| ua741 | 184 | 7.10 | 2.90 | 27.8 | 35.3 | 5.40 | 17.4 |
+
+</details>
+<!-- /bench:corpus -->
+
+### Threads
 
 SANE runs on 4 threads by default (`SANE_THREADS`, `set_parallelism`): in
 every solve the device instances of each evaluation (the operating point,
 the transient, harmonic balance), and the frequencies of AC and noise
-sweeps. On the amplifiers at 4 threads the operating point takes 3.8 ms
-instead of 5.6 and the AC sweep 3.8 ms instead of 9.1, against ngspice's 4.7
-and 4.0 ms, which its OpenMP device load does not change on circuits of this
-size. The results do not depend on the thread count.
+sweeps. The results do not depend on the thread count. The amplifiers over
+the thread count, geometric means; ngspice's OpenMP device load does not
+change on circuits of this size.
 
 ![The amplifiers over the thread count](assets/bench/threads.svg)
+
+<!-- bench:threads -->
+| Threads | OP SANE | OP ngspice | AC SANE | AC ngspice |
+|---|---|---|---|---|
+| 1 | 3.94 | 4.67 | 9.33 | 4.04 |
+| 2 | 2.97 | 4.91 | 5.78 | 4.06 |
+| 4 | 2.46 | 4.69 | 3.58 | 4.06 |
+| 8 | 2.37 | 4.58 | 2.78 | 4.02 |
+| 12 | 2.81 | 4.67 | 2.41 | 4.02 |
+<!-- /bench:threads -->
+
+### VACASK transient suite
+
+The transient cases of the [VACASK](https://codeberg.org/arpadbuermen/VACASK)
+benchmark suite, the ring on the PSP103 Verilog-A model, with the step bound
+of the upstream decks. SANE's time is the transient solve; ngspice's the whole
+process on the upstream deck, as in VACASK's own methodology.
+
+<!-- bench:vacask -->
+| Case | Unknowns | Steps | SANE, s | ngspice, s |
+|---|---|---|---|---|
+| rc | 3 | 1,000,000 | 0.815 | 1.57 |
+| graetz | 13 | 1,000,000 | 5.12 | 2.41 |
+| mul | 15 | 500,000 | 3.10 | 1.30 |
+| ring | 47 | 20,000 | 19.5 | 2.29 |
+<!-- /bench:vacask -->
+
+### Verilog-A against OpenVAF
+
+SANE's Verilog-A compiler against OpenVAF-reloaded on the corpus models:
+compile time, fresh process, best of three. Then the device evaluation per
+Newton iteration on the nine-stage PSP103 ring, native code: SANE's own
+compilation of the model, OpenVAF's code called alone with the flags an OSDI
+host sets, and OpenVAF's OSDI library hosted in SANE.
+
+<!-- bench:openvaf -->
+| Model | SANE, s | OpenVAF, s |
+|---|---|---|
+| PSP103 | 0.033 | 2.41 |
+| BSIM4 | 0.021 | 1.39 |
+| VBIC 1.3 | 0.006 | 0.308 |
+| HICUM L0 | 0.006 | 0.277 |
+| EKV 2.6 | 0.007 | 0.184 |
+
+| Ring, per Newton iteration | SANE, us | OpenVAF, us | OpenVAF in SANE, us |
+|---|---|---|---|
+| operating point | 11.6 | 17.6 | 18.5 |
+| transient | 12.8 | 17.8 | 18.6 |
+<!-- /bench:openvaf -->
+
+### Harmonic balance against Xyce
+
+Diode circuits up to a 512-stage ladder, eight harmonics: SANE's solve
+against Xyce's solver run time, and the largest relative difference of the
+first three harmonics.
+
+<!-- bench:hb -->
+| Circuit | Harmonics | SANE, ms | Xyce, ms | Largest difference, H1-H3 |
+|---|---|---|---|---|
+| biased_diode_rc | 8 | 0.712 | 10.4 | 2.4e-04 |
+| diode_mixer_bias | 8 | 0.716 | 10.4 | 1.9e-04 |
+| diode_ladder_16 | 8 | 3.96 | 14.1 | 1.5e-04 |
+| diode_ladder_64 | 8 | 15.4 | 32.9 | 1.5e-04 |
+| diode_ladder_256 | 8 | 65.0 | 109 | 1.5e-04 |
+| diode_ladder_512 | 8 | 129 | 220 | 1.5e-04 |
+<!-- /bench:hb -->
 
 ## Validation
 
@@ -514,15 +610,14 @@ The numeric path is cross-validated against **ngspice** and **Xyce**:
 
 - DC vs ngspice: 29/32 decks.
 - BSIM4 DC + AC vs ngspice + OSDI: 12/12 SKY130 AnalogGym op-amps, relative error 1e-6..1e-4.
-- Harmonic balance vs Xyce: ~6e-6 %.
+- Harmonic balance vs Xyce: the differences in the table above.
 - Exact sensitivity (DC/AC/pole/transient, first and second order) vs finite-difference oracles (`crates/py/tests/`).
 - Devices: the built-in models (diode, MOSFET, BJT, JFET, MESFET, switches, transformer, transmission line) are themselves Verilog-A (`crates/veriloga/builtin/`), lowered through the same pipeline as user compact models; closed-form physics checks in `crates/veriloga/tests/builtin_devices.rs`.
-- Verilog-A corpus (OpenVAF `integration_tests`, via `SANE_VA_CORPUS`): 19/20 models — BSIM3/4/6/BULK/CMG/IMG/SOI, PSP102/103, MEXTRAM, HICUM, EKV, ASMHEMT, HiSIM family — parse, elaborate and lower; the one exception (HiSIM2) uses an unbounded `while` the analog subset rejects. PSP102/PSP103 and EKV solve DC/AC/pole-zero/transient end-to-end (`crates/py/tests/validate_psp103_ring.py`).
+- Verilog-A corpus (OpenVAF `integration_tests`, via `SANE_VA_CORPUS`): 19/20 models — BSIM3/4/6/BULK/CMG/IMG/SOI, PSP102/103, MEXTRAM, HICUM, EKV, ASMHEMT, HiSIM family — parse, elaborate and lower; the one exception (HiSIM2) uses an unbounded `while` the analog subset rejects. PSP103 runs the VACASK transient suite, the nine-stage ring and the c6288 multiplier.
 
 ```
 cargo test --workspace                      # Rust tests
 maturin develop -m crates/py/Cargo.toml     # Python module `sane`
-python crates/py/tests/validate_ngspice.py  # local; needs ngspice + scipy
 ```
 
 The native backend (residual, Jacobian and device bodies emitted as machine

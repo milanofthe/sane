@@ -14,14 +14,12 @@ use crate::{finite_pencil_roots, pencil_eigvectors, solve_complex};
 impl Model {
     /// Small-signal poles at the operating point `x` (parameters `p`): the finite
     /// generalized eigenvalues of the pencil `(G, C)` with `G = dF/dx`,
-    /// `C = dF/dx'`, computed natively (the engine's standard-reduction
+    /// `C = dQ/dx`, computed natively (the engine's standard-reduction
     /// eigensolver -- no Python-side linear algebra, so no drift). `(re, im)` in
     /// rad/s.
     pub fn poles(&self, x: Vec<f64>, p: Vec<f64>) -> Result<Vec<(f64, f64)>, ModelError> {
-        let n = self.dae().dim();
-        let z = vec![0.0; n];
-        let g = self.cdc().system_matrix_dc(&x, &z, &p, 0.0);
-        let c = self.cdc().jacobian_xdot(&x, &z, &p, 0.0);
+        let g = self.cdc().system_matrix_dc(&x, &p, 0.0);
+        let c = self.cdc().jacobian_q_x(&x, &p, 0.0);
         finite_pencil_roots(&g, &c)
             .map(|v| v.into_iter().map(|r| (r[0], r[1])).collect())
             .map_err(ModelError::Numeric)
@@ -38,10 +36,9 @@ impl Model {
         p: Vec<f64>,
     ) -> Result<Vec<(f64, f64)>, ModelError> {
         let n = self.dae().dim();
-        let z = vec![0.0; n];
-        let g = self.cdc().system_matrix_dc(&x, &z, &p, 0.0);
-        let c = self.cdc().jacobian_xdot(&x, &z, &p, 0.0);
-        let b = self.input_jacobian(input, x.clone(), z.clone(), p.clone(), 0.0)?;
+        let g = self.cdc().system_matrix_dc(&x, &p, 0.0);
+        let c = self.cdc().jacobian_q_x(&x, &p, 0.0);
+        let b = self.jacobian_i_input(input, x.clone(), p.clone(), 0.0)?;
         // M = [[G, b], [e_out^T, 0]],  N = [[C, 0], [0, 0]].
         let mut m = vec![vec![0.0; n + 1]; n + 1];
         let mut nn = vec![vec![0.0; n + 1]; n + 1];
@@ -74,14 +71,13 @@ impl Model {
     ) -> Result<Vec<((f64, f64), Vec<(String, f64, f64)>)>, ModelError> {
         let _g = log::scope("sens/pole_gradient");
         let n = self.dae().dim();
-        let z = vec![0.0; n];
-        let g = self.cdc().system_matrix_dc(&x, &z, &p, 0.0);
-        let cmat = self.cdc().jacobian_xdot(&x, &z, &p, 0.0);
+        let g = self.cdc().system_matrix_dc(&x, &p, 0.0);
+        let cmat = self.cdc().jacobian_q_x(&x, &p, 0.0);
         let eigs = pencil_eigvectors(&g, &cmat).map_err(ModelError::Numeric)?;
         self.cdc()
             .ensure_param_jac(&mut self.context_arc().lock().unwrap(), self.dae());
         let pnames = self.cdc().param_names(&self.context_arc().lock().unwrap());
-        let (prr, prc, prv) = self.cdc().jacobian_p_sparse(&x, &z, &p, 0.0);
+        let ((prr, prc, prv), _) = self.cdc().jacobian_p_sparse(&x, &p, 0.0);
         // G^T as a complex matrix for the w_hat and DC-adjoint solves.
         let gt: Vec<Vec<Complex64>> = (0..n)
             .map(|i| (0..n).map(|j| Complex64::new(g[j][i], 0.0)).collect())
@@ -90,14 +86,10 @@ impl Model {
         let arc = self.context_arc();
         let mut cg = arc.lock().unwrap();
         let c = &mut *cg;
-        let (gr, gc, ge) = self.dae().jacobian_x_coo(c);
-        let (cr, cc, ce) = self.dae().jacobian_xdot_coo(c);
+        let ((gr, gc, ge), (cr, cc, ce)) = self.dae().jacobian_iq_coo(c);
         let mut env: HashMap<SymbolId, f64> = HashMap::new();
         for (i, &s) in self.dae().x.iter().enumerate() {
             env.insert(s, x.get(i).copied().unwrap_or(0.0));
-        }
-        for s in self.dae().xdot.iter().flatten() {
-            env.insert(*s, 0.0);
         }
         let mut psyms = Vec::with_capacity(pnames.len());
         for (j, name) in pnames.iter().enumerate() {
@@ -219,10 +211,9 @@ impl Model {
     ) -> Result<Vec<((f64, f64), Vec<(String, f64, f64)>)>, ModelError> {
         let _g = log::scope("sens/zero_gradient");
         let n = self.dae().dim();
-        let z = vec![0.0; n];
-        let g = self.cdc().system_matrix_dc(&x, &z, &p, 0.0);
-        let cmat = self.cdc().jacobian_xdot(&x, &z, &p, 0.0);
-        let bnum = self.input_jacobian(input, x.clone(), z.clone(), p.clone(), 0.0)?;
+        let g = self.cdc().system_matrix_dc(&x, &p, 0.0);
+        let cmat = self.cdc().jacobian_q_x(&x, &p, 0.0);
+        let bnum = self.jacobian_i_input(input, x.clone(), p.clone(), 0.0)?;
         // Augmented Rosenbrock pencil (dimension n+1).
         let na = n + 1;
         let mut m = vec![vec![0.0; na]; na];
@@ -239,7 +230,7 @@ impl Model {
         self.cdc()
             .ensure_param_jac(&mut self.context_arc().lock().unwrap(), self.dae());
         let pnames = self.cdc().param_names(&self.context_arc().lock().unwrap());
-        let (prr, prc, prv) = self.cdc().jacobian_p_sparse(&x, &z, &p, 0.0);
+        let ((prr, prc, prv), _) = self.cdc().jacobian_p_sparse(&x, &p, 0.0);
         // M^T (augmented) as complex for the w_hat solve; G^T (n) for the shift.
         let mt: Vec<Vec<Complex64>> = (0..na)
             .map(|i| (0..na).map(|j| Complex64::new(m[j][i], 0.0)).collect())
@@ -251,8 +242,7 @@ impl Model {
         let arc = self.context_arc();
         let mut cg = arc.lock().unwrap();
         let c = &mut *cg;
-        let (gr, gc, ge) = self.dae().jacobian_x_coo(c);
-        let (cr, cc, ce) = self.dae().jacobian_xdot_coo(c);
+        let ((gr, gc, ge), (cr, cc, ce)) = self.dae().jacobian_iq_coo(c);
         let isym = {
             let e = c.sym(input);
             match c.node(e) {
@@ -262,16 +252,13 @@ impl Model {
         };
         let bsym: Vec<ExprId> = self
             .dae()
-            .residuals
+            .currents
             .iter()
             .map(|&r| differentiate(c, r, isym))
             .collect();
         let mut env: HashMap<SymbolId, f64> = HashMap::new();
         for (i, &s) in self.dae().x.iter().enumerate() {
             env.insert(s, x.get(i).copied().unwrap_or(0.0));
-        }
-        for s in self.dae().xdot.iter().flatten() {
-            env.insert(*s, 0.0);
         }
         let mut psyms = Vec::with_capacity(pnames.len());
         for (j, name) in pnames.iter().enumerate() {
@@ -397,10 +384,8 @@ impl Model {
         x: Vec<f64>,
         p: Vec<f64>,
     ) -> Result<Vec<((f64, f64), (f64, f64))>, ModelError> {
-        let n = self.dae().dim();
-        let z = vec![0.0; n];
-        let g = self.cdc().system_matrix_dc(&x, &z, &p, 0.0);
-        let c = self.cdc().jacobian_xdot(&x, &z, &p, 0.0);
+        let g = self.cdc().system_matrix_dc(&x, &p, 0.0);
+        let c = self.cdc().jacobian_q_x(&x, &p, 0.0);
         let (dg, dc, _db) = self.ac_derivatives(input, param, x.clone(), p.clone(), 0.0)?;
         crate::pencil_root_sensitivity(&g, &c, &dg, &dc)
             .map(|v| {
@@ -423,10 +408,9 @@ impl Model {
         p: Vec<f64>,
     ) -> Result<Vec<((f64, f64), (f64, f64))>, ModelError> {
         let n = self.dae().dim();
-        let z = vec![0.0; n];
-        let g = self.cdc().system_matrix_dc(&x, &z, &p, 0.0);
-        let c = self.cdc().jacobian_xdot(&x, &z, &p, 0.0);
-        let bin = self.input_jacobian(input, x.clone(), z.clone(), p.clone(), 0.0)?; // dF/d(input)
+        let g = self.cdc().system_matrix_dc(&x, &p, 0.0);
+        let c = self.cdc().jacobian_q_x(&x, &p, 0.0);
+        let bin = self.jacobian_i_input(input, x.clone(), p.clone(), 0.0)?; // dF/d(input)
         let (dg, dc, db) = self.ac_derivatives(input, param, x.clone(), p.clone(), 0.0)?;
         // Rosenbrock M = [[G, dF/din], [e_out, 0]], N = [[C, 0], [0, 0]] (the same
         // convention as `zeros`); its parameter derivatives. d(dF/din)/dp = -dB.

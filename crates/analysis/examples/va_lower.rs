@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use sane_analysis::Model;
 
-const M: &str = "paper/benchmarks/models";
+const M: &str = "benchmarks/corpus/models";
 
 fn deck(model: &str) -> Option<String> {
     Some(match model {

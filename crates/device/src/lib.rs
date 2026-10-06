@@ -51,6 +51,7 @@ pub enum LimitKind {
 /// with power spectral density `psd` and flicker exponent `flicker_exp` (both
 /// expressions evaluated at the operating point; a constant-zero exponent is
 /// white noise, `S(f) = psd / f^exp` otherwise). Consumed by noise analysis.
+#[derive(Clone)]
 pub struct NoiseSource {
     pub hi: Option<SymbolId>,
     pub lo: Option<SymbolId>,
@@ -89,12 +90,6 @@ pub struct FragmentLimit {
     pub kind: LimitKind,
 }
 
-/// What a device contributes to the DAE: a current leaving each external
-/// terminal (summed into node KCL) plus one residual equation (`= 0`) per
-/// extra unknown minted on the [`Lowerer`], in mint order. Residuals may
-/// reference the extra unknowns' derivative symbols, so `ddt`/`idt`/laplace
-/// lower directly. `noise` carries any small-signal noise generators; `limits`
-/// any Newton-step controlling-voltage limits.
 /// What an unknown physically is. `assemble_dae` mints them in blocks -- node
 /// voltages `v{k}`, then one branch current `i_{elem}` per voltage source /
 /// inductor / controlled source, then device-internal states -- and every
@@ -124,9 +119,19 @@ pub struct FragmentEvent {
     pub dir: Crossing,
 }
 
+/// What a device contributes to the DAE, row by row `i(x) + d/dt q(x)`: a
+/// current and a charge leaving each external terminal (summed into node
+/// KCL), plus one row (`= 0`) per extra unknown minted on the [`Lowerer`], in
+/// mint order. `noise` carries any small-signal noise generators; `limits`
+/// any Newton-step controlling-voltage limits.
 pub struct BehavioralFragment {
     pub terminal_currents: Vec<ExprId>,
-    pub residuals: Vec<ExprId>,
+    /// The extra unknowns' rows' currents.
+    pub currents: Vec<ExprId>,
+    /// The charges whose time derivatives the rows hold, beside the currents.
+    /// Empty for a device without charge storage.
+    pub terminal_charges: Vec<ExprId>,
+    pub charges: Vec<ExprId>,
     pub noise: Vec<NoiseSource>,
     /// Switching surfaces (see [`FragmentEvent`]).
     pub events: Vec<FragmentEvent>,
@@ -239,16 +244,14 @@ pub trait DeviceModel: Send + Sync {
 
     /// Lower this device to a DAE fragment -- THE device integration path.
     /// The builder `lo` mints extra unknowns (internal nodes, branch currents
-    /// for voltage contributions, `idt`/laplace states);
-    /// `terminal_v`/`terminal_vdot` are the device's terminal node-voltage and
-    /// node-voltage-derivative expressions (ground terminals get a zero
-    /// derivative); `control_i` holds the controlling branch currents (aligned
-    /// with [`control_currents`](Self::control_currents)).
+    /// for voltage contributions, `idt`/laplace states); `terminal_v` are the
+    /// device's terminal node-voltage expressions; `control_i` holds the
+    /// controlling branch currents (aligned with
+    /// [`control_currents`](Self::control_currents)).
     fn lower_behavioral(
         &self,
         lo: &mut Lowerer,
         terminal_v: &[ExprId],
-        terminal_vdot: &[ExprId],
         control_i: &[ExprId],
     ) -> BehavioralFragment;
 }

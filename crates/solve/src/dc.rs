@@ -172,7 +172,7 @@ impl CompiledDc {
         self.criterion(c).update_ok(dx, x)
     }
 
-    /// Damped Newton at a fixed `gmin` (`xdot = 0`, `t = 0`), warm-started from
+    /// Damped Newton at a fixed `gmin` (at rest, `t = 0`), warm-started from
     /// `x_init`. Returns `(x, converged, iterations)`. `tricks` gates the per-step
     /// shaping (uniform clamp, device limiting, line search, partitioning).
     fn newton(
@@ -185,7 +185,6 @@ impl CompiledDc {
         tricks: SolverTricks,
     ) -> (Vec<f64>, bool, usize) {
         let n = self.n;
-        let xdot: &[f64] = &[];
         let mut x = if x_init.len() == n {
             x_init.to_vec()
         } else {
@@ -218,13 +217,13 @@ impl CompiledDc {
         // only the main phase runs per iteration (the prolog reads no state,
         // so the initial `x` in `inputs` is irrelevant to it). The tokens pin
         // each buffer's backend for the episode.
-        self.fill_inputs(&x, xdot, p, 0.0, &mut inputs);
+        self.fill_inputs(&x, p, 0.0, &mut inputs);
         let mut step_tok = self.tape_step_dc.eval_prolog(&inputs, &mut work);
         let mut res_tok = self.tape_res_dc.eval_prolog(&inputs, &mut wb);
         let mut stall = newton::StallGuard::new();
 
         for it in 0..max_iter {
-            self.fill_inputs(&x, xdot, p, 0.0, &mut inputs);
+            self.fill_inputs(&x, p, 0.0, &mut inputs);
             self.tape_step_dc
                 .eval_main(&mut step_tok, &inputs, &mut work, &mut out);
             // Residual of the *homotopy* system F(x) + gmin*x: the diagonal
@@ -341,7 +340,7 @@ impl CompiledDc {
                 1
             };
             let alpha = newton::backtrack(&mut x, &step, &mut trial, fnorm, tries, |trial| {
-                self.fill_inputs(trial, xdot, p, 0.0, &mut inb);
+                self.fill_inputs(trial, p, 0.0, &mut inb);
                 self.tape_res_dc
                     .eval_main(&mut res_tok, &inb, &mut wb, &mut ob);
                 shunted_norm(&ob, trial, gmin)
@@ -353,9 +352,8 @@ impl CompiledDc {
             if tricks.composite_step && alpha == 1.0 {
                 if let Some(f) = fac.as_mut() {
                     let res_norm = |ob: &[f64], xx: &[f64]| shunted_norm(ob, xx, gmin);
-                    self.fill_inputs(&x, xdot, p, 0.0, &mut inb);
-                    self.tape_res_dc
-                        .eval_main(&mut res_tok, &inb, &mut wb, &mut ob);
+                    // The line search's last probe is the new iterate, so
+                    // `ob` holds its residual already.
                     let f1 = res_norm(&ob, &x);
                     for i in 0..n {
                         rhs[i] = ob[i] + gmin * x[i];
@@ -370,7 +368,7 @@ impl CompiledDc {
                         if tricks.device_limiting && !self.limits.is_empty() {
                             limiting::apply_in_place(&self.limits, &x, &mut trial);
                         }
-                        self.fill_inputs(&trial, xdot, p, 0.0, &mut inb);
+                        self.fill_inputs(&trial, p, 0.0, &mut inb);
                         self.tape_res_dc
                             .eval_main(&mut res_tok, &inb, &mut wb, &mut ob);
                         let f2 = res_norm(&ob, &trial);
@@ -513,7 +511,7 @@ impl CompiledDc {
         (best_x, false, iters)
     }
 
-    /// Solve the DC operating point (`xdot = 0`, `t = 0`) with sparse LU and the
+    /// Solve the DC operating point (at rest, `t = 0`) with sparse LU and the
     /// default set of convergence aids. Tries a plain damped-Newton solve first;
     /// if it stalls, falls back through the continuation tricks. Returns
     /// `(x, converged, iterations)`. The scalar `tol` is the absolute residual
@@ -686,18 +684,19 @@ impl CompiledDc {
     /// behind a capacitor is an open circuit, not a wrong answer.
     fn gmin_dominance(&self, x: &[f64], p: &[f64], vntol: f64) -> Option<(usize, f64)> {
         let n = self.n;
-        let zeros = vec![0.0; n];
         // Through the compiled step path (the reused symbolic pattern and
         // whichever backend it picked, the symmetric LDLT on a power grid):
         // the one-shot KLU this used to build cost 50x the Newton's own
         // factorization on a 45k-node grid (580 ms against 12 ms), on every
-        // converged operating point.
-        let (_, _, jv) = self.jacobian_x_sparse(x, &zeros, p, 0.0);
+        // converged operating point. The Jacobian likewise comes from the
+        // DC step program the Newton loops run (warm, native), not from the
+        // general one (on c6288 the difference was two seconds per point).
+        let jv = &self.jacobian_dc(x, p);
         let mut valbuf = Vec::new();
         let mut fac: Option<sparse::Refactorable> = None;
         // (J + g*I) s = x  =>  dx/dg = -s
         let mut s = vec![0.0; n];
-        if !self.solve_step(&jv, GMIN_DC, x, &mut s, &mut valbuf, &mut fac) {
+        if !self.solve_step(jv, GMIN_DC, x, &mut s, &mut valbuf, &mut fac) {
             return None;
         }
         let mut worst: Option<(usize, f64)> = None;
@@ -1049,7 +1048,9 @@ impl CompiledDc {
         max_iter: usize,
         tricks: SolverTricks,
     ) -> (Vec<f64>, bool, usize) {
-        crate::parallel::solve(|| self.solve_dc_nodeset_with_here(p, nodeset, conv, max_iter, tricks))
+        crate::parallel::solve(|| {
+            self.solve_dc_nodeset_with_here(p, nodeset, conv, max_iter, tricks)
+        })
     }
 
     /// [`solve_dc_nodeset_with`](Self::solve_dc_nodeset_with) on this thread.
@@ -1101,9 +1102,9 @@ impl CompiledDc {
         };
         // One Jacobian and one residual episode: `p` is fixed over the solve.
         let (mut sb, mut rb) = (TapeBufs::default(), TapeBufs::default());
-        // The pinned matrix is `dF/dx + diag(GMIN_DC + g on the pinned rows)` -- the
+        // The pinned matrix is `G + diag(GMIN_DC + g on the pinned rows)` -- the
         // pin entries land on the augmented diagonal, so its pattern is exactly the
-        // precomputed `self.symbolic` (dF/dx nonzeros + full diagonal). Reuse that
+        // precomputed `self.symbolic` (G nonzeros + full diagonal). Reuse that
         // symbolic every iteration (refill values, one numeric LU) instead of a fresh
         // AMD ordering per step (#52). Precompute the constant diagonal shunt once.
         // Per-row spring stiffness: `pin.g` is sized for MNA node rows; a pinned
@@ -1186,7 +1187,7 @@ impl CompiledDc {
     /// Source-stepping continuation (predictor-corrector). The homotopy ramps the
     /// independent sources `0 -> full` via `lambda`, with a modest `SOURCE_GMIN`
     /// shunt during the ramp. The exact path tangent uses that independent sources
-    /// enter the residual *linearly*, so `dF/dlambda = F(x; full) - F(x; off)` is a
+    /// enter the residual *linearly*, so `dI/dlambda = I(x; full) - I(x; off)` is a
     /// constant vector `b_src`; the tangent solves `[J + gmin*I] (dx/dlambda) =
     /// -b_src` with the corrector's own factorization. This is the robust path for
     /// high-gain feedback (op-amps), where the gmin shunt alone breaks the loop.
@@ -1223,7 +1224,6 @@ impl CompiledDc {
             return (x, false, iters);
         }
 
-        let xdot: &[f64] = &[];
         let (mut inputs, mut work, mut out, mut valbuf) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let mut tangent = vec![0.0; n];
@@ -1236,12 +1236,12 @@ impl CompiledDc {
             };
             let lambda = ramp.lambda;
 
-            // dF/dlambda = b_src = residual(x; full sources) - residual(x; off).
-            let r_full = self.residual(&x, &xdot, &p_full, 0.0);
-            let r_zero = self.residual(&x, &xdot, &p_zero, 0.0);
+            // dI/dlambda = b_src = I(x; full sources) - I(x; off).
+            let r_full = self.currents(&x, &p_full, 0.0);
+            let r_zero = self.currents(&x, &p_zero, 0.0);
             let neg_b: Vec<f64> = (0..n).map(|i| r_zero[i] - r_full[i]).collect();
-            // J = dF/dx at x (independent of source values).
-            self.fill_inputs(&x, &xdot, p, 0.0, &mut inputs);
+            // G = dI/dx at x (independent of source values).
+            self.fill_inputs(&x, p, 0.0, &mut inputs);
             self.tape_step_dc.eval(&inputs, &mut work, &mut out);
             let solved = self.solve_step(
                 &out[n..],
@@ -1423,7 +1423,7 @@ impl CompiledDc {
     /// first evaluation, the main phase on every one. `tb` must stay with
     /// `tape` and `p` for its lifetime.
     fn eval_episode(&self, tape: &StepEval, x: &[f64], p: &[f64], tb: &mut TapeBufs) {
-        self.fill_inputs(x, &[], p, 0.0, &mut tb.inputs);
+        self.fill_inputs(x, p, 0.0, &mut tb.inputs);
         let ep = tb
             .episode
             .get_or_insert_with(|| tape.eval_prolog(&tb.inputs, &mut tb.work));
@@ -1467,7 +1467,7 @@ impl CompiledDc {
         self.eval_episode(&self.tape_step_dc, x, p, tb);
         let jac = &tb.out[n..];
         let s = 1.0 - lambda;
-        // Reuse a precomputed symbolic (#52): the pattern (dF/dx nonzeros + companion
+        // Reuse a precomputed symbolic (#52): the pattern (G nonzeros + companion
         // positions + full diagonal) is fixed across the continuation, so only the
         // values change with `lambda`. This refills that pattern and runs one numeric
         // LU per iteration rather than a fresh ordering + symbolic analysis.
@@ -1502,7 +1502,7 @@ impl CompiledDc {
 
     /// Lazily build and cache the reused symbolic for the companion-augmented
     /// homotopy matrix (see [`companion_symbolic`](Self.companion_symbolic)). The
-    /// value order the caller must supply is `dF/dx nonzeros ++ companion values ++
+    /// value order the caller must supply is `G nonzeros ++ companion values ++
     /// full diagonal`, matching how the pattern's `(row, col)` pairs are appended.
     fn companion_symbolic(&self) -> Option<&Symbolic> {
         self.companion_symbolic

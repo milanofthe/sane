@@ -1,8 +1,8 @@
 //! AC-domain analyses: complex response, log-frequency sweep, response
 //! sensitivity, and the descriptor state-space at the operating point.
 
-use crate::linalg::{lu_factor_complex, lu_solve_complex};
 use crate::input_vector;
+use crate::linalg::{lu_factor_complex, lu_solve_complex};
 use num_complex::Complex64;
 use sane_core::constants::{DC_OP_MAXIT, DC_OP_TOL};
 use sane_core::Graph;
@@ -26,7 +26,6 @@ pub fn ac_h(
     w: f64,
 ) -> Option<Complex64> {
     let n = dae.dim();
-    let xdot0 = vec![0.0; n];
     let (x, conv, _) = cdc.solve_dc(p, &[], DC_OP_TOL, DC_OP_MAXIT);
     if !conv {
         return None;
@@ -34,7 +33,7 @@ pub fn ac_h(
     // Sparse complex system A = G + jwC straight from the sparse Jacobians, with
     // the same gmin diagonal shunt the operating point was solved under.
     let (gr, gc, gv) = cdc.system_triplets_dc(&x, p);
-    let (cr, cc, cv) = cdc.jacobian_xdot_sparse(&x, &xdot0, p, 0.0);
+    let (cr, cc, cv) = cdc.jacobian_q_x_sparse(&x, p, 0.0);
     let db = input_vector(ctx, dae, pnames, p, &x, input)?;
     let b: Vec<Complex64> = db.iter().map(|v| Complex64::new(-v, 0.0)).collect();
     let sys = crate::sparse_ac::AcSystem::assemble(n, (&gr, &gc, &gv), (&cr, &cc, &cv), w);
@@ -97,7 +96,7 @@ pub fn ac_response_sensitivity(
 }
 
 /// Descriptor state-space `(E, A, B, C, D)` at the operating point, from the
-/// already-assembled DAE: `E = dF/dx'`, `A = -dF/dx`, `B = -dF/d(input)`,
+/// already-assembled DAE: `E = dQ/dx`, `A = -dI/dx`, `B = -dI/d(input)`,
 /// `C = e_out^T`, `D = 0`. (`E x' = A x + B u`, `y = C x + D u`.)
 #[allow(clippy::type_complexity)]
 pub fn state_space_on_dae(
@@ -110,9 +109,8 @@ pub fn state_space_on_dae(
     p: &[f64],
 ) -> (Vec<Vec<f64>>, Vec<Vec<f64>>, Vec<f64>, Vec<f64>, f64) {
     let n = dae.dim();
-    let xdot0 = vec![0.0; n];
-    let g = cdc.jacobian_x(x, &xdot0, p, 0.0);
-    let e = cdc.jacobian_xdot(x, &xdot0, p, 0.0);
+    let g = cdc.jacobian_i_x(x, p, 0.0);
+    let e = cdc.jacobian_q_x(x, p, 0.0);
     let a: Vec<Vec<f64>> = g
         .iter()
         .map(|row| row.iter().map(|v| -v).collect())
@@ -145,7 +143,6 @@ mod sparse_ac_equiv {
         let pnames = cdc.param_names(&ctx);
         let p: Vec<f64> = parsed.pvec(&pnames);
         let n = dae.dim();
-        let xdot0 = vec![0.0; n];
         let (x, conv, _) = cdc.solve_dc(&p, &[], DC_OP_TOL, DC_OP_MAXIT);
         assert!(conv, "DC did not converge");
         let node = parsed.node("out").unwrap();
@@ -159,8 +156,8 @@ mod sparse_ac_equiv {
         let w = 2.0 * PI * 1e3;
 
         // dense reference
-        let g = cdc.system_matrix_dc(&x, &xdot0, &p, 0.0);
-        let c = cdc.jacobian_xdot(&x, &xdot0, &p, 0.0);
+        let g = cdc.system_matrix_dc(&x, &p, 0.0);
+        let c = cdc.jacobian_q_x(&x, &p, 0.0);
         let mut a = vec![vec![Complex64::new(0.0, 0.0); n]; n];
         for i in 0..n {
             for j in 0..n {
@@ -170,13 +167,13 @@ mod sparse_ac_equiv {
         let h_dense = solve_complex(a, b.clone()).unwrap()[out_idx];
 
         // sparse path (gmin as diagonal triplets, summed in assembly)
-        let (mut gr, mut gc, mut gv) = cdc.jacobian_x_sparse(&x, &xdot0, &p, 0.0);
+        let (mut gr, mut gc, mut gv) = cdc.jacobian_i_x_sparse(&x, &p, 0.0);
         for i in 0..n {
             gr.push(i);
             gc.push(i);
             gv.push(sane_core::constants::GMIN_DC);
         }
-        let (cr, cc, cv) = cdc.jacobian_xdot_sparse(&x, &xdot0, &p, 0.0);
+        let (cr, cc, cv) = cdc.jacobian_q_x_sparse(&x, &p, 0.0);
         let sys = crate::sparse_ac::AcSystem::assemble(n, (&gr, &gc, &gv), (&cr, &cc, &cv), w);
         let h_sparse = sys.solve(&b).unwrap()[out_idx];
 

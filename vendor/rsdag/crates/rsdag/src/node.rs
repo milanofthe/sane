@@ -625,8 +625,13 @@ impl Node {
 /// fixed-arity variants, a pool slice for the variadic ones. Derefs to
 /// `&[ExprId]`.
 pub enum Operands<'a> {
-    Inline { buf: [ExprId; 3], n: u8 },
+    Inline {
+        buf: [ExprId; 3],
+        n: u8,
+    },
     Slice(&'a [ExprId]),
+    /// A bound call's: its arguments, then its context's expressions.
+    Owned(Vec<ExprId>),
 }
 
 impl std::ops::Deref for Operands<'_> {
@@ -635,6 +640,7 @@ impl std::ops::Deref for Operands<'_> {
         match self {
             Operands::Inline { buf, n } => &buf[..*n as usize],
             Operands::Slice(s) => s,
+            Operands::Owned(v) => v,
         }
     }
 }

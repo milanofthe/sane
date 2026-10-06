@@ -4,10 +4,10 @@
 //! An OSDI model exposes residuals `f(x)` (resistive) and `q(x)` (reactive,
 //! `f + dq/dt = 0`) plus their first-order Jacobians through C callbacks. SANE
 //! bridges them as an [`ExternBundle`]: each node's `f_i` and `q_i` become
-//! opaque operators over the device's node voltages, the terminal current is
-//! `f_i + d/dt q_i` (the `d[q_i]/dv_j` partial markers SANE's autodiff mints
-//! are bound to the reactive Jacobian), and one `eval` call per Newton point
-//! serves every output of the group.
+//! opaque operators over the device's node voltages, the terminal's current
+//! `f_i` and charge `q_i` (the `d[q_i]/dv_j` partial markers SANE's autodiff
+//! mints are bound to the reactive Jacobian), and one `eval` call per Newton
+//! point serves every output of the group.
 //!
 //! Trade-offs versus the symbolic Verilog-A frontend (`sane-veriloga`):
 //! - parameters are baked numerically at load time (no parameter
@@ -23,12 +23,19 @@ use rustc_hash::FxHashMap as HashMap;
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::sync::{Arc, Mutex};
 
-use rsdag::{time_derivative, ExprId};
+use rsdag::ExprId;
 use sane_core::Graph;
 use sane_device::{BehavioralFragment, DeviceModel, Lowerer};
 
 mod ffi;
 use ffi::*;
+
+/// Every quantity a model computes: what the bridge serves.
+const ALL: u32 = CALC_RESIST_RESIDUAL
+    | CALC_REACT_RESIDUAL
+    | CALC_RESIST_JACOBIAN
+    | CALC_REACT_JACOBIAN
+    | CALC_NOISE;
 
 /// The host-side `osdi_log` sink: routed into SANE's logger.
 unsafe extern "C" fn osdi_log_sink(_handle: *mut c_void, msg: *const c_char, lvl: u32) {
@@ -276,6 +283,8 @@ struct EvalState {
     /// Active descriptor nodes (repr == itself), in descriptor order:
     /// terminals first, then surviving internals. Bundle argument order.
     active: Vec<usize>,
+    /// The outputs of a [`OsdiDevice::host_eval`].
+    host_buf: Vec<f64>,
     /// Noise sources, collapse-resolved: `(hi, lo)` as active-node indices
     /// (`None` = ground) plus the OSDI noise type (white / flicker; table
     /// sources are skipped with a warning at setup). Order matches
@@ -552,6 +561,7 @@ impl EvalState {
             prev_solve: vec![0.0; ground_slot + 1],
             states: vec![0.0; d.num_states as usize],
             next_states: vec![0.0; d.num_states as usize],
+            host_buf: Vec::new(),
             jr_cells,
             jq_cells,
             active,
@@ -561,12 +571,14 @@ impl EvalState {
         })
     }
 
-    /// One full evaluation at the node voltages `v` (active order): residuals
-    /// `f`/`q` per active node, the aggregated Jacobian cell values, and the
-    /// per-source noise power / exponent.
+    /// One evaluation at the node voltages `v` (active order) of what `flags`
+    /// asks for: residuals `f`/`q` per active node, the aggregated Jacobian
+    /// cell values, and the per-source noise power / exponent.
+    #[allow(clippy::too_many_arguments)]
     fn eval(
         &mut self,
         v: &[f64],
+        flags: u32,
         f: &mut [f64],
         q: &mut [f64],
         jr: &mut [f64],
@@ -590,11 +602,7 @@ impl EvalState {
             prev_solve: self.prev_solve.as_mut_ptr(),
             prev_state: self.states.as_mut_ptr(),
             next_state: self.next_states.as_mut_ptr(),
-            flags: CALC_RESIST_RESIDUAL
-                | CALC_REACT_RESIDUAL
-                | CALC_RESIST_JACOBIAN
-                | CALC_REACT_JACOBIAN
-                | CALC_NOISE,
+            flags,
         };
         // SAFETY: model/instance were set up in `new`; buffers are sized to the
         // descriptor's counts; node_mapping points into prev_solve.
@@ -623,24 +631,26 @@ impl EvalState {
                 self.res_buf.as_mut_ptr(),
             );
             f.copy_from_slice(&self.res_buf[..n_active]);
-            self.res_buf.fill(0.0);
-            (d.load_residual_react)(
-                self.inst.as_ptr(),
-                self.model.as_ptr(),
-                self.res_buf.as_mut_ptr(),
-            );
-            q.copy_from_slice(&self.res_buf[..n_active]);
             (d.write_jacobian_array_resist)(
                 self.inst.as_ptr(),
                 self.model.as_ptr(),
                 self.jr_buf.as_mut_ptr(),
             );
-            (d.write_jacobian_array_react)(
-                self.inst.as_ptr(),
-                self.model.as_ptr(),
-                self.jq_buf.as_mut_ptr(),
-            );
-            if !self.noise.is_empty() {
+            if flags & CALC_REACT_RESIDUAL != 0 {
+                self.res_buf.fill(0.0);
+                (d.load_residual_react)(
+                    self.inst.as_ptr(),
+                    self.model.as_ptr(),
+                    self.res_buf.as_mut_ptr(),
+                );
+                q.copy_from_slice(&self.res_buf[..n_active]);
+                (d.write_jacobian_array_react)(
+                    self.inst.as_ptr(),
+                    self.model.as_ptr(),
+                    self.jq_buf.as_mut_ptr(),
+                );
+            }
+            if flags & CALC_NOISE != 0 && !self.noise.is_empty() {
                 self.pow_buf.fill(0.0);
                 self.exp_buf.fill(0.0);
                 (d.load_noise_params)(
@@ -657,8 +667,10 @@ impl EvalState {
         for (k, (_, slots)) in self.jq_cells.iter().enumerate() {
             jq[k] = slots.iter().map(|&s| self.jq_buf[s]).sum();
         }
-        npow.copy_from_slice(&self.pow_buf);
-        nexp.copy_from_slice(&self.exp_buf);
+        if flags & CALC_NOISE != 0 {
+            npow.copy_from_slice(&self.pow_buf);
+            nexp.copy_from_slice(&self.exp_buf);
+        }
     }
 }
 
@@ -722,7 +734,7 @@ impl rsdag::ExternBundle for OsdiBundle {
         let (jq, rest) = rest.split_at_mut(njq);
         let (npow, rest) = rest.split_at_mut(nn);
         let (nexp, rest) = rest.split_at_mut(nn);
-        st.eval(args, f, q, jr, jq, npow, nexp);
+        st.eval(args, ALL, f, q, jr, jq, npow, nexp);
         rest[0] = 0.0; // the shared zero slot (unavailable second derivatives)
     }
 }
@@ -768,8 +780,34 @@ impl OsdiDevice {
         let mut jq = vec![0.0; bundle.n_jq];
         let mut np = vec![0.0; bundle.n_noise];
         let mut ne = vec![0.0; bundle.n_noise];
-        st.eval(v, &mut f, &mut q, &mut jr, &mut jq, &mut np, &mut ne);
+        st.eval(v, ALL, &mut f, &mut q, &mut jr, &mut jq, &mut np, &mut ne);
         (f, q, jr)
+    }
+
+    /// One evaluation as an OSDI host's Newton iteration asks for it: the
+    /// resistive residual and Jacobian, and with `reactive` (a transient)
+    /// the reactive ones; returns the resistive residual's first entry.
+    pub fn host_eval(&self, v: &[f64], reactive: bool) -> f64 {
+        let bundle = self.state.lock().unwrap().clone().expect("setup first");
+        let mut st = bundle.state.lock().unwrap();
+        let flags = CALC_RESIST_RESIDUAL
+            | CALC_RESIST_JACOBIAN
+            | if reactive {
+                CALC_REACT_RESIDUAL | CALC_REACT_JACOBIAN
+            } else {
+                0
+            };
+        let st = &mut *st;
+        let (n, njr, njq) = (st.n_active(), bundle.n_jr, bundle.n_jq);
+        let mut f = std::mem::take(&mut st.host_buf);
+        f.resize(2 * n + njr + njq, 0.0);
+        let (fr, rest) = f.split_at_mut(n);
+        let (q, rest) = rest.split_at_mut(n);
+        let (jr, jq) = rest.split_at_mut(njr);
+        st.eval(v, flags, fr, q, jr, jq, &mut [], &mut []);
+        let first = f[0];
+        st.host_buf = f;
+        first
     }
 
     /// Set up the instance (parameters, collapse resolution) eagerly so load
@@ -812,7 +850,6 @@ impl DeviceModel for OsdiDevice {
         &self,
         lo: &mut Lowerer,
         terminal_v: &[ExprId],
-        terminal_vdot: &[ExprId],
         _control_i: &[ExprId],
     ) -> BehavioralFragment {
         self.setup().expect("osdi setup validated at load time");
@@ -823,30 +860,19 @@ impl DeviceModel for OsdiDevice {
         let prefix = format!("osdi.{}", self.name);
 
         // Arguments: terminal voltages, then freshly minted internal unknowns
-        // (active order); derivative expressions alongside for ddt. A shorted
-        // terminal is not active (its model row merged away); handled below.
+        // (active order). A shorted terminal is not active (its model row
+        // merged away); handled below.
         let terminal_shorts = st.terminal_shorts.clone();
         let mut args: Vec<ExprId> = Vec::with_capacity(n_active);
-        let mut arg_dots: Vec<ExprId> = Vec::with_capacity(n_active);
-        let mut deriv_of = rustc_hash::FxHashMap::default();
         for &node in st.active.iter() {
             if node < nt {
                 args.push(terminal_v[node]);
-                arg_dots.push(terminal_vdot[node]);
             } else {
                 let label = format!("{}.{}", self.name, self.module.node_names[node]);
-                let (v, vdot) =
-                    lo.unknown_kind(&label, sane_device::UnknownKind::NodeVoltage, false);
-                args.push(v);
-                arg_dots.push(vdot);
+                args.push(lo.unknown_kind(&label, sane_device::UnknownKind::NodeVoltage));
             }
         }
         let ctx = lo.ctx();
-        for (k, &a) in args.iter().enumerate() {
-            if let rsdag::Node::Symbol(s) = ctx.node(a) {
-                deriv_of.insert(*s, arg_dots[k]);
-            }
-        }
 
         // Register the bundle and bind every output / derivative-marker slot.
         let (n_jr, n_jq) = (bundle.n_jr, bundle.n_jq);
@@ -905,36 +931,37 @@ impl DeviceModel for OsdiDevice {
         let out_pow = |k: usize| (2 * n_active + k) as u32;
         let out_exp = |k: usize| (2 * n_active + n_noise + k) as u32;
 
-        // Rows per ACTIVE node: f_i + d/dt q_i.
+        // Rows per ACTIVE node: the current f_i and the charge q_i.
         let active_nodes: Vec<usize> = {
             let st = bundle.state.lock().unwrap();
             st.active.clone()
         };
-        let mut rows: Vec<ExprId> = Vec::with_capacity(n_active);
+        let mut rows: Vec<(ExprId, ExprId)> = Vec::with_capacity(n_active);
         for i in 0..n_active {
             let f = ctx.call(fid, out_f(i), &args);
             let q = ctx.call(fid, out_q(i), &args);
-            let dq = time_derivative(ctx, q, &deriv_of);
-            rows.push(ctx.add(f, dq));
+            rows.push((f, q));
         }
         let zero = ctx.zero();
         let mut terminal_currents = vec![zero; nt];
-        let mut residuals: Vec<ExprId> = Vec::new();
+        let mut terminal_charges = vec![zero; nt];
+        let (mut currents, mut charges) = (Vec::new(), Vec::new());
         for (pos, &node) in active_nodes.iter().enumerate() {
+            let (row, q) = rows[pos];
             if node < nt {
-                terminal_currents[node] = rows[pos];
+                (terminal_currents[node], terminal_charges[node]) = (row, q);
             } else {
-                residuals.push(rows[pos]);
+                currents.push(row);
+                charges.push(q);
             }
         }
         // Model-collapsed terminals: a zero-volt source branch pins the
         // terminal to its target (ground or the representative terminal); the
         // branch current carries whatever the external circuit pushes through.
         for &(t, target) in &terminal_shorts {
-            let (i, _) = lo.unknown_kind(
+            let i = lo.unknown_kind(
                 &format!("{}.short_{}", self.name, self.module.node_names[t]),
                 sane_device::UnknownKind::BranchCurrent,
-                false,
             );
             let ctx = lo.ctx();
             terminal_currents[t] = ctx.add(terminal_currents[t], i);
@@ -946,10 +973,11 @@ impl DeviceModel for OsdiDevice {
                 }
                 None => terminal_v[t],
             };
-            residuals.push(constraint);
+            currents.push(constraint);
+            charges.push(ctx.zero());
         }
         // Noise sources: power / exponent as bundle outputs over the same
-        // argument group (computed in the same eval as the residuals), node
+        // argument group (computed in the same eval as the currents), node
         // pair by voltage symbol. Table sources and collapsed self-pairs are
         // skipped; the PSD's derivative markers (w.r.t. node voltages) bind to
         // zero -- the operating-point dependence of the PSD is not
@@ -983,7 +1011,9 @@ impl DeviceModel for OsdiDevice {
             param_syms: Vec::new(),
             events: Vec::new(),
             terminal_currents,
-            residuals,
+            currents,
+            terminal_charges,
+            charges,
             noise,
             op_vars: Vec::new(),
             limits: Vec::new(),

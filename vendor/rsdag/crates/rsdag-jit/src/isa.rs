@@ -57,6 +57,10 @@ pub(crate) enum Round {
 }
 
 pub(crate) trait Isa {
+    /// Values per register: `1` for scalar code, more for code that runs
+    /// that many instances side by side, one per lane (a slot is then
+    /// `LANES` consecutive values in the work array, an input likewise).
+    const LANES: usize;
     /// The registers the value cache may use, in eviction order. The first
     /// `SAVED` of them survive a host call.
     const CACHE: &'static [u8];
@@ -76,8 +80,13 @@ pub(crate) trait Isa {
     fn prologue(&mut self);
     fn epilogue(&mut self);
 
+    /// A register's `LANES` values from or to memory.
     fn load(&mut self, r: u8, base: Base, off: usize);
     fn store(&mut self, r: u8, base: Base, off: usize);
+    /// One value, into a register's first lane or from it (the scalar
+    /// arguments and result of a host call made lane by lane).
+    fn load_lane(&mut self, r: u8, base: Base, off: usize);
+    fn store_lane(&mut self, r: u8, base: Base, off: usize);
     fn fconst(&mut self, r: u8, v: f64);
     fn mov(&mut self, d: u8, a: u8);
 

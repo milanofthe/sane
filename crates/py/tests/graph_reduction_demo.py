@@ -43,26 +43,20 @@ def main():
     freqs = np.geomspace(1.0, 1e6, 60)
     Hf = dae.small_signal("V1", str(out)).response(freqs)
 
-    def n_terms(d):
-        """Total branch terms across the KCL residuals -- the graph size."""
-        return sum(str(r).count(",") + 1 if str(r).startswith("sum(") else 1
-                   for r in d.residuals)
-
-    def teval(d, p, x, z, reps=3000):
+    def teval(d, p, x, reps=3000):
         """Residual + Jacobian evaluation time (the per-Newton-step cost)."""
-        d.core.jacobian_x_sparse(x, z, p, 0.0)
+        d.core.jacobian_i_x_sparse(x, p, 0.0)
         t0 = time.perf_counter()
         for _ in range(reps):
-            d.core.jacobian_x_sparse(x, z, p, 0.0)
+            d.core.jacobian_i_x_sparse(x, p, 0.0)
         return (time.perf_counter() - t0) / reps
 
     p = [dae.values.get(n, 0.0) for n in dae.params]
     x = dae.core.solve_dc(p, None, 1e-10, 100)
-    z = [0.0] * dae.dim
-    t_full = teval(dae, p, x, z)
+    t_full = teval(dae, p, x)
 
-    print(f"{'rel_tol':>9} {'terms':>7} {'max|dGain|':>12} {'eval speedup':>13}")
-    print(f"{'full':>9} {n_terms(dae):>7} {'-':>12} {'1.00x':>13}")
+    print(f"{'rel_tol':>9} {'removed':>7} {'max|dGain|':>12} {'eval speedup':>13}")
+    print(f"{'full':>9} {0:>7} {'-':>12} {'1.00x':>13}")
     for rel_tol in (1e-4, 1e-3, 1e-2):
         # judge negligibility over the band we actually care about
         red = dae.reduce(rel_tol=rel_tol, freqs=freqs)
@@ -70,8 +64,8 @@ def main():
         err = np.max(np.abs(20 * np.log10(np.abs(Hr)) - 20 * np.log10(np.abs(Hf))))
         pr = [red.values.get(n, 0.0) for n in red.params]
         xr = red.core.solve_dc(pr, None, 1e-10, 100)
-        sp = t_full / teval(red, pr, xr, [0.0] * red.dim)
-        print(f"{rel_tol:>9.0e} {n_terms(red):>7} {err:>11.3f}  {sp:>11.2f}x")
+        sp = t_full / teval(red, pr, xr)
+        print(f"{rel_tol:>9.0e} {len(red.transforms):>7} {err:>11.3f}  {sp:>11.2f}x")
 
     print("\nthe reduced model keeps the same unknowns (same interface), so it"
           "\ndrops straight into transient / AC / sensitivity -- just faster.")

@@ -5,7 +5,8 @@
 //! names, and closed into one function of the graph (see `assemble`): its
 //! node voltages, the unknowns it mints and its parameters in, the current it
 //! draws from each of its nodes and the residuals of its unknowns out. Every
-//! instance is a call. Bodies that lower to the same expressions are one
+//! instance is a call. A body is shared by the instances that place it and
+//! assembled once; bodies that lower to the same expressions are one
 //! function, whatever instance placed them.
 //!
 //! The body's names carry its namespace (`__inv__.R1`, `i___inv__.V1`); an
@@ -13,18 +14,25 @@
 //! prefix with its own name (`X1.R1`). A name without the prefix (a model
 //! card's parameter, `$temp`, a `.global` node) is shared by every instance.
 
+use std::sync::Arc;
+
 use sane_device::DeviceInstance;
 use sane_mna::{Circuit, Element};
 
-/// A subcircuit instance: its placed body and how it connects to its parent.
+/// A subcircuit instance: its body and how it connects to its parent.
 pub struct Instance {
     /// The instance's name in its parent's frame (`X1`, `__inv__.Xa`).
     pub name: String,
-    /// The prefix every instance-owned name in the body carries (`__inv__.`).
-    pub ns: String,
     /// The parent's node of each body node: body node `k` is parent node
     /// `nodes[k - 1]` (`0` is ground). Ports and internal nodes alike.
     pub nodes: Vec<usize>,
+    pub body: Arc<Body>,
+}
+
+/// A placed subcircuit body, in its own names.
+pub struct Body {
+    /// The prefix every instance-owned name in the body carries (`__inv__.`).
+    pub ns: String,
     /// The body's name of each body node (`mid`, a port's name), for views.
     pub node_names: Vec<String>,
     pub circuit: Circuit,
@@ -36,15 +44,7 @@ impl Instance {
     /// A body name in the parent's frame: the namespace replaced by the
     /// instance's name (`i___inv__.V1` -> `i_X1.V1`); a shared name as is.
     pub fn rename(&self, name: &str) -> String {
-        match name.find(&self.ns) {
-            Some(i) => format!(
-                "{}{}.{}",
-                &name[..i],
-                self.name,
-                &name[i + self.ns.len()..]
-            ),
-            None => name.to_string(),
-        }
+        rename(name, &self.name, &self.body.ns)
     }
 
     /// The parent node of body node `k` (`0` stays ground).
@@ -54,6 +54,15 @@ impl Instance {
         } else {
             self.nodes[k - 1]
         }
+    }
+}
+
+/// A name of a body in namespace `ns` in the frame of its instance `inst`
+/// (see [`Instance::rename`]).
+pub(crate) fn rename(name: &str, inst: &str, ns: &str) -> String {
+    match name.find(ns) {
+        Some(i) => format!("{}{inst}.{}", &name[..i], &name[i + ns.len()..]),
+        None => name.to_string(),
     }
 }
 
@@ -69,7 +78,8 @@ pub fn topology(
     let mut elements = circuit.elements().to_vec();
     let mut terminals: Vec<Vec<usize>> = devices.iter().map(|d| d.terminals.clone()).collect();
     for inst in instances {
-        let (es, ts) = topology(&inst.circuit, &inst.devices, &inst.instances);
+        let b = &inst.body;
+        let (es, ts) = topology(&b.circuit, &b.devices, &b.instances);
         elements.extend(es.into_iter().map(|mut e| {
             e.name = inst.rename(&e.name);
             e.a = inst.node(e.a);

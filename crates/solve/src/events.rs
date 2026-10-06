@@ -38,8 +38,8 @@
 use rsdag::{Crossing, Tape};
 use sane_core::constants::*;
 
-use crate::transient::{hermite_point, linear_point, solve_mass};
-use crate::{sparse, CompiledDc, TransientEvent};
+use crate::transient::{hermite_point, linear_point};
+use crate::{CompiledDc, TransientEvent};
 
 /// What an accepted step landed on.
 #[derive(Clone, Copy, Debug, Default)]
@@ -169,12 +169,11 @@ impl<'a> Discontinuities<'a> {
         x_new: &[f64],
         t: f64,
         h: f64,
-        c_lu: Option<&sparse::TripletLu>,
-        slopes: &[Vec<f64>],
+        rates: &mut dyn FnMut() -> Option<(Vec<f64>, Vec<f64>)>,
     ) -> Option<f64> {
         self.surfaces
             .as_mut()
-            .and_then(|s| s.locate(x_prev, x_new, t, h, c_lu, slopes))
+            .and_then(|s| s.locate(x_prev, x_new, t, h, rates))
     }
 
     /// Bookkeeping at an accepted step ending at `(x, t)`: a landed-on instant
@@ -209,7 +208,6 @@ pub(crate) struct EventTracker<'a> {
     inputs: Vec<f64>,
     work: Vec<f64>,
     out: Vec<f64>,
-    zc: Vec<f64>,
     /// `g` at the last accepted point (the start of the current step).
     g_prev: Vec<f64>,
     /// `g` at the candidate step end.
@@ -248,7 +246,6 @@ impl<'a> EventTracker<'a> {
             inputs: Vec::new(),
             work: Vec::new(),
             out: Vec::new(),
-            zc: vec![0.0; x0.len()],
             g_prev: Vec::new(),
             g_new: Vec::new(),
             scale: vec![0.0; m],
@@ -258,7 +255,7 @@ impl<'a> EventTracker<'a> {
             roots: vec![0.0; m],
             fired: Vec::new(),
         };
-        s.cdc.fill_inputs(x0, &s.zc, p, t0, &mut s.inputs);
+        s.cdc.fill_inputs(x0, p, t0, &mut s.inputs);
         s.tape.eval(&s.inputs, &mut s.work, &mut s.out);
         s.g_prev = s.out.clone();
         for k in 0..m {
@@ -268,7 +265,7 @@ impl<'a> EventTracker<'a> {
     }
 
     fn eval(&mut self, x: &[f64], t: f64) {
-        self.cdc.patch_inputs(x, &self.zc, t, &mut self.inputs);
+        self.cdc.patch_inputs(x, t, &mut self.inputs);
         self.tape.eval(&self.inputs, &mut self.work, &mut self.out);
     }
 
@@ -276,14 +273,15 @@ impl<'a> EventTracker<'a> {
     /// `x_new`, on the step's dense output; `None` when no armed surface
     /// changes sign across the step. The returned time is on the near side of
     /// the surface, within `EVENT_TIME_TOL * h` of the crossing.
+    /// `rates` gives the state rates at both ends of the step (`None`: the
+    /// linear interpolant), asked only when a surface is crossed.
     pub fn locate(
         &mut self,
         x_prev: &[f64],
         x_new: &[f64],
         t: f64,
         h: f64,
-        c_lu: Option<&sparse::TripletLu>,
-        slopes: &[Vec<f64>],
+        rates: &mut dyn FnMut() -> Option<(Vec<f64>, Vec<f64>)>,
     ) -> Option<f64> {
         self.eval(x_new, t + h);
         self.g_new.clear();
@@ -295,12 +293,7 @@ impl<'a> EventTracker<'a> {
             return None;
         }
         let n = x_prev.len();
-        let herm = c_lu.map(|lu| {
-            (
-                solve_mass(lu, &slopes[0], n),
-                solve_mass(lu, &slopes[slopes.len() - 1], n),
-            )
-        });
+        let herm = rates();
         let tol = EVENT_TIME_TOL * h;
         let mut best = t + h;
         for &k in &flagged {

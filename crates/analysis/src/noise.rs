@@ -67,14 +67,10 @@ pub fn noise_on_dae(
         return Err("noise needs 0 < fstart < fstop and points >= 2".into());
     }
     let n = dae.dim();
-    let xdot0 = vec![0.0; n];
     // Sparse G (+ gmin) and C, fetched once; the adjoint system A^T w = e_out is
     // solved per frequency on the sparse path (matrix-free transpose).
     let (g_r, g_c, g_v) = log_stage!("noise/assemble_g", cdc.system_triplets_dc(x, p));
-    let (c_r, c_c, c_v) = log_stage!(
-        "noise/assemble_c",
-        cdc.jacobian_xdot_sparse(x, &xdot0, p, 0.0)
-    );
+    let (c_r, c_c, c_v) = log_stage!("noise/assemble_c", cdc.jacobian_q_x_sparse(x, p, 0.0));
 
     // Evaluation environment: unknowns -> x, parameters -> p (the PSD expressions
     // reference both).
@@ -107,7 +103,8 @@ pub fn noise_on_dae(
     let mut srcs: Vec<(Vec<f64>, f64, f64)> = Vec::new();
     let mut tab_srcs: Vec<NoiseTab> = Vec::new();
     let levels = dae.noise_levels(ctx, &env);
-    for (ns, level) in dae.noise_sources.iter().zip(levels) {
+    let flat = dae.observers.flatten(ctx);
+    for (ns, level) in flat.noise.iter().zip(levels) {
         let mut u = vec![0.0; n];
         if let Some(s) = ns.hi {
             if let Some(i) = idx_of(s) {

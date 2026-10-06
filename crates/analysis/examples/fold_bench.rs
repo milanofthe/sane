@@ -3,7 +3,7 @@
 //! seconds to milliseconds. Keeps a few parameters symbolic and folds the rest.
 //!
 //! ```text
-//! cargo run -q --release --example fold_bench -- paper/figures/data/_sane_HoiLee_AFFC_Pin_3.cir vout 3
+//! cargo run -q --release --example fold_bench -- benchmarks/.scratch/sane_HoiLee_AFFC_Pin_3.cir vout 3
 //! ```
 //! Args: <netlist> <output> [n_keep].
 

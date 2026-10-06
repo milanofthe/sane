@@ -20,8 +20,7 @@
 //!
 //! 2. **Reusable numeric kernels** -- the `*_on_dae` analysis cores plus
 //!    `ac_response_sensitivity`, `pencil_root_sensitivity`, `finite_pencil_roots`,
-//!    `symbolic_transfer_approx*`, and the `linalg` / `sparse_ac` / `symbolic_poly`
-//!    modules. These take already-compiled engine objects (no netlist parsing)
+//!    and the `linalg` / `sparse_ac` modules. These take already-compiled engine objects (no netlist parsing)
 //!    and are what the `Model` methods dispatch to.
 //!
 //! UI-free throughout: the analysis stack is a plain Rust library.
@@ -60,8 +59,6 @@ pub use linalg::{solve_complex, solve_real};
 
 mod sparse_ac;
 
-mod symbolic_poly;
-
 mod ac;
 mod noise;
 mod pz;
@@ -71,10 +68,7 @@ mod sweep;
 pub use ac::{ac_h, ac_response_sensitivity, state_space_on_dae};
 pub use noise::noise_on_dae;
 pub use pz::{dominant_subset, finite_pencil_roots, pencil_eigvectors, pencil_root_sensitivity};
-pub use reduce::{
-    model_reduce_on_dae, symbolic_transfer_approx, symbolic_transfer_approx_at,
-    symbolic_transfer_approx_named_at,
-};
+pub use reduce::model_reduce_on_dae;
 pub use sweep::temp_sweep_on_dae;
 
 /// Label a DAE unknown for the UI: `v{k}` -> (node name, "voltage"), else
@@ -298,18 +292,12 @@ pub(crate) fn op_env(
     dae: &sane_dae::Dae,
     pnames: &[String],
     x: &[f64],
-    xdot: &[f64],
     p: &[f64],
     t: f64,
 ) -> HashMap<SymbolId, f64> {
     let mut env: HashMap<SymbolId, f64> = HashMap::new();
     for (i, &s) in dae.x.iter().enumerate() {
         env.insert(s, x.get(i).copied().unwrap_or(0.0));
-    }
-    for (i, opt) in dae.xdot.iter().enumerate() {
-        if let Some(s) = opt {
-            env.insert(*s, xdot.get(i).copied().unwrap_or(0.0));
-        }
     }
     for (k, name) in pnames.iter().enumerate() {
         let e = ctx.sym(name);
@@ -334,7 +322,7 @@ pub fn resolve_out_idx(
     dae.unknowns.iter().position(|u| *u == target)
 }
 
-/// The input-coupling vector dF/d(input) at the operating point (xdot = 0).
+/// The input-coupling vector dI/d(input) at the operating point.
 pub fn input_vector(
     ctx: &mut Graph,
     dae: &sane_dae::Dae,
@@ -349,11 +337,11 @@ pub fn input_vector(
         _ => return None,
     };
     let db: Vec<_> = dae
-        .residuals
+        .currents
         .iter()
         .map(|&r| differentiate(ctx, r, input_sym))
         .collect();
-    let env = op_env(ctx, dae, pnames, &x, &[], p, 0.0);
+    let env = op_env(ctx, dae, pnames, x, p, 0.0);
     Some(rsdag::eval(ctx, &db, &env))
 }
 

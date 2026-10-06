@@ -42,157 +42,90 @@ fn directional(
     acc
 }
 
-/// Exact second-order sensitivity (Hessian) of the metric `y = c^T x` w.r.t. a
-/// subset of parameters, by the second-order adjoint identity
-///
-///   H_ij = -lambda^T B_ij,   B_ij = D_i D_j F,
-///
-/// where `D_k` is the directional derivative of the residual along
-/// `d_k = (s_k, e_{p_k})` (`s_k = dx/dp_k` the state sensitivity), and
-/// `(dF/dx)^T lambda = c`. Both `B_ij` (via nested [`directional`]) and the
-/// final values are computed by **exact symbolic differentiation** -- no finite
-/// differences anywhere. `subset` is `(param_symbol, s_k)`; `env` evaluates all
-/// symbols at the operating point. Returns the dense `|subset| x |subset|`
-/// Hessian (symmetric).
-pub fn hessian(
-    ctx: &mut Graph,
-    dae: &Dae,
-    lambda: &[f64],
-    subset: &[(SymbolId, Vec<f64>)],
-    env: &HashMap<SymbolId, f64>,
-) -> Vec<Vec<f64>> {
-    let k = subset.len();
-    // G[i][r] = D_i F_r  (first directional derivative along d_i).
-    let g: Vec<Vec<ExprId>> = subset
-        .iter()
-        .map(|(p_sym, s)| {
-            dae.residuals
-                .iter()
-                .map(|&r| directional(ctx, r, s, &dae.x, *p_sym))
-                .collect()
-        })
-        .collect();
-
-    let mut h = vec![vec![0.0; k]; k];
-    for i in 0..k {
-        for j in i..k {
-            let (p_sym_j, s_j) = &subset[j];
-            // B_ij[r] = D_j G_i[r]; H_ij = -sum_r lambda_r * B_ij[r](op).
-            let b: Vec<ExprId> = g[i]
-                .iter()
-                .map(|&gi| directional(ctx, gi, s_j, &dae.x, *p_sym_j))
-                .collect();
-            let vals = rsdag::eval(ctx, &b, env);
-            let hij: f64 = -lambda.iter().zip(&vals).map(|(l, v)| l * v).sum::<f64>();
-            h[i][j] = hij;
-            h[j][i] = hij;
-        }
-    }
-    h
-}
-
 /// Augment the DAE with the forward-sensitivity systems for a set of
 /// parameters. For each parameter `p`, appends `n` unknowns `s = dx/dp` whose
-/// residual is the (exact, symbolic) sensitivity equation
+/// row is the (exact, symbolic) sensitivity equation, the derivative of
+/// `I + d/dt Q` in `p`:
 ///
-///   sum_j (dF_i/dx_j) s_j + sum_j (dF_i/dx'_j) s'_j + dF_i/dp = 0,
+///   G s + dI/dp + d/dt (C s + dQ/dp) = 0,   G = dI/dx,   C = dQ/dx,
 ///
-/// i.e. `G s + C s' + dF/dp = 0` along the trajectory. Because `dF/dp` and the
-/// Jacobian entries are kept symbolic (in the original `x`, `x'`, params), this
-/// is correct for ALL parameters including reactive ones (a capacitor's
-/// `dF/dC = (x'_a - x'_b)` couples the state derivative automatically via the
-/// existing `vdot` symbols). Integrating the augmented system yields `x(t)` and
-/// every `dx/dp(t)` together. The new unknowns carry derivative symbols exactly
-/// where the corresponding state unknown does.
+/// a current `G s + dI/dp` and a charge `C s + dQ/dp` along the trajectory.
+/// Because the Jacobian entries and the parameter derivatives are kept
+/// symbolic (in the original `x` and params), this is correct for ALL
+/// parameters including reactive ones (a capacitor's `dQ/dC = v_a - v_b`).
+/// Integrating the augmented system yields `x(t)` and every `dx/dp(t)`
+/// together.
 pub fn augment_with_sensitivities(ctx: &mut Graph, dae: &Dae, params: &[SymbolId]) -> Dae {
     let pairs: Vec<(SymbolId, f64)> = params.iter().map(|&p| (p, 1.0)).collect();
     augment_with_scaled_sensitivities(ctx, dae, &pairs)
 }
 
 /// [`augment_with_sensitivities`] with a per-parameter state scaling: appends
-/// `u = k · dx/dp` (residual `G u + C u' + k·dF/dp = 0`). With `k = |p0|` the
-/// appended states are log-parameter sensitivities `~ dx/d ln p`, which live on
-/// the same magnitude scale as the circuit states -- so a scalar
-/// `atol`/`rtol` error control over the augmented system stays meaningful.
-/// (Raw `dx/dp` states can be ~1/p0 times larger than the circuit; a scalar
-/// `atol` then crushes the step size at every zero crossing.) Callers divide
-/// the resulting trajectories by `k` to recover `dx/dp`.
+/// `u = k · dx/dp` (current `G u + k·dI/dp`, charge `C u + k·dQ/dp`). With
+/// `k = |p0|` the appended states are log-parameter sensitivities
+/// `~ dx/d ln p`, which live on the same magnitude scale as the circuit states
+/// -- so a scalar `atol`/`rtol` error control over the augmented system stays
+/// meaningful. (Raw `dx/dp` states can be ~1/p0 times larger than the circuit;
+/// a scalar `atol` then crushes the step size at every zero crossing.) Callers
+/// divide the resulting trajectories by `k` to recover `dx/dp`.
 pub fn augment_with_scaled_sensitivities(
     ctx: &mut Graph,
     dae: &Dae,
     params: &[(SymbolId, f64)],
 ) -> Dae {
     let n = dae.dim();
-    let (jr, jc, je) = dae.jacobian_x_coo(ctx);
-    let (xr, xc, xe) = dae.jacobian_xdot_coo(ctx);
+    let (g, c) = dae.jacobian_iq_coo(ctx);
+    let syms: Vec<SymbolId> = params.iter().map(|&(p, _)| p).collect();
+    let (gp, cp) = dae.jacobian_p_iq_coo(ctx, &syms);
 
     let mut unknowns = dae.unknowns.clone();
-
     let mut kinds = dae.kinds.clone();
     let mut x = dae.x.clone();
-    let mut xdot = dae.xdot.clone();
-    let mut residuals = dae.residuals.clone();
+    let mut currents = dae.currents.clone();
+    let mut charges = dae.charges.clone();
 
-    for &(p, scale) in params {
+    for (k, &(p, scale)) in params.iter().enumerate() {
         let pname = ctx.symbol_name(p).to_string();
-        // Mint the sensitivity unknowns s_j (and derivatives where x_j is
-        // differential).
-        let mut s_e = Vec::with_capacity(n);
-        let mut sdot_e = vec![ctx.zero(); n];
-        let zero = ctx.zero();
-        let mut new_x = Vec::with_capacity(n);
-        let mut new_xdot = Vec::with_capacity(n);
-        let mut new_names = Vec::with_capacity(n);
-        for j in 0..n {
-            let (e, sy) = sym2(ctx, &format!("S[{pname}]{j}"));
-            s_e.push(e);
-            new_x.push(sy);
-            new_names.push(format!("d({})/d({pname})", dae.unknowns[j]));
-            if dae.xdot[j].is_some() {
-                let (de, dsy) = sym2(ctx, &format!("Sdot[{pname}]{j}"));
-                sdot_e[j] = de;
-                new_xdot.push(Some(dsy));
-            } else {
-                new_xdot.push(None);
+        // Mint the sensitivity unknowns u_j.
+        let (u, new_x): (Vec<ExprId>, Vec<SymbolId>) = (0..n)
+            .map(|j| sym2(ctx, &format!("S[{pname}]{j}")))
+            .unzip();
+        unknowns.extend((dae.unknowns.iter()).map(|name| format!("d({name})/d({pname})")));
+        // The current `G u + k dI/dp` and the charge `C u + k dQ/dp`.
+        let scale = ctx.konst_f64(scale);
+        let [i_u, q_u] = [(&g, &gp), (&c, &cp)].map(|((rows, cols, exprs), (prows, pcols, pexprs))| {
+            let mut terms: Vec<Vec<ExprId>> = vec![Vec::new(); n];
+            for ((&r, &col), &e) in rows.iter().zip(cols).zip(exprs) {
+                terms[r].push(ctx.mul(e, u[col]));
             }
-        }
-        // Sensitivity residual: G u + C u' + scale·dF/dp.
-        let scale_e = ctx.konst_f64(scale);
-        let mut res = vec![zero; n];
-        for k in 0..je.len() {
-            let term = ctx.mul(je[k], s_e[jc[k]]);
-            res[jr[k]] = ctx.add(res[jr[k]], term);
-        }
-        for k in 0..xe.len() {
-            let term = ctx.mul(xe[k], sdot_e[xc[k]]);
-            res[xr[k]] = ctx.add(res[xr[k]], term);
-        }
-        for i in 0..n {
-            let dfp = differentiate(ctx, dae.residuals[i], p);
-            let sdfp = ctx.mul(scale_e, dfp);
-            res[i] = ctx.add(res[i], sdfp);
-        }
-        kinds.extend(std::iter::repeat_n(UnknownKind::DeviceState, new_x.len()));
-        unknowns.extend(new_names);
+            for ((&r, &col), &e) in prows.iter().zip(pcols).zip(pexprs) {
+                if col == k {
+                    terms[r].push(ctx.mul(scale, e));
+                }
+            }
+            (terms.into_iter())
+                .map(|t| ctx.reduce(ReduceOp::Sum, t))
+                .collect::<Vec<_>>()
+        });
+        kinds.extend(std::iter::repeat_n(UnknownKind::DeviceState, n));
         x.extend(new_x);
-        xdot.extend(new_xdot);
-        residuals.extend(res);
+        currents.extend(i_u);
+        charges.extend(q_u);
     }
 
     Dae {
         n_nodes: dae.n_nodes,
         param_defaults: dae.param_defaults.clone(),
-        residuals,
+        currents,
+        charges,
         unknowns,
         kinds,
         x,
-        xdot,
         t: dae.t,
         events: dae.events.clone(),
         delays: dae.delays.clone(),
         companion: Vec::new(),
-        noise_sources: Vec::new(),
-        op_vars: dae.op_vars.clone(),
+        observers: dae.observers.clone(),
         dc_seeds: dae.dc_seeds.clone(),
         limits: Vec::new(),
         sources: dae.sources.clone(),
@@ -202,8 +135,8 @@ pub fn augment_with_scaled_sensitivities(
 }
 
 /// Exact total derivatives of the small-signal matrices w.r.t. a parameter,
-/// **including the operating-point shift**: for `G = dF/dx`, `C = dF/dx'`, and
-/// the input coupling `B = -dF/d(input)`,
+/// **including the operating-point shift**: for `G = dI/dx`, `C = dQ/dx`, and
+/// the input coupling `B = -dI/d(input)`,
 ///
 ///   dG/dp = ∂G/∂p + (∂G/∂x)·s,   dC/dp = ∂C/∂p + (∂C/∂x)·s,   dB/dp likewise,
 ///
@@ -226,7 +159,7 @@ pub fn ac_param_derivatives(
     // Build the directional-derivative expressions up front (mutating the
     // arena), then evaluate each block in a single arena sweep rather than one
     // full sweep per nonzero.
-    let (gr, gc, ge) = dae.jacobian_x_coo(ctx);
+    let ((gr, gc, ge), (cr, cc, ce)) = dae.jacobian_iq_coo(ctx);
     let dgs: Vec<ExprId> = ge
         .iter()
         .map(|&e| directional(ctx, e, s, &dae.x, p_sym))
@@ -235,7 +168,6 @@ pub fn ac_param_derivatives(
     for k in 0..ge.len() {
         dg[gr[k]][gc[k]] = dgv[k];
     }
-    let (cr, cc, ce) = dae.jacobian_xdot_coo(ctx);
     let dcs: Vec<ExprId> = ce
         .iter()
         .map(|&e| directional(ctx, e, s, &dae.x, p_sym))
@@ -245,11 +177,11 @@ pub fn ac_param_derivatives(
         dc[cr[k]][cc[k]] = dcv[k];
     }
 
-    // B = -dF/d(input);  dB/dp = -directional(dF/d(input)).
+    // B = -dI/d(input);  dB/dp = -directional(dI/d(input)).
     let mut db = vec![0.0; n];
     let mut db_rows = Vec::new();
     let mut db_exprs = Vec::new();
-    for (r, &res) in dae.residuals.iter().enumerate() {
+    for (r, &res) in dae.currents.iter().enumerate() {
         let bexpr = differentiate(ctx, res, input_sym);
         if !ctx.is_zero(bexpr) {
             db_rows.push(r);
@@ -263,35 +195,30 @@ pub fn ac_param_derivatives(
     (dg, dc, db)
 }
 
-/// The symbolic second-derivative blocks of the Lagrangian `L = Σ_r λ_r F_r`,
-/// with the multipliers `λ_r` minted as fresh input symbols. These blocks depend
-/// only on the DAE structure (not on the operating point or the multipliers'
-/// numeric values), so they are built once and compiled into a reusable tape;
-/// the exact second-order-adjoint Hessian is then
+/// The symbolic second-derivative blocks of the Lagrangian
+/// `L = Σ_r λ_r I_r + μ_r Q_r` over the states and the parameters, with the
+/// multipliers `λ_r` and `μ_r` minted as fresh input symbols. These blocks
+/// depend only on the DAE structure (not on the operating point or the
+/// multipliers' numeric values), so they are built once and compiled into a
+/// reusable tape. At an operating point (`μ = 0`) the exact second-order-
+/// adjoint Hessian is then
 ///
 ///   H_ij = -( s_iᵀ L_xx s_j + s_iᵀ L_{x,p_j} + s_jᵀ L_{x,p_i} + L_{p_i,p_j} ),
 ///
-/// a numeric contraction of the evaluated blocks with the state sensitivities.
+/// a numeric contraction of the evaluated blocks with the state
+/// sensitivities; a periodic analysis weights the charges with the
+/// adjoint's time derivative through `μ`.
 pub struct HessianSym {
-    /// Multiplier input symbols `λ_r`, one per residual (aligned with `x`).
+    /// Multiplier input symbols `λ_r` of the currents and `μ_r` of the
+    /// charges, one each per row.
     pub lambda: Vec<SymbolId>,
+    pub mu: Vec<SymbolId>,
     /// `L_xx` (state-state) as sparse `(rows, cols, exprs)`.
     pub xx: (Vec<usize>, Vec<usize>, Vec<ExprId>),
     /// `L_xp` (state-parameter), columns indexed like the `params` argument.
     pub xp: (Vec<usize>, Vec<usize>, Vec<ExprId>),
     /// `L_pp` (parameter-parameter).
     pub pp: (Vec<usize>, Vec<usize>, Vec<ExprId>),
-    /// `L_{x'x'}` (rate-rate); rows and cols indexed like `x` (state index).
-    /// Empty entries where a state has no `x'` symbol. Needed for the exact
-    /// second-order sensitivity of any analysis whose unknowns drive `x'`
-    /// (e.g. harmonic balance with nonlinear charge storage); the DC Hessian,
-    /// where `x' = 0` and the state sensitivity has no rate component, never
-    /// touches these blocks.
-    pub xdxd: (Vec<usize>, Vec<usize>, Vec<ExprId>),
-    /// `L_{x x'}` (state-rate): rows indexed like `x`, cols like `x'` (state index).
-    pub xxd: (Vec<usize>, Vec<usize>, Vec<ExprId>),
-    /// `L_{x' p}` (rate-parameter): rows like `x'` (state index), cols like `params`.
-    pub xdp: (Vec<usize>, Vec<usize>, Vec<ExprId>),
 }
 
 /// Build the symbolic Lagrangian-Hessian blocks (see [`HessianSym`]) for the
@@ -300,63 +227,37 @@ pub struct HessianSym {
 pub fn lagrangian_hessian(ctx: &mut Graph, dae: &Dae, params: &[SymbolId]) -> HessianSym {
     let n = dae.dim();
 
-    // λ_r input symbols and the Lagrangian L = Σ_r λ_r F_r.
-    let mut lambda = Vec::with_capacity(n);
-    let mut terms = Vec::with_capacity(n);
-    for (r, &f) in dae.residuals.iter().enumerate() {
+    // λ_r, μ_r input symbols and the Lagrangian L = Σ_r λ_r I_r + μ_r Q_r.
+    let (mut lambda, mut mu) = (Vec::with_capacity(n), Vec::with_capacity(n));
+    let mut terms = Vec::with_capacity(2 * n);
+    for (r, (&i, &q)) in dae.currents.iter().zip(&dae.charges).enumerate() {
         let (le, ls) = sym2(ctx, &format!("__lam{r}"));
+        let (me, ms) = sym2(ctx, &format!("__mu{r}"));
         lambda.push(ls);
-        terms.push(ctx.mul(le, f));
+        mu.push(ms);
+        terms.push(ctx.mul(le, i));
+        if !ctx.is_zero(q) {
+            terms.push(ctx.mul(me, q));
+        }
     }
     let l = ctx.reduce(ReduceOp::Sum, terms);
 
-    // The gradient of L over x, x' and p in one reverse sweep (each entry
-    // linear in λ). The rate gradient is kept aligned with the state index: a
-    // zero where a state has no `x'` symbol.
-    let n_xd = dae.xdot.iter().flatten().count();
-    let wrt: Vec<SymbolId> = dae
-        .x
-        .iter()
-        .copied()
-        .chain(dae.xdot.iter().flatten().copied())
-        .chain(params.iter().copied())
-        .collect();
+    // The gradient of L over x and p in one reverse sweep (each entry linear
+    // in the multipliers), then its Jacobians.
+    let wrt: Vec<SymbolId> = dae.x.iter().chain(params).copied().collect();
     let g = rsdag::gradient(ctx, l, &wrt);
-    let (gx, rest) = g.split_at(n);
-    let (gxd_flat, gp) = rest.split_at(n_xd);
-    let zero = ctx.zero();
-    let mut flat = gxd_flat.iter();
-    let gxd: Vec<ExprId> = dae
-        .xdot
-        .iter()
-        .map(|o| o.map_or(zero, |_| *flat.next().expect("one gradient entry per rate")))
-        .collect();
-
-    // Second-derivative blocks (sparse): the Jacobians of the gradients. Rate
-    // columns are indexed by state index, so the contraction shares the
-    // flattening of `x`.
+    let (gx, gp) = g.split_at(n);
     let x_col: Vec<(usize, SymbolId)> = dae.x.iter().copied().enumerate().collect();
-    let xd_col: Vec<(usize, SymbolId)> = dae
-        .xdot
-        .iter()
-        .enumerate()
-        .filter_map(|(i, o)| o.map(|s| (i, s)))
-        .collect();
     let p_col: Vec<(usize, SymbolId)> = params.iter().copied().enumerate().collect();
     let xx = coo(ctx, gx, &x_col);
     let xp = coo(ctx, gx, &p_col);
     let pp = coo(ctx, gp, &p_col);
-    let xdxd = coo(ctx, &gxd, &xd_col);
-    let xxd = coo(ctx, gx, &xd_col);
-    let xdp = coo(ctx, &gxd, &p_col);
 
     HessianSym {
         lambda,
+        mu,
         xx,
         xp,
         pp,
-        xdxd,
-        xxd,
-        xdp,
     }
 }

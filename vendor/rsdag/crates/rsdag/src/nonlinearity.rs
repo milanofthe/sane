@@ -194,22 +194,13 @@ fn classify_cone<K: Field>(
 ) -> Vec<Nonlinearity> {
     // One sweep over the nodes the expressions reach, ascending (a node
     // after its operands), each classified from its operands'.
-    let mut cone: Vec<ExprId> = Vec::new();
-    let mut seen = rustc_hash::FxHashSet::default();
-    let mut stack = exprs.to_vec();
-    while let Some(e) = stack.pop() {
-        if seen.insert(e) {
-            cone.push(e);
-            stack.extend_from_slice(&g.operands(e));
-        }
-    }
-    cone.sort_unstable();
+    let cone = g.cone_sorted(exprs, false);
     let mut memo: HashMap<ExprId, Nonlinearity> = HashMap::default();
     for &e in &cone {
         let c = match *g.node(e) {
             Node::Symbol(s) => leaf(s),
             Node::Call(o, l) => {
-                let args: Vec<Nonlinearity> = g.args(l).iter().map(|a| memo[a]).collect();
+                let args: Vec<Nonlinearity> = g.full_args(o, l).iter().map(|a| memo[a]).collect();
                 classify_call(g, o, args, calls)
             }
             _ => classify(g, e, |a| memo[&a]),

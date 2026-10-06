@@ -1,8 +1,8 @@
 //! A netlist's DAE as an rsdag module (JSON): the graph with every device
 //! body as a function and the system as the function `circuit` (parameters
-//! with their roles: states, their derivatives, time, circuit parameters;
-//! the residuals as outputs), the circuit parameters' values by name and
-//! the operating point. rsdag's module benchmarks read it.
+//! with their roles: states, time, circuit parameters; the currents, charges
+//! and guards as outputs), the circuit parameters' values by name and the
+//! operating point. rsdag's module benchmarks read it.
 //!
 //!   cargo run --release -p sane-analysis --example export_module -- <deck.cir> <out.json>
 

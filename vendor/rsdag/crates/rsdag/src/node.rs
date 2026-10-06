@@ -89,16 +89,6 @@ impl ReduceOp {
         }
     }
 
-    /// The identity element (value of an empty reduction).
-    pub fn identity(self) -> f64 {
-        match self {
-            ReduceOp::Sum => 0.0,
-            ReduceOp::Product => 1.0,
-            ReduceOp::Min => f64::INFINITY,
-            ReduceOp::Max => f64::NEG_INFINITY,
-        }
-    }
-
     /// Combine an accumulator with the next element (left fold).
     pub fn combine(self, acc: f64, x: f64) -> f64 {
         match self {
@@ -175,11 +165,8 @@ pub enum BinOp {
 pub struct UnarySpec {
     /// The variant this row describes; `UNARY_OPS[op as usize].op == op`.
     pub op: UnaryOp,
-    /// Name in printed expressions and in the Python and C frontends.
+    /// Name in printed expressions and in the Python frontend.
     pub name: &'static str,
-    /// The callee in generated C: a `libm` name where the semantics agree,
-    /// an `rsdag_` helper where rsdag guards or defines the op itself.
-    pub c_fn: &'static str,
     /// Differentiable where it is defined, and differentiated by rsdag.
     /// The rough ones (`floor`, `sign`, the roundings, the noise source)
     /// have a zero or undefined derivative, `trigamma` one rsdag does not
@@ -193,200 +180,167 @@ pub const UNARY_OPS: &[UnarySpec] = &[
     UnarySpec {
         op: UnaryOp::Exp,
         name: "exp",
-        c_fn: "rsdag_exp",
         smooth: true,
     },
     UnarySpec {
         op: UnaryOp::Ln,
         name: "ln",
-        c_fn: "rsdag_ln",
         smooth: true,
     },
     UnarySpec {
         op: UnaryOp::Sqrt,
         name: "sqrt",
-        c_fn: "rsdag_sqrt",
         smooth: true,
     },
     UnarySpec {
         op: UnaryOp::Sin,
         name: "sin",
-        c_fn: "sin",
         smooth: true,
     },
     UnarySpec {
         op: UnaryOp::Cos,
         name: "cos",
-        c_fn: "cos",
         smooth: true,
     },
     UnarySpec {
         op: UnaryOp::Sinh,
         name: "sinh",
-        c_fn: "sinh",
         smooth: true,
     },
     UnarySpec {
         op: UnaryOp::Cosh,
         name: "cosh",
-        c_fn: "cosh",
         smooth: true,
     },
     UnarySpec {
         op: UnaryOp::Tanh,
         name: "tanh",
-        c_fn: "tanh",
         smooth: true,
     },
     UnarySpec {
         op: UnaryOp::Atan,
         name: "atan",
-        c_fn: "atan",
         smooth: true,
     },
     UnarySpec {
         op: UnaryOp::Floor,
         name: "floor",
-        c_fn: "floor",
         smooth: false,
     },
     UnarySpec {
         op: UnaryOp::Tan,
         name: "tan",
-        c_fn: "tan",
         smooth: true,
     },
     UnarySpec {
         op: UnaryOp::Log10,
         name: "log10",
-        c_fn: "log10",
         smooth: true,
     },
     UnarySpec {
         op: UnaryOp::Log2,
         name: "log2",
-        c_fn: "log2",
         smooth: true,
     },
     UnarySpec {
         op: UnaryOp::Log1p,
         name: "log1p",
-        c_fn: "log1p",
         smooth: true,
     },
     UnarySpec {
         op: UnaryOp::Expm1,
         name: "expm1",
-        c_fn: "expm1",
         smooth: true,
     },
     UnarySpec {
         op: UnaryOp::Cbrt,
         name: "cbrt",
-        c_fn: "cbrt",
         smooth: true,
     },
     UnarySpec {
         op: UnaryOp::Abs,
         name: "abs",
-        c_fn: "fabs",
         smooth: false,
     },
     UnarySpec {
         op: UnaryOp::Sign,
         name: "sign",
-        c_fn: "rsdag_sign",
         smooth: false,
     },
     UnarySpec {
         op: UnaryOp::Ceil,
         name: "ceil",
-        c_fn: "ceil",
         smooth: false,
     },
     UnarySpec {
         op: UnaryOp::Round,
         name: "round",
-        c_fn: "round",
         smooth: false,
     },
     UnarySpec {
         op: UnaryOp::Trunc,
         name: "trunc",
-        c_fn: "trunc",
         smooth: false,
     },
     UnarySpec {
         op: UnaryOp::Asin,
         name: "asin",
-        c_fn: "asin",
         smooth: true,
     },
     UnarySpec {
         op: UnaryOp::Acos,
         name: "acos",
-        c_fn: "acos",
         smooth: true,
     },
     UnarySpec {
         op: UnaryOp::Asinh,
         name: "asinh",
-        c_fn: "asinh",
         smooth: true,
     },
     UnarySpec {
         op: UnaryOp::Acosh,
         name: "acosh",
-        c_fn: "acosh",
         smooth: true,
     },
     UnarySpec {
         op: UnaryOp::Atanh,
         name: "atanh",
-        c_fn: "atanh",
         smooth: true,
     },
     UnarySpec {
         op: UnaryOp::Erf,
         name: "erf",
-        c_fn: "erf",
         smooth: true,
     },
     UnarySpec {
         op: UnaryOp::Erfc,
         name: "erfc",
-        c_fn: "erfc",
         smooth: true,
     },
     UnarySpec {
         op: UnaryOp::Lgamma,
         name: "lgamma",
-        c_fn: "lgamma",
         smooth: true,
     },
     UnarySpec {
         op: UnaryOp::Tgamma,
         name: "tgamma",
-        c_fn: "tgamma",
         smooth: true,
     },
     UnarySpec {
         op: UnaryOp::Digamma,
         name: "digamma",
-        c_fn: "rsdag_digamma",
         smooth: true,
     },
     UnarySpec {
         op: UnaryOp::Trigamma,
         name: "trigamma",
-        c_fn: "rsdag_trigamma",
         // Its derivative (polygamma of order 2) is not implemented.
         smooth: false,
     },
     UnarySpec {
         op: UnaryOp::RandUniform,
         name: "rand_uniform",
-        c_fn: "rsdag_rand_uniform",
         smooth: false,
     },
 ];
@@ -401,11 +355,6 @@ impl UnaryOp {
     #[inline]
     pub fn name(self) -> &'static str {
         self.spec().name
-    }
-    /// The callee to emit in generated C.
-    #[inline]
-    pub fn c_fn(self) -> &'static str {
-        self.spec().c_fn
     }
     /// Differentiable everywhere it is defined.
     #[inline]
@@ -437,7 +386,6 @@ impl UnaryOp {
 pub struct BinarySpec {
     pub op: BinOp,
     pub name: &'static str,
-    pub c_fn: &'static str,
     pub smooth: bool,
 }
 
@@ -446,25 +394,21 @@ pub const BINARY_OPS: &[BinarySpec] = &[
     BinarySpec {
         op: BinOp::Powf,
         name: "powf",
-        c_fn: "pow",
         smooth: true,
     },
     BinarySpec {
         op: BinOp::Mod,
         name: "mod",
-        c_fn: "fmod",
         smooth: false,
     },
     BinarySpec {
         op: BinOp::Atan2,
         name: "atan2",
-        c_fn: "atan2",
         smooth: true,
     },
     BinarySpec {
         op: BinOp::Hypot,
         name: "hypot",
-        c_fn: "hypot",
         smooth: true,
     },
 ];
@@ -477,10 +421,6 @@ impl BinOp {
     #[inline]
     pub fn name(self) -> &'static str {
         self.spec().name
-    }
-    #[inline]
-    pub fn c_fn(self) -> &'static str {
-        self.spec().c_fn
     }
     #[inline]
     pub fn is_smooth(self) -> bool {

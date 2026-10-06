@@ -2,15 +2,13 @@
 //! history Jacobian tapes, first-order adjoint sensitivities, and the
 //! second-order-adjoint Hessian over the compiled Lagrangian blocks.
 
-use std::sync::atomic::Ordering;
-
 use rsdag::{SymbolId, Tape};
 use sane_core::constants::GMIN_DC;
 use sane_core::log_stage;
 use sane_core::Graph;
 use sane_dae::{lagrangian_hessian, Dae};
 
-use crate::{sparse, CompiledDc, StepEval, FACTOR_FX_CALLS};
+use crate::{sparse, CompiledDc, StepEval};
 
 /// Compiled `∂I/∂hist` triplets (see [`CompiledDc::ensure_hist_jac`]).
 pub(crate) struct HistJac {
@@ -53,7 +51,7 @@ impl CompiledDc {
             return;
         }
         let (r, c, e) = dae.jacobian_hist_coo(ctx);
-        let tape = crate::eval::step_eval(Tape::compose(ctx, &e, &self.base_inputs));
+        let tape = crate::eval::step_eval(Tape::compile(ctx, &e, &self.base_inputs));
         let _ = self.hjac.set(HistJac {
             tape,
             rows: r,
@@ -97,7 +95,7 @@ impl CompiledDc {
                         .iter()
                         .map(|&r| rsdag::differentiate(ctx, r, input))
                         .collect();
-                    std::sync::Arc::new(crate::eval::step_eval(Tape::compose(
+                    std::sync::Arc::new(crate::eval::step_eval(Tape::compile(
                         ctx,
                         &roots,
                         &self.base_inputs,
@@ -125,7 +123,7 @@ impl CompiledDc {
         let roots: Vec<_> = ie.into_iter().chain(qe).collect();
         let tape = log_stage!(
             "sens/param_jac_tape",
-            crate::eval::step_eval(Tape::compose(ctx, &roots, &self.base_inputs))
+            crate::eval::step_eval(Tape::compile(ctx, &roots, &self.base_inputs))
         );
         let _ = self.pjac.set(ParamJac {
             tape,
@@ -163,7 +161,7 @@ impl CompiledDc {
             pp_rc: (hs.pp.0, hs.pp.1),
             tape: log_stage!(
                 "sens/hessian_tape",
-                crate::eval::step_eval(Tape::compose(ctx, &h_roots, &h_input_syms))
+                crate::eval::step_eval(Tape::compile(ctx, &h_roots, &h_input_syms))
             ),
         };
         let _ = self.chess.set(ch);
@@ -230,11 +228,6 @@ impl CompiledDc {
     /// sensitivity solves. Forward solves use [`KluSolver::solve`], adjoints
     /// [`KluSolver::solve_transpose`] on the same factorization.
     fn factor_fx(&self, x: &[f64], p: &[f64], t: f64) -> Option<sparse::TripletLu> {
-        // Instrumentation for the "factor once" contract (#48): a full factorization
-        // (triplet build + ordering + numeric LU) is the expensive step the
-        // batched Hessian solve exists to amortise. Cheap relaxed counter, read by
-        // `factor_fx_calls` for the count-based verification.
-        FACTOR_FX_CALLS.fetch_add(1, Ordering::Relaxed);
         let n = self.n;
         let (mut jr, mut jc, mut jv) = self.jacobian_i_x_sparse(x, p, t);
         for i in 0..n {

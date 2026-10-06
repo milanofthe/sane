@@ -237,7 +237,7 @@ pub fn dominant_subset(roots: &[[f64; 2]], order: usize) -> Vec<[f64; 2]> {
 }
 
 #[cfg(test)]
-use crate::{parse_ic, resolve_out_idx, IcTarget, Model};
+use crate::{eng, Model};
 #[cfg(test)]
 use rsdag::Node;
 #[cfg(test)]
@@ -274,6 +274,51 @@ fn inverse_apply(m: &[Vec<f64>], n_mat: &[Vec<f64>]) -> Option<faer::Mat<f64>> {
 mod pz_tests {
     use super::*;
     use num_complex::Complex64;
+
+    /// A user initial condition: a node voltage `V(net)` or a branch current
+    /// `I(element)` (e.g. an inductor) to start the transient from.
+    enum IcTarget {
+        V(String),
+        I(String),
+    }
+
+    /// Parse `.ic V(net)=value I(L1)=value ...` directives.
+    fn parse_ic(netlist: &str) -> Vec<(IcTarget, f64)> {
+        let mut out = Vec::new();
+        for raw in netlist.lines() {
+            let line = raw.trim();
+            if !line.to_ascii_lowercase().starts_with(".ic") {
+                continue;
+            }
+            for tok in line.split_whitespace().skip(1) {
+                let Some(eq) = tok.find('=') else { continue };
+                let lhs = tok[..eq].trim();
+                let Some(val) = eng(tok[eq + 1..].trim()) else {
+                    continue;
+                };
+                let low = lhs.to_ascii_lowercase();
+                if low.starts_with("v(") && lhs.ends_with(')') {
+                    out.push((IcTarget::V(lhs[2..lhs.len() - 1].to_string()), val));
+                } else if low.starts_with("i(") && lhs.ends_with(')') {
+                    out.push((IcTarget::I(lhs[2..lhs.len() - 1].to_string()), val));
+                }
+            }
+        }
+        out
+    }
+
+    fn resolve_out_idx(
+        parsed: &sane_netlist::ParsedCircuit,
+        dae: &sane_dae::Dae,
+        output: &str,
+    ) -> Option<usize> {
+        let k = parsed.node(output)?;
+        if k == 0 {
+            return None;
+        }
+        let target = format!("v{k}");
+        dae.unknowns.iter().position(|u| *u == target)
+    }
 
     fn nearest_real(poles: &[[f64; 2]], target: f64) -> f64 {
         poles

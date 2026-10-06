@@ -166,17 +166,14 @@ fn compat_report_flags_ignored_directives_and_unknown_params() {
 /// devices fold their parallel multiplicity `m` into the lowered graph, so the
 /// modifier is observable only through the current.
 fn device_terminal_current(p: &crate::ParsedCircuit, di: usize, bias: &[f64]) -> f64 {
-    use num_complex::Complex64;
     use std::collections::HashMap as Map;
     let mut ctx = sane_core::Graph::new();
     let n = p.devices[di].model.n_terminals();
     let term_v: Vec<_> = (0..n).map(|k| ctx.sym(&format!("tv{k}"))).collect();
     let mut lo = sane_device::Lowerer::new(&mut ctx);
-    let frag = p.devices[di]
-        .model
-        .lower_behavioral(&mut lo, &term_v, &[]);
+    let frag = p.devices[di].model.lower_behavioral(&mut lo, &term_v, &[]);
     let i = frag.terminal_currents[0];
-    let mut env: Map<rsdag::SymbolId, Complex64> = Map::new();
+    let mut env: Map<rsdag::SymbolId, f64> = Map::new();
     for s in ctx.free_symbols(i) {
         let name = ctx.symbol_name(s).to_string();
         let v = if let Some(k) = name.strip_prefix("tv") {
@@ -186,9 +183,9 @@ fn device_terminal_current(p: &crate::ParsedCircuit, di: usize, bias: &[f64]) ->
         } else {
             p.param_value(&name).unwrap_or(0.0)
         };
-        env.insert(s, Complex64::new(v, 0.0));
+        env.insert(s, v);
     }
-    rsdag::eval(&ctx, &[i], &env)[0].re
+    rsdag::eval(&ctx, &[i], &env)[0]
 }
 
 #[test]

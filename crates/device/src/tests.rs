@@ -1,15 +1,14 @@
 use super::*;
-use num_complex::Complex64;
 use rsdag::{eval, Node, SymbolId};
 use sane_core::Graph;
 use std::collections::HashMap;
 
-fn env_of(ctx: &mut Graph, vals: &[(&str, f64)]) -> HashMap<SymbolId, Complex64> {
+fn env_of(ctx: &mut Graph, vals: &[(&str, f64)]) -> HashMap<SymbolId, f64> {
     let mut env = HashMap::new();
     for (name, x) in vals {
         let id = ctx.sym(name);
         if let Node::Symbol(s) = ctx.node(id) {
-            env.insert(*s, Complex64::new(*x, 0.0));
+            env.insert(*s, *x);
         }
     }
     env
@@ -41,14 +40,14 @@ fn cswitch_on_and_off() {
     let mut on = pars.to_vec();
     on.push(("i_V1", 1e-3));
     let env = env_of(&mut ctx, &on);
-    assert!((eval(&ctx, &[i[0]], &env)[0].re - 0.2).abs() < 1e-9);
+    assert!((eval(&ctx, &[i[0]], &env)[0] - 0.2).abs() < 1e-9);
     // Off: zero control current -> fully off, i = (Va-Vb)/Roff = 2e-6.
     let mut off = pars.to_vec();
     off.push(("i_V1", 0.0));
     let env = env_of(&mut ctx, &off);
-    assert!((eval(&ctx, &[i[0]], &env)[0].re - 2e-6).abs() < 1e-12);
+    assert!((eval(&ctx, &[i[0]], &env)[0] - 2e-6).abs() < 1e-12);
     // KCL closes.
-    let s = eval(&ctx, &[i[0]], &env)[0].re + eval(&ctx, &[i[1]], &env)[0].re;
+    let s = eval(&ctx, &[i[0]], &env)[0] + eval(&ctx, &[i[1]], &env)[0];
     assert!(s.abs() < 1e-15);
 }
 
@@ -60,7 +59,7 @@ fn safe_exp_is_exact_below_and_linear_above_the_knot() {
     let e = safe_exp(&mut ctx, x);
     let at = |ctx: &mut Graph, xv: f64| {
         let env = env_of(ctx, &[("x", xv)]);
-        eval(ctx, &[e], &env)[0].re
+        eval(ctx, &[e], &env)[0]
     };
     // Exact below the knot.
     assert!((at(&mut ctx, 1.5) - 1.5_f64.exp()).abs() < 1e-12 * 1.5_f64.exp());

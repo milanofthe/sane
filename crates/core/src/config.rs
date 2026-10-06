@@ -4,7 +4,7 @@
 //! Each field is a knob with a default that is right for a solve on a
 //! developer machine; the environment variable named on the field overrides it
 //! for A/B benchmarking and debugging without a code change, and a host (the
-//! Python binding, the browser build, an embedding application) sets the
+//! Python binding, an embedding application) sets the
 //! struct directly through [`set_config`] / [`update_config`]. Nothing in the
 //! engine reads an environment variable itself: [`config`] is the one source,
 //! so a switch is documented exactly once, here, and there is no guessing

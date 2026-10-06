@@ -18,30 +18,6 @@ pub fn differentiate<K: Field>(ctx: &mut Graph<K>, expr: ExprId, wrt: SymbolId) 
     d
 }
 
-/// Total time derivative `d/dt(e) = Σ_s (∂e/∂s) · deriv_of[s]`, summed over the
-/// free symbols of `e` that have a known time-derivative entry in `deriv_of`
-/// (mapping a state symbol to its derivative expression, e.g. `v{k}` -> `vdot{k}`).
-/// The symbolic analogue of forming a capacitive current `dq/dt` from a charge
-/// `q(v)`; used to lower Verilog-A `ddt(...)` in arbitrary residual rows.
-pub fn time_derivative<K: Field>(
-    ctx: &mut Graph<K>,
-    e: ExprId,
-    deriv_of: &HashMap<SymbolId, ExprId>,
-) -> ExprId {
-    let syms: Vec<SymbolId> = ctx.free_symbols(e).into_iter().collect();
-    let mut terms: Vec<ExprId> = Vec::new();
-    for s in syms {
-        if let Some(&sdot) = deriv_of.get(&s) {
-            let de = differentiate(ctx, e, s);
-            if !ctx.is_zero(de) {
-                let term = ctx.mul(de, sdot);
-                terms.push(term);
-            }
-        }
-    }
-    ctx.reduce(ReduceOp::Sum, terms)
-}
-
 /// Local derivative `d(op(a))/da` of a unary op, shared by the forward
 /// ([`differentiate`]) and reverse ([`gradient`]) sweeps so both modes apply the
 /// identical rule. The rules mirror the domain guards in
@@ -617,7 +593,7 @@ pub fn sparse_jacobian<K: Field>(
 /// `Min` / `Max` subgradients) are shared with [`differentiate`], so both modes
 /// return the same values everywhere; only the graph shape of the result
 /// differs. The result is an ordinary expression in the same context, so it can
-/// be differentiated again (see [`hessian`]).
+/// be differentiated again.
 pub fn gradient<K: Field>(ctx: &mut Graph<K>, f: ExprId, wrt: &[SymbolId]) -> Vec<ExprId> {
     // The cone of f, ascending: walked backwards, every node comes after
     // all of its consumers. `pos` is a node's place in it.
@@ -857,29 +833,4 @@ pub fn gradient<K: Field>(ctx: &mut Graph<K>, f: ExprId, wrt: &[SymbolId]) -> Ve
     wrt.iter()
         .map(|s| sym_adj.get(s).copied().unwrap_or(zero))
         .collect()
-}
-
-/// Symbolic Hessian `hess[i][j] = d²f / d(wrt[i]) d(wrt[j])`, built
-/// forward-over-reverse: one reverse sweep for the gradient, then one forward
-/// sweep per column over the gradient entries up to the diagonal, the
-/// lower triangle the mirror of the upper, so the result is exactly
-/// symmetric. Like every derivative here it is an ordinary expression, so
-/// third and higher orders are just repeated application.
-pub fn hessian<K: Field>(ctx: &mut Graph<K>, f: ExprId, wrt: &[SymbolId]) -> Vec<Vec<ExprId>> {
-    let grad = gradient(ctx, f, wrt);
-    let n = wrt.len();
-    let mut hess = vec![vec![ctx.zero(); n]; n];
-    let mut memo = ctx.take_memo();
-    for j in 0..n {
-        memo.begin(ctx.len());
-        for (i, d) in forward(ctx, &grad[..=j], wrt[j], &mut memo)
-            .into_iter()
-            .enumerate()
-        {
-            hess[i][j] = d;
-            hess[j][i] = d;
-        }
-    }
-    ctx.put_memo(memo);
-    hess
 }

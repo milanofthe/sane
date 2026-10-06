@@ -4,7 +4,6 @@
 use crate::input_vector;
 use crate::linalg::{lu_factor_complex, lu_solve_complex};
 use num_complex::Complex64;
-use sane_core::constants::{DC_OP_MAXIT, DC_OP_TOL};
 use sane_core::Graph;
 use sane_solve::CompiledDc;
 use std::f64::consts::PI;
@@ -12,33 +11,9 @@ use std::f64::consts::PI;
 #[cfg(test)]
 use crate::solve_complex;
 #[cfg(test)]
+use sane_core::constants::{DC_OP_MAXIT, DC_OP_TOL};
 #[cfg(test)]
 use sane_netlist::parse;
-
-pub fn ac_h(
-    ctx: &mut Graph,
-    cdc: &CompiledDc,
-    dae: &sane_dae::Dae,
-    pnames: &[String],
-    p: &[f64],
-    input: &str,
-    out_idx: usize,
-    w: f64,
-) -> Option<Complex64> {
-    let n = dae.dim();
-    let (x, conv, _) = cdc.solve_dc(p, &[], DC_OP_TOL, DC_OP_MAXIT);
-    if !conv {
-        return None;
-    }
-    // Sparse complex system A = G + jwC straight from the sparse Jacobians, with
-    // the same gmin diagonal shunt the operating point was solved under.
-    let (gr, gc, gv) = cdc.system_triplets_dc(&x, p);
-    let (cr, cc, cv) = cdc.jacobian_q_x_sparse(&x, p, 0.0);
-    let db = input_vector(ctx, dae, pnames, p, &x, input)?;
-    let b: Vec<Complex64> = db.iter().map(|v| Complex64::new(-v, 0.0)).collect();
-    let sys = crate::sparse_ac::AcSystem::assemble(n, (&gr, &gc, &gv), (&cr, &cc, &cv), w);
-    sys.solve(&b).map(|v| v[out_idx])
-}
 
 /// Exact AC-transfer sensitivity `dH/dp(jw)` at each frequency, solved natively:
 /// `dH = e_out^T A^{-1} (dB - (dG + jw dC) A^{-1} B)` with `A = G + jw C`. `b` is

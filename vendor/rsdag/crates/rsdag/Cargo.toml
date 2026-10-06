@@ -13,25 +13,13 @@ description = "Rust symbolic graph backend: hash-consed expression graph, differ
 # opt-in, so a consumer that builds and evaluates pays for nothing more.
 default = []
 
-# Exact rational constants: `Graph<BigRational>`, where folding never rounds
-# (symbolic analysis, closed forms, exact small-signal models).
+# Exact rational constants: `Graph<BigRational>`, where folding never rounds.
 exact = ["dep:num-bigint", "dep:num-rational", "dep:num-traits"]
-
-# Equality saturation over exact graphs (`simplify_egraph`), on `egg`.
-# Native only: egg reads a clock, which a plain wasm32 module has not.
-egraph = ["exact", "dep:egg"]
-
-# Evaluation in `Complex64` (frequency-domain analyses).
-complex = ["dep:num-complex"]
 
 # The synthetic program generator (`rsdag::synth`). Off by default: it is
 # there for the parity fuzzers and the benchmarks of this workspace and for
 # consumers that want to fuzz their own pipelines, not for production paths.
 synth = []
-
-# `rayon::ThreadPool` as a `parallel::Pool`, the pool a program's
-# independent calls run on (`rsdag::parallel`).
-rayon = ["dep:rayon"]
 
 # Serialization of a module (`Module`, `rsdag::module`): the interchange
 # format for caching analyses, code generation and FMI export.
@@ -44,27 +32,18 @@ serde = { version = "1", features = ["derive"], optional = true }
 num-bigint = { workspace = true, optional = true }
 num-rational = { workspace = true, optional = true }
 num-traits = { workspace = true, optional = true }
-num-complex = { workspace = true, optional = true }
-egg = { workspace = true, optional = true }
-rayon = { workspace = true, optional = true }
 
 [dev-dependencies]
 # The crate's own integration tests and the benchmarks draw synthetic
 # programs; a dev-dependency on self is how a test gets an optional feature
 # of its own crate.
-rsdag = { path = ".", features = ["synth", "serde", "exact", "complex", "rayon"] }
+rsdag = { path = ".", features = ["synth", "serde", "exact"] }
 # The integration tests link against the crate, not against its
 # dependencies, so the few they name themselves are listed again here.
-num-complex.workspace = true
 num-rational.workspace = true
 num-traits.workspace = true
 rustc-hash.workspace = true
 serde_json = "1"
-rayon.workspace = true
 
 [lints]
 workspace = true
-
-# The e-graph tests, where the feature builds (not wasm32, see `egraph`).
-[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-rsdag = { path = ".", features = ["egraph"] }

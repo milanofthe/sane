@@ -53,8 +53,9 @@ type ChunkFn = unsafe extern "C" fn(*mut f64, *const f64, *const Bundles);
 /// caller-owned work buffer, inputs padded with NaN, and the prolog/main
 /// split of a specialized tape.
 pub struct NativeTape {
-    /// Every chunk's code in one mapping, and each chunk's entry in it.
-    code: Mapping,
+    /// Every chunk's code in one mapping, held while the chunks point into
+    /// it, and each chunk's entry in it.
+    _code: Mapping,
     chunks: Vec<ChunkFn>,
     prolog_chunks: usize,
     /// The call and kernel descriptors the code holds the addresses of.
@@ -570,15 +571,6 @@ impl NativeTape {
         Self::compile_opts(tape, &Options::default(), &[])
     }
 
-    /// Compile with `chunk_ops` ops per emitted function.
-    pub fn compile_with(tape: &Tape, chunk_ops: usize) -> Result<NativeTape, JitError> {
-        let opts = Options {
-            chunk_ops,
-            ..Options::default()
-        };
-        Self::compile_opts(tape, &opts, &[])
-    }
-
     /// Compile as `opts` says, keeping the slots `live` written to the work
     /// array at the end of the program, as the outputs are: what a consumer
     /// that reads a specialized tape's prolog guards from `work` after
@@ -819,7 +811,7 @@ impl NativeTape {
             .map(|&o| unsafe { std::mem::transmute::<*mut u8, ChunkFn>(code.ptr.add(o)) })
             .collect();
         Ok(NativeTape {
-            code,
+            _code: code,
             chunks,
             _descs: descs,
             prolog_chunks,
@@ -834,16 +826,6 @@ impl NativeTape {
             reads,
             phase_ops,
         })
-    }
-
-    /// Number of emitted functions (diagnostics).
-    pub fn n_chunks(&self) -> usize {
-        self.chunks.len()
-    }
-
-    /// Bytes of machine code (diagnostics).
-    pub fn code_len(&self) -> usize {
-        self.code.len
     }
 
     fn padded<'a>(&self, inputs: &'a [f64], buf: &'a mut Vec<f64>) -> &'a [f64] {

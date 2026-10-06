@@ -134,18 +134,6 @@ impl SpecializedTape {
         &self.tape
     }
 
-    /// Number of real (non-guard) outputs.
-    pub fn n_real(&self) -> usize {
-        self.n_real
-    }
-
-    /// Expected truth (`1`/`0`) of each guard output, for a caller that
-    /// evaluates [`tape`](Self::tape) through another backend and re-implements
-    /// the [`eval_checked`](Self::eval_checked) guard test.
-    pub fn expected(&self) -> &[u8] {
-        &self.expected
-    }
-
     /// Evaluate the shortened tape. Returns `true` if every pinned choice still
     /// holds, in which case `out` is bit-exact against the full tape. On
     /// `false` a region flipped and `out` is NOT valid: re-trace on the full

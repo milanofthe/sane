@@ -87,7 +87,6 @@ pub fn linearize(ctx: &mut Graph, dae: &Dae) -> Dae {
 pub(crate) mod tests_support {
     use super::*;
     use crate::{assemble_dae, DeviceInstance};
-    use num_complex::Complex64;
     use rsdag::eval;
     use sane_mna::Circuit;
     use std::collections::HashMap;
@@ -118,25 +117,23 @@ pub(crate) mod tests_support {
         assemble_dae(ctx, &c, &devs)
     }
 
-    /// Deterministic pseudo-random complex value for a symbol name (FNV-1a of the
+    /// Deterministic pseudo-random value for a symbol name (FNV-1a of the
     /// name, salted per evaluation point) -- lets the verification probe `G` and
     /// `C` at several points without `Math::random`.
-    fn pseudo(name: &str, salt: u64) -> Complex64 {
+    fn pseudo(name: &str, salt: u64) -> f64 {
         let mut h = 0xcbf29ce484222325u64 ^ salt;
         for b in name.bytes() {
             h = (h ^ b as u64).wrapping_mul(0x100000001b3);
         }
         // Kept on the thermal-voltage scale (~0.02..0.05) so a diode/MOSFET
         // exponent v/(N*Vt) stays modest and the entries evaluate finite.
-        let re = (h % 30) as f64 / 1000.0 + 0.02;
-        let im = ((h >> 17) % 30) as f64 / 1000.0 + 0.005;
-        Complex64::new(re, im)
+        (h % 30) as f64 / 1000.0 + 0.02
     }
 
     /// Bind every free symbol of `mats` for evaluation: an operating-point freeze
     /// symbol `"X#op"` gets the *same* value as its base `"X"`, so evaluating
     /// frozen and unfrozen matrices at one point is a like-for-like comparison.
-    fn env_for(ctx: &Graph, mats: &[&[Vec<ExprId>]], salt: u64) -> HashMap<SymbolId, Complex64> {
+    fn env_for(ctx: &Graph, mats: &[&[Vec<ExprId>]], salt: u64) -> HashMap<SymbolId, f64> {
         use sane_core::constants::{TEMP_NOMINAL_K, TEMP_SYMBOL};
         let mut env = HashMap::new();
         for mat in mats {
@@ -150,7 +147,7 @@ pub(crate) mod tests_support {
                         // diode's exp temperature scaling.
                         let val =
                             if base == TEMP_SYMBOL || base.to_ascii_lowercase().ends_with("tnom") {
-                                Complex64::new(TEMP_NOMINAL_K, 0.0)
+                                TEMP_NOMINAL_K
                             } else {
                                 pseudo(base, salt)
                             };
@@ -175,9 +172,9 @@ pub(crate) mod tests_support {
                 for j in 0..n {
                     let lhs = eval(ctx, &[a[i][j]], &env)[0];
                     let rhs = eval(ctx, &[b[i][j]], &env)[0];
-                    let tol = 1e-9 * (1.0 + lhs.norm());
+                    let tol = 1e-9 * (1.0 + lhs.abs());
                     assert!(
-                        (lhs - rhs).norm() <= tol,
+                        (lhs - rhs).abs() <= tol,
                         "[{i}][{j}] mismatch at salt {salt}: {lhs} vs {rhs}"
                     );
                 }

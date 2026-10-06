@@ -112,25 +112,6 @@ pub fn eval<T: Scalar, K: Field>(
     roots.iter().map(|&r| w[at(r)]).collect()
 }
 
-/// [`eval`] with symbols bound by name.
-pub fn eval_named<T: Scalar, K: Field>(
-    ctx: &mut Graph<K>,
-    roots: &[ExprId],
-    values: &[(&str, T)],
-) -> Vec<T> {
-    let env: HashMap<SymbolId, T> = values
-        .iter()
-        .map(|(name, v)| {
-            let e = ctx.sym(name);
-            match ctx.node(e) {
-                Node::Symbol(sid) => (*sid, *v),
-                _ => unreachable!("sym() always yields a Symbol node"),
-            }
-        })
-        .collect();
-    eval(ctx, roots, &env)
-}
-
 /// Per-sweep function evaluation: a body per function and the outputs of
 /// every distinct `(function, argument list)` already evaluated.
 pub struct FuncEval<T: Scalar> {

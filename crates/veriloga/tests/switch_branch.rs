@@ -1,4 +1,3 @@
-use num_complex::Complex64;
 use rsdag::{eval, Node, SymbolId};
 use sane_core::Graph;
 use sane_dae::{assemble_dae, DeviceInstance};
@@ -12,12 +11,12 @@ fn elab(src: &str) -> Arc<sane_veriloga::ElaboratedModule> {
     Arc::new(elaborate(&ms[0]).expect("elab"))
 }
 
-fn env_of(ctx: &mut Graph, vals: &[(&str, f64)]) -> HashMap<SymbolId, Complex64> {
+fn env_of(ctx: &mut Graph, vals: &[(&str, f64)]) -> HashMap<SymbolId, f64> {
     let mut env = HashMap::new();
     for (n, x) in vals {
         let e = ctx.sym(n);
         if let Node::Symbol(s) = ctx.node(e) {
-            env.insert(*s, Complex64::new(*x, 0.0));
+            env.insert(*s, *x);
         }
     }
     env
@@ -62,8 +61,8 @@ fn switch_branch_single_arm_is_constrained() {
     let env_false = env_of(&mut ctx, &base(0.0));
     let env_true = env_of(&mut ctx, &base(1.0));
     let found = dae.currents.iter().any(|r| {
-        (eval(&ctx, &[*r], &env_false)[0].re - 1.0).abs() < 1e-9
-            && eval(&ctx, &[*r], &env_true)[0].re.abs() < 1e-9
+        (eval(&ctx, &[*r], &env_false)[0] - 1.0).abs() < 1e-9
+            && eval(&ctx, &[*r], &env_true)[0].abs() < 1e-9
     });
     assert!(
         found,
@@ -112,7 +111,7 @@ fn switchable_resistor_branch() {
     }
     let env = env_of(&mut ctx, &vals);
     for (k, r) in dae.currents.iter().enumerate() {
-        let val = eval(&ctx, &[*r], &env)[0].norm();
+        let val = eval(&ctx, &[*r], &env)[0].abs();
         assert!(
             val < 1e-9,
             "residual {k} ({}) = {val}",

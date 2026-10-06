@@ -806,7 +806,7 @@ class Circuit:
         m = Model(raw_model, list(self._names), values)
         # power ports from deck `P` elements: (name, node, z0) per port, in
         # deck order; Model.sp() picks these up when no ports are passed
-        m._deck_ports = list(self._raw.ports()) if hasattr(self._raw, "ports") else []
+        m._deck_ports = list(self._raw.ports())
         if fold is not None and keep is not None:
             raise ValueError("extract: give fold or keep, not both")
         if fold is not None or keep is not None:
@@ -816,14 +816,14 @@ class Circuit:
         return m
 
     def extract_dae(self):
-        """Extract the raw compiled ``sane._core.Dae`` (positional API).
+        """Extract the raw compiled ``sane._core.Model`` (positional API).
 
         The low-level escape hatch behind :meth:`extract`; prefer :meth:`extract`
         for the ergonomic, name-labeled :class:`~sane.model.Model`.
 
         Returns
         -------
-        sane._core.Dae
+        sane._core.Model
             the raw compiled system (positional, unlabeled API)
         """
         return self._raw.extract_dae()

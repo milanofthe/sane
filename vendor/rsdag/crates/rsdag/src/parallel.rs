@@ -136,20 +136,6 @@ pub fn block(n: usize) -> usize {
     (n / (threads * 4)).max(1)
 }
 
-#[cfg(feature = "rayon")]
-impl Pool for rayon::ThreadPool {
-    fn threads(&self) -> usize {
-        self.current_num_threads()
-    }
-    fn run(&self, n: usize, f: &(dyn Fn(usize) + Sync)) {
-        use rayon::prelude::*;
-        self.install(|| (0..n).into_par_iter().for_each(f));
-    }
-    fn enter(&self, f: &mut (dyn FnMut() + Send)) {
-        self.install(f)
-    }
-}
-
 /// How long [`Workers`] keep waiting for the next stage before they sleep:
 /// longer than the serial stretch between a solver's evaluations.
 pub const SPIN: std::time::Duration = std::time::Duration::from_micros(300);

@@ -1,11 +1,10 @@
 use super::*;
-use num_complex::Complex64;
 use rsdag::eval;
 use sane_device::Lowerer;
 use sane_mna::{Circuit, SourceFn};
 use std::collections::{HashMap, HashSet};
 
-fn env_of(ctx: &mut Graph, vals: &[(&str, f64)]) -> HashMap<SymbolId, Complex64> {
+fn env_of(ctx: &mut Graph, vals: &[(&str, f64)]) -> HashMap<SymbolId, f64> {
     // Native devices read the global `$temp` and per-instance Tnom/Eg/XTI;
     // default them to nominal (temperature scalings become identities) for
     // every instance referenced, unless the test overrides them.
@@ -26,7 +25,7 @@ fn env_of(ctx: &mut Graph, vals: &[(&str, f64)]) -> HashMap<SymbolId, Complex64>
     for (name, x) in &all {
         let e = ctx.sym(name);
         if let Node::Symbol(s) = ctx.node(e) {
-            env.insert(*s, Complex64::new(*x, 0.0));
+            env.insert(*s, *x);
         }
     }
     env
@@ -34,15 +33,19 @@ fn env_of(ctx: &mut Graph, vals: &[(&str, f64)]) -> HashMap<SymbolId, Complex64>
 
 /// The largest `|I + C x'|` at `env`, the state moving at `rates` (one per
 /// unknown, empty for rest).
-fn max_resid(ctx: &mut Graph, dae: &Dae, env: &HashMap<SymbolId, Complex64>, rates: &[f64]) -> f64 {
+fn max_resid(ctx: &mut Graph, dae: &Dae, env: &HashMap<SymbolId, f64>, rates: &[f64]) -> f64 {
     let (_, (rows, cols, c)) = dae.jacobian_iq_coo(ctx);
-    let mut f: Vec<Complex64> = dae.currents.iter().map(|&r| eval(ctx, &[r], env)[0]).collect();
+    let mut f: Vec<f64> = dae
+        .currents
+        .iter()
+        .map(|&r| eval(ctx, &[r], env)[0])
+        .collect();
     for ((&r, &col), &e) in rows.iter().zip(&cols).zip(&c) {
         if let Some(&v) = rates.get(col) {
             f[r] += eval(ctx, &[e], env)[0] * v;
         }
     }
-    f.iter().map(|z| z.norm()).fold(0.0, f64::max)
+    f.iter().map(|z| z.abs()).fold(0.0, f64::max)
 }
 
 /// A capacitor expressed through the behavioral lowering path: the charge
@@ -116,9 +119,15 @@ fn behavioral_capacitor_matches_native() {
             ("t", 0.0),
         ],
     );
-    let rows = |d: &Dae| d.currents.iter().chain(&d.charges).copied().collect::<Vec<_>>();
+    let rows = |d: &Dae| {
+        d.currents
+            .iter()
+            .chain(&d.charges)
+            .copied()
+            .collect::<Vec<_>>()
+    };
     for (i, (rn, rb)) in rows(&native).iter().zip(&rows(&behav)).enumerate() {
-        let d = (eval(&ctx, &[*rn], &env)[0] - eval(&ctx, &[*rb], &env)[0]).norm();
+        let d = (eval(&ctx, &[*rn], &env)[0] - eval(&ctx, &[*rb], &env)[0]).abs();
         assert!(d < 1e-9, "row {i} differs by {d}");
     }
 }
@@ -160,11 +169,7 @@ fn mfactor_scales_terminal_current() {
     // Row 1 is the node-2 KCL: its m=2 charge exceeds m=1 by exactly C*v2.
     let q1 = eval(&ctx, &[d1.charges[1]], &env)[0];
     let q2 = eval(&ctx, &[d2.charges[1]], &env)[0];
-    assert!(
-        ((q2 - q1).re - cap * 0.4).abs() < 1e-12,
-        "delta={}",
-        (q2 - q1).re
-    );
+    assert!(((q2 - q1) - cap * 0.4).abs() < 1e-12, "delta={}", q2 - q1);
     // Every current and the other charges are identical (multiplicity
     // touches only this device's charge).
     let rows = |d: &Dae| {
@@ -173,7 +178,7 @@ fn mfactor_scales_terminal_current() {
         r
     };
     for (i, (a, b)) in rows(&d1).iter().zip(&rows(&d2)).enumerate() {
-        let d = (eval(&ctx, &[*a], &env)[0] - eval(&ctx, &[*b], &env)[0]).norm();
+        let d = (eval(&ctx, &[*a], &env)[0] - eval(&ctx, &[*b], &env)[0]).abs();
         assert!(d < 1e-12, "row {i} changed by {d}");
     }
 }

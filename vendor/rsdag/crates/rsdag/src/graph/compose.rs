@@ -2,7 +2,7 @@
 //! graph is imported with the functions it calls; calls into it compose it
 //! into whatever this graph builds, and a program over the composition is
 //! compiled as one, its composite functions as templates (see
-//! [`Tape::compose`](crate::Tape::compose)).
+//! [`Tape::compile`](crate::Tape::compile)).
 
 use super::*;
 

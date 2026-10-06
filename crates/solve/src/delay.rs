@@ -138,12 +138,6 @@ impl DelayHistory {
         self.times.len == 0
     }
 
-    /// Newest knot time, or `None` when empty.
-    #[inline]
-    pub fn last_time(&self) -> Option<f64> {
-        (self.times.len > 0).then(|| self.times.get(self.times.len - 1))
-    }
-
     /// Append one accepted knot: time `t` (must exceed the newest knot;
     /// equal-time pushes REPLACE the newest knot, which is how breakpoint
     /// re-landings and the initial condition update cleanly), the delayed
@@ -202,32 +196,6 @@ impl DelayHistory {
         }
         for (s, d) in self.ders_out.iter_mut().zip(ders) {
             s.set_last(*d.borrow());
-        }
-    }
-
-    /// Rewind the history to `t` (drop every knot with time > `t`): called
-    /// when the integrator restarts from an earlier accepted state.
-    pub fn truncate_after(&mut self, t: f64) {
-        let mut n = self.times.len;
-        while n > 0 && self.times.get(n - 1) > t {
-            n -= 1;
-        }
-        let drop = self.times.len - n;
-        if drop > 0 {
-            // dropping from the BACK: shrink `len` (head untouched)
-            self.times.len -= drop;
-            for s in self.vals.iter_mut() {
-                s.len -= drop;
-            }
-            for s in self.ders_in.iter_mut() {
-                s.len -= drop;
-            }
-            for s in self.ders_out.iter_mut() {
-                s.len -= drop;
-            }
-            for c in self.cursors.iter_mut() {
-                *c = (*c).min(self.times.len.saturating_sub(1));
-            }
         }
     }
 
@@ -422,19 +390,6 @@ mod tests {
         h.push(1.0, &[9.0], &[0.0]);
         assert_eq!(h.len(), 2);
         assert_eq!(h.eval(0, 1.0), 9.0);
-    }
-
-    #[test]
-    fn truncate_after_rewinds() {
-        let mut h = DelayHistory::new(1, f64::INFINITY);
-        for k in 0..10 {
-            h.push(k as f64, &[k as f64], &[1.0]);
-        }
-        h.truncate_after(4.5);
-        assert_eq!(h.len(), 5);
-        assert_eq!(h.last_time(), Some(4.0));
-        h.push(4.25, &[4.25], &[1.0]);
-        assert!((h.eval(0, 4.1) - 4.1).abs() < 1e-12);
     }
 
     #[test]

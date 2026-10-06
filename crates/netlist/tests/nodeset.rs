@@ -59,13 +59,25 @@ fn nodeset_breaks_symmetry_onto_a_stable_branch() {
     let (ia, ib) = (node_idx(&parsed, &dae, "a"), node_idx(&parsed, &dae, "b"));
 
     // Pin a high: the solve must land on the a-high / b-low stable branch.
-    let (xh, ch, _) = cdc.solve_dc_nodeset(&p, &[(ia, 1.0)], Convergence::from_tol(1e-10), 100);
+    let (xh, ch, _) = cdc.solve_dc_nodeset_with(
+        &p,
+        &[(ia, 1.0)],
+        Convergence::from_tol(1e-10),
+        100,
+        cdc.tricks(),
+    );
     assert!(ch, "node-set DC should converge");
     assert!(xh[ia] > 0.6, "a = {} (expected high branch)", xh[ia]);
     assert!(xh[ib] < 0.4, "b = {} (expected low branch)", xh[ib]);
 
     // Pin a low: the mirror branch (a low, b high).
-    let (xl, cl, _) = cdc.solve_dc_nodeset(&p, &[(ia, 0.0)], Convergence::from_tol(1e-10), 100);
+    let (xl, cl, _) = cdc.solve_dc_nodeset_with(
+        &p,
+        &[(ia, 0.0)],
+        Convergence::from_tol(1e-10),
+        100,
+        cdc.tricks(),
+    );
     assert!(cl, "node-set DC should converge");
     assert!(xl[ia] < 0.4, "a = {} (expected low branch)", xl[ia]);
     assert!(xl[ib] > 0.6, "b = {} (expected high branch)", xl[ib]);

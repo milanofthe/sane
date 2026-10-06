@@ -56,9 +56,6 @@ struct Circuit {
     node_names: Vec<String>,
     /// Power ports from `P` elements, in deck order: `(name, node, z0)`.
     ports: Vec<(String, String, f64)>,
-    /// Parsing diagnostics summary (ignored directives, dropped parameters);
-    /// empty for a fully-honoured deck or a programmatically built circuit.
-    report: String,
 }
 
 #[pymethods]
@@ -72,15 +69,7 @@ impl Circuit {
             values: HashMap::new(),
             node_names: vec!["0".to_string()],
             ports: Vec::new(),
-            report: String::new(),
         }
-    }
-
-    /// Compatibility diagnostics from `parse`: directives this parser ignored
-    /// and model/instance parameters that were dropped. Empty when the deck was
-    /// fully honoured.
-    fn compatibility_report(&self) -> String {
-        self.report.clone()
     }
 
     /// Node names indexed by internal node id (`node_names()[k]` is the node
@@ -196,11 +185,6 @@ impl Circuit {
             .collect()
     }
 
-    /// Number of circuit nodes (including ground).
-    fn node_count(&self) -> usize {
-        self.circuit.node_count()
-    }
-
     /// Number of the top level's nonlinear device instances (D/M/Q/switches);
     /// devices inside subcircuit instances are not counted.
     fn device_count(&self) -> usize {
@@ -248,7 +232,6 @@ fn parse(netlist: &str) -> PyResult<Circuit> {
             .iter()
             .map(|p| (p.name.clone(), p.node.clone(), p.z0))
             .collect(),
-        report: parsed.report.summary(),
     })
 }
 
@@ -288,34 +271,6 @@ fn set_log_level(level: &str) {
 #[pyfunction]
 fn drain_warnings() -> Vec<String> {
     sane_core::log::drain_captured()
-}
-
-/// Reset the internal `dF/dx`-factorization counter, returning its previous value.
-/// Instrumentation for the sensitivity/Hessian "factor once, K RHS" contract (#48):
-/// bracket a `hessian` call between this and [`factor_fx_calls`] to assert a single
-/// factorization is run regardless of the parameter-subset size.
-#[pyfunction]
-fn reset_factor_fx_calls() -> usize {
-    sane_solve::reset_factor_fx_calls()
-}
-
-/// Read the internal `dF/dx`-factorization counter (see [`reset_factor_fx_calls`]).
-#[pyfunction]
-fn factor_fx_calls() -> usize {
-    sane_solve::factor_fx_calls()
-}
-
-/// Reset the HB state-waveform synthesis counter, returning its previous value.
-/// Instrumentation for the "synth once per Newton iteration" contract (#51).
-#[pyfunction]
-fn reset_hb_synth_calls() -> usize {
-    sane_solve::reset_hb_synth_calls()
-}
-
-/// Read the HB state-waveform synthesis counter (see [`reset_hb_synth_calls`]).
-#[pyfunction]
-fn hb_synth_calls() -> usize {
-    sane_solve::hb_synth_calls()
 }
 
 /// Fit tabulated p-port admittance data `Y(f)` (flattened p^2 entries per
@@ -458,69 +413,17 @@ struct PyModel {
 
 #[pymethods]
 impl PyModel {
-    /// Build a `Model` from a SPICE-like netlist string.
-    #[staticmethod]
-    fn from_netlist(src: &str) -> PyResult<PyModel> {
-        let inner = sane_analysis::Model::from_netlist(src).map_err(model_err)?;
-        Ok(PyModel { inner })
-    }
-
-    /// Index-2 topologies of the deck, as `{"cv_loops": [[...]], "li_cutsets": [[...]]}`
-    /// with each entry the element names forming it (source first). Empty lists
-    /// for an ordinary index-1 circuit.
-    fn index2(&self) -> std::collections::HashMap<String, Vec<Vec<String>>> {
-        let r = self.inner.index2();
-        let names = |ps: &[sane_mna::index2::Index2Path]| -> Vec<Vec<String>> {
-            ps.iter()
-                .map(|p| {
-                    std::iter::once(p.source.clone())
-                        .chain(p.storage.iter().cloned())
-                        .collect()
-                })
-                .collect()
-        };
-        [
-            ("cv_loops".to_string(), names(&r.cv_loops)),
-            ("li_cutsets".to_string(), names(&r.li_cutsets)),
-        ]
-        .into_iter()
-        .collect()
-    }
-
     fn params(&self) -> Vec<String> {
         self.inner.params().to_vec()
     }
     fn unknowns(&self) -> Vec<String> {
         self.inner.unknowns().to_vec()
     }
-    fn node_names(&self) -> Vec<String> {
-        self.inner.node_names().to_vec()
-    }
     fn dim(&self) -> usize {
         self.inner.dim()
     }
-    fn get(&self, name: &str) -> PyResult<f64> {
-        self.inner
-            .get(name)
-            .ok_or_else(|| PyValueError::new_err(format!("'{name}' is not a parameter")))
-    }
-    fn set(&self, name: &str, value: f64) -> PyResult<()> {
-        self.inner.set(name, value).map_err(model_err)
-    }
-    fn reset(&self) {
-        self.inner.reset()
-    }
     fn values(&self) -> HashMap<String, f64> {
         self.inner.values()
-    }
-    fn is_param(&self, name: &str) -> bool {
-        self.inner.is_param(name)
-    }
-    fn is_group(&self, name: &str) -> bool {
-        self.inner.is_group(name)
-    }
-    fn children(&self, prefix: &str) -> Vec<String> {
-        self.inner.children(prefix)
     }
 
     /// Fold parameters to their current values: each becomes a constant in a
@@ -539,153 +442,6 @@ impl PyModel {
         let refs: Vec<&str> = paths.iter().map(|s| s.as_str()).collect();
         let inner = self.inner.keep(&refs).map_err(model_err)?;
         Ok(PyModel { inner })
-    }
-    fn resolve(&self, reference: &str) -> Option<usize> {
-        self.inner.resolve(reference)
-    }
-
-    #[pyo3(signature = (overrides=None))]
-    fn operating_point(
-        &self,
-        py: Python<'_>,
-        overrides: Option<HashMap<String, f64>>,
-    ) -> PyResult<PyOp> {
-        let ov = overrides.unwrap_or_default();
-        py.allow_threads(|| self.inner.operating_point(&overrides_vec(&ov)))
-            .map(|inner| PyOp { inner })
-            .map_err(model_err)
-    }
-
-    #[pyo3(signature = (output, fstart, fstop, points=50, overrides=None))]
-    fn noise(
-        &self,
-        py: Python<'_>,
-        output: &str,
-        fstart: f64,
-        fstop: f64,
-        points: usize,
-        overrides: Option<HashMap<String, f64>>,
-    ) -> PyResult<PyNoise> {
-        let ov = overrides.unwrap_or_default();
-        py.allow_threads(|| {
-            self.inner
-                .noise(&overrides_vec(&ov), output, fstart, fstop, points)
-        })
-        .map(|inner| PyNoise { inner })
-        .map_err(model_err)
-    }
-
-    #[pyo3(signature = (input, output, fstart, fstop, points=50, overrides=None))]
-    fn ac(
-        &self,
-        py: Python<'_>,
-        input: &str,
-        output: &str,
-        fstart: f64,
-        fstop: f64,
-        points: usize,
-        overrides: Option<HashMap<String, f64>>,
-    ) -> PyResult<PyAc> {
-        let ov = overrides.unwrap_or_default();
-        py.allow_threads(|| {
-            self.inner
-                .ac(&overrides_vec(&ov), input, output, fstart, fstop, points)
-        })
-        .map(|inner| PyAc { inner })
-        .map_err(model_err)
-    }
-
-    #[pyo3(signature = (input="", output="", overrides=None))]
-    fn poles_zeros(
-        &self,
-        py: Python<'_>,
-        input: &str,
-        output: &str,
-        overrides: Option<HashMap<String, f64>>,
-    ) -> PyResult<PyPz> {
-        let ov = overrides.unwrap_or_default();
-        py.allow_threads(|| self.inner.poles_zeros(&overrides_vec(&ov), input, output))
-            .map(|inner| PyPz { inner })
-            .map_err(model_err)
-    }
-
-    #[pyo3(signature = (input, output, overrides=None))]
-    fn state_space(
-        &self,
-        py: Python<'_>,
-        input: &str,
-        output: &str,
-        overrides: Option<HashMap<String, f64>>,
-    ) -> PyResult<PySs> {
-        let ov = overrides.unwrap_or_default();
-        py.allow_threads(|| self.inner.state_space(&overrides_vec(&ov), input, output))
-            .map(|inner| PySs { inner })
-            .map_err(model_err)
-    }
-
-    #[pyo3(signature = (output, t0, t1, points=50, overrides=None))]
-    fn temp_sweep(
-        &self,
-        py: Python<'_>,
-        output: &str,
-        t0: f64,
-        t1: f64,
-        points: usize,
-        overrides: Option<HashMap<String, f64>>,
-    ) -> PyResult<PyTs> {
-        let ov = overrides.unwrap_or_default();
-        py.allow_threads(|| {
-            self.inner
-                .temp_sweep(&overrides_vec(&ov), output, t0, t1, points)
-        })
-        .map(|inner| PyTs { inner })
-        .map_err(model_err)
-    }
-
-    #[pyo3(signature = (input, output, order, fstart, fstop, points=50, overrides=None))]
-    fn model_reduce(
-        &self,
-        py: Python<'_>,
-        input: &str,
-        output: &str,
-        order: usize,
-        fstart: f64,
-        fstop: f64,
-        points: usize,
-        overrides: Option<HashMap<String, f64>>,
-    ) -> PyResult<PyMr> {
-        let ov = overrides.unwrap_or_default();
-        py.allow_threads(|| {
-            self.inner.model_reduce(
-                &overrides_vec(&ov),
-                input,
-                output,
-                order,
-                fstart,
-                fstop,
-                points,
-            )
-        })
-        .map(|inner| PyMr { inner })
-        .map_err(model_err)
-    }
-
-    #[pyo3(signature = (f0=0.0, harmonics=8, overrides=None, x0=None))]
-    fn harmonic_balance(
-        &self,
-        py: Python<'_>,
-        f0: f64,
-        harmonics: usize,
-        overrides: Option<HashMap<String, f64>>,
-        x0: Option<Vec<f64>>,
-    ) -> PyResult<PyHb> {
-        let ov = overrides.unwrap_or_default();
-        py.allow_threads(|| {
-            self.inner
-                .harmonic_balance(&overrides_vec(&ov), f0, harmonics, x0.as_deref())
-        })
-        .map(|inner| PyHb { inner })
-        .map_err(model_err)
     }
 
     // --- parameter store (low-level; the hierarchical Python API builds on it) ---
@@ -729,12 +485,6 @@ impl PyModel {
             self.inner.set(&k, v).map_err(model_err)?;
         }
         Ok(())
-    }
-
-    /// Per-stage extraction timings; empty (timings live on `Circuit.extract`).
-    #[getter]
-    fn profile(&self) -> Vec<(String, f64)> {
-        Vec::new()
     }
 
     // --- graph transforms (return a new Model sharing this context) --------
@@ -1287,23 +1037,6 @@ impl PyModel {
             .map_err(model_err)
     }
 
-    /// Native VJP sweep for multi-output AC losses (S-parameters): per
-    /// frequency a list of `(out_idx, c_re, c_im)` cotangent entries; returns
-    /// `(param, dL/dp)` accumulated over the whole sweep. One forward + one
-    /// weighted adjoint solve per frequency, setup hoisted out of the loop.
-    fn ac_vjp_sweep(
-        &self,
-        py: Python<'_>,
-        input: &str,
-        weights: Vec<Vec<(usize, f64, f64)>>,
-        x: Vec<f64>,
-        p: Vec<f64>,
-        freqs: Vec<f64>,
-    ) -> PyResult<Vec<(String, f64)>> {
-        py.allow_threads(|| self.inner.ac_vjp_sweep(input, &weights, x, p, freqs))
-            .map_err(model_err)
-    }
-
     /// S-parameter sweep at an explicit operating point: `ports` are
     /// `(drive source, out_idx, z0)` in port order; returns per frequency the
     /// flattened row-major n x n scattering matrix as (re, im) pairs.
@@ -1450,228 +1183,6 @@ impl PyModel {
     }
 }
 
-#[pyclass(name = "AcResponse")]
-struct PyAc {
-    inner: sane_analysis::ModelAcResponse,
-}
-#[pymethods]
-impl PyAc {
-    #[getter]
-    fn freqs(&self) -> Vec<f64> {
-        self.inner.freqs.clone()
-    }
-    #[getter]
-    fn mag_db(&self) -> Vec<f64> {
-        self.inner.mag_db.clone()
-    }
-    #[getter]
-    fn phase_deg(&self) -> Vec<f64> {
-        self.inner.phase_deg.clone()
-    }
-}
-
-#[pyclass(name = "PoleZero")]
-struct PyPz {
-    inner: sane_analysis::PoleZero,
-}
-#[pymethods]
-impl PyPz {
-    fn poles(&self) -> Vec<(f64, f64)> {
-        self.inner.poles.iter().map(|c| (c[0], c[1])).collect()
-    }
-    fn zeros(&self) -> Vec<(f64, f64)> {
-        self.inner.zeros.iter().map(|c| (c[0], c[1])).collect()
-    }
-}
-
-#[pyclass(name = "StateSpace")]
-struct PySs {
-    inner: sane_analysis::ModelStateSpace,
-}
-#[pymethods]
-impl PySs {
-    #[getter]
-    fn e(&self) -> Vec<Vec<f64>> {
-        self.inner.e.clone()
-    }
-    #[getter]
-    fn a(&self) -> Vec<Vec<f64>> {
-        self.inner.a.clone()
-    }
-    #[getter]
-    fn b(&self) -> Vec<f64> {
-        self.inner.b.clone()
-    }
-    #[getter]
-    fn c(&self) -> Vec<f64> {
-        self.inner.c.clone()
-    }
-    #[getter]
-    fn d(&self) -> f64 {
-        self.inner.d
-    }
-}
-
-#[pyclass(name = "TempSweep")]
-struct PyTs {
-    inner: sane_analysis::TempSweep,
-}
-#[pymethods]
-impl PyTs {
-    #[getter]
-    fn temps(&self) -> Vec<f64> {
-        self.inner.temps.clone()
-    }
-    #[getter]
-    fn values(&self) -> Vec<f64> {
-        self.inner.values.clone()
-    }
-}
-
-#[pyclass(name = "ReducedModel")]
-struct PyMr {
-    inner: sane_analysis::ReducedModel,
-}
-#[pymethods]
-impl PyMr {
-    #[getter]
-    fn freqs(&self) -> Vec<f64> {
-        self.inner.freqs.clone()
-    }
-    #[getter]
-    fn full_db(&self) -> Vec<f64> {
-        self.inner.full_db.clone()
-    }
-    #[getter]
-    fn red_db(&self) -> Vec<f64> {
-        self.inner.red_db.clone()
-    }
-    fn poles(&self) -> Vec<(f64, f64)> {
-        self.inner.poles.iter().map(|c| (c[0], c[1])).collect()
-    }
-    fn zeros(&self) -> Vec<(f64, f64)> {
-        self.inner.zeros.iter().map(|c| (c[0], c[1])).collect()
-    }
-    #[getter]
-    fn max_err_db(&self) -> f64 {
-        self.inner.max_err_db
-    }
-}
-
-#[pyclass(name = "HarmonicBalance")]
-struct PyHb {
-    inner: sane_analysis::ModelHarmonicBalance,
-}
-#[pymethods]
-impl PyHb {
-    #[getter]
-    fn converged(&self) -> bool {
-        self.inner.converged
-    }
-    fn magnitude(&self, reference: &str) -> PyResult<Vec<f64>> {
-        self.inner
-            .magnitude(reference)
-            .map(|s| s.to_vec())
-            .ok_or_else(|| PyValueError::new_err(format!("'{reference}' not found")))
-    }
-    fn phase(&self, reference: &str) -> PyResult<Vec<f64>> {
-        self.inner
-            .phase(reference)
-            .map(|s| s.to_vec())
-            .ok_or_else(|| PyValueError::new_err(format!("'{reference}' not found")))
-    }
-}
-
-#[pyclass(name = "OperatingPoint")]
-struct PyOp {
-    inner: sane_analysis::OperatingPoint,
-}
-
-#[pymethods]
-impl PyOp {
-    fn vector(&self) -> Vec<f64> {
-        self.inner.vector().to_vec()
-    }
-    fn __getitem__(&self, reference: &str) -> PyResult<f64> {
-        self.inner
-            .get(reference)
-            .ok_or_else(|| PyValueError::new_err(format!("'{reference}' not found")))
-    }
-    fn get(&self, reference: &str) -> Option<f64> {
-        self.inner.get(reference)
-    }
-    fn to_dict(&self) -> HashMap<String, f64> {
-        self.inner.to_map()
-    }
-    fn sensitivity(&self, output: &str) -> PyResult<PySens> {
-        self.inner
-            .sensitivity(output)
-            .map(|inner| PySens { inner })
-            .map_err(model_err)
-    }
-    fn hessian(&self, output: &str, wrt: Vec<String>) -> PyResult<Vec<Vec<f64>>> {
-        let w: Vec<&str> = wrt.iter().map(|s| s.as_str()).collect();
-        self.inner.hessian(output, &w).map_err(model_err)
-    }
-    /// The gmin at which this operating point held if it is gmin-regularized
-    /// (converged=true but physically suspect), else `None` (issue #54).
-    #[getter]
-    fn regularized_at_gmin(&self) -> Option<f64> {
-        self.inner.regularized_at_gmin()
-    }
-    /// Operating-point variables exported by Verilog-A devices via `(* desc *)`
-    /// annotations, as `[(name, value, desc, units), ...]`.
-    fn opvars(&self) -> Vec<(String, f64, String, Option<String>)> {
-        self.inner
-            .op_vars()
-            .into_iter()
-            .map(|v| (v.name, v.value, v.desc, v.units))
-            .collect()
-    }
-}
-
-#[pyclass(name = "NoiseSpectrum")]
-struct PyNoise {
-    inner: sane_analysis::NoiseSpectrum,
-}
-
-#[pymethods]
-impl PyNoise {
-    #[getter]
-    fn freqs(&self) -> Vec<f64> {
-        self.inner.freqs.clone()
-    }
-    #[getter]
-    fn psd(&self) -> Vec<f64> {
-        self.inner.psd.clone()
-    }
-}
-
-#[pyclass(name = "Sensitivity")]
-struct PySens {
-    inner: sane_analysis::Sensitivity,
-}
-
-#[pymethods]
-impl PySens {
-    #[getter]
-    fn names(&self) -> Vec<String> {
-        self.inner.names.clone()
-    }
-    #[getter]
-    fn grad(&self) -> Vec<f64> {
-        self.inner.grad.clone()
-    }
-    #[getter]
-    fn output(&self) -> String {
-        self.inner.output.clone()
-    }
-    #[getter]
-    fn value(&self) -> f64 {
-        self.inner.value
-    }
-}
-
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // No thread setting here: the linear solves are sequential by construction
@@ -1680,25 +1191,12 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // mean "faer sequential" and would now shrink that pool to one thread.
     m.add_class::<Circuit>()?;
     m.add_class::<PyModel>()?;
-    m.add_class::<PyOp>()?;
-    m.add_class::<PyNoise>()?;
-    m.add_class::<PySens>()?;
-    m.add_class::<PyAc>()?;
-    m.add_class::<PyPz>()?;
-    m.add_class::<PySs>()?;
-    m.add_class::<PyTs>()?;
-    m.add_class::<PyMr>()?;
-    m.add_class::<PyHb>()?;
     m.add_function(wrap_pyfunction!(parse, m)?)?;
     m.add_function(wrap_pyfunction!(value_symbol_name, m)?)?;
     m.add_function(wrap_pyfunction!(set_parallelism, m)?)?;
     m.add_function(wrap_pyfunction!(set_log_level, m)?)?;
     m.add_function(wrap_pyfunction!(drain_warnings, m)?)?;
-    m.add_function(wrap_pyfunction!(reset_factor_fx_calls, m)?)?;
-    m.add_function(wrap_pyfunction!(factor_fx_calls, m)?)?;
-    m.add_function(wrap_pyfunction!(reset_hb_synth_calls, m)?)?;
     m.add_function(wrap_pyfunction!(vectfit_verilog_a, m)?)?;
-    m.add_function(wrap_pyfunction!(hb_synth_calls, m)?)?;
     m.add_function(wrap_pyfunction!(profile_begin, m)?)?;
     m.add_function(wrap_pyfunction!(profile_take, m)?)?;
     Ok(())

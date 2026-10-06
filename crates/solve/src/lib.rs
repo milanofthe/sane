@@ -24,39 +24,6 @@
 //!    `gmin` never changes the pattern (and costs nothing when `gmin = 0`).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-/// Process-global count of sparse `G` factorizations run by `factor_fx` (the
-/// adjoint / sensitivity path). Used to assert the "factor once, K right-hand
-/// sides" contract of [`CompiledDc::hessian`] (#48) rather than one factorization
-/// per parameter. Relaxed; exact only when a single analysis runs at a time.
-static FACTOR_FX_CALLS: AtomicUsize = AtomicUsize::new(0);
-
-/// Read the [`FACTOR_FX_CALLS`] counter (for count-based sensitivity verification).
-pub fn factor_fx_calls() -> usize {
-    FACTOR_FX_CALLS.load(Ordering::Relaxed)
-}
-
-/// Reset the [`FACTOR_FX_CALLS`] counter to zero, returning the previous value.
-pub fn reset_factor_fx_calls() -> usize {
-    FACTOR_FX_CALLS.swap(0, Ordering::Relaxed)
-}
-
-/// Process-global count of HB state-waveform syntheses ([`hb`]'s `synth`, the per
-/// unknown inverse-FFT AFT). Used to assert the "synth once per Newton iteration"
-/// contract (#51): one synthesis per iteration rather than one for the residual
-/// and one for the Jacobian. Relaxed; exact only when a single HB solve runs.
-pub(crate) static HB_SYNTH_CALLS: AtomicUsize = AtomicUsize::new(0);
-
-/// Read the [`HB_SYNTH_CALLS`] counter (for count-based HB verification).
-pub fn hb_synth_calls() -> usize {
-    HB_SYNTH_CALLS.load(Ordering::Relaxed)
-}
-
-/// Reset the [`HB_SYNTH_CALLS`] counter to zero, returning the previous value.
-pub fn reset_hb_synth_calls() -> usize {
-    HB_SYNTH_CALLS.swap(0, Ordering::Relaxed)
-}
 
 use rsdag::{Crossing, SymbolId, Tape};
 use sane_core::Graph;
@@ -448,7 +415,7 @@ pub struct CompiledDc {
     iscale_rows: Vec<(usize, usize)>,
     /// User `.nodeset` targets `(unknown_index, value)`. Empty by default. When
     /// set, every *cold-started* DC solve runs a stiff-pin phase first
-    /// (symmetry breaking; see [`solve_dc_nodeset`](Self::solve_dc_nodeset)), so
+    /// (symmetry breaking; see [`solve_dc_nodeset_with`](Self::solve_dc_nodeset_with)), so
     /// all analyses honor the node-set without per-call-site plumbing. Warm
     /// (non-empty `x0`) solves ignore it -- the warm start already supersedes it.
     nodeset: Vec<(usize, f64)>,

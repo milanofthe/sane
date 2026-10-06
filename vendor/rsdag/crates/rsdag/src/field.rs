@@ -128,7 +128,7 @@ pub const EXACT_POWI_MAX: u64 = 1024;
 /// Exact integer power of a rational by repeated squaring (negative
 /// exponents invert; the caller excludes zero to a negative power).
 #[cfg(feature = "exact")]
-pub fn ratio_powi(base: &BigRational, n: i64) -> BigRational {
+fn ratio_powi(base: &BigRational, n: i64) -> BigRational {
     if n == 0 {
         return <BigRational as One>::one();
     }

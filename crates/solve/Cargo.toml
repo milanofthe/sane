@@ -8,7 +8,6 @@ description = "Numeric DC/Newton solver for SANE DAEs (sparse Jacobian, rslab sp
 
 [dependencies]
 rsdag.workspace = true
-rustc-hash.workspace = true
 sane-core.workspace = true
 sane-dae = { path = "../dae" }
 rsdag-jit = { workspace = true, optional = true }
@@ -30,8 +29,6 @@ jit = ["dep:rsdag-jit"]
 sane-veriloga = { path = "../veriloga" }
 sane-mna.workspace = true
 sane-device = { path = "../device" }
-# examples only: the tape_purity_probe loads a Verilog-A deck end to end
-sane-netlist = { path = "../netlist" }
 
 [lints]
 workspace = true

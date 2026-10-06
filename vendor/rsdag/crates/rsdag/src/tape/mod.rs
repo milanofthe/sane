@@ -159,14 +159,6 @@ impl Fold {
     pub const SUB: Fold = Fold(1);
     /// `c + d` with `c` the accumulator operand.
     pub const ADD: Fold = Fold(2);
-    /// `c - d` with `c` the product of entry `j` of the same kernel.
-    pub fn sub_self(j: u32) -> Fold {
-        Fold(1 | 4 | (j << 3))
-    }
-    /// `c + d` with `c` the product of entry `j` of the same kernel.
-    pub fn add_self(j: u32) -> Fold {
-        Fold(2 | 4 | (j << 3))
-    }
     pub fn is_plain(self) -> bool {
         self.0 & 3 == 0
     }
@@ -643,17 +635,6 @@ impl Tape {
         self.write(inputs, work, out);
     }
 
-    /// A holder for the buffers, for callers that would rather read values
-    /// than manage memory: allocates once, lends the outputs out per
-    /// evaluation.
-    pub fn runner<T: Scalar>(&self) -> Runner<'_, T> {
-        Runner {
-            tape: self,
-            work: vec![T::zero(); self.work_len()],
-            out: vec![T::zero(); self.out_len()],
-        }
-    }
-
     /// Evaluate the tape in any execution scalar (`f64`, `f32`,
     /// `Complex<f64>`): constants convert from their `f64` lowering, every
     /// op goes through [`Scalar`]'s reference arithmetic for `T`, so a value
@@ -661,8 +642,7 @@ impl Tape {
     /// `work` is resized and reused; `out` receives one value per output.
     ///
     /// The `Vec` form is the convenience over
-    /// [`eval_into`](Self::eval_into); a caller in an inner loop wants that
-    /// one or [`runner`](Self::runner).
+    /// [`eval_into`](Self::eval_into), the one a caller in an inner loop wants.
     pub fn eval<T: Scalar>(&self, inputs: &[T], work: &mut Vec<T>, out: &mut Vec<T>) {
         self.eval_with(inputs, work, out, &mut NoTrace);
     }
@@ -1011,18 +991,6 @@ impl Tape {
         self.dst[i]
     }
 
-    /// Where operand `j` of a call goes among its groups' arguments (see
-    /// [`Op::Call`]): group `j / n_in`, its argument at `j % n_in` or, with
-    /// `reads`, at the position the pool names.
-    pub fn call_places(&self, reads: u32, n_args: u32, n_in: u32) -> impl Fn(usize) -> usize + '_ {
-        let (na, ni) = (n_args as usize, n_in as usize);
-        let pos = (reads != ALL_ARGS).then(|| self.pool(reads, n_in));
-        move |j| match pos {
-            None => j,
-            Some(p) => (j / ni) * na + p[j % ni] as usize,
-        }
-    }
-
     /// The inputs the main phase reads, ascending: what a call of this
     /// tape as a body needs per evaluation once its prolog ran.
     pub fn main_reads(&self) -> Vec<u32> {
@@ -1159,44 +1127,6 @@ impl Tape {
     /// Its stages of independent calls, in op order (see [`Stage`]).
     pub fn stages(&self) -> &[Stage] {
         &self.stages
-    }
-}
-
-/// A tape with the buffers to run it, for callers that want values rather
-/// than memory management: [`Tape::runner`] allocates once, every
-/// [`eval`](Runner::eval) writes into the same buffers and lends the outputs
-/// out. One runner per thread, since it owns the work buffer.
-pub struct Runner<'t, T: Scalar> {
-    tape: &'t Tape,
-    work: Vec<T>,
-    out: Vec<T>,
-}
-
-impl<T: Scalar> Runner<'_, T> {
-    /// Evaluate at `inputs` and borrow the outputs. No allocation, no copy;
-    /// a `to_vec` on the result is the caller's choice, not the tape's.
-    pub fn eval(&mut self, inputs: &[T]) -> &[T] {
-        self.tape.eval_into(inputs, &mut self.work, &mut self.out);
-        &self.out
-    }
-
-    /// The parameter-pure prolog, once per parameter binding
-    /// ([`Tape::compile_split`]); [`main`](Runner::main) then runs per
-    /// iteration over the same buffer.
-    pub fn prolog(&mut self, inputs: &[T]) {
-        self.tape.eval_prolog_into(inputs, &mut self.work);
-    }
-
-    /// The main phase over the buffer [`prolog`](Runner::prolog) prepared.
-    pub fn main(&mut self, inputs: &[T]) -> &[T] {
-        self.tape
-            .eval_main_into(inputs, &mut self.work, &mut self.out);
-        &self.out
-    }
-
-    /// The outputs of the last evaluation.
-    pub fn outputs(&self) -> &[T] {
-        &self.out
     }
 }
 

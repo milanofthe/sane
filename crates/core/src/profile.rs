@@ -81,14 +81,6 @@ impl Profile {
         self.spans.push((name.into(), dur));
     }
 
-    /// Append another profile's spans, each prefixed with `prefix` (e.g. merging
-    /// a sub-stage profile into the top-level one under `compile/`).
-    pub fn extend_prefixed(&mut self, prefix: &str, other: &Profile) {
-        for (n, d) in &other.spans {
-            self.spans.push((format!("{prefix}{n}"), *d));
-        }
-    }
-
     /// `(stage, milliseconds)` pairs, in record order.
     pub fn millis(&self) -> Vec<(String, f64)> {
         self.spans
@@ -116,12 +108,6 @@ impl Profile {
             }
         }
         order.into_iter().zip(totals).collect()
-    }
-
-    /// Total wall time across all recorded spans (ms). Note: nested stages
-    /// double-count, so this is a sum of spans, not an exclusive total.
-    pub fn total_millis(&self) -> f64 {
-        self.spans.iter().map(|(_, d)| d.as_secs_f64() * 1e3).sum()
     }
 }
 

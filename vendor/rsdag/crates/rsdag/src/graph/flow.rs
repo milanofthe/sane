@@ -22,8 +22,6 @@ thread_local! {
 /// The operands a value passes through, and how a call passes it on.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum Through {
-    /// Every operand; a call's arguments as written, its body unseen.
-    Syntax,
     /// Every operand; of a call, the arguments its output reads.
     Reads,
     /// The operands a derivative reads (not a comparison's, not a
@@ -335,7 +333,7 @@ impl<K: Field> Graph<K> {
             let node = *self.node(e);
             let v = match node {
                 Node::Const(_) | Node::Symbol(_) => leaf(&node),
-                Node::Call(o, l) if through != Through::Syntax => {
+                Node::Call(o, l) => {
                     let (f, k) = self.output(o);
                     let (args, globals) = (self.full_args(o, l), self.globals(f));
                     let operand = |p: u32| match args.get(p as usize) {

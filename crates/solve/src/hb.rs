@@ -402,7 +402,6 @@ impl<'a> CompiledHb<'a> {
     /// the inverse real FFT, which is the unnormalised sum
     /// `Σ_k X_k e^{jkw0 t_m}` -- exactly `x(t_m)`.
     fn synth(&self, spectra: &[Vec<Complex64>]) -> Vec<Vec<f64>> {
-        crate::HB_SYNTH_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut x_time = vec![vec![0.0; self.m]; self.n];
         let mut spec = self.c2r.make_input_vec();
         for i in 0..self.n {

@@ -259,8 +259,8 @@ fn convergence_criterion_presets_solve() {
     );
     let out = cdc_unknown_index(&dae, "v2");
 
-    let (xd, cd, _) = cdc.solve_dc_conv(&p, &[], Convergence::default(), 100);
-    let (xs, cs, _) = cdc.solve_dc_conv(&p, &[], Convergence::spice(), 100);
+    let (xd, cd, _) = cdc.solve_dc_conv_with(&p, &[], Convergence::default(), 100, cdc.tricks());
+    let (xs, cs, _) = cdc.solve_dc_conv_with(&p, &[], Convergence::spice(), 100, cdc.tricks());
     assert!(cd && cs, "both presets must converge");
     // Same physical root regardless of how tightly it was chased.
     assert!(
@@ -271,7 +271,7 @@ fn convergence_criterion_presets_solve() {
     );
 
     // The default-converged residual meets the tight per-row floor.
-    let res = cdc.residual(&xd, &vec![0.0; cdc.dim()], &p, 0.0);
+    let res = cdc.currents(&xd, &p, 0.0);
     assert!(
         cdc.residual_converged(&res, &xd, GMIN_DC, &Convergence::default()),
         "default solve must satisfy its own residual criterion"
@@ -471,7 +471,7 @@ fn partitioned_solve_matches_residual() {
     let (x, conv, _) = cdc.solve_dc(&p, &[], 1e-10, 100);
     assert!(conv, "partitioned DC did not converge");
     // The currents at the solution must be ~zero (DC).
-    let r = cdc.residual(&x, &vec![0.0; cdc.dim()], &p, 0.0);
+    let r = cdc.currents(&x, &p, 0.0);
     let rnorm = r.iter().map(|v| v * v).sum::<f64>().sqrt();
     assert!(
         rnorm < 1e-8,
@@ -759,7 +759,7 @@ fn device_limiting_preserves_operating_point() {
         ..SolverTricks::default()
     };
     let (x_off, c_off, _) = cdc.solve_dc(&p, &[], 1e-10, 100);
-    let (x_on, c_on, _) = cdc.solve_dc_with(&p, &[], 1e-10, 100, on);
+    let (x_on, c_on, _) = cdc.solve_dc_conv_with(&p, &[], Convergence::from_tol(1e-10), 100, on);
     assert!(
         c_off && c_on,
         "MOSFET CS did not converge (off={c_off}, on={c_on})"
@@ -795,7 +795,7 @@ fn device_limiting_preserves_operating_point() {
         ],
     );
     let (x_off, c_off, _) = cdc.solve_dc(&p, &[], 1e-12, 100);
-    let (x_on, c_on, _) = cdc.solve_dc_with(&p, &[], 1e-12, 100, on);
+    let (x_on, c_on, _) = cdc.solve_dc_conv_with(&p, &[], Convergence::from_tol(1e-12), 100, on);
     assert!(
         c_off && c_on,
         "diode did not converge (off={c_off}, on={c_on})"

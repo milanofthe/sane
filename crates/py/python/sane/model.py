@@ -447,15 +447,6 @@ class Model:
         """The system dimension ``len(unknowns)`` (int)."""
         return self._d.dim()
 
-    @property
-    def profile(self):
-        """Per-stage extraction timings as a list of ``(stage, milliseconds)``,
-        in execution order: ``assemble`` (graph/residual build) followed by the
-        ``compile/...`` sub-stages (sparse Jacobians, tape compilation, symbolic
-        LU, block classification). Empty for models produced by :meth:`reduce` /
-        :meth:`eliminate`, which rebuild only the solver, not the graph."""
-        return list(self._d.profile)
-
     # --- internal helpers --------------------------------------------------
 
     #: Newton tolerance (max-norm of the residual) for the internal DC solve

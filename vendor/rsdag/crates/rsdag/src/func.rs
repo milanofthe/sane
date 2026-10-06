@@ -79,7 +79,6 @@ pub struct Function {
     output_roles: Vec<OutputRole>,
     /// The numeric bundle of an extern function; `None` for a symbolic one.
     extern_body: Option<Arc<dyn ExternBundle>>,
-    compiled: Vec<Body>,
     /// The interpreted bodies [`body_for`](Function::body_for) built, one per
     /// set of outputs a program asked for: every later program over the
     /// graph that calls a subset of one takes it, so a body is compiled once
@@ -194,7 +193,6 @@ impl Function {
             outputs: Vec::new(),
             output_roles: Vec::new(),
             extern_body,
-            compiled: Vec::new(),
             interpreted: Default::default(),
             deriv_index: HashMap::default(),
             support: Default::default(),
@@ -315,10 +313,6 @@ impl Function {
         cache[out as usize] = Some(support);
     }
 
-    pub(crate) fn compiled_mut(&mut self) -> &mut Vec<Body> {
-        &mut self.compiled
-    }
-
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -342,18 +336,6 @@ impl Function {
     pub fn extern_body(&self) -> Option<&Arc<dyn ExternBundle>> {
         self.extern_body.as_ref()
     }
-    /// The bodies a consumer compiled itself and registered with
-    /// [`Graph::set_func_body`](crate::Graph::set_func_body), used in place
-    /// of the interpreted body of a symbolic function (a consumer's body may
-    /// cache work over its solve-constant arguments, say) by every program
-    /// whose calls it covers ([`Function::body_for`]); a program that calls
-    /// an expression output it lacks (a derivative demanded later) takes the
-    /// interpreted body until the consumer registers one that covers it.
-    /// The symbolic outputs stay: differentiation and printing read them,
-    /// only the evaluation goes through the registered bundle.
-    pub fn compiled(&self) -> &[Body] {
-        &self.compiled
-    }
 
     /// The function as something to call: an extern function is its bundle
     /// with the slot of each output, a symbolic one is its body compiled to
@@ -365,7 +347,7 @@ impl Function {
     }
 
     /// [`body`](Self::body) for a program that calls the outputs `needed`:
-    /// among the registered bodies that carry each of them that is an
+    /// among the bodies built so far that carry each of them that is an
     /// expression, the one computing the fewest outputs; else the body of
     /// exactly those outputs, interpreted.
     pub fn body_for<K: crate::field::Field>(
@@ -373,10 +355,6 @@ impl Function {
         ctx: &crate::graph::Graph<K>,
         needed: &[u32],
     ) -> Body {
-        let covering = self.compiled.iter().filter(|c| self.covers(c, needed));
-        if let Some(c) = covering.min_by_key(|c| c.bundle.n_outputs()) {
-            return c.clone();
-        }
         if self.extern_body.is_none() {
             let built = self.interpreted.lock().unwrap();
             let covering = built.iter().filter(|c| self.covers(c, needed));
@@ -456,13 +434,6 @@ impl Function {
             !matches!(self.outputs[k as usize], Output::Expr(_))
                 || body.slot_of.get(k as usize).is_some_and(|s| s.is_some())
         })
-    }
-
-    /// Indices of the parameters carrying `role`, in argument order.
-    pub fn params_with_role(&self, role: impl Fn(&ParamRole) -> bool) -> Vec<u32> {
-        (0..self.params.len() as u32)
-            .filter(|&i| role(&self.param_roles[i as usize]))
-            .collect()
     }
 
     /// Indices of the outputs carrying `role`, in output order.

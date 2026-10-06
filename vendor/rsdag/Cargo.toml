@@ -3,21 +3,19 @@ resolver = "2"
 members = ["crates/rsdag", "crates/rsdag-jit"]
 
 [workspace.package]
-version = "2.0.0"
+version = "3.0.0"
 edition = "2021"
 license = "AGPL-3.0-only"
 authors = ["Milan Rother"]
 repository = "https://github.com/milanofthe/rsdag"
 
 [workspace.dependencies]
-rsdag = { path = "crates/rsdag", version = "2.0.0" }
+rsdag = { path = "crates/rsdag", version = "3.0.0" }
 num-bigint = "0.4"
 num-rational = "0.4"
 num-traits = "0.2"
-num-complex = "0.4"
 rustc-hash = "2"
 libm = "0.2"
-egg = "0.9"
 rayon = "1"
 
 [workspace.lints.clippy]

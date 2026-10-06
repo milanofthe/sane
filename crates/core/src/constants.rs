@@ -46,15 +46,6 @@ pub const TEMP_SYMBOL: &str = "$temp";
 /// far above any physical junction current yet far below `f64::MAX`.
 pub const EXP_VCRIT: f64 = 40.0;
 
-/// Thermal voltage kT/q at the nominal temperature (~300 K). SPICE derives this
-/// from `temp`; decks never state it, so it is the default for junction `Vt`.
-pub const THERMAL_VOLTAGE: f64 = 0.025852;
-
-/// Stand-in for an infinite Early voltage (ngspice's default when `VAF`/`VAR`
-/// are unspecified): large enough that `1/VAf` is numerically negligible, so the
-/// base-width-modulation term vanishes and transport is ideal.
-pub const EARLY_INF: f64 = 1e12;
-
 /// Default companion conductance for homotopy continuation (see
 /// [`sane_device::DeviceModel::companion`]). A ~1 S conductance star makes the
 /// `lambda = 0` linear network strongly regular (it dominates typical device

@@ -302,53 +302,6 @@ impl<K: Field> Graph<K> {
         all.iter().map(SymbolId).collect()
     }
 
-    /// Which outputs of `f` structurally read which of its parameters:
-    /// `feedthrough(f)[out][param]`.
-    ///
-    /// Structural, not numeric: it asks whether the parameter occurs in the
-    /// output's expression at all, so it costs one walk per output and needs
-    /// no differentiation. That is the question a block scheduler asks --
-    /// direct feedthrough decides the evaluation order, and a cycle among
-    /// the blocks that have it is an algebraic loop.
-    ///
-    /// An extern output is opaque and is reported as reading every
-    /// parameter, which is the safe direction: it can cost an ordering
-    /// constraint, never a missed loop. A zero output reads nothing.
-    pub fn feedthrough(&self, f: FuncId) -> Vec<Vec<bool>> {
-        let n = self.funcs[f.0 as usize].params().len();
-        let all: Vec<u32> = (0..n as u32).collect();
-        self.reads(f, Through::Syntax, &all)
-            .iter()
-            .map(|r| {
-                let mut row = vec![false; n];
-                r.iter().for_each(|&p| row[p as usize] = true);
-                row
-            })
-            .collect()
-    }
-
-    /// Jacobian of the outputs of `f` with a role against its parameters with
-    /// a role: `(output index, param index, derivative output index)` for
-    /// every structurally nonzero pair, differentiating on demand.
-    pub fn jacobian_by_role(
-        &mut self,
-        f: FuncId,
-        out_role: impl Fn(&OutputRole) -> bool,
-        param_role: impl Fn(&ParamRole) -> bool,
-    ) -> Vec<(u32, u32, u32)> {
-        let outs = self.funcs[f.0 as usize].outputs_with_role(out_role);
-        let pars = self.funcs[f.0 as usize].params_with_role(param_role);
-        let mut entries = Vec::new();
-        for &o in &outs {
-            for (&p, k) in pars.iter().zip(self.derivative_outputs(f, o, &pars)) {
-                if !matches!(self.funcs[f.0 as usize].outputs()[k as usize], Output::Zero) {
-                    entries.push((o, p, k));
-                }
-            }
-        }
-        entries
-    }
-
     /// Define an extern function over `arity` arguments whose outputs are the
     /// given slots of `body` (or [`Output::Zero`]). Derivative outputs the body
     /// carries are declared with [`declare_derivative`](Self::declare_derivative).
@@ -407,27 +360,6 @@ impl<K: Field> Graph<K> {
     /// Number of symbols.
     pub fn n_symbols(&self) -> usize {
         self.symbol_names.len()
-    }
-
-    /// Register a body a consumer compiled for the symbolic function `f`:
-    /// from now on a tape calls `body` (see [`Function::compiled`]). A tape
-    /// compiled before keeps the body it was compiled with.
-    pub fn set_func_body(&mut self, f: FuncId, body: crate::func::Body) {
-        assert!(
-            !self.funcs[f.0 as usize].is_extern(),
-            "an extern function is its own body"
-        );
-        // Several bodies may serve one function (a residual-only one and
-        // one with the partials); a program takes the smallest that covers
-        // the outputs it calls.
-        let bodies = self.funcs[f.0 as usize].compiled_mut();
-        let ptr = Arc::as_ptr(&body.bundle) as *const () as usize;
-        if !bodies
-            .iter()
-            .any(|b| Arc::as_ptr(&b.bundle) as *const () as usize == ptr)
-        {
-            bodies.push(body);
-        }
     }
 
     pub fn n_funcs(&self) -> usize {
@@ -616,14 +548,6 @@ impl<K: Field> Graph<K> {
         }
     }
 
-    /// The expression of a symbolic output, `None` for a slot or zero output.
-    pub fn output_expr(&self, f: FuncId, out: u32) -> Option<ExprId> {
-        match self.funcs[f.0 as usize].outputs()[out as usize] {
-            Output::Expr(e) => Some(e),
-            _ => None,
-        }
-    }
-
     /// Output `out` of `f` applied to `args` (one argument per parameter). A
     /// zero output folds to the constant zero.
     pub fn call(&mut self, f: FuncId, out: u32, args: &[ExprId]) -> ExprId {
@@ -672,14 +596,6 @@ impl<K: Field> Graph<K> {
             self.list_shape.insert((ctx, l), shape);
         }
         self.intern(Node::Call(o, l))
-    }
-
-    /// [`call`](Self::call) by output id.
-    pub fn call_output(&mut self, o: OutputId, args: &[ExprId]) -> ExprId {
-        let (f, out) = self.output(o);
-        let ctx = self.context_of(o);
-        let l = self.intern_args(args);
-        self.call_list_in(f, out, ctx, l)
     }
 
     /// The call of output `o` over [`operands`](Self::operands): its
@@ -761,32 +677,6 @@ impl<K: Field> Graph<K> {
             .iter()
             .map(|&p| self.derivative_output(f, out, p))
             .collect()
-    }
-
-    /// Inline a call: the output expression with the parameters replaced by
-    /// `args`. `None` for an extern (slot) output, which has no body to inline.
-    pub fn inline_call(&mut self, f: FuncId, out: u32, args: &[ExprId]) -> Option<ExprId> {
-        match self.funcs[f.0 as usize].outputs()[out as usize] {
-            Output::Slot(_) => None,
-            _ => Some(self.inline_outputs(f, &[out], args)[0]),
-        }
-    }
-
-    /// Inline several outputs of a symbolic function at once, with one shared
-    /// substitution pass (the outputs of a device template share its core, so
-    /// per-output substitution would rebuild that core per output).
-    pub fn inline_outputs(&mut self, f: FuncId, outs: &[u32], args: &[ExprId]) -> Vec<ExprId> {
-        let map = self.binding(f, args);
-        let func = &self.funcs[f.0 as usize];
-        let exprs: Vec<ExprId> = outs
-            .iter()
-            .map(|&o| match func.outputs()[o as usize] {
-                Output::Expr(e) => e,
-                Output::Zero => self.zero,
-                Output::Slot(_) => panic!("cannot inline an extern function output"),
-            })
-            .collect();
-        crate::transform::substitute(self, &exprs, &map)
     }
 
     /// Every `(function, output)` called anywhere in `exprs` (one pass over

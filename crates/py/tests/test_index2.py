@@ -68,26 +68,20 @@ def build(deck):
     [(CV_LOOP, "V1", {"C1", "C2"}), (CAP_ACROSS_SOURCE, "V1", {"C1"})],
 )
 def test_capacitor_source_loops_are_detected_and_named(deck, source, storage):
-    model, msg = build(deck)
-    loops = model._d.index2()["cv_loops"]
-    assert len(loops) == 1, loops
-    assert loops[0][0] == source
-    assert set(loops[0][1:]) == storage
-    assert msg is not None and source in msg
+    _, msg = build(deck)
+    assert msg is not None and "capacitor/voltage-source loop" in msg
+    assert all(name in msg for name in {source, *storage}), msg
 
 
 def test_inductor_source_cutsets_are_detected_and_named():
-    model, msg = build(LI_CUTSET)
-    cutsets = model._d.index2()["li_cutsets"]
-    assert cutsets == [["I1", "L1"]]
-    assert msg is not None and "cutset" in msg
+    _, msg = build(LI_CUTSET)
+    assert msg is not None and "inductor/current-source cutset" in msg
+    assert "I1" in msg and "L1" in msg, msg
 
 
 @pytest.mark.parametrize("deck", [INDEX1_REFERENCE, "V1 n1 0 SIN(0 1 15.9155)\nR1 n1 n2 1\nC1 n2 0 1\n.end\n"])
 def test_ordinary_decks_are_index_1_and_silent(deck):
-    model, msg = build(deck)
-    report = model._d.index2()
-    assert report == {"cv_loops": [], "li_cutsets": []}
+    _, msg = build(deck)
     assert msg is None
 
 

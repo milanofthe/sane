@@ -516,9 +516,8 @@ impl CompiledDc {
     /// if it stalls, falls back through the continuation tricks. Returns
     /// `(x, converged, iterations)`. The scalar `tol` is the absolute residual
     /// floor of the per-component criterion ([`Convergence::from_tol`]); use
-    /// [`solve_dc_conv`](Self::solve_dc_conv) for full `reltol`/`abstol`/`vntol`
-    /// control, or [`solve_dc_with`](Self::solve_dc_with) for explicit
-    /// [`SolverTricks`].
+    /// [`solve_dc_conv_with`](Self::solve_dc_conv_with) for full
+    /// `reltol`/`abstol`/`vntol` control and explicit [`SolverTricks`].
     pub fn solve_dc(
         &self,
         p: &[f64],
@@ -527,31 +526,6 @@ impl CompiledDc {
         max_iter: usize,
     ) -> (Vec<f64>, bool, usize) {
         self.solve_dc_conv_with(p, x0, Convergence::from_tol(tol), max_iter, self.tricks)
-    }
-
-    /// DC operating point with an explicit set of [`SolverTricks`] (scalar `tol`,
-    /// mapped via [`Convergence::from_tol`]).
-    pub fn solve_dc_with(
-        &self,
-        p: &[f64],
-        x0: &[f64],
-        tol: f64,
-        max_iter: usize,
-        tricks: SolverTricks,
-    ) -> (Vec<f64>, bool, usize) {
-        self.solve_dc_conv_with(p, x0, Convergence::from_tol(tol), max_iter, tricks)
-    }
-
-    /// DC operating point with an explicit per-component [`Convergence`] criterion
-    /// and the default convergence aids.
-    pub fn solve_dc_conv(
-        &self,
-        p: &[f64],
-        x0: &[f64],
-        conv: Convergence,
-        max_iter: usize,
-    ) -> (Vec<f64>, bool, usize) {
-        self.solve_dc_conv_with(p, x0, conv, max_iter, self.tricks)
     }
 
     /// DC operating point with an explicit [`Convergence`] criterion and
@@ -714,7 +688,7 @@ impl CompiledDc {
     }
 
     /// The full DC cascade with an explicit node-set (the registered one for the
-    /// public entries, the per-call one for [`Self::solve_dc_nodeset`]), so basin
+    /// public entries, the per-call one for [`Self::solve_dc_nodeset_with`]), so basin
     /// selection reaches every stage rather than only the cold-start seed.
     fn dc_cascade(
         &self,
@@ -1022,24 +996,12 @@ impl CompiledDc {
     /// a list of `(unknown_index, target_value)`. Phase 1 solves the *stiff-pinned*
     /// system so the solution lands near the targets (breaking the symmetry of a
     /// bistable circuit onto one branch); phase 2 removes the pin and runs the
-    /// full robust cascade ([`solve_dc_with`](Self::solve_dc_with)) warm-started
-    /// from phase 1, so the converged operating point is exact. With no node-sets
-    /// it is exactly a plain [`solve_dc`](Self::solve_dc). (Analyses normally use
-    /// [`set_nodeset`](Self::set_nodeset) instead, which routes every solve through
-    /// the same phase-1 automatically.)
-    pub fn solve_dc_nodeset(
-        &self,
-        p: &[f64],
-        nodeset: &[(usize, f64)],
-        conv: Convergence,
-        max_iter: usize,
-    ) -> (Vec<f64>, bool, usize) {
-        self.solve_dc_nodeset_with(p, nodeset, conv, max_iter, self.tricks)
-    }
-
-    /// [`Self::solve_dc_nodeset`] with an explicit trick set. The per-call
+    /// full robust cascade warm-started from phase 1, so the converged operating
+    /// point is exact. With no node-sets it is a plain cascade. The per-call
     /// node-set flows into every cascade stage (the basin re-pin of the source
-    /// continuation included), exactly like a registered one.
+    /// continuation included), exactly like a registered one. (Analyses normally
+    /// use [`set_nodeset`](Self::set_nodeset) instead, which routes every solve
+    /// through the same phase 1 automatically.)
     pub fn solve_dc_nodeset_with(
         &self,
         p: &[f64],

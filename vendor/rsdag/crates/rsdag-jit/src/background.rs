@@ -14,14 +14,11 @@ use std::sync::OnceLock;
 
 type Job = Box<dyn FnOnce() + Send>;
 
-/// The compile pool: half the cores (at least one) unless
-/// [`set_threads`] ran first.
+/// The compile pool: half the cores (at least one).
 pub fn pool() -> &'static rayon::ThreadPool {
     POOL.get_or_init(|| {
-        let n = THREADS.get().copied().unwrap_or_else(|| {
-            let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
-            (cores / 2).max(1)
-        });
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let n = (cores / 2).max(1);
         rayon::ThreadPoolBuilder::new()
             .num_threads(n)
             .thread_name(|i| format!("rsdag-jit-{i}"))
@@ -31,27 +28,12 @@ pub fn pool() -> &'static rayon::ThreadPool {
 }
 
 static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
-static THREADS: OnceLock<usize> = OnceLock::new();
-
-/// Size the compile pool before its first use; `false` when it is too
-/// late (the pool exists, or a size was set already).
-pub fn set_threads(n: usize) -> bool {
-    POOL.get().is_none() && THREADS.set(n.max(1)).is_ok()
-}
 
 /// Run `job` on the compile pool, after every job submitted before it.
 /// The submission is one channel send, so it costs the caller nothing
 /// measurable; a panic in the job is caught and ends only the job.
 pub fn submit(job: impl FnOnce() + Send + 'static) {
     let _ = queue().send(Box::new(job));
-}
-
-/// Run `job` on the compile pool now, beside whatever the queue is running
-/// (for independent compiles, a consumer's function bodies say).
-pub fn spawn(job: impl FnOnce() + Send + 'static) {
-    pool().spawn(move || {
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
-    });
 }
 
 fn queue() -> &'static Sender<Job> {

@@ -62,10 +62,6 @@ impl Degree {
             None => Degree::Unbounded,
         }
     }
-    /// The degree as a number, `None` when unbounded.
-    pub fn finite_value(self) -> Option<u32> {
-        self.value()
-    }
 }
 
 /// A set of unary ops, one bit each.

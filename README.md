@@ -226,7 +226,7 @@ resolve in order: unknown name → node name → source branch current.
 - `params: list[str]`, `values: dict[str, float]`
 - `node_names: list[str]`
 - `unknown_index(ref) -> int`, `unknown_name(ref) -> str`
-- `profile: list[(stage, ms)]`, `transforms`, `eliminated`
+- `transforms`, `eliminated`
 - `core` *(raw `_core.Model`)*
 
 ## `Model` — transforms
@@ -396,8 +396,7 @@ See `crates/analysis/tests/embed.rs` for a worked acceptance suite.
 
 Every run-time switch of the engine is a field of `sane_core::Config`, documented there. The
 configuration is read from the environment once, on first use, and a host sets it directly
-with `sane_core::set_config` or `update_config` (the browser build, for example, selects the
-interpreter-friendly tape schedule). The variables below override the defaults for A/B
+with `sane_core::set_config` or `update_config`. The variables below override the defaults for A/B
 benchmarking and debugging; the log level (`SANE_LOG`) and the test-corpus locations
 (`SANE_VA_CORPUS`, `SANE_OPENVAF_BIN`) are read where they are used.
 

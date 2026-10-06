@@ -2,7 +2,6 @@
 //! retired native Rust models' test suite: closed-form currents per region,
 //! breakdown, polarity folding, switch conductance, BJT KCL and Early effect.
 
-use num_complex::Complex64;
 use rsdag::{eval, ExprId, Node, SymbolId};
 use sane_core::constants::{K_OVER_Q, TEMP_NOMINAL_K, TEMP_SYMBOL};
 use sane_core::Graph;
@@ -26,7 +25,7 @@ fn currents(
         .terminal_currents
 }
 
-fn env_of(ctx: &mut Graph, vals: &[(&str, f64)]) -> HashMap<SymbolId, Complex64> {
+fn env_of(ctx: &mut Graph, vals: &[(&str, f64)]) -> HashMap<SymbolId, f64> {
     // The models read the global `$temp` and per-instance Tnom/Eg/XTI; default
     // them to nominal (temperature scalings become identities) for every
     // instance referenced, unless the test overrides them.
@@ -47,7 +46,7 @@ fn env_of(ctx: &mut Graph, vals: &[(&str, f64)]) -> HashMap<SymbolId, Complex64>
     for (name, x) in &all {
         let id = ctx.sym(name);
         if let Node::Symbol(s) = ctx.node(id) {
-            env.insert(*s, Complex64::new(*x, 0.0));
+            env.insert(*s, *x);
         }
     }
     env
@@ -61,7 +60,7 @@ fn diode_current_matches_formula() {
         &mut ctx,
         &[("va", 0.7), ("vk", 0.0), ("D1.Is", 1e-14), ("D1.N", 1.0)],
     );
-    let got = eval(&ctx, &[i[0]], &env)[0].re;
+    let got = eval(&ctx, &[i[0]], &env)[0];
     let vt = K_OVER_Q * TEMP_NOMINAL_K;
     let want = 1e-14 * ((0.7_f64 / (1.0 * vt)).exp() - 1.0);
     assert!(
@@ -69,7 +68,7 @@ fn diode_current_matches_formula() {
         "got {got} want {want}"
     );
     // KCL: anode + cathode current sum to zero.
-    assert!((eval(&ctx, &[i[0]], &env)[0].re + eval(&ctx, &[i[1]], &env)[0].re).abs() < 1e-12);
+    assert!((eval(&ctx, &[i[0]], &env)[0] + eval(&ctx, &[i[1]], &env)[0]).abs() < 1e-12);
 }
 
 #[test]
@@ -94,7 +93,7 @@ fn diode_breakdown_clamps_in_reverse() {
         let mut vals = vec![("va", 0.0), ("vk", -vd)]; // va - vk = vd
         vals.extend_from_slice(&params);
         let env = env_of(ctx, &vals);
-        eval(ctx, &[i[0]], &env)[0].re
+        eval(ctx, &[i[0]], &env)[0]
     };
     let i_bv = id_at(&mut ctx, -5.6);
     assert!(
@@ -140,24 +139,21 @@ fn mosfet_regions() {
     // Saturation: vds=1.8 >= vov.
     let env = env_of(&mut ctx, &base(1.8, 1.2));
     let want_sat = 0.5 * k * vov * vov;
-    assert!((eval(&ctx, &[i[0]], &env)[0].re - want_sat).abs() <= want_sat * 1e-9);
-    assert!(
-        eval(&ctx, &[i[1]], &env)[0].re.abs() < 1e-15,
-        "gate current"
-    );
+    assert!((eval(&ctx, &[i[0]], &env)[0] - want_sat).abs() <= want_sat * 1e-9);
+    assert!(eval(&ctx, &[i[1]], &env)[0].abs() < 1e-15, "gate current");
 
     // Triode: vds=0.1 < vov.
     let env = env_of(&mut ctx, &base(0.1, 1.2));
     let want_tri = k * (vov * 0.1 - 0.5 * 0.1 * 0.1);
-    assert!((eval(&ctx, &[i[0]], &env)[0].re - want_tri).abs() <= want_tri * 1e-9);
+    assert!((eval(&ctx, &[i[0]], &env)[0] - want_tri).abs() <= want_tri * 1e-9);
 
     // Subthreshold (weak inversion): 0.2 V below Vth is a small exponential
     // leakage, decaying ~exp(vov/(n*Vt)).
     let vt = K_OVER_Q * TEMP_NOMINAL_K;
     let e02 = env_of(&mut ctx, &base(1.8, 0.2));
-    let i_02 = eval(&ctx, &[i[0]], &e02)[0].re;
+    let i_02 = eval(&ctx, &[i[0]], &e02)[0];
     let e03 = env_of(&mut ctx, &base(1.8, 0.3));
-    let i_03 = eval(&ctx, &[i[0]], &e03)[0].re;
+    let i_03 = eval(&ctx, &[i[0]], &e03)[0];
     assert!(i_02 > 0.0 && i_02 < 1e-6, "subthreshold leakage {i_02}");
     let ratio = i_03 / i_02; // 0.1 V step in vgs (n = 1)
     let expect = (0.1_f64 / vt).exp();
@@ -167,7 +163,7 @@ fn mosfet_regions() {
     );
     // Deep cutoff: 1.4 V below Vth -> negligible.
     let edeep = env_of(&mut ctx, &base(1.8, -1.0));
-    let i_deep = eval(&ctx, &[i[0]], &edeep)[0].re;
+    let i_deep = eval(&ctx, &[i[0]], &edeep)[0];
     assert!(i_deep < 1e-12, "deep cutoff {i_deep}");
 }
 
@@ -208,27 +204,24 @@ fn pmos_regions() {
     // Saturation: vsd = 1.8 >= vov -> Id = -0.5*k*vov^2 (negative for P).
     let env = env_of(&mut ctx, &base(3.2, 3.8));
     let want_sat = -0.5 * k * vov * vov;
-    assert!((eval(&ctx, &[i[0]], &env)[0].re - want_sat).abs() <= want_sat.abs() * 1e-9);
-    assert!(
-        eval(&ctx, &[i[1]], &env)[0].re.abs() < 1e-15,
-        "gate current"
-    );
+    assert!((eval(&ctx, &[i[0]], &env)[0] - want_sat).abs() <= want_sat.abs() * 1e-9);
+    assert!(eval(&ctx, &[i[1]], &env)[0].abs() < 1e-15, "gate current");
 
     // Subthreshold: vsg = 0.2 -> small negative exponential leakage.
     let ecut = env_of(&mut ctx, &base(3.2, 4.8));
-    let i_cut = eval(&ctx, &[i[0]], &ecut)[0].re;
+    let i_cut = eval(&ctx, &[i[0]], &ecut)[0];
     assert!(
         i_cut < 0.0 && i_cut.abs() < 1e-6,
         "subthreshold leakage {i_cut}"
     );
     // Deep cutoff: vsg = -0.6 -> negligible.
     let edeep = env_of(&mut ctx, &base(3.2, 5.6));
-    let i_deep = eval(&ctx, &[i[0]], &edeep)[0].re;
+    let i_deep = eval(&ctx, &[i[0]], &edeep)[0];
     assert!(i_deep.abs() < 1e-12, "deep cutoff {i_deep}");
 
     // KCL closes: drain + source currents sum to zero (gate is 0).
     let env = env_of(&mut ctx, &base(3.2, 3.8));
-    let sum = eval(&ctx, &[i[0]], &env)[0].re + eval(&ctx, &[i[2]], &env)[0].re;
+    let sum = eval(&ctx, &[i[0]], &env)[0] + eval(&ctx, &[i[2]], &env)[0];
     assert!(sum.abs() < 1e-15, "KCL: {sum}");
 }
 
@@ -249,13 +242,13 @@ fn vswitch_on_and_off() {
     let mut on = pars.to_vec();
     on.extend([("cp", 1.0), ("cm", 0.0)]);
     let env = env_of(&mut ctx, &on);
-    assert!((eval(&ctx, &[i[0]], &env)[0].re - 0.2).abs() < 1e-9);
+    assert!((eval(&ctx, &[i[0]], &env)[0] - 0.2).abs() < 1e-9);
 
     // Off: control 0.0 << Vt-Vh -> fully off, i = (Va-Vb)/Roff = 2e-6.
     let mut off = pars.to_vec();
     off.extend([("cp", 0.0), ("cm", 0.0)]);
     let env = env_of(&mut ctx, &off);
-    assert!((eval(&ctx, &[i[0]], &env)[0].re - 2e-6).abs() < 1e-12);
+    assert!((eval(&ctx, &[i[0]], &env)[0] - 2e-6).abs() < 1e-12);
 
     // Mid-window (control exactly at Vt, wide Vh): smoothstep = 0.5, so the
     // log-interpolated conductance is the geometric mean sqrt(Gon*Goff).
@@ -271,7 +264,7 @@ fn vswitch_on_and_off() {
     let env = env_of(&mut ctx, &mid);
     let g_mid = (0.1_f64 * 1e-6).sqrt(); // sqrt(Gon*Goff)
     assert!(
-        (eval(&ctx, &[i[0]], &env)[0].re - 2.0 * g_mid).abs() < 1e-9 * (2.0 * g_mid),
+        (eval(&ctx, &[i[0]], &env)[0] - 2.0 * g_mid).abs() < 1e-9 * (2.0 * g_mid),
         "mid-window conductance should be the geometric mean"
     );
 }
@@ -300,9 +293,9 @@ fn bjt_kcl_and_beta() {
             ("Q1.NC", 2.0),
         ],
     );
-    let ic = eval(&ctx, &[i[0]], &env)[0].re;
-    let ib = eval(&ctx, &[i[1]], &env)[0].re;
-    let ie = eval(&ctx, &[i[2]], &env)[0].re;
+    let ic = eval(&ctx, &[i[0]], &env)[0];
+    let ib = eval(&ctx, &[i[1]], &env)[0];
+    let ie = eval(&ctx, &[i[2]], &env)[0];
     assert!(
         (ic + ib + ie).abs() <= 1e-12 * (1.0 + ic.abs()),
         "KCL: {ic}+{ib}+{ie}"
@@ -341,8 +334,8 @@ fn bjt_early_effect_finite_output_resistance() {
     };
     let e1 = env_at(&mut ctx, 5.0);
     let e2 = env_at(&mut ctx, 6.0);
-    let ic1 = eval(&ctx, &[i[0]], &e1)[0].re;
-    let ic2 = eval(&ctx, &[i[0]], &e2)[0].re;
+    let ic1 = eval(&ctx, &[i[0]], &e1)[0];
+    let ic2 = eval(&ctx, &[i[0]], &e2)[0];
     let gce = (ic2 - ic1) / 1.0;
     let want = ic1 / vaf;
     assert!((gce - want).abs() <= want * 0.05, "gce={gce}, want~{want}");

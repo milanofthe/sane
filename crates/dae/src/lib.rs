@@ -188,9 +188,9 @@ impl Dae {
     /// outputs of the same row, and every switching surface as a `Guard`
     /// output with its crossing direction.
     ///
-    /// Nothing calls this function; it is how the system layer states what it
-    /// is, so a consumer (SANE's own solver, an exporter, another backend)
-    /// reads the structure off the graph instead of off SANE-side metadata.
+    /// This is how the system layer states what it is: a consumer (SANE's own
+    /// solver, an exporter, another backend) reads the structure off the graph
+    /// instead of off SANE-side metadata.
     pub fn register_function(&self, ctx: &mut Graph, name: &str) -> rsdag::FuncId {
         let mut params: Vec<SymbolId> = Vec::with_capacity(self.x.len() * 2 + 1);
         let mut roles: Vec<rsdag::ParamRole> = Vec::with_capacity(params.capacity());
@@ -442,10 +442,7 @@ pub type Coo = (Vec<usize>, Vec<usize>, Vec<ExprId>);
 pub(crate) fn coo(ctx: &mut Graph, rows: &[ExprId], cols: &[(usize, SymbolId)]) -> Coo {
     let wrt: Vec<SymbolId> = cols.iter().map(|&(_, s)| s).collect();
     let mut out = Coo::default();
-    for (i, row) in sparse_jacobian(ctx, rows, &wrt)
-        .into_iter()
-        .enumerate()
-    {
+    for (i, row) in sparse_jacobian(ctx, rows, &wrt).into_iter().enumerate() {
         for (j, e) in row {
             out.0.push(i);
             out.1.push(cols[j].0);

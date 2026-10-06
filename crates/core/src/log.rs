@@ -7,7 +7,7 @@
 //! Python's `logging`: `HH:MM:SS - LEVEL - message`.
 //!
 //! Disabled by default, so library use and the test/bench suites stay silent.
-//! Hosts opt in via [`set_level`] / [`set_enabled`] (the Python API exposes
+//! Hosts opt in via [`set_level`] (the Python API exposes
 //! `sane.set_log_level(...)`).
 
 use crate::time::Instant;
@@ -85,15 +85,6 @@ pub fn on_level_change(hook: fn(LogLevel)) {
         hooks.push(hook);
     }
     hook(level());
-}
-
-/// Convenience: enable at INFO, or disable entirely.
-pub fn set_enabled(on: bool) {
-    set_level(if on {
-        LogLevel::Info
-    } else {
-        LogLevel::Disabled
-    });
 }
 
 /// The current global threshold.
@@ -396,14 +387,9 @@ pub struct ProgressTracker {
 
 impl ProgressTracker {
     /// `total` is a human-facing magnitude for the start line (e.g. simulated
-    /// seconds, number of points); progress passed to [`update`] is a fraction
-    /// in `[0, 1]`.
-    pub fn new(total: f64, description: &str) -> Self {
-        Self::with_details(total, description, "")
-    }
-
-    /// Like [`new`](Self::new), with a separate details clause: the STARTING
-    /// line reads `STARTING -> <description> <details>`, the closing line
+    /// seconds, number of points); progress passed to [`update`](Self::update)
+    /// is a fraction in `[0, 1]`. The STARTING line reads
+    /// `STARTING -> <description> <details>`, the closing line
     /// `FINISHED -> <description> (steps: .., ok: .., runtime: ..)` -- the
     /// pathsim/fastsim vocabulary.
     pub fn with_details(total: f64, description: &str, details: &str) -> Self {
@@ -584,10 +570,10 @@ mod tests {
         assert!(enabled(LogLevel::Error));
         set_level(LogLevel::Disabled);
         assert!(!enabled(LogLevel::Error));
-        set_enabled(true);
+        set_level(LogLevel::Info);
         assert!(enabled(LogLevel::Info));
         // Restore silence for the rest of the suite.
-        set_enabled(false);
+        set_level(LogLevel::Disabled);
     }
 
     #[test]

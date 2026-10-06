@@ -692,7 +692,6 @@ mod tests {
     use super::ast::Module;
     use super::device::VerilogADevice;
     use super::elaborate::elaborate;
-    use num_complex::Complex64;
     use rsdag::{eval, Crossing, Node, SymbolId};
     use sane_core::Graph;
     use sane_dae::{assemble_dae, Dae, DeviceInstance};
@@ -704,10 +703,7 @@ mod tests {
         Arc::new(elaborate(&ms[0]).expect("elaborate"))
     }
 
-    fn env_of(
-        ctx: &mut Graph,
-        vals: &[(&str, f64)],
-    ) -> std::collections::HashMap<SymbolId, Complex64> {
+    fn env_of(ctx: &mut Graph, vals: &[(&str, f64)]) -> std::collections::HashMap<SymbolId, f64> {
         // Native devices read the global `$temp` and per-instance Tnom/Eg/XTI;
         // default them to nominal so temperature scalings are identities.
         let tnom = sane_core::constants::TEMP_NOMINAL_K;
@@ -728,7 +724,7 @@ mod tests {
         for (name, x) in &all {
             let e = ctx.sym(name);
             if let Node::Symbol(s) = ctx.node(e) {
-                env.insert(*s, Complex64::new(*x, 0.0));
+                env.insert(*s, *x);
             }
         }
         env
@@ -740,12 +736,18 @@ mod tests {
         ctx: &Graph,
         a: &Dae,
         b: &Dae,
-        env: &std::collections::HashMap<SymbolId, Complex64>,
+        env: &std::collections::HashMap<SymbolId, f64>,
     ) {
         assert_eq!(a.unknowns, b.unknowns, "unknown layout differs");
-        let rows = |d: &Dae| d.currents.iter().chain(&d.charges).copied().collect::<Vec<_>>();
+        let rows = |d: &Dae| {
+            d.currents
+                .iter()
+                .chain(&d.charges)
+                .copied()
+                .collect::<Vec<_>>()
+        };
         for (i, (ra, rb)) in rows(a).iter().zip(&rows(b)).enumerate() {
-            let d = (eval(ctx, &[*ra], env)[0] - eval(ctx, &[*rb], env)[0]).norm();
+            let d = (eval(ctx, &[*ra], env)[0] - eval(ctx, &[*rb], env)[0]).abs();
             assert!(d < 1e-9, "row {i} differs by {d}");
         }
     }
@@ -819,7 +821,7 @@ mod tests {
         assert_dae_match(&ctx, &native, &va, &env);
     }
 
-    fn resistor_env(ctx: &mut Graph) -> std::collections::HashMap<SymbolId, Complex64> {
+    fn resistor_env(ctx: &mut Graph) -> std::collections::HashMap<SymbolId, f64> {
         env_of(
             ctx,
             &[

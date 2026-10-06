@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Circuit IR and symbolic determinant for SANE"
+description = "Circuit IR and topology checks for SANE"
 
 [dependencies]
 rsdag.workspace = true

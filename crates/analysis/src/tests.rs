@@ -4,6 +4,23 @@
 
 use super::*;
 
+/// Label a DAE unknown for the UI: `v{k}` -> (node name, "voltage"), else
+/// (stripped name, "current").
+fn label_unknown(u: &str, node_names: &[String]) -> (String, &'static str) {
+    if let Some(rest) = u.strip_prefix('v') {
+        if let Ok(k) = rest.parse::<usize>() {
+            let name = node_names.get(k).cloned().unwrap_or_else(|| u.to_string());
+            return (name, "voltage");
+        }
+    }
+    (
+        u.strip_prefix("i_")
+            .map(str::to_string)
+            .unwrap_or_else(|| u.to_string()),
+        "current",
+    )
+}
+
 mod veriloga_engine_tests {
     //! WP5 gate: a Verilog-A model in a deck must flow through every engine
     //! path (DC bias, AC, pole-zero, transient) and match the equivalent native

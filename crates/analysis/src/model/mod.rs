@@ -323,14 +323,6 @@ impl Model {
     /// symbolic context (e.g. a graph transform: prune / eliminate / linearize
     /// produces a new DAE on the same arena). The shared `Arc<Mutex<Graph>>`
     /// keeps symbol ids consistent, so expression handles interoperate.
-    /// The deck's index-2 topologies: capacitor/voltage-source loops and
-    /// inductor/current-source cutsets, by element name. Empty for the
-    /// index-1 circuits that make up almost everything. Callers that care
-    /// about transient accuracy can consult this and set `dt_max`.
-    pub fn index2(&self) -> &sane_mna::index2::Index2Report {
-        &self.inner.index2
-    }
-
     pub fn from_parts(
         ctx: Arc<Mutex<Graph>>,
         dae: sane_dae::Dae,

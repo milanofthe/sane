@@ -488,12 +488,6 @@ impl Case {
         self.compare(path, 0.0, f)
     }
 
-    /// Check a path against the reference within a relative tolerance, for
-    /// the paths that call a different `libm` than the interpreter.
-    pub fn expect_close(&self, path: &str, tol: f64, f: impl FnMut(&[f64]) -> Vec<f64>) {
-        self.compare(path, tol, f)
-    }
-
     fn compare(&self, path: &str, tol: f64, mut f: impl FnMut(&[f64]) -> Vec<f64>) {
         for (row, want) in self.rows.iter().zip(self.reference()) {
             let got = f(row);

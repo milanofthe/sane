@@ -8,35 +8,27 @@
 //! (`rsdag::parallel`), bit for bit as serially; its workers stay awake across
 //! the short serial stretches of a Newton loop.
 //!
-//! The default is **4 threads**, in each pool. Override it either with the
-//! `SANE_THREADS` environment variable or programmatically via [`configure`]
-//! (both must take effect before the pools are first used).
+//! The default is **4 threads**, in each pool. Override it with the
+//! `SANE_THREADS` environment variable (read before the pools are first used).
 //!
 //! Sweep parallelism is *outer*: each task solves its systems sequentially
 //! (rslab's KLU is sequential, and inside a sweep no solver runs its devices
 //! on the workers), so the two never nest and oversubscribe the machine.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use rsdag::parallel::{Parallel, Workers};
 
-/// Worker-thread count when neither `SANE_THREADS` nor [`configure`] is set.
+/// Worker-thread count when `SANE_THREADS` is not set.
 pub const DEFAULT_THREADS: usize = 4;
 
 static POOL: OnceLock<ThreadPool> = OnceLock::new();
 static WORKERS: OnceLock<Arc<Workers>> = OnceLock::new();
-/// The count [`configure`] set (0: none).
-static CONFIGURED: AtomicUsize = AtomicUsize::new(0);
-
-/// The configured thread count: [`configure`], `Config::threads`, otherwise
+/// The configured thread count: `Config::threads`, otherwise
 /// [`DEFAULT_THREADS`].
 fn requested_threads() -> usize {
-    match CONFIGURED.load(Ordering::Relaxed) {
-        0 => sane_core::config().threads.unwrap_or(DEFAULT_THREADS),
-        n => n,
-    }
+    sane_core::config().threads.unwrap_or(DEFAULT_THREADS)
 }
 
 fn build(n: usize) -> ThreadPool {
@@ -45,17 +37,6 @@ fn build(n: usize) -> ThreadPool {
         .thread_name(|i| format!("sane-worker-{i}"))
         .build()
         .expect("failed to build SANE worker pool")
-}
-
-/// Set the thread count. Effective only if called before the pools are
-/// first used; returns `false` if one was already built, in which case the
-/// count is unchanged.
-pub fn configure(threads: usize) -> bool {
-    if cfg!(target_arch = "wasm32") || WORKERS.get().is_some() {
-        return false;
-    }
-    CONFIGURED.store(threads.max(1), Ordering::Relaxed);
-    POOL.set(build(threads)).is_ok()
 }
 
 /// The shared sweep pool, built on first use with the configured thread count.

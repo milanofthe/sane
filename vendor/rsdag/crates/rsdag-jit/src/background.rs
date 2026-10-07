@@ -36,6 +36,15 @@ pub fn submit(job: impl FnOnce() + Send + 'static) {
     let _ = queue().send(Box::new(job));
 }
 
+/// Wait until every job submitted before this call has run.
+pub fn drain() {
+    let (tx, rx) = channel::<()>();
+    submit(move || {
+        let _ = tx.send(());
+    });
+    let _ = rx.recv();
+}
+
 fn queue() -> &'static Sender<Job> {
     static Q: OnceLock<Sender<Job>> = OnceLock::new();
     Q.get_or_init(|| {

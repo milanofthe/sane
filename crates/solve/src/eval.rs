@@ -15,6 +15,10 @@ pub(crate) fn step_eval(tape: Tape) -> StepEval {
     let policy = Policy {
         jit: cfg!(feature = "jit") && cfg.jit,
         specialize: cfg.tape_specialization,
+        variants: rsdag::variant::VariantPolicy {
+            enabled: cfg.variants,
+            ..Default::default()
+        },
         ..Policy::default()
     };
     #[cfg(feature = "jit")]

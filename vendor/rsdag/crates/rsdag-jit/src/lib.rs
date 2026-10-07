@@ -58,6 +58,12 @@ pub struct Options {
     pub batch: Batch,
     /// Lane code for the function bodies.
     pub lanes: Lanes,
+    /// Whether a body's per-binding variants (see [`rsdag::variant`]) are
+    /// found, built and compiled on the [`background`] queue, an instance
+    /// running the full body until its variant is ready. Off, a prolog
+    /// does that work itself where it first needs it: it pays once, and
+    /// what runs is a function of the calls made alone.
+    pub background: bool,
 }
 
 impl Default for Options {
@@ -66,6 +72,7 @@ impl Default for Options {
             chunk_ops: CHUNK_OPS,
             batch: Batch::Serial,
             lanes: Lanes::Auto,
+            background: true,
         }
     }
 }

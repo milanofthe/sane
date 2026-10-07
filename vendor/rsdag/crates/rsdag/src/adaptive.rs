@@ -72,6 +72,11 @@ pub struct Policy {
     /// `spec_thrash_evals` evaluations.
     pub spec_thrash_flips: u64,
     pub spec_thrash_evals: u64,
+    /// How the program's bodies specialize per parameter binding. Where
+    /// the program is compiled, the compiled form builds the variants (on
+    /// the compiler's background queue) and the interpreted one runs its
+    /// bodies whole meanwhile; without, the interpreter specializes.
+    pub variants: crate::variant::VariantPolicy,
 }
 
 impl Default for Policy {
@@ -88,6 +93,7 @@ impl Default for Policy {
             spec_interp_cost: 4,
             spec_thrash_flips: 8,
             spec_thrash_evals: 8,
+            variants: crate::variant::VariantPolicy::default(),
         }
     }
 }
@@ -141,10 +147,11 @@ pub struct Stats {
 }
 
 /// Which specialization, if any, prepared an episode's buffer (see
-/// [`Adaptive::eval_prolog`]). The full tape and its native code share
-/// their layout, so they are one kind of episode.
+/// [`Adaptive::eval_prolog`]), and the forms it saw (see
+/// [`Adaptive::eval_main`]). The full tape and its native code share their
+/// layout, so they are one kind of episode.
 #[derive(Clone)]
-pub struct Episode(Kind);
+pub struct Episode(Kind, u64);
 
 #[derive(Clone)]
 enum Kind {
@@ -166,7 +173,19 @@ pub struct Adaptive {
 impl Adaptive {
     /// `compiler` supplies the native code; without it the interpreter and
     /// its specialization serve.
-    pub fn new(tape: Tape, policy: Policy, compiler: Option<Arc<dyn Compiler>>) -> Adaptive {
+    pub fn new(mut tape: Tape, policy: Policy, compiler: Option<Arc<dyn Compiler>>) -> Adaptive {
+        let submit = compiler.clone().map(|c| -> crate::Submit {
+            Arc::new(move |job: Box<dyn FnOnce() + Send>| c.submit(job))
+        });
+        let compiled = policy.jit && compiler.is_some();
+        tape.with_backend(&crate::BodyBackend {
+            submit,
+            variants: Some(crate::variant::VariantPolicy {
+                interpreted: policy.variants.interpreted && !compiled,
+                ..policy.variants
+            }),
+            ..crate::BodyBackend::default()
+        });
         let spec = (policy.specialize && tape.n_selects() >= policy.spec_min_selects)
             .then(|| Arc::new(Mutex::new(Spec::default())));
         Adaptive {
@@ -205,6 +224,14 @@ impl Adaptive {
     /// The native code of the full tape, once compiled.
     pub fn native(&self) -> Option<&dyn Program> {
         self.jit.compiled.get().and_then(Option::as_deref)
+    }
+
+    /// A count that moves whenever a form a prolog would run on lands: the
+    /// native code (its prolog starts the bodies' variants), a body's
+    /// variant (see [`Tape::forms_epoch`]). Both only grow.
+    fn forms(&self) -> u64 {
+        let native = self.jit.compiled.get().is_some();
+        self.tape.forms_epoch().wrapping_add(u64::from(native))
     }
 
     /// The whole program on the best rung: native specialization, native
@@ -278,17 +305,20 @@ impl Adaptive {
     pub fn eval_prolog(&self, inputs: &[f64], work: &mut Vec<f64>) -> Episode {
         // An episode counts toward the compile as an evaluation does.
         self.maybe_kick();
+        // Read before the prolog: a form landing while it runs brings the
+        // next main pass back here.
+        let forms = self.forms();
         if let Some(cache) = &self.spec {
             if let Ok(mut st) = cache.try_lock() {
                 if !st.disabled {
                     if let Some(kind) = self.spec_prolog(&mut st, inputs, work) {
-                        return Episode(kind);
+                        return Episode(kind, forms);
                     }
                 }
             }
         }
         self.full_prolog(inputs, work);
-        Episode(Kind::Full)
+        Episode(Kind::Full, forms)
     }
 
     /// The specialized episode starts, `None` for a full one.
@@ -340,7 +370,10 @@ impl Adaptive {
     /// Phase 2: a main pass over the buffer the episode's prolog prepared.
     /// A region flip under a specialization moves the episode to the full
     /// tape (the retrace that handles the flip leaves the full tape's state
-    /// in `work`), for its remainder.
+    /// in `work`), for its remainder. `inputs` hold the binding the prolog
+    /// ran at, so the episode may run it again when a faster form lands:
+    /// the native code, or a function body's variant (see
+    /// [`Tape::forms_epoch`]).
     pub fn eval_main(
         &self,
         ep: &mut Episode,
@@ -349,6 +382,13 @@ impl Adaptive {
         out: &mut Vec<f64>,
     ) {
         self.maybe_kick();
+        // A faster form landed in the background since the prolog (the
+        // native code, a function body's variant for this binding): the
+        // episode runs the prolog again to take it, once per landing,
+        // rather than for its whole length on what was ready when it began.
+        if self.forms() != ep.1 {
+            *ep = self.eval_prolog(inputs, work);
+        }
         match &ep.0 {
             Kind::SpecNative(native, sp) => {
                 main(&**native, inputs, work, out);

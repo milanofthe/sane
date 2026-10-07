@@ -89,17 +89,7 @@ fn translate_bexpr(
                 '-' => ctx.sub(x, y),
                 '*' => ctx.mul(x, y),
                 '/' => ctx.div(x, y),
-                '^' => {
-                    // integer constant exponent -> pow_i, else exp(b*ln(a))
-                    if let BExpr::Const(c) = **b {
-                        if c.fract() == 0.0 && c.abs() < 64.0 {
-                            return ctx.pow_i(x, c as i64);
-                        }
-                    }
-                    let l = ctx.ln(x);
-                    let yl = ctx.mul(y, l);
-                    ctx.exp(yl)
-                }
+                '^' => sane_core::mathfn::pow(ctx, x, y),
                 // Comparison sentinels (see `sane_netlist::behavioral::cmp_sentinel`):
                 // each yields 1.0 / 0.0, to be consumed by `if(cond, then, else)`.
                 '<' => ctx.cmp(CmpOp::Lt, x, y),
@@ -135,7 +125,11 @@ fn translate_bexpr(
 }
 
 /// Assemble a flat circuit (no subcircuit instances).
-pub fn assemble_dae(ctx: &mut Graph, circuit: &Circuit, devices: &[DeviceInstance]) -> Dae {
+pub fn assemble_dae(
+    ctx: &mut Graph,
+    circuit: &Circuit,
+    devices: &[DeviceInstance],
+) -> Result<Dae, String> {
     assemble(ctx, circuit, devices, &[])
 }
 
@@ -175,6 +169,13 @@ struct Part {
     source_names: Vec<String>,
     /// Display names (see [`Dae::labels`]).
     labels: Vec<(ExprId, String)>,
+    /// See [`Dae::assertions`].
+    assertions: Vec<sane_device::Assertion>,
+    /// See [`Dae::structure`].
+    structure: Vec<sane_device::Assertion>,
+    /// The collapsed internal nodes and their voltages (see
+    /// [`Dae::aliases`]).
+    aliases: Vec<(String, ExprId)>,
 }
 
 /// The subcircuit functions built so far, by what they compute: a body's
@@ -208,12 +209,25 @@ fn body_nodes(circuit: &Circuit, devices: &[DeviceInstance], instances: &[Instan
 /// Assemble the DAE of a circuit with its subcircuit instances. Every node
 /// of the hierarchy is a top-level node (`v{k}`); every other unknown keeps
 /// its block (branch currents, then device extras) in the instance's names.
+/// An error names the device whose model does not lower.
 pub fn assemble(
     ctx: &mut Graph,
     circuit: &Circuit,
     devices: &[DeviceInstance],
     instances: &[Instance],
-) -> Dae {
+) -> Result<Dae, String> {
+    assemble_at(ctx, circuit, devices, instances, &|_| None)
+}
+
+/// [`assemble`] with the devices' structure decided at `values` (by
+/// parameter symbol name) where those set a parameter.
+pub fn assemble_at(
+    ctx: &mut Graph,
+    circuit: &Circuit,
+    devices: &[DeviceInstance],
+    instances: &[Instance],
+    values: &dyn Fn(&str) -> Option<f64>,
+) -> Result<Dae, String> {
     let n = body_nodes(circuit, devices, instances);
     let zero = ctx.zero();
     let (t_e, t) = sym2(ctx, "t");
@@ -228,16 +242,8 @@ pub fn assemble(
 
     let dev_t0 = sane_core::time::Instant::now();
     let mut bodies = Bodies::default();
-    let mut lo = Lowerer::new(ctx);
-    let part = lower_body(
-        &mut lo,
-        &mut bodies,
-        circuit,
-        devices,
-        instances,
-        &v,
-        t_e,
-    );
+    let mut lo = Lowerer::at(ctx, values);
+    let part = lower_body(&mut lo, &mut bodies, circuit, devices, instances, &v, t_e)?;
     drop(lo); // release the &mut Graph borrow before reusing `ctx` below
     sane_core::log::stage("dae/devices", dev_t0.elapsed());
     sane_core::log::stage("dae/devices_lower", bodies.lower_t);
@@ -303,12 +309,26 @@ pub fn assemble(
             hi: fl.hi.and_then(|s| unknown_of.get(&s).copied()),
             lo: fl.lo.and_then(|s| unknown_of.get(&s).copied()),
             kind: fl.kind,
+            when: fl.when,
         })
         .collect();
 
-    Dae {
+    // A collapsed node's voltage is a kept node's, or ground's.
+    let aliases = (part.aliases.iter())
+        .filter_map(|&(ref name, v)| match ctx.node(v) {
+            rsdag::Node::Symbol(s) => unknown_of
+                .get(s)
+                .map(|&k| (name.clone(), Some(unknowns[k].clone()))),
+            _ if ctx.const_f64(v) == Some(0.0) => Some((name.clone(), None)),
+            _ => None,
+        })
+        .collect();
+    Ok(Dae {
         currents,
         charges,
+        assertions: part.assertions,
+        structure: part.structure,
+        aliases,
         n_nodes: n,
         param_defaults: part.param_defaults,
         events,
@@ -324,7 +344,7 @@ pub fn assemble(
         sources: part.sources,
         source_names: part.source_names,
         labels: part.labels.into_iter().collect(),
-    }
+    })
 }
 
 /// The currents, the charges and the switching surfaces with every call that
@@ -359,7 +379,7 @@ fn lower_body(
     instances: &[Instance],
     v: &[ExprId],
     t_e: ExprId,
-) -> Part {
+) -> Result<Part, String> {
     let n = v.len() - 1;
     let mut part = Part {
         node_terms: vec![Vec::new(); n],
@@ -503,7 +523,13 @@ fn lower_body(
         // currents and charges + one row per minted extra unknown), so internal
         // nodes and behavioral states are treated uniformly.
         let lt = sane_core::time::Instant::now();
-        let mut frag = inst.model.lower_behavioral(lo, &term_v, &ctrl_i);
+        let mut frag =
+            (inst.model.lower_behavioral(lo, &term_v, &ctrl_i)).map_err(|e| {
+                match inst.model.instance_name() {
+                    Some(name) => format!("{name}: {e}"),
+                    None => e,
+                }
+            })?;
         bodies.lower_t += lt.elapsed();
         // Parallel multiplicity (`M=` * `nf`): scale the terminal currents by m,
         // modelling m identical devices in parallel. Internal-node rows stay
@@ -588,6 +614,9 @@ fn lower_body(
             part.labels.extend(calls.map(|&e| (e, name.to_string())));
         }
         part.observers.op_vars.extend(frag.op_vars);
+        part.assertions.extend(frag.assertions);
+        part.structure.extend(frag.structural);
+        part.aliases.extend(frag.collapsed);
         part.limits.extend(frag.limits);
     }
 
@@ -703,9 +732,9 @@ fn lower_body(
     }
 
     for inst in instances {
-        instantiate(lo, bodies, inst, v, t_e, &mut part);
+        instantiate(lo, bodies, inst, v, t_e, &mut part)?;
     }
-    part
+    Ok(part)
 }
 
 /// A subcircuit body assembled once, for every instance of it: its part in
@@ -736,9 +765,9 @@ fn lowered(
     body: &Arc<Body>,
     t_e: ExprId,
     labels: &mut Vec<(ExprId, String)>,
-) -> Rc<Lowered> {
+) -> Result<Rc<Lowered>, String> {
     if let Some(l) = bodies.lowered.get(&Arc::as_ptr(body)) {
-        return l.clone();
+        return Ok(l.clone());
     }
     let n = body.node_names.len();
     let ctx = lo.ctx();
@@ -755,7 +784,7 @@ fn lowered(
         &body.instances,
         &fv,
         t_e,
-    );
+    )?;
     for (k, name) in body.node_names.iter().enumerate() {
         part.labels.push((fv[k + 1], name.clone()));
     }
@@ -827,7 +856,7 @@ fn lowered(
         funcs,
     });
     bodies.lowered.insert(Arc::as_ptr(body), l.clone());
-    l
+    Ok(l)
 }
 
 /// A subcircuit instance into its parent's `part`: its body's functions
@@ -840,8 +869,8 @@ fn instantiate(
     v: &[ExprId],
     t_e: ExprId,
     part: &mut Part,
-) {
-    let low = lowered(lo, bodies, &inst.body, t_e, &mut part.labels);
+) -> Result<(), String> {
+    let low = lowered(lo, bodies, &inst.body, t_e, &mut part.labels)?;
     let body = &low.part;
     let ctx = lo.ctx();
 
@@ -929,16 +958,51 @@ fn instantiate(
         }
     }
     for l in &body.limits {
+        let when = l.when.map(|w| {
+            let rename: rustc_hash::FxHashMap<SymbolId, ExprId> = ctx
+                .free_symbols_in(&[w])
+                .into_iter()
+                .filter_map(|s| actual_sym(ctx, s).map(|a| (s, ctx.symbol_expr(a))))
+                .collect();
+            rsdag::substitute(ctx, &[w], &rename)[0]
+        });
         part.limits.push(sane_device::FragmentLimit {
             hi: l.hi.and_then(|s| actual_sym(ctx, s)),
             lo: l.lo.and_then(|s| actual_sym(ctx, s)),
             kind: l.kind,
+            when,
         });
     }
     part.sources
         .extend(body.sources.iter().map(|(name, s)| (inst.rename(name), *s)));
     part.source_names
         .extend(body.source_names.iter().map(|s| inst.rename(s)));
+    // The body's assertions and structure over the instance's parameters,
+    // and its collapsed nodes in the instance's names and nodes.
+    let exprs: Vec<ExprId> = (body.assertions.iter().chain(&body.structure))
+        .map(|a| a.holds)
+        .chain(body.aliases.iter().map(|&(_, v)| v))
+        .collect();
+    let rename: rustc_hash::FxHashMap<SymbolId, ExprId> = ctx
+        .free_symbols_in(&exprs)
+        .into_iter()
+        .map(|s| (s, actual(ctx, s)))
+        .collect();
+    let mut exprs = rsdag::substitute(ctx, &exprs, &rename).into_iter();
+    for (list, into) in [
+        (&body.assertions, &mut part.assertions),
+        (&body.structure, &mut part.structure),
+    ] {
+        into.extend(list.iter().map(|a| sane_device::Assertion {
+            holds: exprs.next().expect("one per assertion"),
+            message: a.message.clone(),
+        }));
+    }
+    part.aliases.extend(
+        (body.aliases.iter())
+            .map(|(name, _)| (inst.rename(name), exprs.next().expect("one per alias"))),
+    );
+    Ok(())
 }
 
 /// `outs` as a function of their free symbols, `firsts` leading in their

@@ -28,7 +28,7 @@ B2 0 b I=0.5 - 0.3183098862*atan(10*(V(a)-0.5))
 fn build() -> (Graph, ParsedCircuit, Dae, CompiledDc, Vec<f64>) {
     let parsed = parse(LATCH).expect("parse");
     let mut ctx = Graph::new();
-    let dae = parsed.assemble(&mut ctx);
+    let dae = parsed.assemble(&mut ctx).unwrap();
     let cdc = CompiledDc::new(&mut ctx, &dae);
     let p: Vec<f64> = parsed.pvec(&cdc.param_names(&ctx));
     (ctx, parsed, dae, cdc, p)

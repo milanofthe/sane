@@ -175,6 +175,33 @@ impl CompiledDc {
     /// Damped Newton at a fixed `gmin` (at rest, `t = 0`), warm-started from
     /// `x_init`. Returns `(x, converged, iterations)`. `tricks` gates the per-step
     /// shaping (uniform clamp, device limiting, line search, partitioning).
+    /// The rounding the shunted residual `res + gmin x` at `x` is computed
+    /// with: per row (into `terms`) the size of the terms it sums, `|G| |x|`
+    /// over the Jacobian values `g` plus the shunt's, `NEWTON_ROUNDOFF` ulps
+    /// of them; returned, whether every row is within it (solved to machine
+    /// precision) and that floor of the residual's 2-norm.
+    fn rounding(
+        &self,
+        res: &[f64],
+        g: &[f64],
+        x: &[f64],
+        gmin: f64,
+        terms: &mut Vec<f64>,
+    ) -> (bool, f64) {
+        terms.clear();
+        terms.extend(
+            x.iter()
+                .map(|v| NEWTON_ROUNDOFF * f64::EPSILON * gmin * v.abs()),
+        );
+        for (e, v) in g.iter().enumerate().take(self.nnz_x) {
+            terms[self.jx_rows[e]] +=
+                NEWTON_ROUNDOFF * f64::EPSILON * v.abs() * x[self.jx_cols[e]].abs();
+        }
+        let rounded =
+            (res.iter().zip(x).zip(terms.iter())).all(|((r, xi), t)| (r + gmin * xi).abs() <= *t);
+        (rounded, norm2(terms))
+    }
+
     fn newton(
         &self,
         p: &[f64],
@@ -221,6 +248,7 @@ impl CompiledDc {
         let mut step_tok = self.tape_step_dc.eval_prolog(&inputs, &mut work);
         let mut res_tok = self.tape_res_dc.eval_prolog(&inputs, &mut wb);
         let mut stall = newton::StallGuard::new();
+        let mut terms = Vec::new();
 
         for it in 0..max_iter {
             self.fill_inputs(&x, p, 0.0, &mut inputs);
@@ -234,6 +262,12 @@ impl CompiledDc {
             // step is known, below). `fnorm` is kept for the line search and
             // the stall guard.
             let res_ok = self.residual_converged(&out[..n], &x, gmin, conv);
+            // Solved to machine precision: no step reduces a row further, it
+            // would only move what the rows hold weakly by their rounding.
+            let (rounded, floor) = self.rounding(&out[..n], &out[n..], &x, gmin, &mut terms);
+            if rounded {
+                return (x, true, it);
+            }
             if !res_ok && stall.stalled(fnorm) {
                 if trace {
                     sane_core::log::debug(&format!("DCTRACE stalled at it={it} fnorm={fnorm:.3e}"));
@@ -339,12 +373,13 @@ impl CompiledDc {
             } else {
                 1
             };
-            let alpha = newton::backtrack(&mut x, &step, &mut trial, fnorm, tries, |trial| {
-                self.fill_inputs(trial, p, 0.0, &mut inb);
-                self.tape_res_dc
-                    .eval_main(&mut res_tok, &inb, &mut wb, &mut ob);
-                shunted_norm(&ob, trial, gmin)
-            });
+            let alpha =
+                newton::backtrack(&mut x, &step, &mut trial, fnorm, floor, tries, |trial| {
+                    self.fill_inputs(trial, p, 0.0, &mut inb);
+                    self.tape_res_dc
+                        .eval_main(&mut res_tok, &inb, &mut wb, &mut ob);
+                    shunted_norm(&ob, trial, gmin)
+                });
             // Composite (Traub) step: a full Newton step was taken, so the
             // iterate is in the contracting regime; one chord step on the
             // factorization just built, from the residual at the new iterate,
@@ -410,6 +445,7 @@ impl CompiledDc {
         let (mut sb, mut rb) = (TapeBufs::default(), TapeBufs::default());
         let mut valbuf = Vec::new();
         let mut jacbuf: Vec<f64> = Vec::new();
+        let mut terms = Vec::new();
         // Per-iteration scratch reused across the whole solve (no realloc per step).
         let mut rhs = vec![0.0; n];
         let mut dx = vec![0.0; n];
@@ -493,11 +529,13 @@ impl CompiledDc {
                 newton::limit_step(&self.limits, &x, &mut step[..n]);
             }
             // Backtracking line search on the (true) residual norm.
+            let (_, floor) = self.rounding(&out[..n], &out[n..], &x, GMIN_DC, &mut terms);
             newton::backtrack(
                 &mut x,
                 &step,
                 &mut trial,
                 fnorm,
+                floor,
                 LINE_SEARCH_TRIES,
                 |trial| {
                     self.eval_episode(&self.tape_res_dc, trial, p, &mut rb);
@@ -1111,6 +1149,7 @@ impl CompiledDc {
             }
         };
         let (mut h, mut dx, mut trial) = (Vec::new(), vec![0.0; n], vec![0.0; n]);
+        let mut terms = Vec::new();
 
         let mut stall = newton::StallGuard::new();
         for it in 0..max_iter {
@@ -1136,12 +1175,21 @@ impl CompiledDc {
                 return (x, true, it);
             }
             // Backtracking line search on the pinned residual norm.
-            newton::backtrack(&mut x, &dx, &mut trial, fnorm, LINE_SEARCH_TRIES, |trial| {
-                self.eval_episode(&self.tape_res_dc, trial, p, &mut rb);
-                let ob = &rb.out;
-                pin_res(trial, &ob, &mut h);
-                norm2(&h)
-            });
+            let (_, floor) = self.rounding(&out[..n], &out[n..], &x, GMIN_DC, &mut terms);
+            newton::backtrack(
+                &mut x,
+                &dx,
+                &mut trial,
+                fnorm,
+                floor,
+                LINE_SEARCH_TRIES,
+                |trial| {
+                    self.eval_episode(&self.tape_res_dc, trial, p, &mut rb);
+                    let ob = &rb.out;
+                    pin_res(trial, &ob, &mut h);
+                    norm2(&h)
+                },
+            );
         }
         (x, false, max_iter)
     }
@@ -1536,7 +1584,9 @@ impl CompiledDc {
             } else {
                 1
             };
-            newton::backtrack(&mut x, &step, &mut trial, fnorm, tries, |trial| {
+            // Its waypoints take the residual half alone, which the rounding
+            // never keeps from passing: no floor needed.
+            newton::backtrack(&mut x, &step, &mut trial, fnorm, 0.0, tries, |trial| {
                 self.companion_residual(trial, p, lambda, res);
                 norm2(&res.out)
             });

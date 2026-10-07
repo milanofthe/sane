@@ -90,7 +90,6 @@ pub(crate) fn place_va_device(
     devices: &mut Vec<DeviceInstance>,
     values: &mut HashMap<String, f64>,
     report: &mut CompatReport,
-    validated: &mut HashSet<String>,
     name: &str,
     modelname: &str,
     em: &Arc<ElaboratedModule>,
@@ -102,8 +101,6 @@ pub(crate) fn place_va_device(
     geom_scale: Option<f64>,
     inst_scale: &[(&str, f64)],
     nf_scales_mfactor: bool,
-    line_no: usize,
-    line_col: usize,
 ) -> Result<(), ParseError> {
     // Bind the `.model` card then the inline instance `key=value` params, using a
     // probe device for its `default_params`; the resolved instance values let
@@ -221,19 +218,8 @@ pub(crate) fn place_va_device(
     dev.params = pvals;
     dev.given = given;
     dev.mfactor = mfactor;
-    // Surface any unsupported construct up front (logged + parse error) rather
-    // than producing unexpected results during analysis. Done once per module
-    // (see `validated`): the trial lowering is a module-level property and
-    // re-running it per instance dominates parse time for large compact models.
-    if validated.insert(em.name.clone()) {
-        if let Err(e) = dev.validate() {
-            return Err(err_at(
-                line_no,
-                line_col,
-                &format!("veriloga model '{modelname}': {e}"),
-            ));
-        }
-    }
+    // What of the module does not lower is an error of the assembly, which
+    // lowers it once per structure anyway.
     devices.push(DeviceInstance::new(Box::new(dev), terminals));
     Ok(())
 }

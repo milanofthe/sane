@@ -22,7 +22,7 @@ fn all_fixtures_parse_and_extract() {
 
         let parsed = parse(&text).unwrap_or_else(|e| panic!("{name}: parse failed: {e}"));
         let mut ctx = Graph::new();
-        let dae = parsed.assemble(&mut ctx);
+        let dae = parsed.assemble(&mut ctx).unwrap();
         assert!(dae.dim() > 0, "{name}: empty DAE");
 
         let rows: Vec<ExprId> = dae.currents.iter().chain(&dae.charges).copied().collect();

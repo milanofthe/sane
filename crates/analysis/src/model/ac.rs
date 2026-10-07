@@ -64,6 +64,7 @@ impl Model {
         p: Vec<f64>,
         t: f64,
     ) -> Result<(Vec<Vec<f64>>, Vec<Vec<f64>>, Vec<f64>), ModelError> {
+        self.inner.bound(&p)?;
         let arc = self.context_arc();
         let mut c = arc.lock().unwrap();
         let dae = self.dae();
@@ -115,6 +116,7 @@ impl Model {
         p: Vec<f64>,
         freqs_hz: Vec<f64>,
     ) -> Result<Vec<(f64, f64)>, ModelError> {
+        self.inner.bound(&p)?;
         // Transport delays are exact in AC: `hist_k = x_src(t - τ_k)` becomes
         // `e^{-jωτ_k} X_src`, an extra (frequency-dependent) coupling entry.
         self.ensure_hist_jac_ready();
@@ -194,6 +196,7 @@ impl Model {
         fstop: f64,
         points: usize,
     ) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>), ModelError> {
+        self.inner.bound(&p)?;
         if !(fstart > 0.0) || !(fstop > fstart) || points < 2 {
             return Err(ModelError::Numeric(
                 "AC needs 0 < fstart < fstop and points >= 2".into(),
@@ -227,6 +230,7 @@ impl Model {
         p: Vec<f64>,
         freqs_hz: Vec<f64>,
     ) -> Result<Vec<(f64, f64)>, ModelError> {
+        self.inner.bound(&p)?;
         self.ensure_no_delays("ac_sensitivity")?;
         let g = self.cdc().system_matrix_dc(&x, &p, 0.0);
         let c = self.cdc().jacobian_q_x(&x, &p, 0.0);
@@ -259,6 +263,7 @@ impl Model {
         p: Vec<f64>,
         freq: f64,
     ) -> Result<Vec<(String, f64, f64)>, ModelError> {
+        self.inner.bound(&p)?;
         let (names, mut rows) = self.ac_gradient_sweep(input, out_idx, x, p, &[freq])?;
         let (_, d) = rows.pop().unwrap_or_default();
         Ok(names
@@ -280,6 +285,7 @@ impl Model {
         p: Vec<f64>,
         freqs: &[f64],
     ) -> Result<(Vec<String>, Vec<((f64, f64), Vec<(f64, f64)>)>), ModelError> {
+        self.inner.bound(&p)?;
         self.ensure_no_delays("ac_gradient")?;
         let _g = log::scope("sens/ac_gradient");
         let setup = self.ac_adjoint_setup(input, &x, &p)?;
@@ -351,6 +357,7 @@ impl Model {
         p: Vec<f64>,
         freqs: Vec<f64>,
     ) -> Result<Vec<(String, f64)>, ModelError> {
+        self.inner.bound(&p)?;
         self.ensure_no_delays("ac_vjp_sweep")?;
         let _g = log::scope("sens/ac_vjp_sweep");
         if weights.len() != freqs.len() {
@@ -418,6 +425,7 @@ impl Model {
         p: Vec<f64>,
         freqs_hz: Vec<f64>,
     ) -> Result<Vec<Vec<(f64, f64)>>, ModelError> {
+        self.inner.bound(&p)?;
         let n = ports.len();
         if n == 0 {
             return Err(ModelError::Numeric("sp_response: no ports".into()));
@@ -455,6 +463,7 @@ impl Model {
         freqs_hz: Vec<f64>,
         cot: &[Vec<(f64, f64)>],
     ) -> Result<Vec<(String, f64)>, ModelError> {
+        self.inner.bound(&p)?;
         let n = ports.len();
         if n == 0 {
             return Err(ModelError::Numeric("sp_vjp: no ports".into()));
@@ -721,6 +730,7 @@ impl Model {
         freq: f64,
         subset: Vec<String>,
     ) -> Result<(f64, f64, Vec<f64>, Vec<f64>, Vec<Vec<f64>>, Vec<Vec<f64>>), ModelError> {
+        self.inner.bound(&p)?;
         let _g = log::scope("sens/ac_hessian");
         let n = self.dae().dim();
         let w = 2.0 * PI * freq;
@@ -812,6 +822,9 @@ impl Model {
         let combined = CoreDae {
             charges: vec![zero; currents.len()],
             currents,
+            assertions: self.dae().assertions.clone(),
+            structure: self.dae().structure.clone(),
+            aliases: self.dae().aliases.clone(),
             n_nodes: self.dae().n_nodes,
             param_defaults: self.dae().param_defaults.clone(),
             events: Vec::new(),

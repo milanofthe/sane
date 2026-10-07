@@ -127,7 +127,7 @@ impl Observed {
         let exprs: Vec<ExprId> = body
             .noise
             .iter()
-            .flat_map(|n| [n.psd, n.flicker_exp])
+            .flat_map(|n| n.exprs())
             .chain(body.op_vars.iter().map(|o| o.value))
             .collect();
         let mut map: HashMap<SymbolId, ExprId> = self.binding.iter().copied().collect();
@@ -159,13 +159,7 @@ impl Observed {
             .collect();
         let mut vals = rsdag::substitute(ctx, &exprs, &map).into_iter();
         for (n, (hi, lo)) in body.noise.iter().zip(hilo) {
-            out.noise.push(NoiseSource {
-                hi,
-                lo,
-                psd: vals.next().expect("one per expression"),
-                flicker_exp: vals.next().expect("one per expression"),
-                table: n.table.clone(),
-            });
+            out.noise.push(n.with_exprs(hi, lo, &mut vals));
         }
         for (o, value) in body.op_vars.iter().zip(vals) {
             out.op_vars.push(OpVar {

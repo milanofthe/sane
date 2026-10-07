@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::FxHashMap as HashMap;
 use sane_device::{CSwitch, DeviceInstance};
 use sane_mna::{BKind, Circuit};
 use sane_veriloga::builtin_module;
@@ -56,10 +56,6 @@ pub(crate) struct Placer<'a> {
     pub circuit: Circuit,
     pub devices: Vec<DeviceInstance>,
     pub values: HashMap<String, f64>,
-    /// Verilog-A modules already trial-lowered by `validate()`: the check
-    /// surfaces unsupported constructs in the module source, a module-level
-    /// property, so it runs once per module rather than once per instance.
-    pub validated: HashSet<String>,
     pub report: CompatReport,
     pub ports: Vec<PortDef>,
     pub params: &'a HashMap<String, f64>,
@@ -199,7 +195,6 @@ impl Placer<'_> {
             &mut self.devices,
             &mut self.values,
             &mut self.report,
-            &mut self.validated,
             name,
             base,
             &em,
@@ -211,14 +206,11 @@ impl Placer<'_> {
             None,
             &[],
             false,
-            line_no,
-            line_col,
         )?;
         Ok(())
     }
     pub(crate) fn place_vswitch(&mut self, el: &Elem<'_>) -> Result<(), ParseError> {
-        let (name, base, tok, line_no, line_col) =
-            (el.name, el.base, el.tok, el.line_no, el.line_col);
+        let (name, base, tok) = (el.name, el.base, el.tok);
         // Voltage-controlled switch: S name n+ n- nc+ nc- [model].
         // Built-in Verilog-A model (smooth log-conductance transition).
         el.need(5)?;
@@ -234,7 +226,6 @@ impl Placer<'_> {
             &mut self.devices,
             &mut self.values,
             &mut self.report,
-            &mut self.validated,
             name,
             modelname,
             &em,
@@ -246,8 +237,6 @@ impl Placer<'_> {
             None,
             &[],
             false,
-            line_no,
-            line_col,
         )?;
         Ok(())
     }
@@ -345,8 +334,7 @@ impl Placer<'_> {
     /// Nonlinear devices. A trailing model-card token is allowed and
     /// ignored for now (parameters stay symbolic, e.g. `D1.Is`).
     pub(crate) fn place_diode(&mut self, el: &Elem<'_>) -> Result<(), ParseError> {
-        let (name, base, tok, line_no, line_col) =
-            (el.name, el.base, el.tok, el.line_no, el.line_col);
+        let (name, base, tok) = (el.name, el.base, el.tok);
         // Built-in Verilog-A diode; charge storage, breakdown and the
         // series-resistance internal node fold structurally from the
         // bound parameters, so a bare card lowers to the bare junction.
@@ -361,7 +349,6 @@ impl Placer<'_> {
             &mut self.devices,
             &mut self.values,
             &mut self.report,
-            &mut self.validated,
             name,
             modelname,
             &em,
@@ -373,8 +360,6 @@ impl Placer<'_> {
             None,
             &[],
             false,
-            line_no,
-            line_col,
         )?;
         Ok(())
     }
@@ -449,7 +434,6 @@ impl Placer<'_> {
                     &mut self.devices,
                     &mut self.values,
                     &mut self.report,
-                    &mut self.validated,
                     name,
                     modelname,
                     em,
@@ -461,8 +445,6 @@ impl Placer<'_> {
                     Some(self.options.scale()),
                     &[],
                     false,
-                    line_no,
-                    line_col,
                 )?;
                 return Ok(());
             }
@@ -488,7 +470,6 @@ impl Placer<'_> {
             &mut self.devices,
             &mut self.values,
             &mut self.report,
-            &mut self.validated,
             name,
             model_name.unwrap_or(base),
             &em,
@@ -500,14 +481,11 @@ impl Placer<'_> {
             Some(self.options.scale()),
             &[],
             true,
-            line_no,
-            line_col,
         )?;
         Ok(())
     }
     pub(crate) fn place_bjt(&mut self, el: &Elem<'_>) -> Result<(), ParseError> {
-        let (name, base, tok, line_no, line_col) =
-            (el.name, el.base, el.tok, el.line_no, el.line_col);
+        let (name, base, tok) = (el.name, el.base, el.tok);
         // Q name collector base emitter [model] [area].
         el.need(4)?;
         let c = self.nodes.resolve(tok[1]);
@@ -549,7 +527,6 @@ impl Placer<'_> {
             &mut self.devices,
             &mut self.values,
             &mut self.report,
-            &mut self.validated,
             name,
             modelname,
             &em,
@@ -561,14 +538,11 @@ impl Placer<'_> {
             None,
             &area_scale,
             false,
-            line_no,
-            line_col,
         )?;
         Ok(())
     }
     pub(crate) fn place_jfet(&mut self, el: &Elem<'_>) -> Result<(), ParseError> {
-        let (name, base, tok, line_no, line_col) =
-            (el.name, el.base, el.tok, el.line_no, el.line_col);
+        let (name, base, tok) = (el.name, el.base, el.tok);
         // JFET: J name drain gate source [model]. Polarity from the model
         // type (PJF -> P, else N-channel).
         el.need(4)?;
@@ -592,7 +566,6 @@ impl Placer<'_> {
             &mut self.devices,
             &mut self.values,
             &mut self.report,
-            &mut self.validated,
             name,
             modelname,
             &em,
@@ -604,8 +577,6 @@ impl Placer<'_> {
             None,
             &[],
             false,
-            line_no,
-            line_col,
         )?;
         Ok(())
     }
@@ -635,8 +606,7 @@ impl Placer<'_> {
         Ok(())
     }
     pub(crate) fn place_zener(&mut self, el: &Elem<'_>) -> Result<(), ParseError> {
-        let (name, base, tok, line_no, line_col) =
-            (el.name, el.base, el.tok, el.line_no, el.line_col);
+        let (name, base, tok) = (el.name, el.base, el.tok);
         // MESFET: Z name drain gate source [model]. PMF -> P-channel.
         el.need(4)?;
         let d = self.nodes.resolve(tok[1]);
@@ -659,7 +629,6 @@ impl Placer<'_> {
             &mut self.devices,
             &mut self.values,
             &mut self.report,
-            &mut self.validated,
             name,
             modelname,
             &em,
@@ -671,8 +640,6 @@ impl Placer<'_> {
             None,
             &[],
             false,
-            line_no,
-            line_col,
         )?;
         Ok(())
     }
@@ -774,7 +741,6 @@ impl Placer<'_> {
             &mut self.devices,
             &mut self.values,
             &mut self.report,
-            &mut self.validated,
             name,
             modelname,
             em,
@@ -786,8 +752,6 @@ impl Placer<'_> {
             None,
             &[],
             false,
-            line_no,
-            line_col,
         )?;
         Ok(())
     }

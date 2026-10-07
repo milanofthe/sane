@@ -59,6 +59,10 @@ pub struct Lowerer<'a> {
     /// pattern, multiplicity), so a compact model is lowered once per
     /// structure and every instance is a call.
     cache: HashMap<String, Box<dyn Any>>,
+    /// The parameter values, by symbol name, the devices decide their
+    /// structure at where they are not their own (a circuit assembled at a
+    /// binding); see [`value`](Self::value).
+    values: Option<&'a dyn Fn(&str) -> Option<f64>>,
 }
 
 impl<'a> Lowerer<'a> {
@@ -68,7 +72,24 @@ impl<'a> Lowerer<'a> {
             extras: Vec::new(),
             delays: Vec::new(),
             cache: HashMap::new(),
+            values: None,
         }
+    }
+
+    /// A lowerer whose devices decide their structure at `values` (by
+    /// parameter symbol name; `None` for a parameter the binding does not
+    /// set).
+    pub fn at(ctx: &'a mut Graph, values: &'a dyn Fn(&str) -> Option<f64>) -> Self {
+        Self {
+            values: Some(values),
+            ..Self::new(ctx)
+        }
+    }
+
+    /// The value of the parameter symbol `name` the structure is decided
+    /// at, where the lowering is at a binding that sets it.
+    pub fn value(&self, name: &str) -> Option<f64> {
+        self.values.and_then(|v| v(name))
     }
 
     /// The shared symbolic context, for building contribution expressions.

@@ -46,7 +46,9 @@ def test_raw_numeric_interface_is_consistent():
     gi = _dense(d.jacobian_i_p_sparse(x, p, 0.0), (n, len(p)))
     gq = _dense(d.jacobian_q_p_sparse(x, p, 0.0), (n, len(p)))
     for k in range(len(p)):
-        s = h * max(1.0, abs(p[k]))
+        # relative to the parameter: an absolute step would carry a small
+        # one across its domain (Cj0 > 0 switches the junction charge)
+        s = h * (abs(p[k]) or 1.0)
         pp, pm = list(p), list(p)
         pp[k] += s
         pm[k] -= s

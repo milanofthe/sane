@@ -171,7 +171,10 @@ fn device_terminal_current(p: &crate::ParsedCircuit, di: usize, bias: &[f64]) ->
     let n = p.devices[di].model.n_terminals();
     let term_v: Vec<_> = (0..n).map(|k| ctx.sym(&format!("tv{k}"))).collect();
     let mut lo = sane_device::Lowerer::new(&mut ctx);
-    let frag = p.devices[di].model.lower_behavioral(&mut lo, &term_v, &[]);
+    let frag = p.devices[di]
+        .model
+        .lower_behavioral(&mut lo, &term_v, &[])
+        .unwrap();
     let i = frag.terminal_currents[0];
     let mut env: Map<rsdag::SymbolId, f64> = Map::new();
     for s in ctx.free_symbols(i) {
@@ -454,7 +457,7 @@ fn global_nodes_pass_through_subckts() {
     let r1 = elements.iter().find(|e| e.name == "X1.R1").unwrap();
     assert_eq!((r1.a, r1.b), (p.node("vdd").unwrap(), p.node("a").unwrap()));
     let mut ctx = sane_core::Graph::new();
-    let dae = p.assemble(&mut ctx);
+    let dae = p.assemble(&mut ctx).unwrap();
     assert!(
         dae.unknowns.iter().any(|u| u == "vvdd" || u == "v1"),
         "{:?}",

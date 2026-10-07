@@ -26,10 +26,6 @@ pub struct Config {
     /// Choice-specialise the circuit-level tapes after a solve settles
     /// (`SANE_TAPE_SPEC`, `0` disables).
     pub tape_specialization: bool,
-    /// Merge the nodes of statically zero-volt Verilog-A branches before
-    /// lowering (`SANE_NO_COLLAPSE` disables: every such branch lowers as an
-    /// explicit source with its own unknown).
-    pub node_collapse: bool,
     /// Worker threads of the engine's pool (`SANE_THREADS`); `None` picks the
     /// solver's default.
     pub threads: Option<usize>,
@@ -52,8 +48,10 @@ pub struct Config {
     /// Report non-finite compile-time constants during Verilog-A lowering
     /// (`SANE_VA_TRACE_NAN`).
     pub va_trace_nan: bool,
-    /// Trace the Verilog-A `while`-loop unrolling scan (`SANE_VA_DEBUG_WHILE`).
-    pub va_debug_while: bool,
+    /// Run a function body per parameter binding, its parameter branches
+    /// decided (`SANE_VARIANTS`, `0` runs every body whole; see
+    /// `rsdag::variant`).
+    pub variants: bool,
 }
 
 impl Default for Config {
@@ -61,7 +59,6 @@ impl Default for Config {
         Config {
             jit: true,
             tape_specialization: true,
-            node_collapse: true,
             threads: None,
             transient_fixed_step: false,
             events: true,
@@ -69,7 +66,7 @@ impl Default for Config {
             tran_trace: false,
             hb_band: None,
             va_trace_nan: false,
-            va_debug_while: false,
+            variants: true,
         }
     }
 }
@@ -91,9 +88,6 @@ impl Config {
         if off("SANE_TAPE_SPEC") {
             c.tape_specialization = false;
         }
-        if set("SANE_NO_COLLAPSE") {
-            c.node_collapse = false;
-        }
         c.threads = std::env::var("SANE_THREADS")
             .ok()
             .and_then(|s| s.trim().parse::<usize>().ok())
@@ -108,7 +102,9 @@ impl Config {
             .ok()
             .and_then(|s| s.trim().parse::<u32>().ok());
         c.va_trace_nan = set("SANE_VA_TRACE_NAN");
-        c.va_debug_while = set("SANE_VA_DEBUG_WHILE");
+        if off("SANE_VARIANTS") {
+            c.variants = false;
+        }
         c
     }
 }
@@ -135,8 +131,7 @@ pub fn set_config(c: Config) {
 /// environment first if needed).
 pub fn update_config(f: impl FnOnce(&mut Config)) {
     let mut w = CONFIG.write().unwrap();
-    let c = w.get_or_insert_with(Config::from_env);
-    f(c);
+    f(w.get_or_insert_with(Config::from_env));
 }
 
 #[cfg(test)]

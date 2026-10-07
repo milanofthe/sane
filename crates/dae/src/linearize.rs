@@ -59,6 +59,9 @@ pub fn linearize(ctx: &mut Graph, dae: &Dae) -> Dae {
         param_defaults: dae.param_defaults.clone(),
         currents,
         charges,
+        assertions: dae.assertions.clone(),
+        structure: dae.structure.clone(),
+        aliases: dae.aliases.clone(),
         events: Vec::new(),
         delays: dae.delays.clone(),
         unknowns: dae.unknowns.clone(),
@@ -100,7 +103,7 @@ pub(crate) mod tests_support {
             .resistor("R1", 1, 0)
             .inductor("L1", 1, 0)
             .capacitor("C1", 1, 0);
-        assemble_dae(ctx, &c, &[])
+        assemble_dae(ctx, &c, &[]).unwrap()
     }
 
     /// A diode-loaded RC node: a nonlinear DAE whose small-signal entries are the
@@ -114,7 +117,7 @@ pub(crate) mod tests_support {
             Box::new(sane_veriloga::builtin_device("sane_diode", "D1", &[])),
             vec![1, 0],
         )];
-        assemble_dae(ctx, &c, &devs)
+        assemble_dae(ctx, &c, &devs).unwrap()
     }
 
     /// Deterministic pseudo-random value for a symbol name (FNV-1a of the

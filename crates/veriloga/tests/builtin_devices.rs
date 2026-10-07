@@ -19,18 +19,38 @@ fn currents(
     terms: &[&str],
 ) -> Vec<ExprId> {
     let dev = builtin_device(module, inst, fold_params);
+    // The instance's parameter values, for `env_of`: the lowering keeps every
+    // parameter a symbol, the ones it branches on included.
+    PARAMS.with(|p| {
+        let mut p = p.borrow_mut();
+        for (name, default) in dev.default_params() {
+            let v = fold_params
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map_or(default, |&(_, v)| v);
+            p.push((format!("{inst}.{name}"), v));
+        }
+    });
     let term_v: Vec<ExprId> = terms.iter().map(|n| ctx.sym(n)).collect();
     let mut lo = Lowerer::new(ctx);
     dev.lower_behavioral(&mut lo, &term_v, &[])
+        .unwrap()
         .terminal_currents
+}
+
+thread_local! {
+    /// The parameter values of the devices `currents` lowered on this thread.
+    static PARAMS: std::cell::RefCell<Vec<(String, f64)>> = Default::default();
 }
 
 fn env_of(ctx: &mut Graph, vals: &[(&str, f64)]) -> HashMap<SymbolId, f64> {
     // The models read the global `$temp` and per-instance Tnom/Eg/XTI; default
     // them to nominal (temperature scalings become identities) for every
-    // instance referenced, unless the test overrides them.
+    // instance referenced, unless the test overrides them. Every other
+    // parameter takes the value its device was lowered with.
     let tnom = TEMP_NOMINAL_K;
-    let mut all: Vec<(String, f64)> = vec![(TEMP_SYMBOL.to_string(), tnom)];
+    let mut all: Vec<(String, f64)> = PARAMS.with(|p| p.borrow().clone());
+    all.push((TEMP_SYMBOL.to_string(), tnom));
     let mut insts = std::collections::HashSet::new();
     for (name, _) in vals {
         if let Some((inst, _)) = name.split_once('.') {

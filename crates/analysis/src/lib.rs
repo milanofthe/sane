@@ -41,7 +41,6 @@ pub fn set_log_level(level: &str) {
 }
 #[cfg(test)]
 use sane_core::constants::{DC_OP_MAXIT, DC_OP_TOL};
-use sane_netlist::parse;
 use sane_solve::CompiledDc;
 use std::collections::HashMap;
 #[cfg(test)]
@@ -73,26 +72,34 @@ pub use sweep::temp_sweep_on_dae;
 
 // --- shared analysis front end ----------------------------------------------
 
-/// The compiled front end of a netlist-string analysis: the symbolic context,
-/// the parsed deck, the assembled DAE, and the compiled DC solver. Returned by
-/// [`prepare`] as an owned bundle (no field borrows another), so each caller
-/// destructures the pieces it needs.
+/// The compiled front end of a circuit: the symbolic context, the assembled
+/// DAE, and the compiled DC solver. Returned by [`prepare`] as an owned
+/// bundle (no field borrows another), so each caller destructures the pieces
+/// it needs.
 struct Prepared {
     ctx: Graph,
-    parsed: sane_netlist::ParsedCircuit,
     dae: sane_dae::Dae,
     cdc: CompiledDc,
 }
 
-/// Parse a netlist, assemble the symbolic DAE, and compile the DC solver -- the
-/// identical setup [`Model::from_netlist`](crate::Model::from_netlist) begins
-/// with. Returns a human-readable error string on a parse failure (callers map
-/// it to their own result type). This is the single place the analysis front
-/// end lives, so every analysis enters the engine the same way.
-fn prepare(netlist: &str) -> Result<Prepared, String> {
-    let parsed = log_stage!("parse", parse(netlist)).map_err(|e| format!("parse error: {e}"))?;
+/// Assemble a circuit's symbolic DAE and compile the DC solver: the one
+/// setup every model of a circuit goes through, parsed or built (see
+/// [`Model::from_parsed`](crate::Model::from_parsed)). The devices decide
+/// their structure at `values` (by parameter name) where those set a
+/// parameter, else at the circuit's own; `targets` holds the `.nodeset`
+/// targets (node name, volts). An error names what does not assemble.
+fn prepare(
+    parsed: &sane_netlist::ParsedCircuit,
+    targets: &[(String, f64)],
+    values: &dyn Fn(&str) -> Option<f64>,
+) -> Result<Prepared, String> {
     let mut ctx = Graph::new();
-    let dae = log_stage!("dae/assemble", parsed.assemble(&mut ctx));
+    let mut dae = log_stage!("dae/assemble", parsed.assemble_at(&mut ctx, values))?;
+    // The devices' Newton limits under the parameters the circuit is at.
+    dae.keep_limits_at(&ctx, |s| {
+        let name = ctx.symbol_name(s);
+        values(name).or_else(|| parsed.param_value(name))
+    });
     let mut cdc = log_stage!("compile", CompiledDc::new(&mut ctx, &dae));
     // `.nodeset` symmetry breaking: device-emitted DC seeds first (`idt(u, ic)`
     // states, keyed by unknown name), then explicit `.nodeset` directives on
@@ -108,7 +115,7 @@ fn prepare(netlist: &str) -> Result<Prepared, String> {
                 .map(|i| (i, *val))
         })
         .collect();
-    for (node, val) in parse_nodeset(netlist) {
+    for (node, val) in targets.iter().cloned() {
         let Some(i) = parsed
             .node(&node)
             .and_then(|k| dae.unknowns.iter().position(|u| *u == format!("v{k}")))
@@ -123,12 +130,7 @@ fn prepare(netlist: &str) -> Result<Prepared, String> {
     if !nodeset.is_empty() {
         cdc.set_nodeset(nodeset);
     }
-    Ok(Prepared {
-        ctx,
-        parsed,
-        dae,
-        cdc,
-    })
+    Ok(Prepared { ctx, dae, cdc })
 }
 
 /// Parse an engineering-notation number like `10u`, `1meg`, `2.2k`.

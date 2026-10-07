@@ -139,6 +139,9 @@ pub(crate) struct StageWorkspace<'a> {
     /// residual's rounding floor).
     pub jmag: Vec<f64>,
     pub rowmag: Vec<f64>,
+    /// Per unknown, the rounding floor of the stage solves (see
+    /// [`CompiledDc::rounding_floor`]).
+    pub floor: Vec<f64>,
     /// The stage Newton's scratch: the scaled right-hand side and the
     /// Newton step. The error estimates reuse both once the stages are
     /// solved.
@@ -200,6 +203,7 @@ impl<'a> StageWorkspace<'a> {
             q: vec![0.0; n],
             jmag: Vec::new(),
             rowmag: vec![0.0; n],
+            floor: vec![0.0; n],
             rhs: vec![0.0; n],
             step: vec![0.0; n],
             f: vec![0.0; n],
@@ -340,7 +344,7 @@ impl CompiledDc {
                 let r = (q - ws.qn[k] - ws.psi[k]) / hg + i;
                 ws.rhs[k] = r;
                 let terms = (q.abs() + ws.qn[k].abs() + ws.psi[k].abs()) / hg + ws.rowmag[k];
-                rounded &= r.abs() <= IRK_STAGE_ROUNDOFF * f64::EPSILON * terms;
+                rounded &= r.abs() <= NEWTON_ROUNDOFF * f64::EPSILON * terms;
             }
             if rounded {
                 self.residual_slope(ws, x, ti);
@@ -422,6 +426,32 @@ impl CompiledDc {
             prev_wn = wn;
         }
         false
+    }
+
+    /// The rounding floor of the stage solves into `ws.floor`, times `gain`:
+    /// per unknown, the move the residual's own rounding (the ulps of the
+    /// terms each row sums, as `stage_newton` bounds them) makes through the
+    /// stage matrix at the last stage `(x, h gamma)`. A mode the circuit pins only
+    /// algebraically and weakly -- a floating bridge held by megaohms against
+    /// a large capacitor's charge -- amplifies that rounding, as `1/h`; no
+    /// tolerance below it is resolvable. `false` when the solve fails.
+    pub(crate) fn rounding_floor(
+        &self,
+        ws: &mut StageWorkspace<'_>,
+        x: &[f64],
+        hg: f64,
+        gain: f64,
+    ) -> bool {
+        self.row_magnitudes(ws, x, hg);
+        for k in 0..self.n {
+            let terms = (ws.q[k].abs() + ws.qn[k].abs() + ws.psi[k].abs()) / hg + ws.rowmag[k];
+            ws.rhs[k] = NEWTON_ROUNDOFF * f64::EPSILON * terms;
+        }
+        if !ws.fac.solve_into(&ws.rhs, &mut ws.floor) {
+            return false;
+        }
+        ws.floor.iter_mut().for_each(|v| *v = gain * v.abs());
+        true
     }
 
     /// Refresh the stage factorization at `(x, t)` for step size `h` and

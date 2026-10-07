@@ -84,7 +84,20 @@ pub struct VarDecl {
     /// annotation marks an operating-point variable (the compact-model OPP
     /// idiom) that analyses can report after a solve.
     pub attrs: Vec<(String, AttrVal)>,
+    /// `real x = expr;`: the value the variable starts from.
+    pub init: Option<Expr>,
     pub span: Span,
+}
+
+impl VarDecl {
+    /// The initializer as the assignment it amounts to.
+    pub fn init_stmt(&self) -> Option<Stmt> {
+        self.init.clone().map(|rhs| Stmt::Assign {
+            lhs: self.name.clone(),
+            rhs,
+            span: self.span,
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -266,7 +279,88 @@ pub enum Expr {
     },
 }
 
+impl Stmt {
+    /// Every expression the statement holds, its sub-statements' included,
+    /// each visited as a whole (see [`Expr::visit`] for its parts).
+    pub fn for_each_expr<'s>(&'s self, f: &mut impl FnMut(&'s Expr)) {
+        match self {
+            Stmt::Block(ss) => ss.iter().for_each(|s| s.for_each_expr(f)),
+            Stmt::Assign { rhs, .. } | Stmt::Contribution { rhs, .. } => f(rhs),
+            Stmt::Indirect { lhs, rhs, .. } => {
+                f(lhs);
+                f(rhs);
+            }
+            Stmt::If { cond, then, els } => {
+                f(cond);
+                then.for_each_expr(f);
+                if let Some(e) = els {
+                    e.for_each_expr(f);
+                }
+            }
+            Stmt::Case {
+                sel,
+                items,
+                default,
+            } => {
+                f(sel);
+                for (labels, body) in items {
+                    labels.iter().for_each(&mut *f);
+                    body.for_each_expr(f);
+                }
+                if let Some(d) = default {
+                    d.for_each_expr(f);
+                }
+            }
+            Stmt::For {
+                init,
+                cond,
+                step,
+                body,
+            } => {
+                init.for_each_expr(f);
+                f(cond);
+                step.for_each_expr(f);
+                body.for_each_expr(f);
+            }
+            Stmt::While { cond, body } => {
+                f(cond);
+                body.for_each_expr(f);
+            }
+            Stmt::InitialStep(b) => b.for_each_expr(f),
+            Stmt::Event { args, body, .. } => {
+                args.iter().for_each(&mut *f);
+                body.for_each_expr(f);
+            }
+            Stmt::SysTask { args, .. } | Stmt::Call { args, .. } => args.iter().for_each(f),
+            Stmt::IgnoredCall | Stmt::Empty => {}
+        }
+    }
+}
+
 impl Expr {
+    /// The expression and every sub-expression of it, outermost first.
+    pub fn visit<'s>(&'s self, f: &mut impl FnMut(&'s Expr)) {
+        f(self);
+        match self {
+            Expr::Array(v) | Expr::SysFn { args: v, .. } | Expr::Call { args: v, .. } => {
+                v.iter().for_each(|e| e.visit(f))
+            }
+            Expr::Unary { arg, .. } => arg.visit(f),
+            Expr::Binary { lhs, rhs, .. } => {
+                lhs.visit(f);
+                rhs.visit(f);
+            }
+            Expr::Ternary {
+                cond, then, els, ..
+            } => {
+                cond.visit(f);
+                then.visit(f);
+                els.visit(f);
+            }
+            Expr::Num(_) | Expr::Str(_) | Expr::Ident(..) | Expr::Access { .. } => {}
+        }
+    }
+
     pub fn span(&self) -> Span {
         match self {
             Expr::Num(_) | Expr::Str(_) | Expr::Array(_) => Span::default(),

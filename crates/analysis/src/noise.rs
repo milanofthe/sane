@@ -117,8 +117,8 @@ pub fn noise_on_dae(
             }
         }
         match level {
-            None => tab_srcs.push((u, ns.table.clone())),
-            Some((psd, fexp)) => {
+            sane_dae::NoiseLevel::Table(table) => tab_srcs.push((u, table)),
+            sane_dae::NoiseLevel::Spectral { psd, fexp } => {
                 if psd.is_finite() && psd > 0.0 && fexp.is_finite() {
                     srcs.push((u, psd, fexp));
                 }

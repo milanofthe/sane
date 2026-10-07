@@ -851,8 +851,8 @@ impl DeviceModel for OsdiDevice {
         lo: &mut Lowerer,
         terminal_v: &[ExprId],
         _control_i: &[ExprId],
-    ) -> BehavioralFragment {
-        self.setup().expect("osdi setup validated at load time");
+    ) -> Result<BehavioralFragment, String> {
+        self.setup()?;
         let bundle = self.state.lock().unwrap().clone().expect("set up above");
         let st = bundle.state.lock().unwrap();
         let nt = self.module.num_terminals;
@@ -1007,8 +1007,11 @@ impl DeviceModel for OsdiDevice {
                 table: Vec::new(),
             });
         }
-        BehavioralFragment {
+        Ok(BehavioralFragment {
             param_syms: Vec::new(),
+            structural: Vec::new(),
+            collapsed: Vec::new(),
+            assertions: Vec::new(),
             events: Vec::new(),
             terminal_currents,
             currents,
@@ -1017,7 +1020,7 @@ impl DeviceModel for OsdiDevice {
             noise,
             op_vars: Vec::new(),
             limits: Vec::new(),
-        }
+        })
     }
 }
 

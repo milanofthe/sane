@@ -23,7 +23,9 @@ fn cswitch_on_and_off() {
     let (a, b) = (ctx.sym("a"), ctx.sym("b"));
     let ic = ctx.sym("i_V1");
     let mut lo = Lowerer::new(&mut ctx);
-    let frag = CSwitch::new("W1", "V1").lower_behavioral(&mut lo, &[a, b], &[ic]);
+    let frag = CSwitch::new("W1", "V1")
+        .lower_behavioral(&mut lo, &[a, b], &[ic])
+        .unwrap();
     assert!(frag.currents.is_empty(), "no extra unknowns");
     let i = frag.terminal_currents.clone();
     drop(lo);

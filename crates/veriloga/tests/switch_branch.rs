@@ -37,7 +37,7 @@ fn switch_branch_single_arm_is_constrained() {
     c.voltage_source("VP", 1, 0).voltage_source("VC", 2, 0);
     let dev = VerilogADevice::new("X1", elab(src));
     let devs = vec![DeviceInstance::new(Box::new(dev), vec![1, 0, 2])];
-    let dae = assemble_dae(&mut ctx, &c, &devs);
+    let dae = assemble_dae(&mut ctx, &c, &devs).unwrap();
     let sw = dae
         .unknowns
         .iter()
@@ -86,7 +86,7 @@ fn switchable_resistor_branch() {
         Default::default(),
     );
     let devs = vec![DeviceInstance::new(Box::new(dev), vec![1, 0])];
-    let dae = assemble_dae(&mut ctx, &c, &devs);
+    let dae = assemble_dae(&mut ctx, &c, &devs).unwrap();
     println!("UNKNOWNS = {:?}", dae.unknowns);
 
     // Consistent operating point: v1 = 2 V, branch current i = g*v1 = 2 mA,

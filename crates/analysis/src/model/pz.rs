@@ -18,6 +18,7 @@ impl Model {
     /// eigensolver -- no Python-side linear algebra, so no drift). `(re, im)` in
     /// rad/s.
     pub fn poles(&self, x: Vec<f64>, p: Vec<f64>) -> Result<Vec<(f64, f64)>, ModelError> {
+        self.inner.bound(&p)?;
         let g = self.cdc().system_matrix_dc(&x, &p, 0.0);
         let c = self.cdc().jacobian_q_x(&x, &p, 0.0);
         finite_pencil_roots(&g, &c)
@@ -35,6 +36,7 @@ impl Model {
         x: Vec<f64>,
         p: Vec<f64>,
     ) -> Result<Vec<(f64, f64)>, ModelError> {
+        self.inner.bound(&p)?;
         let n = self.dae().dim();
         let g = self.cdc().system_matrix_dc(&x, &p, 0.0);
         let c = self.cdc().jacobian_q_x(&x, &p, 0.0);
@@ -69,6 +71,7 @@ impl Model {
         x: Vec<f64>,
         p: Vec<f64>,
     ) -> Result<Vec<((f64, f64), Vec<(String, f64, f64)>)>, ModelError> {
+        self.inner.bound(&p)?;
         let _g = log::scope("sens/pole_gradient");
         let n = self.dae().dim();
         let g = self.cdc().system_matrix_dc(&x, &p, 0.0);
@@ -209,6 +212,7 @@ impl Model {
         x: Vec<f64>,
         p: Vec<f64>,
     ) -> Result<Vec<((f64, f64), Vec<(String, f64, f64)>)>, ModelError> {
+        self.inner.bound(&p)?;
         let _g = log::scope("sens/zero_gradient");
         let n = self.dae().dim();
         let g = self.cdc().system_matrix_dc(&x, &p, 0.0);
@@ -384,6 +388,7 @@ impl Model {
         x: Vec<f64>,
         p: Vec<f64>,
     ) -> Result<Vec<((f64, f64), (f64, f64))>, ModelError> {
+        self.inner.bound(&p)?;
         let g = self.cdc().system_matrix_dc(&x, &p, 0.0);
         let c = self.cdc().jacobian_q_x(&x, &p, 0.0);
         let (dg, dc, _db) = self.ac_derivatives(input, param, x.clone(), p.clone(), 0.0)?;
@@ -407,6 +412,7 @@ impl Model {
         x: Vec<f64>,
         p: Vec<f64>,
     ) -> Result<Vec<((f64, f64), (f64, f64))>, ModelError> {
+        self.inner.bound(&p)?;
         let n = self.dae().dim();
         let g = self.cdc().system_matrix_dc(&x, &p, 0.0);
         let c = self.cdc().jacobian_q_x(&x, &p, 0.0);

@@ -62,7 +62,7 @@ fn diode_ladder(k: usize) -> (Graph, Dae) {
             vec![i + 1, 0],
         ));
     }
-    let dae = assemble_dae(&mut ctx, &c, &devs);
+    let dae = assemble_dae(&mut ctx, &c, &devs).unwrap();
     (ctx, dae)
 }
 
@@ -100,7 +100,7 @@ fn rc_grid(w: usize, h: usize, diodes: usize) -> (Graph, Dae) {
             vec![node, 0],
         ));
     }
-    let dae = assemble_dae(&mut ctx, &c, &devs);
+    let dae = assemble_dae(&mut ctx, &c, &devs).unwrap();
     (ctx, dae)
 }
 

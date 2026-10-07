@@ -23,7 +23,7 @@ X3 in 0 quarter
 fn instances_share_one_function_per_body() {
     let parsed = sane_netlist::parse(DECK).unwrap();
     let mut ctx = sane_core::Graph::new();
-    let dae = parsed.assemble(&mut ctx);
+    let dae = parsed.assemble(&mut ctx).unwrap();
     // `half` (all four instances, two nested in `quarter`) and `quarter`;
     // the resistors' noise stays the bodies' (see `Observers`). The currents
     // and charges call their copies specialized to rest, one per body.

@@ -27,6 +27,7 @@ mod simd;
 #[cfg(any(test, feature = "synth"))]
 pub mod synth;
 pub mod tape;
+pub mod variant;
 // The rewrite machinery stays internal; substitution is exposed through the
 // `substitute` re-export below, not as a module path.
 pub(crate) mod transform;
@@ -36,7 +37,7 @@ pub use autodiff::{differentiate, gradient, sparse_jacobian, SparseRows};
 pub use builder::{Builder, Numeric};
 pub use display::to_string;
 pub use eval::eval;
-pub use extern_fn::{BackendCache, ExternBundle};
+pub use extern_fn::{BackendCache, BodyBackend, BodyCompiler, ExternBundle, Instances, Submit};
 pub use field::{Field, F64};
 pub use func::{Body, FuncId, Function, Output, OutputId};
 pub use graph::{Bound, Graph};
@@ -54,6 +55,6 @@ pub use scope::Scope;
 pub use semantics::{
     binary_f64, cmp_bool, dot_slice, reduce_slice, unary_f64, EXP_LIMIT, LN_FLOOR,
 };
-pub use tape::{NoTrace, Program, SpecializedTape, Tape, TraceSink};
+pub use tape::{NoTrace, ParamSelects, Program, SpecializedTape, Tape, TraceSink};
 
 pub use transform::substitute;

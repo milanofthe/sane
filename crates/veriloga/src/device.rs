@@ -80,6 +80,14 @@ impl VerilogADevice {
             .filter(|_| !self.inline.contains(param))
     }
 
+    /// The instance's values of its module's parameters (its own, else the
+    /// module's defaults): what decides its structure (see `template`).
+    pub fn values(&self) -> rustc_hash::FxHashMap<String, f64> {
+        (self.module.params.iter())
+            .map(|p| (p.name.clone(), self.params.get(&p.name).copied().unwrap_or(p.default)))
+            .collect()
+    }
+
     /// Trial-lower the device into a scratch context to surface any unsupported
     /// construct (a flow probe, a time-domain filter, an unsupported system
     /// function, a runtime switch branch, ...) UP FRONT, with a clear message,
@@ -92,8 +100,8 @@ impl VerilogADevice {
         lower_analog(
             &self.module,
             &self.name,
-            &self.params,
             &self.given,
+            &self.values(),
             self.mfactor,
             &mut lo,
             &term_v,
@@ -150,11 +158,10 @@ impl DeviceModel for VerilogADevice {
         lo: &mut Lowerer,
         terminal_v: &[ExprId],
         _control_i: &[ExprId],
-    ) -> BehavioralFragment {
+    ) -> Result<BehavioralFragment, String> {
         // A call of the module's function for this structure (see
-        // `crate::template`), built on the first such instance. Unsupported
-        // constructs are caught at load time by `validate()`, so a lowering
-        // error here is a bug and panics inside.
+        // `crate::template`), built on the first such instance.
         crate::template::lower_templated(self, lo, terminal_v)
+            .map_err(|e| format!("veriloga model '{}': {e}", self.module.name))
     }
 }

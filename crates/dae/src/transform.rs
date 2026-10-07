@@ -29,6 +29,9 @@ impl Dae {
         Dae {
             currents,
             charges,
+            assertions: self.assertions.clone(),
+            structure: self.structure.clone(),
+            aliases: self.aliases.clone(),
             n_nodes,
             param_defaults: self.param_defaults.clone(),
             unknowns,

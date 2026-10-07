@@ -453,22 +453,22 @@ the AC sweep over 801 points.
 <!-- bench:amplifiers -->
 | Amplifier | Unknowns | OP SANE | OP ngspice | OP Xyce | AC SANE | AC ngspice | AC Xyce |
 |---|---|---|---|---|---|---|---|
-| Yan_AZ | 148 | 1.35 | 0.500 | 58.7 | 6.43 | 3.75 | 21.0 |
-| Alfio_RAFFC | 166 | 1.46 | 0.250 | 6.10 | 6.86 | 3.90 | 24.0 |
-| Fan_SMC | 166 | 1.58 | 2.60 | 31.0 | 7.68 | 3.75 | 24.0 |
-| Leung_NMCF | 166 | 1.84 | 8.80 | 41.8 | 7.15 | 3.75 | 22.2 |
-| Ramos_PFC | 166 | 4.59 | 14.0 | 56.4 | 7.62 | 3.60 | 23.4 |
-| Sau_CFCC | 166 | 1.55 | 0.400 | 50.8 | 7.18 | 3.80 | 23.2 |
-| Leung_NMCNR | 167 | 3.75 | 12.2 | 89.3 | 7.11 | 4.10 | 24.5 |
-| Qu2017_AZC | 175 | 11.8 | 9.25 | 82.9 | 7.44 | 4.40 | 23.0 |
-| Leung_DFCFC1 | 179 | 2.65 | 8.95 | 58.6 | 7.72 | 4.00 | 24.6 |
-| Leung_DFCFC2 | 179 | 2.04 | 6.95 | 43.8 | 7.45 | 3.90 | 25.8 |
-| Peng_ACBC | 185 | 2.42 | 9.90 | 44.6 | 7.87 | 4.15 | 27.3 |
-| HoiLee_AFFC | 205 | 2.74 | 6.65 | 54.7 | 8.64 | 4.40 | 29.7 |
-| Peng_TCFC | 221 | 22.2 | 9.70 | 149 | 10.1 | 5.15 | 32.3 |
-| Peng_IAC | 235 | 32.5 | 12.4 | 102 | 10.5 | 5.55 | 35.1 |
-| Song_DACFC | 252 | 2.21 | 16.2 | 36.2 | 11.2 | 6.05 | 39.0 |
-| **geometric mean** |  | **3.42** | **4.76** | **50.4** | **7.96** | **4.23** | **26.2** |
+| Yan_AZ | 85 | 1.83 | 0.500 | 58.7 | 4.85 | 3.75 | 21.0 |
+| Alfio_RAFFC | 94 | 2.08 | 0.250 | 6.10 | 5.80 | 3.90 | 24.0 |
+| Fan_SMC | 94 | 2.25 | 2.60 | 31.0 | 5.59 | 3.75 | 24.0 |
+| Leung_NMCF | 94 | 2.24 | 8.80 | 41.8 | 5.25 | 3.75 | 22.2 |
+| Ramos_PFC | 94 | 5.58 | 14.0 | 56.4 | 5.48 | 3.60 | 23.4 |
+| Sau_CFCC | 94 | 2.14 | 0.400 | 50.8 | 5.62 | 3.80 | 23.2 |
+| Leung_NMCNR | 95 | 4.13 | 12.2 | 89.3 | 5.39 | 4.10 | 24.5 |
+| Qu2017_AZC | 100 | 11.1 | 9.25 | 82.9 | 5.78 | 4.40 | 23.0 |
+| Leung_DFCFC1 | 101 | 4.09 | 8.95 | 58.6 | 5.80 | 4.00 | 24.6 |
+| Leung_DFCFC2 | 101 | 2.54 | 6.95 | 43.8 | 5.62 | 3.90 | 25.8 |
+| Peng_ACBC | 104 | 3.02 | 9.90 | 44.6 | 5.97 | 4.15 | 27.3 |
+| HoiLee_AFFC | 115 | 3.49 | 6.65 | 54.7 | 6.65 | 4.40 | 29.7 |
+| Peng_TCFC | 125 | 20.8 | 9.70 | 149 | 7.84 | 5.15 | 32.3 |
+| Peng_IAC | 133 | 34.5 | 12.4 | 102 | 8.09 | 5.55 | 35.1 |
+| Song_DACFC | 141 | 2.87 | 16.2 | 36.2 | 8.65 | 6.05 | 39.0 |
+| **geometric mean** |  | **4.22** | **4.76** | **50.4** | **6.07** | **4.23** | **26.2** |
 <!-- /bench:amplifiers -->
 
 ### Textbook corpus
@@ -481,8 +481,8 @@ DC solves take microseconds, under ngspice's timer resolution.
 <!-- bench:corpus -->
 | Analysis | vs ngspice | faster on | vs Xyce | faster on |
 |---|---|---|---|---|
-| AC sweep, 801 points | 0.832x | 2 of 30 | 6.60x | 29 of 29 |
-| Transient, 400 points | 0.455x | 6 of 30 | 2.80x | 25 of 29 |
+| AC sweep, 801 points | 0.836x | 2 of 30 | 6.78x | 29 of 29 |
+| Transient, 400 points | 0.426x | 6 of 30 | 2.66x | 25 of 29 |
 
 Speed: the reference's time over SANE's, above 1 SANE is faster.
 
@@ -490,38 +490,38 @@ Speed: the reference's time over SANE's, above 1 SANE is faster.
 
 | Circuit | Unknowns | AC SANE | AC ngspice | AC Xyce | Tran SANE | Tran ngspice | Tran Xyce |
 |---|---|---|---|---|---|---|---|
-| diode_clipper | 3 | 0.322 | 0.350 | 2.25 | 2.90 | 0.800 | 4.56 |
-| parallel_tank | 3 | 0.386 | 0.350 | 2.33 | 0.368 | 0.800 | 25.5 |
-| rc_lowpass | 3 | 0.292 | 0.250 | 2.28 | 0.408 | 0.800 | 4.32 |
-| rc_timeconst | 3 | 0.315 | 0.250 | 2.37 | 0.402 | 0.600 | 4.38 |
-| voltage_divider | 3 | 0.301 | 0.300 | 2.39 | 1.29 | 0.600 | 4.11 |
-| zener_regulator | 3 | 0.295 | 0.300 | 2.26 | 2.41 | 0.800 | 4.35 |
-| bjt_current_mirror | 4 | 0.342 | 0.300 | 2.33 | 3.25 | 1.00 | 4.61 |
-| bridge_rectifier | 4 | 0.351 | 0.350 | 2.48 | 3.81 | 0.800 | 4.64 |
-| mesfet_cs | 4 | 0.325 | 0.250 | 2.52 | 2.22 | 0.800 | 4.43 |
-| mos_current_mirror | 4 | 0.330 | 0.300 | 2.41 | 2.46 | 1.00 | 4.62 |
-| nmos_curve | 4 | 0.406 | 0.350 | 2.55 | 2.51 | 0.800 | 4.45 |
-| subckt_divider | 4 | 0.319 | 0.300 | 2.60 | 1.77 | 0.600 | 4.32 |
-| zener_clipper | 4 | 0.315 | 0.300 | 2.55 | 2.41 | 1.00 | 4.61 |
-| bjt_emitter_follower | 5 | 0.370 | 0.350 | 2.54 | 3.06 | 0.800 | 4.52 |
-| cmos_inverter | 5 | 0.389 | 0.300 | 2.63 | 1.13 | 0.600 | 4.55 |
-| jfet_cs | 5 | 0.370 | 0.350 | 2.71 | 0.704 | 0.600 | 5.46 |
-| op_inverting | 5 | 0.384 | 0.300 | 2.70 | 1.55 | 0.800 | 4.28 |
-| series_rlc | 5 | 0.362 | 0.350 | 2.62 | 0.476 | 0.800 | 4.73 |
-| symcirc_simple_lc | 5 | 0.374 | 0.350 | 2.61 | 0.744 | 0.600 | 14.5 |
-| colpitts_oscillator | 6 | 0.415 | 0.300 | 2.67 | 0.745 | 1.00 | 4.74 |
-| sallen_key_lp | 6 | 0.392 | 0.350 | 2.79 | 0.518 | 0.800 | 4.62 |
-| vswitch_divider | 6 | 0.356 | 0.350 | - | 2.09 | 0.600 | - |
-| biased_clipper | 7 | 0.512 | 0.400 | 2.80 | 3.56 | 0.800 | 4.43 |
-| cswitch_load | 7 | 0.404 | 0.350 | - | 1.86 | 0.800 | - |
-| bjt_ce_min | 8 | 0.477 | 0.350 | 2.98 | 3.74 | 1.00 | 4.63 |
-| symcirc_mos_amp | 10 | 0.496 | - | - | 1.25 | - | - |
-| symcirc_emitteramp | 12 | 0.603 | 0.450 | 3.24 | 1.47 | 0.800 | 5.08 |
-| cmos_diffpair_ota | 16 | 0.724 | 0.600 | 5.31 | 7.49 | 1.40 | 6.10 |
-| symcirc_conrad2st | 20 | 0.892 | - | 4.38 | 2.61 | - | 6.42 |
-| multistage_bjt_opamp | 21 | 0.973 | 0.750 | 6.54 | 11.3 | 1.60 | 6.54 |
-| ua741_inverting | 180 | 7.06 | 2.90 | 25.3 | 28.0 | 4.80 | 15.8 |
-| ua741 | 184 | 7.10 | 2.90 | 27.8 | 35.3 | 5.40 | 17.4 |
+| diode_clipper | 3 | 0.324 | 0.350 | 2.27 | 3.03 | 0.800 | 4.30 |
+| parallel_tank | 3 | 0.303 | 0.350 | 2.66 | 0.370 | 0.800 | 26.0 |
+| rc_lowpass | 3 | 0.299 | 0.250 | 2.41 | 0.413 | 0.800 | 4.81 |
+| rc_timeconst | 3 | 0.342 | 0.250 | 2.31 | 0.400 | 0.600 | 4.38 |
+| voltage_divider | 3 | 0.310 | 0.300 | 2.40 | 1.35 | 0.600 | 4.21 |
+| zener_regulator | 3 | 0.341 | 0.300 | 2.35 | 2.69 | 0.800 | 4.46 |
+| bjt_current_mirror | 4 | 0.424 | 0.300 | 2.25 | 3.88 | 1.00 | 4.55 |
+| bridge_rectifier | 4 | 0.378 | 0.350 | 2.44 | 4.04 | 0.800 | 4.52 |
+| mesfet_cs | 4 | 0.359 | 0.250 | 2.55 | 2.55 | 0.800 | 4.40 |
+| mos_current_mirror | 4 | 0.401 | 0.300 | 2.48 | 2.96 | 1.00 | 4.65 |
+| nmos_curve | 4 | 0.361 | 0.350 | 2.48 | 2.79 | 0.800 | 4.44 |
+| subckt_divider | 4 | 0.330 | 0.300 | 2.63 | 1.87 | 0.600 | 4.89 |
+| zener_clipper | 4 | 0.329 | 0.300 | 2.58 | 2.57 | 1.00 | 4.71 |
+| bjt_emitter_follower | 5 | 0.459 | 0.350 | 2.52 | 3.46 | 0.800 | 4.39 |
+| cmos_inverter | 5 | 0.381 | 0.300 | 2.57 | 1.28 | 0.600 | 4.58 |
+| jfet_cs | 5 | 0.362 | 0.350 | 2.80 | 0.780 | 0.600 | 5.30 |
+| op_inverting | 5 | 0.391 | 0.300 | 2.68 | 1.60 | 0.800 | 4.44 |
+| series_rlc | 5 | 0.391 | 0.350 | 2.67 | 0.480 | 0.800 | 4.78 |
+| symcirc_simple_lc | 5 | 0.366 | 0.350 | 2.71 | 0.750 | 0.600 | 14.5 |
+| colpitts_oscillator | 6 | 0.438 | 0.300 | 2.70 | 0.823 | 1.00 | 4.74 |
+| sallen_key_lp | 6 | 0.389 | 0.350 | 2.74 | 0.513 | 0.800 | 4.63 |
+| vswitch_divider | 6 | 0.397 | 0.350 | - | 2.56 | 0.600 | - |
+| biased_clipper | 7 | 0.424 | 0.400 | 2.87 | 3.68 | 0.800 | 4.38 |
+| cswitch_load | 7 | 0.409 | 0.350 | - | 1.97 | 0.800 | - |
+| bjt_ce_min | 8 | 0.443 | 0.350 | 3.07 | 4.04 | 1.00 | 4.62 |
+| symcirc_emitteramp | 10 | 0.545 | 0.450 | 3.33 | 1.53 | 0.800 | 5.07 |
+| symcirc_mos_amp | 10 | 0.540 | - | - | 1.33 | - | - |
+| cmos_diffpair_ota | 16 | 0.801 | 0.600 | 5.36 | 8.47 | 1.40 | 6.09 |
+| symcirc_conrad2st | 16 | 0.807 | - | 4.46 | 2.71 | - | 6.55 |
+| multistage_bjt_opamp | 21 | 1.01 | 0.750 | 6.68 | 14.8 | 1.60 | 6.45 |
+| ua741_inverting | 105 | 4.32 | 2.90 | 25.7 | 24.0 | 4.80 | 16.1 |
+| ua741 | 109 | 4.57 | 2.90 | 27.7 | 31.4 | 5.40 | 18.4 |
 
 </details>
 <!-- /bench:corpus -->
@@ -540,11 +540,11 @@ change on circuits of this size.
 <!-- bench:threads -->
 | Threads | OP SANE | OP ngspice | AC SANE | AC ngspice |
 |---|---|---|---|---|
-| 1 | 3.94 | 4.67 | 9.33 | 4.04 |
-| 2 | 2.97 | 4.91 | 5.78 | 4.06 |
-| 4 | 2.46 | 4.69 | 3.58 | 4.06 |
-| 8 | 2.37 | 4.58 | 2.78 | 4.02 |
-| 12 | 2.81 | 4.67 | 2.41 | 4.02 |
+| 1 | 4.28 | 4.67 | 6.02 | 4.04 |
+| 2 | 2.93 | 4.91 | 4.02 | 4.06 |
+| 4 | 2.48 | 4.69 | 2.92 | 4.06 |
+| 8 | 2.79 | 4.58 | 2.37 | 4.02 |
+| 12 | 2.78 | 4.67 | 2.36 | 4.02 |
 <!-- /bench:threads -->
 
 ### VACASK transient suite
@@ -557,10 +557,10 @@ process on the upstream deck, as in VACASK's own methodology.
 <!-- bench:vacask -->
 | Case | Unknowns | Steps | SANE, s | ngspice, s |
 |---|---|---|---|---|
-| rc | 3 | 1,000,000 | 0.815 | 1.57 |
-| graetz | 13 | 1,000,000 | 5.12 | 2.41 |
-| mul | 15 | 500,000 | 3.10 | 1.30 |
-| ring | 47 | 20,000 | 19.5 | 2.29 |
+| rc | 3 | 1,000,000 | 0.835 | 1.57 |
+| graetz | 9 | 1,000,000 | 4.96 | 2.41 |
+| mul | 11 | 500,000 | 3.24 | 1.30 |
+| ring | 47 | 20,000 | 17.7 | 2.29 |
 <!-- /bench:vacask -->
 
 ### Verilog-A against OpenVAF
@@ -574,16 +574,16 @@ host sets, and OpenVAF's OSDI library hosted in SANE.
 <!-- bench:openvaf -->
 | Model | SANE, s | OpenVAF, s |
 |---|---|---|
-| PSP103 | 0.033 | 2.41 |
-| BSIM4 | 0.021 | 1.39 |
-| VBIC 1.3 | 0.006 | 0.308 |
-| HICUM L0 | 0.006 | 0.277 |
-| EKV 2.6 | 0.007 | 0.184 |
+| PSP103 | 0.070 | 2.43 |
+| BSIM4 | 0.017 | 1.43 |
+| VBIC 1.3 | 0.009 | 0.309 |
+| HICUM L0 | 0.007 | 0.275 |
+| EKV 2.6 | 0.007 | 0.182 |
 
 | Ring, per Newton iteration | SANE, us | OpenVAF, us | OpenVAF in SANE, us |
 |---|---|---|---|
-| operating point | 11.6 | 17.6 | 18.5 |
-| transient | 12.8 | 17.8 | 18.6 |
+| operating point | 11.3 | 15.0 | 16.4 |
+| transient | 12.4 | 15.6 | 16.6 |
 <!-- /bench:openvaf -->
 
 ### Harmonic balance against Xyce
@@ -595,12 +595,12 @@ first three harmonics.
 <!-- bench:hb -->
 | Circuit | Harmonics | SANE, ms | Xyce, ms | Largest difference, H1-H3 |
 |---|---|---|---|---|
-| biased_diode_rc | 8 | 0.712 | 10.4 | 2.4e-04 |
-| diode_mixer_bias | 8 | 0.716 | 10.4 | 1.9e-04 |
-| diode_ladder_16 | 8 | 3.96 | 14.1 | 1.5e-04 |
-| diode_ladder_64 | 8 | 15.4 | 32.9 | 1.5e-04 |
-| diode_ladder_256 | 8 | 65.0 | 109 | 1.5e-04 |
-| diode_ladder_512 | 8 | 129 | 220 | 1.5e-04 |
+| biased_diode_rc | 8 | 0.773 | 10.2 | 2.4e-04 |
+| diode_mixer_bias | 8 | 0.748 | 10.9 | 1.9e-04 |
+| diode_ladder_16 | 8 | 4.46 | 14.4 | 1.5e-04 |
+| diode_ladder_64 | 8 | 16.8 | 35.0 | 1.5e-04 |
+| diode_ladder_256 | 8 | 67.5 | 119 | 1.5e-04 |
+| diode_ladder_512 | 8 | 137 | 228 | 1.5e-04 |
 <!-- /bench:hb -->
 
 ## Validation

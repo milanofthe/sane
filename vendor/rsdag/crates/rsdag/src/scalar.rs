@@ -300,7 +300,8 @@ impl Scalar for f64 {
         states: &mut [f64],
     ) {
         if n_groups >= 2 {
-            b.prolog_batch(pure, n_groups, n_pure, states);
+            let at = crate::Instances::first(n_groups, n_pure, b.state_len());
+            b.prolog_batch(pure, states, &at);
         } else if n_groups == 1 {
             b.prolog_into(pure, work, states);
         }
@@ -315,7 +316,8 @@ impl Scalar for f64 {
         out: &mut [f64],
     ) {
         if n_groups >= 2 {
-            b.main_batch(args, states, n_groups, n_args, out);
+            let at = crate::Instances::first(n_groups, n_args, b.state_len());
+            b.main_batch(args, states, out, &at);
         } else if n_groups == 1 {
             b.main_into(args, states, work, out);
         }

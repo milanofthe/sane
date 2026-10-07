@@ -61,6 +61,9 @@ pub struct ElaboratedModule {
     /// alias in a deck sets the target; the alias is not itself a parameter.
     pub aliases: HashMap<String, String>,
     pub vars: Vec<(String, VarType)>,
+    /// The parameters `$param_given` asks about, sorted: whether an instance
+    /// set each is part of its structure.
+    pub given_reads: Vec<String>,
     /// Named branch -> (hi node, lo node).
     pub branches: HashMap<String, (String, String)>,
     pub functions: HashMap<String, AnalogFunction>,
@@ -77,6 +80,9 @@ pub struct ElaboratedModule {
     pub canon: HashMap<String, &'static str>,
     /// Lower-cased aliases of system functions (`aliasparam m = $mfactor`).
     pub sysfn_aliases: HashSet<String>,
+    /// The statements of `analog` outside its topology slice, found once
+    /// (see [`crate::topology`]).
+    pub(crate) slice: crate::topology::SliceCache,
 }
 
 /// Intern a parameter name as a `&'static str` for `DeviceModel::default_params`
@@ -250,6 +256,23 @@ pub fn elaborate(m: &Module) -> Result<ElaboratedModule, Diagnostics> {
         }
     }
 
+    let mut given_reads: Vec<String> = Vec::new();
+    let mut note = |e: &Expr| {
+        e.visit(&mut |x| {
+            if let Expr::SysFn { name, args, .. } = x {
+                if let (true, Some(Expr::Ident(p, _))) = (name == "param_given", args.first()) {
+                    given_reads.push(p.clone());
+                }
+            }
+        })
+    };
+    m.analog.iter().for_each(|s| s.for_each_expr(&mut note));
+    for f in &m.functions {
+        f.body.iter().for_each(|s| s.for_each_expr(&mut note));
+    }
+    given_reads.sort();
+    given_reads.dedup();
+
     Ok(ElaboratedModule {
         name: m.name.clone(),
         ports: m.ports.clone(),
@@ -260,13 +283,21 @@ pub fn elaborate(m: &Module) -> Result<ElaboratedModule, Diagnostics> {
         opvars,
         aliases,
         vars,
+        given_reads,
         branches,
         functions,
-        analog: m.analog.clone(),
+        // Declaration initializers run first, in declaration order.
+        analog: m
+            .vars
+            .iter()
+            .filter_map(VarDecl::init_stmt)
+            .chain(m.analog.iter().cloned())
+            .collect(),
         default_params_static,
         default_map,
         canon,
         sysfn_aliases,
+        slice: Default::default(),
     })
 }
 

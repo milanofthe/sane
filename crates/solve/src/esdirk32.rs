@@ -107,12 +107,21 @@ impl CompiledDc {
         // A max norm let a single switching node dictate the step for the whole
         // system, systematically over-restricting circuits whose error is
         // concentrated in a few active nodes (a ring oscillator: 2 of 47).
-        let (err, worst) = ws_error_norm(ws, x, &ws.step, hg);
+        let (mut err, mut worst) = ws_error_norm(ws, x, &ws.step, hg, &[]);
+        // A step is rejected for truncation error, not for the rounding of
+        // its own stage solves: a stage moves by up to the rounding floor,
+        // the estimate by `sum |tr_i| / gamma` times that.
+        if err > 1.0 {
+            let gain = ESDIRK32_TR.iter().map(|t| t.abs()).sum::<f64>() / ESDIRK32_GAMMA;
+            if self.rounding_floor(ws, x, hg, gain) {
+                (err, worst) = ws_error_norm(ws, x, &ws.step, hg, &ws.floor);
+            }
+        }
         if ws.trace && err > 1.0 {
             eprintln!(
-                "tran:     error worst=x[{worst}] e={:.3e} raw={:.3e} x={:.6e} slopes={:?}",
+                "tran:     error worst=x[{worst}] e={:.3e} floor={:.3e} x={:.6e} slopes={:?}",
                 ws.step[worst] / hg,
-                ws.rhs[worst],
+                ws.floor[worst],
                 x[worst],
                 (0..ESDIRK32_STAGES)
                     .map(|i| ws.slopes[i][worst])
@@ -124,18 +133,21 @@ impl CompiledDc {
 }
 
 /// The WRMS norm of a filtered error estimate against the integration
-/// tolerances, `(norm, index of the worst component)`.
+/// tolerances widened by a rounding `floor` (empty: none), `(norm, index of
+/// the worst component)`.
 pub(crate) fn ws_error_norm(
     ws: &StageWorkspace<'_>,
     x_new: &[f64],
     e_filt: &[f64],
     scale: f64,
+    floor: &[f64],
 ) -> (f64, usize) {
     let n = x_new.len();
     let mut acc = 0.0;
     let (mut worst, mut worst_e) = (0usize, 0.0f64);
     for r in 0..n {
-        let sc = (ws.atol + ws.rtol * x_new[r].abs()).max(f64::MIN_POSITIVE);
+        let floor = floor.get(r).copied().unwrap_or(0.0);
+        let sc = (ws.atol + ws.rtol * x_new[r].abs() + floor).max(f64::MIN_POSITIVE);
         let e = (e_filt[r] / scale) / sc;
         acc += e * e;
         if e.abs() > worst_e {

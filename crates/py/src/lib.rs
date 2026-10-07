@@ -21,11 +21,10 @@ use std::collections::HashMap;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
-use sane_core::Graph;
 use sane_dae::DeviceInstance;
 use sane_device::CSwitch;
-use sane_mna::{Circuit as MnaCircuit, Kind, SourceFn};
-use sane_solve::CompiledDc;
+use sane_mna::{Kind, SourceFn};
+use sane_netlist::ParsedCircuit;
 
 /// A sparse matrix as `(rows, cols, values)`.
 type Coo = (Vec<usize>, Vec<usize>, Vec<f64>);
@@ -48,14 +47,11 @@ fn kind_name(k: &Kind) -> &'static str {
 /// A circuit builder. Nodes are integers; 0 is ground.
 #[pyclass]
 struct Circuit {
-    circuit: MnaCircuit,
-    devices: Vec<DeviceInstance>,
-    /// Subcircuit instances of a parsed deck (none for a built circuit).
-    instances: Vec<sane_dae::Instance>,
-    values: HashMap<String, f64>,
-    node_names: Vec<String>,
-    /// Power ports from `P` elements, in deck order: `(name, node, z0)`.
-    ports: Vec<(String, String, f64)>,
+    /// The circuit, parsed or built, as every model of it is set up from
+    /// (see `sane_analysis::Model::from_parsed`).
+    parsed: ParsedCircuit,
+    /// The netlist it was parsed from, while no builder call edited it.
+    source: Option<String>,
 }
 
 #[pymethods]
@@ -63,63 +59,65 @@ impl Circuit {
     #[new]
     fn new() -> Self {
         Circuit {
-            circuit: MnaCircuit::new(),
-            devices: Vec::new(),
-            instances: Vec::new(),
-            values: HashMap::new(),
-            node_names: vec!["0".to_string()],
-            ports: Vec::new(),
+            parsed: ParsedCircuit::new(),
+            source: None,
         }
     }
 
     /// Node names indexed by internal node id (`node_names()[k]` is the node
     /// behind DAE unknown `v{k}`). Index 0 is ground.
     fn node_names(&self) -> Vec<String> {
-        self.node_names.clone()
+        self.parsed.node_names.clone()
     }
 
     /// Power ports (`P` elements) in deck order: `(name, node, z0)` per port.
     /// The port name doubles as the AC/SP drive-source name.
     fn ports(&self) -> Vec<(String, String, f64)> {
-        self.ports.clone()
+        (self.parsed.ports.iter())
+            .map(|p| (p.name.clone(), p.node.clone(), p.z0))
+            .collect()
     }
 
     /// Bound element / parameter values by symbol name (e.g. `R1`, `D1.Is`).
     /// Populated by `parse`; empty for a programmatically built circuit (whose
     /// values are tracked on the Python wrapper until extraction).
     fn values(&self) -> HashMap<String, f64> {
-        self.values.clone()
+        self.parsed
+            .values
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect()
     }
 
     fn resistor(&mut self, name: &str, a: usize, b: usize) {
-        self.circuit.resistor(name, a, b);
+        self.edit().circuit.resistor(name, a, b);
     }
     fn capacitor(&mut self, name: &str, a: usize, b: usize) {
-        self.circuit.capacitor(name, a, b);
+        self.edit().circuit.capacitor(name, a, b);
     }
     fn inductor(&mut self, name: &str, a: usize, b: usize) {
-        self.circuit.inductor(name, a, b);
+        self.edit().circuit.inductor(name, a, b);
     }
     fn voltage_source(&mut self, name: &str, a: usize, b: usize) {
-        self.circuit.voltage_source(name, a, b);
+        self.edit().circuit.voltage_source(name, a, b);
     }
     fn current_source(&mut self, name: &str, a: usize, b: usize) {
-        self.circuit.current_source(name, a, b);
+        self.edit().circuit.current_source(name, a, b);
     }
     fn vccs(&mut self, name: &str, np: usize, nm: usize, cp: usize, cm: usize) {
-        self.circuit.vccs(name, np, nm, cp, cm);
+        self.edit().circuit.vccs(name, np, nm, cp, cm);
     }
     fn vcvs(&mut self, name: &str, np: usize, nm: usize, cp: usize, cm: usize) {
-        self.circuit.vcvs(name, np, nm, cp, cm);
+        self.edit().circuit.vcvs(name, np, nm, cp, cm);
     }
     fn cccs(&mut self, name: &str, np: usize, nm: usize, ctrl: &str) {
-        self.circuit.cccs(name, np, nm, ctrl);
+        self.edit().circuit.cccs(name, np, nm, ctrl);
     }
     fn ccvs(&mut self, name: &str, np: usize, nm: usize, ctrl: &str) {
-        self.circuit.ccvs(name, np, nm, ctrl);
+        self.edit().circuit.ccvs(name, np, nm, ctrl);
     }
     fn mutual(&mut self, name: &str, l1: &str, l2: &str) {
-        self.circuit.mutual(name, l1, l2);
+        self.edit().circuit.mutual(name, l1, l2);
     }
 
     fn diode(&mut self, name: &str, anode: usize, cathode: usize) {
@@ -145,23 +143,24 @@ impl Circuit {
     /// Attach a time-domain source shape to the most recently added element.
     /// Parameter values (e.g. `V1.sin_w`) are supplied numerically at eval time.
     fn source_sin(&mut self) {
-        self.circuit.set_source(SourceFn::Sin);
+        self.edit().circuit.set_source(SourceFn::Sin);
     }
     fn source_pulse(&mut self) {
-        self.circuit.set_source(SourceFn::Pulse);
+        self.edit().circuit.set_source(SourceFn::Pulse);
     }
     fn source_exp(&mut self) {
-        self.circuit.set_source(SourceFn::Exp);
+        self.edit().circuit.set_source(SourceFn::Exp);
     }
     fn source_pwl(&mut self, n: usize) {
-        self.circuit.set_source(SourceFn::Pwl(n));
+        self.edit().circuit.set_source(SourceFn::Pwl(n));
     }
 
     /// The top level's linear/controlled elements as tuples `(name, kind,
     /// node_a, node_b, control_element)`. Nonlinear devices (D/M/Q/switches)
     /// and the elements inside subcircuit instances are not included.
     fn elements(&self) -> Vec<(String, String, usize, usize, Option<String>)> {
-        self.circuit
+        self.parsed
+            .circuit
             .elements()
             .iter()
             .map(|e| {
@@ -178,7 +177,8 @@ impl Circuit {
 
     /// Inductive couplings as tuples `(name, inductor_1, inductor_2)`.
     fn couplings(&self) -> Vec<(String, String, String)> {
-        self.circuit
+        self.parsed
+            .circuit
             .couplings()
             .iter()
             .map(|k| (k.name.clone(), k.l1.clone(), k.l2.clone()))
@@ -188,32 +188,28 @@ impl Circuit {
     /// Number of the top level's nonlinear device instances (D/M/Q/switches);
     /// devices inside subcircuit instances are not counted.
     fn device_count(&self) -> usize {
-        self.devices.len()
+        self.parsed.devices.len()
     }
 
     /// Extract the DAE `I(x, t) + d/dt Q(x) = 0` (with its analytic Jacobians).
     fn extract_dae(&self) -> PyResult<PyModel> {
-        let mut core = Graph::new();
-        let inner = sane_dae::assemble(&mut core, &self.circuit, &self.devices, &self.instances);
-        let (cdc, _cprof) = CompiledDc::new_profiled(&mut core, &inner);
-        let arc = std::sync::Arc::new(std::sync::Mutex::new(core));
-        let (elements, terminals) =
-            sane_dae::topology(&self.circuit, &self.devices, &self.instances);
-        let model = sane_analysis::Model::from_parts(
-            arc,
-            inner,
-            cdc,
-            self.values.clone(),
-            self.node_names.clone(),
-            Some((&elements, &terminals)),
-        );
-        Ok(PyModel { inner: model })
+        sane_analysis::Model::from_parsed(&self.parsed, self.source.as_deref())
+            .map(|inner| PyModel { inner })
+            .map_err(model_err)
     }
 }
 
 impl Circuit {
+    /// The circuit to edit: no longer the netlist it was parsed from.
+    fn edit(&mut self) -> &mut ParsedCircuit {
+        self.source = None;
+        &mut self.parsed
+    }
+
     fn push_device(&mut self, model: Box<dyn sane_device::DeviceModel>, terminals: Vec<usize>) {
-        self.devices.push(DeviceInstance::new(model, terminals));
+        self.edit()
+            .devices
+            .push(DeviceInstance::new(model, terminals));
     }
 }
 
@@ -222,16 +218,8 @@ impl Circuit {
 fn parse(netlist: &str) -> PyResult<Circuit> {
     let parsed = sane_netlist::parse(netlist).map_err(|e| PyValueError::new_err(e.to_string()))?;
     Ok(Circuit {
-        circuit: parsed.circuit,
-        devices: parsed.devices,
-        instances: parsed.instances,
-        values: parsed.values.into_iter().collect(),
-        node_names: parsed.node_names,
-        ports: parsed
-            .ports
-            .iter()
-            .map(|p| (p.name.clone(), p.node.clone(), p.z0))
-            .collect(),
+        parsed,
+        source: Some(netlist.to_string()),
     })
 }
 
@@ -481,10 +469,8 @@ impl PyModel {
                 return Err(PyValueError::new_err(format!("'{k}' is not a parameter")));
             }
         }
-        for (k, v) in vals {
-            self.inner.set(&k, v).map_err(model_err)?;
-        }
-        Ok(())
+        let vals: Vec<(&str, f64)> = vals.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+        self.inner.set_many(&vals).map_err(model_err)
     }
 
     // --- graph transforms (return a new Model sharing this context) --------
@@ -547,15 +533,17 @@ impl PyModel {
         out_idx: usize,
         x: Vec<f64>,
         p: Vec<f64>,
-    ) -> (
+    ) -> PyResult<(
         Vec<String>,
         Vec<Vec<f64>>,
         Vec<Vec<f64>>,
         Vec<f64>,
         Vec<f64>,
         f64,
-    ) {
-        self.inner.state_space_raw(input, out_idx, x, p)
+    )> {
+        self.inner
+            .state_space_raw(input, out_idx, x, p)
+            .map_err(model_err)
     }
 
     /// Temperature sweep of the unknown at `out_idx` over `[tstart, tstop]` degC.
@@ -607,41 +595,41 @@ impl PyModel {
     // --- low-level numeric interface (evaluated in Rust) ------------------
 
     /// The currents `I(x, p, t)`. Every row reads `I(x, t) + d/dt Q(x)`.
-    fn currents(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> Vec<f64> {
-        self.inner.currents(x, p, t)
+    fn currents(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> PyResult<Vec<f64>> {
+        self.inner.currents(x, p, t).map_err(model_err)
     }
     /// The charges `Q(x, p)`.
-    fn charges(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> Vec<f64> {
-        self.inner.charges(x, p, t)
+    fn charges(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> PyResult<Vec<f64>> {
+        self.inner.charges(x, p, t).map_err(model_err)
     }
     /// The residual `F = I(x, t) + C(x) x'` at the state `x` moving at the
     /// rate `xdot`.
-    fn residual(&self, x: Vec<f64>, xdot: Vec<f64>, p: Vec<f64>, t: f64) -> Vec<f64> {
-        self.inner.residual(x, xdot, p, t)
+    fn residual(&self, x: Vec<f64>, xdot: Vec<f64>, p: Vec<f64>, t: f64) -> PyResult<Vec<f64>> {
+        self.inner.residual(x, xdot, p, t).map_err(model_err)
     }
     /// `G = dI/dx` as a dense matrix.
-    fn jacobian_i_x(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> Vec<Vec<f64>> {
-        self.inner.jacobian_i_x(x, p, t)
+    fn jacobian_i_x(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> PyResult<Vec<Vec<f64>>> {
+        self.inner.jacobian_i_x(x, p, t).map_err(model_err)
     }
     /// `C = dQ/dx` as a dense matrix.
-    fn jacobian_q_x(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> Vec<Vec<f64>> {
-        self.inner.jacobian_q_x(x, p, t)
+    fn jacobian_q_x(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> PyResult<Vec<Vec<f64>>> {
+        self.inner.jacobian_q_x(x, p, t).map_err(model_err)
     }
     /// Sparse `G = dI/dx` as `(rows, cols, values)` (COO).
-    fn jacobian_i_x_sparse(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> Coo {
-        self.inner.jacobian_i_x_sparse(x, p, t)
+    fn jacobian_i_x_sparse(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> PyResult<Coo> {
+        self.inner.jacobian_i_x_sparse(x, p, t).map_err(model_err)
     }
     /// Sparse `C = dQ/dx` as `(rows, cols, values)` (COO).
-    fn jacobian_q_x_sparse(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> Coo {
-        self.inner.jacobian_q_x_sparse(x, p, t)
+    fn jacobian_q_x_sparse(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> PyResult<Coo> {
+        self.inner.jacobian_q_x_sparse(x, p, t).map_err(model_err)
     }
     /// Sparse `dI/dp` as `(rows, cols, values)` (COO).
-    fn jacobian_i_p_sparse(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> Coo {
-        self.inner.jacobian_i_p_sparse(x, p, t)
+    fn jacobian_i_p_sparse(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> PyResult<Coo> {
+        self.inner.jacobian_i_p_sparse(x, p, t).map_err(model_err)
     }
     /// Sparse `dQ/dp` as `(rows, cols, values)` (COO).
-    fn jacobian_q_p_sparse(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> Coo {
-        self.inner.jacobian_q_p_sparse(x, p, t)
+    fn jacobian_q_p_sparse(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> PyResult<Coo> {
+        self.inner.jacobian_q_p_sparse(x, p, t).map_err(model_err)
     }
     /// Number of structural nonzeros in the sparse `G` pattern.
     fn nnz(&self) -> usize {

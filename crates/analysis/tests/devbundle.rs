@@ -126,8 +126,8 @@ fn sensitivity_wrt_bundled_device_param_matches_scalar() {
     assert!(((s1 - s2) / s1).abs() < 1e-6, "scalar {s1} vs bundled {s2}");
 }
 
-/// A module whose `TYPE` decides its structure through a variable (the
-/// decision reads `k`, which came from `TYPE`) and whose `Is` does not.
+/// A module that branches on its `TYPE` through a variable (the condition
+/// reads `k`, which came from `TYPE`).
 const DECK_SWITCHED: &str = "\
 .veriloga
 module swdiode(a, c);
@@ -168,12 +168,12 @@ fn called_functions(model: &Model) -> usize {
         .len()
 }
 
-/// Instances that differ only in a parameter no structural decision reads
-/// share one template, one function; a parameter a decision reads, even
-/// through a variable, splits them. Every node voltage is the one of the
-/// instance alone in its own deck, where nothing is shared.
+/// Instances share one function whatever their parameters, a parameter the
+/// module branches on included (the branch is in the function, each binding
+/// takes its arm). Every node voltage is the one of the instance alone in its
+/// own deck, where nothing is shared.
 #[test]
-fn templates_are_shared_across_non_structural_parameters() {
+fn templates_are_shared_across_parameters() {
     let instances = [
         (1, "Is=1e-14"),
         (2, "Is=3e-14"),
@@ -182,7 +182,7 @@ fn templates_are_shared_across_non_structural_parameters() {
         (5, "TYPE=-1 Is=5e-14"),
     ];
     let model = Model::from_netlist(&switched_deck(&instances)).expect("model");
-    assert_eq!(called_functions(&model), 2, "one function per structure");
+    assert_eq!(called_functions(&model), 1, "one function for every binding");
     let op = model.operating_point(&[]).expect("dc");
     for &(k, params) in &instances {
         let alone = Model::from_netlist(&switched_deck(&[(k, params)])).expect("alone");

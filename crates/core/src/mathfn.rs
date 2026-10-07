@@ -19,6 +19,19 @@ fn gdiv(ctx: &mut Graph, a: ExprId, b: ExprId) -> ExprId {
     }
 }
 
+/// `a ** b`. A constant integer exponent is an integer power (repeated
+/// products): exact for a negative or zero base, as the language defines it,
+/// and smooth everywhere. Any other exponent goes through the domain-guarded
+/// `exp(b ln a)`, whose base must be positive.
+pub fn pow(ctx: &mut Graph, a: ExprId, b: ExprId) -> ExprId {
+    if let Some(n) = ctx.const_f64(b).filter(|n| n.fract() == 0.0 && n.abs() <= i32::MAX as f64) {
+        return ctx.pow_i(a, n as i64);
+    }
+    let l = ctx.ln(a);
+    let bl = ctx.mul(b, l);
+    ctx.exp(bl)
+}
+
 /// Lower a call to an elementary math function over already-lowered arguments.
 /// Returns `None` for an unknown name/arity combination (the caller decides how
 /// to report that). Functions with a native [`crate::node::UnaryOp`] map to it
@@ -132,11 +145,7 @@ pub fn lower_math_call(ctx: &mut Graph, name: &str, a: &[ExprId]) -> Option<Expr
             let f = ctx.floor(n);
             ctx.neg(f)
         }
-        ("pow", 2) => {
-            let l = ctx.ln(a[0]);
-            let bl = ctx.mul(a[1], l);
-            ctx.exp(bl)
-        }
+        ("pow", 2) => pow(ctx, a[0], a[1]),
         ("min", 2) => {
             let le = ctx.cmp(CmpOp::Le, a[0], a[1]);
             ctx.select(le, a[0], a[1])

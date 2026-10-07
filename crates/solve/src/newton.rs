@@ -140,7 +140,9 @@ pub(crate) fn limit_step(limits: &[Limit], x: &[f64], step: &mut [f64]) -> f64 {
 
 /// The forward backtracking search: `x -= alpha * step` with the largest
 /// `alpha` (from `1`, halving `tries - 1` times) whose trial residual norm is
-/// below `fnorm`; when every probe fails the last, smallest fraction is taken
+/// below `fnorm`, or at most `floor`, the rounding the norm is computed with
+/// (below it two norms tell nothing apart, and a step refused on that noise
+/// would never be taken); when every probe fails the last, smallest fraction is taken
 /// anyway (the direction is still a descent direction of the linear model).
 /// Real or complex iterates and steps; `trial` is the caller's scratch of
 /// `x`'s length. The last probe `eval_norm` sees is the returned iterate,
@@ -150,6 +152,7 @@ pub(crate) fn backtrack<T>(
     step: &[T],
     trial: &mut [T],
     fnorm: f64,
+    floor: f64,
     tries: usize,
     mut eval_norm: impl FnMut(&[T]) -> f64,
 ) -> f64
@@ -163,7 +166,8 @@ where
         for i in 0..n {
             trial[i] = x[i] - step[i] * alpha;
         }
-        if eval_norm(trial) < fnorm {
+        let f = eval_norm(trial);
+        if f < fnorm || f <= floor {
             x.copy_from_slice(trial);
             return alpha;
         }
@@ -254,6 +258,7 @@ mod tests {
             &[step],
             &mut [0.0],
             f(x0).abs(),
+            0.0,
             LINE_SEARCH_TRIES,
             |t| f(t[0]).abs(),
         );

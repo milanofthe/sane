@@ -84,7 +84,8 @@ fn osdi_resistor_divider_matches_analytic() {
         &mut ctx,
         &c,
         &[DeviceInstance::new(Box::new(dev), vec![1, 2])],
-    );
+    )
+    .unwrap();
     let cdc = CompiledDc::new(&mut ctx, &dae);
     let p = params_vec(&ctx, &dae, &[("V1", 2.0), ("R2", 1000.0)]);
     let (x, conv, _) = cdc.solve_dc(&p, &[], 1e-12, 100);
@@ -143,7 +144,7 @@ fn osdi_diode_matches_analytic() {
     } else {
         vec![2, 0]
     };
-    let dae = assemble_dae(&mut ctx, &c, &[DeviceInstance::new(Box::new(dev), terms)]);
+    let dae = assemble_dae(&mut ctx, &c, &[DeviceInstance::new(Box::new(dev), terms)]).unwrap();
     let cdc = CompiledDc::new(&mut ctx, &dae);
     let p = params_vec(&ctx, &dae, &[("V1", 0.7), ("R1", 1000.0)]);
     let (x, conv, _) = cdc.solve_dc(&p, &[], 1e-12, 200);
@@ -188,7 +189,8 @@ fn osdi_psp103_matches_symbolic_frontend() {
         &mut ctx,
         &c,
         &[DeviceInstance::new(Box::new(dev), vec![1, 2, 0, 0])],
-    );
+    )
+    .unwrap();
     let cdc = CompiledDc::new(&mut ctx, &dae);
     let p = params_vec(&ctx, &dae, &[("Vd", 1.0), ("Vg", 0.8)]);
     let (x, conv, _) = cdc.solve_dc(&p, &[], 1e-12, 200);
@@ -241,7 +243,8 @@ fn osdi_capacitor_transient_matches_analytic() {
         &mut ctx,
         &c,
         &[DeviceInstance::new(Box::new(dev), vec![2, 0])],
-    );
+    )
+    .unwrap();
     let cdc = CompiledDc::new(&mut ctx, &dae);
     let (r, cap) = (1000.0, 1e-6);
     let tau = r * cap;

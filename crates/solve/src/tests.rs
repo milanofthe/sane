@@ -46,7 +46,7 @@ fn divider_dc() {
     c.voltage_source("V1", 1, 0)
         .resistor("R1", 1, 2)
         .resistor("R2", 2, 0);
-    let dae = assemble_dae(&mut ctx, &c, &[]);
+    let dae = assemble_dae(&mut ctx, &c, &[]).unwrap();
     let cdc = CompiledDc::new(&mut ctx, &dae);
     let p = params_vec(&ctx, &dae, &[("V1", 10.0), ("R1", 1000.0), ("R2", 1000.0)]);
     let (x, conv, _) = cdc.solve_dc(&p, &[], 1e-12, 50);
@@ -69,7 +69,7 @@ fn stage_solve_matches_dense() {
     c.voltage_source("V1", 1, 0)
         .resistor("R1", 1, 2)
         .capacitor("C1", 2, 0);
-    let dae = assemble_dae(&mut ctx, &c, &[]);
+    let dae = assemble_dae(&mut ctx, &c, &[]).unwrap();
     let cdc = CompiledDc::new(&mut ctx, &dae);
     let n = cdc.dim();
     let p = params_vec(&ctx, &dae, &[("V1", 5.0), ("R1", 1000.0), ("C1", 1e-6)]);
@@ -124,7 +124,7 @@ fn esdirk32_rc_step() {
     c.voltage_source("V1", 1, 0)
         .resistor("R1", 1, 2)
         .capacitor("C1", 2, 0);
-    let dae = assemble_dae(&mut ctx, &c, &[]);
+    let dae = assemble_dae(&mut ctx, &c, &[]).unwrap();
     let cdc = CompiledDc::new(&mut ctx, &dae);
     let n = cdc.dim();
     let p = params_vec(&ctx, &dae, &[("V1", 1.0), ("R1", 1000.0), ("C1", 1e-6)]); // RC = 1ms
@@ -160,7 +160,7 @@ fn ideal_transformer_steps_voltage() {
         Box::new(sane_veriloga::builtin_device("sane_transformer", "X1", &[])),
         vec![1, 0, 2, 0], // [p+, p-, s+, s-]
     )];
-    let dae = assemble_dae(&mut ctx, &c, &devs);
+    let dae = assemble_dae(&mut ctx, &c, &devs).unwrap();
     let cdc = CompiledDc::new(&mut ctx, &dae);
     let p = params_vec(
         &ctx,
@@ -196,7 +196,7 @@ fn companion_continuation_converges() {
         Box::new(sane_veriloga::builtin_device("sane_diode", "D1", &[])),
         vec![2, 0],
     )];
-    let dae = assemble_dae(&mut ctx, &c, &devs);
+    let dae = assemble_dae(&mut ctx, &c, &devs).unwrap();
     assert!(
         !dae.companion.is_empty(),
         "diode should emit a companion network"
@@ -244,7 +244,7 @@ fn convergence_criterion_presets_solve() {
         Box::new(sane_veriloga::builtin_device("sane_diode", "D1", &[])),
         vec![2, 0],
     )];
-    let dae = assemble_dae(&mut ctx, &c, &devs);
+    let dae = assemble_dae(&mut ctx, &c, &devs).unwrap();
     let cdc = CompiledDc::new(&mut ctx, &dae);
     let p = params_vec(
         &ctx,
@@ -290,7 +290,7 @@ fn relative_kcl_criterion_scales_with_node_current() {
         Box::new(sane_veriloga::builtin_device("sane_diode", "D1", &[])),
         vec![2, 0],
     )];
-    let dae = assemble_dae(&mut ctx, &c, &devs);
+    let dae = assemble_dae(&mut ctx, &c, &devs).unwrap();
     let cdc = CompiledDc::new(&mut ctx, &dae);
     let p = params_vec(
         &ctx,
@@ -360,7 +360,7 @@ fn hessian_matches_finite_differences() {
         Box::new(sane_veriloga::builtin_device("sane_diode", "D1", &[])),
         vec![2, 0],
     )];
-    let dae = assemble_dae(&mut ctx, &c, &devs);
+    let dae = assemble_dae(&mut ctx, &c, &devs).unwrap();
     let cdc = CompiledDc::new(&mut ctx, &dae);
 
     let pnames: Vec<String> = dae
@@ -425,7 +425,7 @@ fn partition_isolates_nonlinear_block() {
         Box::new(sane_veriloga::builtin_device("sane_diode", "D1", &[])),
         vec![stages + 1, 0],
     )];
-    let dae = assemble_dae(&mut ctx, &c, &devs);
+    let dae = assemble_dae(&mut ctx, &c, &devs).unwrap();
     let cdc = CompiledDc::new(&mut ctx, &dae);
     let (nl, nv) = cdc.partition_sizes().expect("should partition");
     // Only the diode anode node varies; everything else is linear.
@@ -454,7 +454,7 @@ fn partitioned_solve_matches_residual() {
         Box::new(sane_veriloga::builtin_device("sane_diode", "D1", &[])),
         vec![stages + 1, 0],
     )];
-    let dae = assemble_dae(&mut ctx, &c, &devs);
+    let dae = assemble_dae(&mut ctx, &c, &devs).unwrap();
     let cdc = CompiledDc::new(&mut ctx, &dae);
     assert!(cdc.partition_sizes().is_some(), "should be partitioned");
     let mut vals = vec![
@@ -488,7 +488,7 @@ fn diode_rectifier_dc() {
         Box::new(sane_veriloga::builtin_device("sane_diode", "D1", &[])),
         vec![2, 0],
     )];
-    let dae = assemble_dae(&mut ctx, &c, &devs);
+    let dae = assemble_dae(&mut ctx, &c, &devs).unwrap();
     let cdc = CompiledDc::new(&mut ctx, &dae);
     let p = params_vec(
         &ctx,
@@ -512,7 +512,7 @@ fn one_source(ctx: &mut Graph, src: SourceFn, params: &[(&str, f64)]) -> (Compil
     let mut c = Circuit::new();
     c.voltage_source("V1", 1, 0).set_source(src);
     c.resistor("R1", 1, 0);
-    let dae = assemble_dae(ctx, &c, &[]);
+    let dae = assemble_dae(ctx, &c, &[]).unwrap();
     let cdc = CompiledDc::new(ctx, &dae);
     let p = params_vec(ctx, &dae, params);
     (cdc, p)
@@ -528,7 +528,7 @@ fn transient_tricks_toggle_is_correctness_neutral() {
     c.voltage_source("V1", 1, 0)
         .resistor("R1", 1, 2)
         .capacitor("C1", 2, 0);
-    let dae = assemble_dae(&mut ctx, &c, &[]);
+    let dae = assemble_dae(&mut ctx, &c, &[]).unwrap();
     let mut cdc = CompiledDc::new(&mut ctx, &dae);
     let (r, cap) = (1000.0, 1e-6);
     let tau = r * cap;
@@ -645,7 +645,7 @@ fn rc_step_transient() {
     c.voltage_source("V1", 1, 0)
         .resistor("R1", 1, 2)
         .capacitor("C1", 2, 0);
-    let dae = assemble_dae(&mut ctx, &c, &[]);
+    let dae = assemble_dae(&mut ctx, &c, &[]).unwrap();
     let cdc = CompiledDc::new(&mut ctx, &dae);
     let (r, cap) = (1000.0, 1e-6);
     let tau = r * cap; // 1e-3 s
@@ -691,7 +691,7 @@ fn mosfet_cs_gmin_homotopy() {
         Box::new(sane_veriloga::builtin_device("sane_mos", "M1", &[])),
         vec![2, 3, 0, 0], // d g s b (body at ground)
     )];
-    let dae = assemble_dae(&mut ctx, &c, &devs);
+    let dae = assemble_dae(&mut ctx, &c, &devs).unwrap();
     let cdc = CompiledDc::new(&mut ctx, &dae);
     let p = params_vec(
         &ctx,
@@ -734,7 +734,7 @@ fn device_limiting_preserves_operating_point() {
         Box::new(sane_veriloga::builtin_device("sane_mos", "M1", &[])),
         vec![2, 3, 0, 0],
     )];
-    let dae = assemble_dae(&mut ctx, &c, &devs);
+    let dae = assemble_dae(&mut ctx, &c, &devs).unwrap();
     let cdc = CompiledDc::new(&mut ctx, &dae);
     let p = params_vec(
         &ctx,
@@ -781,7 +781,7 @@ fn device_limiting_preserves_operating_point() {
         Box::new(sane_veriloga::builtin_device("sane_diode", "D1", &[])),
         vec![2, 0],
     )];
-    let dae = assemble_dae(&mut ctx, &c, &devs);
+    let dae = assemble_dae(&mut ctx, &c, &devs).unwrap();
     let cdc = CompiledDc::new(&mut ctx, &dae);
     let p = params_vec(
         &ctx,
@@ -821,7 +821,7 @@ fn symbolic_reuse_present() {
         Box::new(sane_veriloga::builtin_device("sane_bjt", "Q1", &[])),
         vec![2, 1, 0],
     )];
-    let dae = assemble_dae(&mut ctx, &c, &devs);
+    let dae = assemble_dae(&mut ctx, &c, &devs).unwrap();
     let cdc = CompiledDc::new(&mut ctx, &dae);
     assert!(
         cdc.symbolic.is_some(),

@@ -222,7 +222,7 @@ mod specialize;
 mod topo;
 
 use calls::Shared;
-pub use specialize::SpecializedTape;
+pub use specialize::{ParamSelects, SpecializedTape};
 
 /// Consecutive calls of a tape that read nothing another of them writes:
 /// every instance of every call in it is a piece of work of its own, run
@@ -1016,6 +1016,27 @@ impl Tape {
     /// The bundles the calls call, by index.
     pub fn bundles(&self) -> &[Arc<dyn ExternBundle>] {
         &self.bundles
+    }
+
+    /// The bundles' [`forms_epoch`](ExternBundle::forms_epoch) together:
+    /// when it moved since a prolog, running the prolog again may give a
+    /// faster state (a function body's variant landed in the background).
+    pub fn forms_epoch(&self) -> u64 {
+        self.bundles
+            .iter()
+            .fold(0, |e, b| e.wrapping_add(b.forms_epoch()))
+    }
+
+    /// Run the tapes the bundles carry of their own as `backend` says (see
+    /// [`ExternBundle::with_backend`]). A program calls leaf bodies only
+    /// (a composite function is compiled into it as a template), so this
+    /// reaches every body it runs.
+    pub fn with_backend(&mut self, backend: &crate::extern_fn::BodyBackend) {
+        for b in &mut self.bundles {
+            if let Some(nb) = b.with_backend(backend) {
+                *b = nb;
+            }
+        }
     }
 
     /// A kernel's dense operand of `len` values.

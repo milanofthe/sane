@@ -31,7 +31,7 @@ mod sens;
 mod tests;
 mod transform;
 
-pub use assemble::{assemble, assemble_dae};
+pub use assemble::{assemble, assemble_at, assemble_dae};
 pub use hierarchy::{topology, Body, Instance};
 pub use observers::{Flat, Observers};
 pub use sens::{
@@ -40,7 +40,7 @@ pub use sens::{
 };
 pub use transform::{eliminate_nodes, reduce_graph};
 
-pub use sane_device::{DeviceInstance, DeviceModel, LimitKind, NoiseSource, UnknownKind};
+pub use sane_device::{Assertion, DeviceInstance, DeviceModel, LimitKind, NoiseSource, UnknownKind};
 
 /// A device controlling-voltage limit (SPICE `pnjlim` / `fetlim`) mapped to the
 /// global unknown vector: `v(hi) - v(lo)`, where `None` denotes ground. The DC
@@ -51,6 +51,33 @@ pub struct Limit {
     pub hi: Option<usize>,
     pub lo: Option<usize>,
     pub kind: LimitKind,
+    /// The condition over the parameters it holds under (see
+    /// [`sane_device::FragmentLimit::when`]); `None` for always.
+    pub when: Option<ExprId>,
+}
+
+impl Dae {
+    /// Keep the limits that hold at the parameter values `value_of` gives
+    /// (by symbol; an unvalued symbol keeps its limit): the Newton aids of
+    /// the model built at those values. Limits only shape the Newton path,
+    /// so this decides no result.
+    pub fn keep_limits_at(&mut self, ctx: &Graph, value_of: impl Fn(SymbolId) -> Option<f64>) {
+        let whens: Vec<ExprId> = self.limits.iter().filter_map(|l| l.when).collect();
+        if whens.is_empty() {
+            return;
+        }
+        let env: HashMap<SymbolId, f64> = ctx
+            .free_symbols_in(&whens)
+            .into_iter()
+            .filter_map(|s| value_of(s).map(|v| (s, v)))
+            .collect();
+        let on = rsdag::eval(ctx, &whens, &env);
+        let mut on = on.into_iter();
+        self.limits.retain(|l| match l.when {
+            None => true,
+            Some(_) => on.next().is_some_and(|v| v != 0.0 || v.is_nan()),
+        });
+    }
 }
 
 /// One transport delay: the engine integrates the SOURCE unknown `src`
@@ -148,6 +175,20 @@ pub struct Dae {
     /// current). Empty for transformed or hand-built DAEs, where the solver
     /// falls back to the name heuristic.
     pub source_names: Vec<String>,
+    /// What must hold of the parameters for the residuals to be the circuit's
+    /// (see [`sane_device::Assertion`]), over the circuit's parameter symbols:
+    /// the devices' own and what their structure rests on (see
+    /// `BehavioralFragment::structural`).
+    pub assertions: Vec<sane_device::Assertion>,
+    /// What the devices' structure rests on (see
+    /// `BehavioralFragment::structural`): the integer modes and the
+    /// conditions on parameters that decided their topology at the values
+    /// the DAE was assembled at. A binding where one fails is a circuit of
+    /// another structure, assembled anew.
+    pub structure: Vec<sane_device::Assertion>,
+    /// The internal nodes the structure collapsed, by name, with the
+    /// unknown whose voltage each takes (`None`: ground).
+    pub aliases: Vec<(String, Option<String>)>,
     /// Display names of nodes the residuals reach, for views of the graph:
     /// a call by the instance that made it (`X1`, `M1`; inside a subcircuit
     /// body the body's own name, `__inv__.M1`), a subcircuit body's formal
@@ -155,29 +196,35 @@ pub struct Dae {
     pub labels: rustc_hash::FxHashMap<ExprId, String>,
 }
 
+/// A noise source's level at an operating point (see [`Dae::noise_levels`]).
+#[derive(Clone, Debug, PartialEq)]
+pub enum NoiseLevel {
+    /// White or flicker: `psd / f^fexp`.
+    Spectral { psd: f64, fexp: f64 },
+    /// Tabular: `(frequency, psd)` points, interpolated linearly.
+    Table(Vec<(f64, f64)>),
+}
+
 impl Dae {
-    /// Every white/flicker noise source's `(psd, flicker exponent)` over
-    /// `env`, in one arena sweep: the sources share the device subexpressions
-    /// and calls they read. `None` for a tabular source.
+    /// Every noise source's level over `env`, in one arena sweep: the sources
+    /// share the device subexpressions and calls they read.
     pub fn noise_levels(
         &self,
         ctx: &mut Graph,
         env: &HashMap<SymbolId, f64>,
-    ) -> Vec<Option<(f64, f64)>> {
+    ) -> Vec<NoiseLevel> {
         let flat = self.observers.flatten(ctx);
-        let roots: Vec<ExprId> = flat
-            .noise
-            .iter()
-            .filter(|ns| ns.table.is_empty())
-            .flat_map(|ns| [ns.psd, ns.flicker_exp])
-            .collect();
-        let vals = rsdag::eval(ctx, &roots, env);
-        let mut pairs = vals.as_chunks::<2>().0.iter();
+        let roots: Vec<ExprId> = flat.noise.iter().flat_map(|ns| ns.exprs()).collect();
+        let mut vals = rsdag::eval(ctx, &roots, env).into_iter();
+        let mut next = || vals.next().expect("one per expression");
         flat.noise
             .iter()
             .map(|ns| {
-                let &[psd, fexp] = ns.table.is_empty().then(|| pairs.next())??;
-                Some((psd, fexp))
+                let (psd, fexp) = (next(), next());
+                match ns.table.len() {
+                    0 => NoiseLevel::Spectral { psd, fexp },
+                    n => NoiseLevel::Table((0..n).map(|_| (next(), next())).collect()),
+                }
             })
             .collect()
     }
@@ -335,8 +382,8 @@ impl Dae {
         coo(ctx, &self.currents, &cols)
     }
 
-    /// Parameter symbols: free symbols in the currents and charges that are
-    /// neither unknowns nor time, sorted by id.
+    /// Parameter symbols: free symbols in the currents, charges and
+    /// assertions that are neither unknowns nor time, sorted by id.
     pub fn params(&self, ctx: &Graph) -> Vec<SymbolId> {
         // The currents and charges, the delay times (parameters even though they appear
         // only in the delay registry) and the switching surfaces (which may
@@ -348,6 +395,12 @@ impl Dae {
             .copied()
             .chain(self.delays.iter().map(|dl| dl.tau))
             .chain(self.events.iter().map(|ev| ev.g))
+            .chain(
+                self.assertions
+                    .iter()
+                    .chain(&self.structure)
+                    .map(|a| a.holds),
+            )
             .collect();
         let mut all = ctx.free_symbols_in(&roots);
         for s in &self.x {
@@ -382,12 +435,9 @@ impl Dae {
         let noise = flat
             .noise
             .iter()
-            .map(|n| NoiseSource {
-                hi: n.hi,
-                lo: n.lo,
-                psd: rsdag::substitute(ctx, &[n.psd], fold)[0],
-                flicker_exp: rsdag::substitute(ctx, &[n.flicker_exp], fold)[0],
-                table: n.table.clone(),
+            .map(|n| {
+                let mut e = rsdag::substitute(ctx, &n.exprs(), fold).into_iter();
+                n.with_exprs(n.hi, n.lo, &mut e)
             })
             .collect();
         let op_vars = flat
@@ -398,9 +448,22 @@ impl Dae {
                 ..v.clone()
             })
             .collect();
+        let mut fold_all = |list: &[sane_device::Assertion]| -> Vec<sane_device::Assertion> {
+            list.iter()
+                .map(|a| sane_device::Assertion {
+                    holds: rsdag::substitute(ctx, &[a.holds], fold)[0],
+                    message: a.message.clone(),
+                })
+                .collect()
+        };
+        let assertions = fold_all(&self.assertions);
+        let structure = fold_all(&self.structure);
         Dae {
             currents,
             charges,
+            assertions,
+            structure,
+            aliases: self.aliases.clone(),
             n_nodes: self.n_nodes,
             param_defaults: self.param_defaults.clone(),
             events: self

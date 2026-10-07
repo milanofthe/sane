@@ -59,7 +59,7 @@ fn main() {
             continue;
         };
         let mut ctx = Graph::new();
-        let dae = parsed.assemble(&mut ctx);
+        let dae = parsed.assemble(&mut ctx).unwrap();
         let mut cdc = CompiledDc::new(&mut ctx, &dae);
         let p = parsed.pvec(&cdc.param_names(&ctx));
         let mut row = format!(

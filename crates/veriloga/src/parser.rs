@@ -501,17 +501,20 @@ impl<'a> Parser<'a> {
         loop {
             let span = self.span();
             let name = self.ident()?;
-            // optional array range [a:b] or initializer = expr (skip)
+            // optional array range [a:b] (skipped) and initializer
             while self.at(&Tok::LBrack) {
                 self.skip_bracket()?;
             }
-            if self.eat(&Tok::Assign) {
-                let _ = self.expr()?;
-            }
+            let init = if self.eat(&Tok::Assign) {
+                Some(self.expr()?)
+            } else {
+                None
+            };
             m.vars.push(VarDecl {
                 name,
                 ty,
                 attrs: attrs.clone(),
+                init,
                 span,
             });
             if !self.eat(&Tok::Comma) {
@@ -628,6 +631,7 @@ impl<'a> Parser<'a> {
                     span,
                 };
                 self.var_decl(&mut tmp, Vec::new())?;
+                body.extend(tmp.vars.iter().filter_map(VarDecl::init_stmt));
             } else {
                 body.push(self.stmt()?);
             }
@@ -726,10 +730,11 @@ impl<'a> Parser<'a> {
                 }
                 return Err(self.err("expected '<+' or ':' after an access lvalue"));
             }
-            // assignment: lhs = expr ;   (lhs may have an array index, skipped)
+            // assignment: lhs = expr ;
             self.bump(); // name
-            while self.at(&Tok::LBrack) {
-                self.skip_bracket()?;
+            if self.at(&Tok::LBrack) {
+                // An element would otherwise be assigned to the whole variable.
+                return Err(self.err("array variables are not supported"));
             }
             if self.eat(&Tok::Assign) {
                 let rhs = self.expr()?;
@@ -782,9 +787,12 @@ impl<'a> Parser<'a> {
                     analog: vec![],
                     span: self.span(),
                 };
-                if let Err(d) = self.var_decl(&mut tmp, Vec::new()) {
-                    self.diags.push(d);
-                    self.recover();
+                match self.var_decl(&mut tmp, Vec::new()) {
+                    Ok(()) => stmts.extend(tmp.vars.iter().filter_map(VarDecl::init_stmt)),
+                    Err(d) => {
+                        self.diags.push(d);
+                        self.recover();
+                    }
                 }
             } else {
                 match self.stmt() {

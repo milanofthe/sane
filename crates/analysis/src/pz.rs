@@ -684,7 +684,7 @@ N1 a 0 vadio
         // as they take different step sequences).
         let parsed = parse("Vin a 0 SIN(0 1 1e6)\nR1 a b 1k\nC1 b 0 1n\n").unwrap();
         let mut ctx = Graph::new();
-        let dae = parsed.assemble(&mut ctx);
+        let dae = parsed.assemble(&mut ctx).unwrap();
         let cdc = CompiledDc::new(&mut ctx, &dae);
         let pnames = cdc.param_names(&ctx);
         let p: Vec<f64> = parsed.pvec(&pnames);

@@ -9,21 +9,20 @@
 //! calls; symbolic tooling that wants the expressions inlines them
 //! (`Graph::inline_all`).
 //!
-//! Two instances share a function only if their lowering is provably
-//! identical. The key is `(module, terminal-connectivity pattern,
-//! multiplicity)`, and under it each function carries the values of the
-//! parameters that decided its structure (and, for `$param_given`, whether
-//! they were set):
-//! - a parameter's value enters the graph only through a structural decision
-//!   (a branch, a loop bound, a static short, a folded constant); everywhere
-//!   else it is the function's parameter. The lowering records which
-//!   parameters its decisions read, through the constant shadow of every
-//!   variable they went into;
-//! - the terminal pattern captures which terminals are ground and which are tied
-//!   together, since those collapse `V(a,b)` terms and change the graph shape.
-//! Same key and the same values on those parameters => the same decisions =>
-//! the same function. Instances that differ only in the others (a transistor's
-//! W and L, say) share it, and their parameters are its arguments.
+//! Two instances share a function when their lowering is identical. The
+//! lowering is exact in the parameters (a parameter is a symbol, every branch
+//! on one kept in the graph), so what tells two lowerings apart is only:
+//! - the terminal pattern: which terminals are ground and which are tied
+//!   together, since those collapse `V(a,b)` terms and change the graph shape;
+//! - the multiplicity, baked into every flow;
+//! - which of the parameters `$param_given` asks about the instance set;
+//! - its structure: the integer parameters it reads (mode selectors), and
+//!   the truth of each condition on parameters that decides the topology (a
+//!   branch shorted or open), folded at the instance's values. The function
+//!   keeps them as assertions, and an instance takes the function whose
+//!   assertions hold at its values.
+//! Every instance with the same of those is a call of one function, its
+//! parameters the call's arguments, whatever their values.
 
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
@@ -34,7 +33,7 @@ use sane_device::{
 };
 
 use crate::device::VerilogADevice;
-use crate::lower::{lower_analog_structural, sym_of};
+use crate::lower::{lower_analog, sym_of};
 
 /// An extra unknown the function's body reads, minted afresh per instance.
 #[derive(Clone)]
@@ -61,7 +60,8 @@ struct DelayMeta {
 struct NoiseMeta {
     hi: Option<SymbolId>,
     lo: Option<SymbolId>,
-    table: Vec<(f64, f64)>,
+    /// The source as lowered, for its shape (its expressions are outputs).
+    source: NoiseSource,
 }
 
 /// A module lowered once for one structure: the function, its formal leaves
@@ -97,68 +97,62 @@ struct ModelFn {
     out_opvar: u32,
     out_tau: u32,
     out_event: u32,
+    /// Its assertions, over the formal parameters.
+    assertions: Vec<sane_device::Assertion>,
+    /// What its structure rests on (see the module docs), over the formal
+    /// parameters.
+    structure: Vec<sane_device::Assertion>,
+    /// The internal nodes its structure merged, with their formal voltage.
+    collapsed: Vec<(String, ExprId)>,
 }
 
-/// The functions of one (module, terminal pattern, multiplicity), each with
-/// the values of the parameters that decided its structure (`$given(X)`:
-/// whether `X` was set, as 0 or 1).
-type Bucket = std::rc::Rc<std::cell::RefCell<Vec<(Vec<(String, u64)>, ModelFn)>>>;
+/// `dev`'s parameter values its structure is decided at: those of the
+/// binding `lo` lowers at, else its own.
+fn values_of(dev: &VerilogADevice, lo: &Lowerer) -> rustc_hash::FxHashMap<String, f64> {
+    let mut values = dev.values();
+    for (name, v) in values.iter_mut() {
+        if let Some(b) = lo.value(&dev.param_symbol(name)) {
+            *v = b;
+        }
+    }
+    values
+}
+
+impl ModelFn {
+    /// Whether `values` are of this function's structure.
+    fn fits(&self, values: &rustc_hash::FxHashMap<String, f64>, ctx: &Graph) -> bool {
+        if self.structure.is_empty() {
+            return true;
+        }
+        let env: std::collections::HashMap<SymbolId, f64> = (self.param_syms.iter())
+            .filter_map(|(name, s)| Some((*s, *values.get(name)?)))
+            .collect();
+        let holds: Vec<ExprId> = self.structure.iter().map(|a| a.holds).collect();
+        rsdag::eval::<f64, _>(ctx, &holds, &env)
+            .iter()
+            .all(|&h| h == 1.0)
+    }
+}
 
 /// Lower `dev` as a call of its module's function, building the function on
-/// the first instance of its (module, structure).
+/// the first instance of its structure (see the module docs); an error
+/// names what of the module does not lower.
 pub(crate) fn lower_templated(
     dev: &VerilogADevice,
     lo: &mut Lowerer,
     term_v: &[ExprId],
-) -> BehavioralFragment {
+) -> Result<BehavioralFragment, String> {
     let key = cache_key(dev, lo.ctx(), term_v);
-    let bucket = match lo.cache_get::<Bucket>(&key) {
-        Some(b) => b,
-        None => {
-            let b = Bucket::default();
-            lo.cache_put(key.clone(), b.clone());
-            b
-        }
-    };
-    let env = instance_param_env(dev);
-    // A structural read: a parameter's value, or whether it was set.
-    let bits_of = |name: &str| -> u64 {
-        match name
-            .strip_prefix("$given(")
-            .and_then(|s| s.strip_suffix(')'))
-        {
-            Some(p) => dev.given.contains(p) as u64,
-            None => env.get(name).map_or(u64::MAX, |v| v.to_bits()),
-        }
-    };
-    let hit = bucket.borrow().iter().find_map(|(sig, mf)| {
-        sig.iter()
-            .all(|(name, bits)| bits_of(name) == *bits)
-            .then(|| mf.clone())
-    });
-    let mf = match hit {
-        Some(mf) => mf,
+    let mut fns = lo.cache_get::<Vec<ModelFn>>(&key).unwrap_or_default();
+    let values = values_of(dev, lo);
+    let mf = match fns.iter().find(|mf| mf.fits(&values, lo.ctx())) {
+        Some(mf) => mf.clone(),
         None => {
             let t = sane_core::time::Instant::now();
             let ns = format!("{}#{}", dev.module.name, lo.ctx().n_funcs());
-            let (mf, structural) = build_function(dev, lo, term_v, &ns);
-            let sig: Vec<(String, u64)> = structural
-                .into_iter()
-                .map(|name| {
-                    let bits = bits_of(&name);
-                    (name, bits)
-                })
-                .collect();
-            sane_core::log::debug(&format!(
-                "model function '{ns}' ({}): structure fixed by {} parameters: {}",
-                dev.name,
-                sig.len(),
-                sig.iter()
-                    .map(|(n, _)| n.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            ));
-            bucket.borrow_mut().push((sig, mf.clone()));
+            let mf = build_function(dev, &values, lo, term_v, &ns)?;
+            fns.push(mf.clone());
+            lo.cache_put(key, fns);
             sane_core::profile::record_tpl_build(t.elapsed().as_nanos());
             mf
         }
@@ -166,18 +160,18 @@ pub(crate) fn lower_templated(
     let t = sane_core::time::Instant::now();
     let frag = instantiate(&mf, dev, lo, term_v);
     sane_core::profile::record_tpl_clone(t.elapsed().as_nanos());
-    frag
+    Ok(frag)
 }
 
 /// Lower `dev`'s module into a function named `ns` over formal leaves, the
-/// terminals laid out by `term_v`'s connectivity pattern. Returns it and the
-/// parameters whose values fixed its structure.
+/// terminals laid out by `term_v`'s connectivity pattern.
 fn build_function(
     dev: &VerilogADevice,
+    values: &rustc_hash::FxHashMap<String, f64>,
     lo: &mut Lowerer,
     term_v: &[ExprId],
     ns: &str,
-) -> (ModelFn, std::collections::BTreeSet<String>) {
+) -> Result<ModelFn, String> {
     // Formal terminals: one symbol per distinct connected node (tied
     // terminals share it), the actual constant for a ground terminal.
     let mut fv = Vec::new();
@@ -206,26 +200,10 @@ fn build_function(
     // registries while it lowers, keep what it minted as the function's.
     let saved_extras = std::mem::take(&mut lo.extras);
     let saved_delays = std::mem::take(&mut lo.delays);
-    let lowered = lower_analog_structural(
-        &dev.module,
-        ns,
-        &dev.params,
-        &dev.given,
-        dev.mfactor,
-        lo,
-        &fv,
-    );
+    let lowered = lower_analog(&dev.module, ns, &dev.given, values, dev.mfactor, lo, &fv);
     let minted = std::mem::replace(&mut lo.extras, saved_extras);
     let minted_delays = std::mem::replace(&mut lo.delays, saved_delays);
-    let (frag, structural) = match lowered {
-        Ok(r) => r,
-        Err(e) => {
-            // validate() runs at load time, so an unsupported construct is
-            // already a parse error; reaching here is a real bug.
-            sane_core::log::error(&format!("Verilog-A lowering of '{}': {e}", dev.module.name));
-            panic!("Verilog-A lowering of '{}': {e}", dev.module.name);
-        }
-    };
+    let frag = lowered?;
     let extras: Vec<ExtraMeta> = minted
         .iter()
         .map(|u| ExtraMeta {
@@ -266,8 +244,7 @@ fn build_function(
         .collect();
     let out_noise = outs.len() as u32;
     for n in &frag.noise {
-        outs.push(n.psd);
-        outs.push(n.flicker_exp);
+        outs.extend(n.exprs());
     }
     let out_opvar = outs.len() as u32;
     outs.extend(frag.op_vars.iter().map(|v| v.value));
@@ -325,7 +302,7 @@ fn build_function(
             .map(|n| NoiseMeta {
                 hi: n.hi,
                 lo: n.lo,
-                table: n.table.clone(),
+                source: n.clone(),
             })
             .collect(),
         limits: frag.limits.clone(),
@@ -344,8 +321,11 @@ fn build_function(
         out_opvar,
         out_tau,
         out_event,
+        assertions: frag.assertions.clone(),
+        structure: frag.structural.clone(),
+        collapsed: frag.collapsed.clone(),
     };
-    (mf, structural)
+    Ok(mf)
 }
 
 /// `dev` as a call of `mf`: its extras minted, its leaves bound, one call per
@@ -450,16 +430,13 @@ fn instantiate(
             tau,
         })
         .collect();
+    let mut noise_vals = noise_vals.into_iter();
     let noise = mf
         .noise
         .iter()
-        .zip(noise_vals.chunks(2))
-        .map(|(n, pf)| NoiseSource {
-            hi: remap_sym(n.hi, &map, ctx),
-            lo: remap_sym(n.lo, &map, ctx),
-            psd: pf[0],
-            flicker_exp: pf[1],
-            table: n.table.clone(),
+        .map(|n| {
+            let (hi, lo) = (remap_sym(n.hi, &map, ctx), remap_sym(n.lo, &map, ctx));
+            n.source.with_exprs(hi, lo, &mut noise_vals)
         })
         .collect();
     let op_vars = mf
@@ -474,6 +451,11 @@ fn instantiate(
             value,
         })
         .collect();
+    let rename: HashMap<SymbolId, ExprId> = mf
+        .param_syms
+        .iter()
+        .filter_map(|(_, s)| map.get(s).map(|&a| (*s, a)))
+        .collect();
     let limits = mf
         .limits
         .iter()
@@ -481,8 +463,27 @@ fn instantiate(
             hi: remap_sym(l.hi, &map, ctx),
             lo: remap_sym(l.lo, &map, ctx),
             kind: l.kind,
+            when: l.when.map(|w| rsdag::substitute(ctx, &[w], &rename)[0]),
         })
         .collect();
+    let renamed =
+        |ctx: &mut Graph, list: &[sane_device::Assertion]| -> Vec<sane_device::Assertion> {
+            let holds: Vec<ExprId> = list.iter().map(|a| a.holds).collect();
+            let holds = rsdag::substitute(ctx, &holds, &rename);
+            (list.iter().zip(holds))
+                .map(|(a, holds)| sane_device::Assertion {
+                    holds,
+                    message: format!("{}: {}", dev.name, a.message),
+                })
+                .collect()
+        };
+    let structural = renamed(ctx, &mf.structure);
+    let voltages: Vec<ExprId> = mf.collapsed.iter().map(|&(_, v)| v).collect();
+    let voltages = rsdag::substitute(ctx, &voltages, &map);
+    let collapsed = (mf.collapsed.iter().zip(voltages))
+        .map(|((node, _), v)| (format!("{}.{}", dev.name, node), v))
+        .collect();
+    let assertions = renamed(ctx, &mf.assertions);
     lo.delays.extend(inst_delays);
     BehavioralFragment {
         terminal_currents,
@@ -494,21 +495,27 @@ fn instantiate(
         param_syms,
         op_vars,
         limits,
+        assertions,
+        structural,
+        collapsed,
     }
 }
 
-/// `(module, terminal pattern, multiplicity)` -- see module docs. `mfactor`
-/// is in the key because it is baked into the graph (every flow scales by
-/// it), so instances of different multiplicity need distinct functions. The
-/// parameter values and `$param_given` answers a function depends on are
-/// checked per function within the key (see [`Bucket`]).
+/// `(module, terminal pattern, multiplicity, given-set)` -- see the module
+/// docs. `mfactor` is baked into the graph (every flow scales by it), and
+/// `$param_given` answers fold to constants, so both are structure; the
+/// functions under one key tell their structure apart by their assertions.
 fn cache_key(dev: &VerilogADevice, ctx: &Graph, term_v: &[ExprId]) -> String {
     let pattern = terminal_pattern(ctx, term_v);
+    let given: String = (dev.module.given_reads.iter())
+        .map(|p| if dev.given.contains(p) { '1' } else { '0' })
+        .collect();
     format!(
-        "va\u{1}{}\u{1}{}\u{1}{}",
+        "va\u{1}{}\u{1}{}\u{1}{}\u{1}{}",
         dev.module.name,
         pattern,
-        dev.mfactor.to_bits()
+        dev.mfactor.to_bits(),
+        given,
     )
 }
 
@@ -531,19 +538,6 @@ fn terminal_pattern(ctx: &Graph, term_v: &[ExprId]) -> String {
         out.push(',');
     }
     out
-}
-
-fn instance_param_env(dev: &VerilogADevice) -> HashMap<String, f64> {
-    let mut env: HashMap<String, f64> = dev
-        .module
-        .params
-        .iter()
-        .map(|p| (p.name.clone(), p.default))
-        .collect();
-    for (k, v) in &dev.params {
-        env.insert(k.clone(), *v);
-    }
-    env
 }
 
 /// Remap a formal node symbol (a noise generator's, a limit's) to the

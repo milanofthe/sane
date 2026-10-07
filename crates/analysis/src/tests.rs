@@ -3,6 +3,7 @@
 //! so they live here rather than in `tests/`.
 
 use super::*;
+use sane_netlist::parse;
 
 /// Label a DAE unknown for the UI: `v{k}` -> (node name, "voltage"), else
 /// (stripped name, "current").
@@ -1044,7 +1045,7 @@ mod nonlinearity_reality {
     fn classify(net: &str) -> rsdag::Nonlinearity {
         let parsed = parse(net).expect("parse");
         let mut ctx = Graph::new();
-        let dae = parsed.assemble(&mut ctx);
+        let dae = parsed.assemble(&mut ctx).unwrap();
         dae.nonlinearity(&ctx)
     }
 
@@ -1121,7 +1122,7 @@ mod hb_verify {
         let net = "V1 in 0 SIN(0 1 1000)\nR1 in out 1k\nC1 out 0 1u\n.end";
         let parsed = parse(net).unwrap();
         let mut ctx = Graph::new();
-        let dae = parsed.assemble(&mut ctx);
+        let dae = parsed.assemble(&mut ctx).unwrap();
         let cdc = CompiledDc::new(&mut ctx, &dae);
         let pnames = cdc.param_names(&ctx);
         let p: Vec<f64> = parsed.pvec(&pnames);
@@ -1180,7 +1181,7 @@ mod hb_verify {
                    C1 mid 0 100n\n.model DMOD D(Is=1e-14 N=1 Vt=0.02585)\n.end";
         let parsed = parse(net).unwrap();
         let mut ctx = Graph::new();
-        let dae = parsed.assemble(&mut ctx);
+        let dae = parsed.assemble(&mut ctx).unwrap();
         let cdc = CompiledDc::new(&mut ctx, &dae);
         let pnames = cdc.param_names(&ctx);
         let p: Vec<f64> = parsed.pvec(&pnames);
@@ -1247,7 +1248,7 @@ mod hb_verify {
                    C1 mid 0 100n\n.model DMOD D(Is=1e-14 N=1 Vt=0.02585)\n.end";
         let parsed = parse(net).unwrap();
         let mut ctx = Graph::new();
-        let dae = parsed.assemble(&mut ctx);
+        let dae = parsed.assemble(&mut ctx).unwrap();
         let cdc = CompiledDc::new(&mut ctx, &dae);
         cdc.ensure_param_jac(&mut ctx, &dae);
         let pnames = cdc.param_names(&ctx);
@@ -1290,7 +1291,7 @@ mod hb_verify {
                    C1 mid 0 100n\n.model DMOD D(Is=1e-14 N=1 Vt=0.02585)\n.end";
         let parsed = parse(net).unwrap();
         let mut ctx = Graph::new();
-        let dae = parsed.assemble(&mut ctx);
+        let dae = parsed.assemble(&mut ctx).unwrap();
         let cdc = CompiledDc::new(&mut ctx, &dae);
         cdc.ensure_param_jac(&mut ctx, &dae);
         cdc.ensure_hessian(&mut ctx, &dae);
@@ -1342,7 +1343,7 @@ mod hb_verify {
     ) {
         let parsed = parse(net).unwrap();
         let mut ctx = Graph::new();
-        let dae = parsed.assemble(&mut ctx);
+        let dae = parsed.assemble(&mut ctx).unwrap();
         let cdc = CompiledDc::new(&mut ctx, &dae);
         let pnames = cdc.param_names(&ctx);
         let p: Vec<f64> = parsed.pvec(&pnames);

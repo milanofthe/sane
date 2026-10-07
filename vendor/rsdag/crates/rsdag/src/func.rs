@@ -124,6 +124,17 @@ pub struct InterpretedBody {
 }
 
 impl InterpretedBody {
+    /// `tape` as a body of `n_out` outputs, split over the inputs `pure`
+    /// flags (empty when none is).
+    pub(crate) fn new(tape: crate::tape::Tape, n_out: usize, pure: Vec<bool>) -> InterpretedBody {
+        InterpretedBody {
+            tape,
+            n_out,
+            pure,
+            backends: Default::default(),
+        }
+    }
+
     /// The work layout: the tape's buffer, its outputs, then the arguments
     /// a prolog is run on.
     fn parts<'w>(&self, work: &'w mut [f64]) -> (&'w mut [f64], &'w mut [f64], &'w mut [f64]) {
@@ -163,11 +174,13 @@ impl ExternBundle for InterpretedBody {
             };
         }
         self.tape.eval_prolog_into(args, w);
-        state.copy_from_slice(&w[..state.len()]);
+        let sl = self.tape.state_len();
+        state[..sl].copy_from_slice(&w[..sl]);
     }
     fn main_into(&self, args: &[f64], state: &[f64], work: &mut [f64], out: &mut [f64]) {
         let (w, o, _) = self.parts(work);
-        w[..state.len()].copy_from_slice(state);
+        let sl = self.tape.state_len();
+        w[..sl].copy_from_slice(&state[..sl]);
         self.tape.eval_main_into(args, w, o);
         out.copy_from_slice(&o[..self.n_out]);
     }
@@ -415,15 +428,15 @@ impl Function {
         } else {
             (crate::tape::Tape::compile(ctx, &roots, &inputs), Vec::new())
         };
-        let body = Body {
-            bundle: Arc::new(InterpretedBody {
-                tape,
-                n_out: roots.len(),
-                pure,
-                backends: Default::default(),
-            }),
-            slot_of,
+        // A body whose selects a binding decides runs each binding's
+        // variant (see `crate::variant`).
+        let variants = !pure.is_empty() && tape.has_param_selects(&pure);
+        let full = InterpretedBody::new(tape, roots.len(), pure);
+        let bundle: Arc<dyn ExternBundle> = match variants {
+            true => Arc::new(crate::variant::VariantBody::new(full)),
+            false => Arc::new(full),
         };
+        let body = Body { bundle, slot_of };
         self.interpreted.lock().unwrap().push(body.clone());
         body
     }

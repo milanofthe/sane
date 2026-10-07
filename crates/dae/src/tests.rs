@@ -63,15 +63,18 @@ impl sane_device::DeviceModel for BehavioralCap {
         lo: &mut Lowerer,
         term_v: &[ExprId],
         _control_i: &[ExprId],
-    ) -> sane_device::BehavioralFragment {
+    ) -> Result<sane_device::BehavioralFragment, String> {
         let ctx = lo.ctx();
         let c = ctx.sym(&self.name);
         let zero = ctx.zero();
         let dv = ctx.sub(term_v[0], term_v[1]);
         let q = ctx.mul(c, dv);
         let nq = ctx.neg(q);
-        sane_device::BehavioralFragment {
+        Ok(sane_device::BehavioralFragment {
             param_syms: Vec::new(),
+            structural: Vec::new(),
+            collapsed: Vec::new(),
+            assertions: Vec::new(),
             events: Vec::new(),
             terminal_currents: vec![zero, zero],
             currents: Vec::new(),
@@ -80,7 +83,7 @@ impl sane_device::DeviceModel for BehavioralCap {
             noise: Vec::new(),
             op_vars: Vec::new(),
             limits: Vec::new(),
-        }
+        })
     }
 }
 
@@ -93,7 +96,7 @@ fn behavioral_capacitor_matches_native() {
     cn.voltage_source("V1", 1, 0)
         .resistor("R", 1, 2)
         .capacitor("C", 2, 0);
-    let native = assemble_dae(&mut ctx, &cn, &[]);
+    let native = assemble_dae(&mut ctx, &cn, &[]).unwrap();
 
     let mut cb = Circuit::new();
     cb.voltage_source("V1", 1, 0).resistor("R", 1, 2);
@@ -101,7 +104,7 @@ fn behavioral_capacitor_matches_native() {
         Box::new(BehavioralCap { name: "C".into() }),
         vec![2, 0],
     )];
-    let behav = assemble_dae(&mut ctx, &cb, &devs);
+    let behav = assemble_dae(&mut ctx, &cb, &devs).unwrap();
 
     assert_eq!(native.unknowns, behav.unknowns, "same unknown layout");
     assert_eq!(behav.dim(), 3, "behavioral cap mints no extra unknown");
@@ -146,7 +149,7 @@ fn mfactor_scales_terminal_current() {
                 DeviceInstance::new(Box::new(BehavioralCap { name: "C".into() }), vec![2, 0])
                     .with_mfactor(m),
             ];
-        assemble_dae(ctx, &cb, &devs)
+        assemble_dae(ctx, &cb, &devs).unwrap()
     };
     let d1 = build(&mut ctx, 1.0);
     let d2 = build(&mut ctx, 2.0);
@@ -190,7 +193,7 @@ fn rc_dae_consistent_point() {
     c.voltage_source("V1", 1, 0)
         .resistor("R", 1, 2)
         .capacitor("C", 2, 0);
-    let dae = assemble_dae(&mut ctx, &c, &[]);
+    let dae = assemble_dae(&mut ctx, &c, &[]).unwrap();
     assert_eq!(dae.dim(), 3);
     assert_eq!(dae.unknowns, vec!["v1", "v2", "i_V1"]);
 
@@ -224,7 +227,7 @@ fn eliminate_resistive_node_preserves_point() {
         .resistor("R1", 1, 2)
         .resistor("R2", 2, 3)
         .resistor("Rload", 3, 0);
-    let dae = assemble_dae(&mut ctx, &c, &[]);
+    let dae = assemble_dae(&mut ctx, &c, &[]).unwrap();
     assert_eq!(dae.unknowns, vec!["v1", "v2", "v3", "i_V1"]);
 
     let mut keep = HashSet::new();
@@ -259,7 +262,7 @@ fn diode_rectifier_consistent_point() {
         Box::new(sane_veriloga::builtin_device("sane_diode", "D1", &[])),
         vec![2, 0], // anode = node 2, cathode = ground
     )];
-    let dae = assemble_dae(&mut ctx, &c, &devs);
+    let dae = assemble_dae(&mut ctx, &c, &devs).unwrap();
     assert_eq!(dae.dim(), 3);
 
     // Pick a diode voltage, derive the rest so F = 0. The diode's thermal
@@ -297,7 +300,7 @@ fn ccvs_consistent_point() {
         .resistor("R1", 1, 0)
         .ccvs("H1", 2, 0, "V1")
         .resistor("RL", 2, 0);
-    let dae = assemble_dae(&mut ctx, &c, &[]);
+    let dae = assemble_dae(&mut ctx, &c, &[]).unwrap();
     assert_eq!(dae.dim(), 4); // v1, v2, i_V1, i_H1
 
     let (vin, r1, gain, rl) = (1.0, 1000.0, 5.0, 2000.0);
@@ -327,7 +330,7 @@ fn sin_source_residual_is_time_dependent() {
     let mut c = Circuit::new();
     c.voltage_source("V1", 1, 0).set_source(SourceFn::Sin);
     c.resistor("R1", 1, 0);
-    let dae = assemble_dae(&mut ctx, &c, &[]);
+    let dae = assemble_dae(&mut ctx, &c, &[]).unwrap();
     let i_v1 = dae.unknowns.iter().position(|u| u == "i_V1").unwrap();
     let s = rsdag::to_string(&ctx, dae.currents[i_v1]);
     assert!(
@@ -345,7 +348,7 @@ fn current_switch_uses_control_current() {
         Box::new(sane_device::CSwitch::new("W1", "Vc")),
         vec![2, 0],
     )];
-    let dae = assemble_dae(&mut ctx, &c, &devs);
+    let dae = assemble_dae(&mut ctx, &c, &devs).unwrap();
     // node 2 KCL carries the switch conductance (a Select on I(Vc)).
     let v2 = dae.unknowns.iter().position(|u| u == "v2").unwrap();
     let s = rsdag::to_string(&ctx, dae.currents[v2]);
@@ -365,7 +368,7 @@ fn mutual_inductance_couples_constraints() {
         .inductor("L2", 2, 0)
         .resistor("RL", 2, 0)
         .mutual("K1", "L1", "L2");
-    let dae = assemble_dae(&mut ctx, &c, &[]);
+    let dae = assemble_dae(&mut ctx, &c, &[]).unwrap();
     let i_l1 = dae.unknowns.iter().position(|u| u == "i_L1").unwrap();
     // the coupling is in the L1 row's flux
     let s = rsdag::to_string(&ctx, dae.charges[i_l1]);

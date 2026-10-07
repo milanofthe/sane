@@ -189,3 +189,192 @@ impl SpecializedTape {
         ok
     }
 }
+
+/// The `Select`s of a tape split over its parameters whose condition is
+/// parameter-pure (a prolog value, or a pure input): the choices a
+/// parameter binding makes once for every evaluation after it (see
+/// [`Tape::param_selects`]).
+pub struct ParamSelects {
+    /// The distinct conditions, one output each, over the tape's inputs.
+    conds: Tape,
+    /// Per decided select, its instruction in the tape's program and the
+    /// output of `conds` that is its condition.
+    of: Vec<(u32, u32)>,
+}
+
+impl ParamSelects {
+    /// Per instruction of `p` (the tape's program), the arm `pattern`
+    /// decides it to, for the selects this decides.
+    fn arms(&self, p: &super::compile::Program, pattern: &[bool]) -> Vec<Option<Ref>> {
+        let mut arm: Vec<Option<Ref>> = vec![None; p.insts.len()];
+        for &(i, c) in &self.of {
+            let ins = p.ins(i as usize);
+            arm[i as usize] = Some(if pattern[c as usize] { ins[1] } else { ins[2] });
+        }
+        arm
+    }
+
+    /// The number of distinct conditions, the length of a pattern.
+    pub fn n_conds(&self) -> usize {
+        self.conds.outputs.len()
+    }
+
+    /// The pattern of the conditions at the inputs `args` (the tape's
+    /// inputs; only the pure ones are read): one truth per condition.
+    pub fn pattern(&self, args: &[f64], work: &mut Vec<f64>, out: &mut Vec<f64>) -> Vec<bool> {
+        self.conds.eval(args, work, out);
+        out.iter().map(|&c| c != 0.0).collect()
+    }
+
+    /// The tape of the conditions, an output each, over the tape's inputs:
+    /// what a backend compiles to compute [`pattern`](Self::pattern).
+    pub fn tape(&self) -> &Tape {
+        &self.conds
+    }
+}
+
+impl Tape {
+    /// Whether the tape has a select a parameter binding decides: any of the
+    /// prolog's, or one of the main phase whose condition is a prolog value
+    /// or a pure input (`pure_inputs`). A scan of the ops, for deciding
+    /// cheaply whether [`param_selects`](Self::param_selects) has anything
+    /// to find.
+    pub fn has_param_selects(&self, pure_inputs: &[bool]) -> bool {
+        self.ops.iter().enumerate().any(|(k, op)| match *op {
+            super::Op::Select(_, _, _) if k < self.prolog_ops => true,
+            super::Op::Select(c, _, _) => match input_index(c) {
+                Some(i) => pure_inputs.get(i as usize).copied().unwrap_or(false),
+                None => (c as usize) < self.state_len,
+            },
+            _ => false,
+        })
+    }
+
+    /// The selects a parameter binding decides: those whose condition is
+    /// computed in the prolog or is a pure input (`pure_inputs`, one flag
+    /// per input), in the prolog or the main phase. `None` for a tape
+    /// without a prolog split or without such a select.
+    pub fn param_selects(&self, pure_inputs: &[bool]) -> Option<ParamSelects> {
+        if self.prolog_ops == 0 && !pure_inputs.iter().any(|&p| p) {
+            return None;
+        }
+        let mut p = self.lift();
+        let pure = |r: Ref, p: &super::compile::Program| match r {
+            Ref::Input(k) => pure_inputs.get(k as usize).copied().unwrap_or(false),
+            Ref::Value(j, _) => p.insts[j as usize].pure,
+        };
+        let mut conds: Vec<Ref> = Vec::new();
+        let mut of = Vec::new();
+        for i in 0..p.insts.len() {
+            let inst = &p.insts[i];
+            if !matches!(inst.kind, Kind::Select) {
+                continue;
+            }
+            let c = p.ins(i)[0];
+            if !pure(c, &p) {
+                continue;
+            }
+            let k = match conds.iter().position(|&d| d == c) {
+                Some(k) => k,
+                None => {
+                    conds.push(c);
+                    conds.len() - 1
+                }
+            };
+            of.push((i as u32, k as u32));
+        }
+        if of.is_empty() {
+            return None;
+        }
+        p.roots = conds;
+        p.retain_reachable();
+        let order = p.schedule();
+        let mut tape = p.emit(&order, false);
+        tape.n_inputs = self.n_inputs;
+        Some(ParamSelects { conds: tape, of })
+    }
+
+    /// The instructions, undecided and decided by each of `patterns` (see
+    /// [`decide`](Self::decide)), counted on the tape's program without
+    /// compiling it again: what deciding would remove.
+    pub fn ops_decided(&self, ps: &ParamSelects, patterns: &[Vec<bool>]) -> (usize, Vec<usize>) {
+        let p = self.lift();
+        let count = |pattern: Option<&[bool]>| -> usize {
+            let arm = match pattern {
+                Some(pattern) => ps.arms(&p, pattern),
+                None => vec![None; p.insts.len()],
+            };
+            let mut seen = vec![false; p.insts.len()];
+            let mut stack: Vec<Ref> = p
+                .roots
+                .iter()
+                .map(|&r| decided(&p, &arm, r, true))
+                .collect();
+            let mut n = 0;
+            while let Some(r) = stack.pop() {
+                let Ref::Value(i, _) = r else { continue };
+                let i = i as usize;
+                if std::mem::replace(&mut seen[i], true) {
+                    continue;
+                }
+                n += 1;
+                let main = !p.insts[i].pure;
+                stack.extend(p.ins(i).iter().map(|&r| decided(&p, &arm, r, main)));
+            }
+            n
+        };
+        let decided = patterns.iter().map(|q| count(Some(q))).collect();
+        (count(None), decided)
+    }
+
+    /// This tape with the selects of `ps` decided by `pattern` (one truth
+    /// per condition, see [`ParamSelects::pattern`]):
+    /// each the arm its condition picks, what only the other arms read
+    /// dropped. Bit for bit the tape's outputs wherever the conditions take
+    /// `pattern`; the prolog split kept, its state laid out anew, the main
+    /// phase reading no more than the tape's (see [`decided`]). No guards:
+    /// the caller computes the pattern.
+    pub fn decide(&self, ps: &ParamSelects, pattern: &[bool]) -> Tape {
+        let mut p = self.lift();
+        assert_eq!(pattern.len(), ps.n_conds(), "pattern length mismatch");
+        let arm = ps.arms(&p, pattern);
+        // Each operand as the instruction reading it sees it decided.
+        let mut main = vec![false; p.pool.len()];
+        for inst in &p.insts {
+            let (s, l) = inst.ins;
+            main[s as usize..(s + l) as usize].fill(!inst.pure);
+        }
+        let pool: Vec<Ref> = (0..p.pool.len())
+            .map(|k| decided(&p, &arm, p.pool[k], main[k]))
+            .collect();
+        let roots: Vec<Ref> = p
+            .roots
+            .iter()
+            .map(|&r| decided(&p, &arm, r, true))
+            .collect();
+        (p.pool, p.roots) = (pool, roots);
+        p.retain_reachable();
+        let order = p.schedule();
+        let mut tape = p.emit(&order, self.prolog_ops > 0);
+        tape.n_inputs = self.n_inputs;
+        tape
+    }
+}
+
+/// The operand `r` of the program `p`, read by the main phase (`main`) or
+/// the prolog, with the selects `arm` decides resolved to their arms. A
+/// prolog select whose arm is an input stays, for the main phase: its value
+/// is in the state, where its arm would be a parameter the main phase reads
+/// itself, passed on every evaluation. Deciding it saves the prolog one op
+/// per binding, nothing per evaluation.
+fn decided(p: &super::compile::Program, arm: &[Option<Ref>], r: Ref, main: bool) -> Ref {
+    let mut r = r;
+    while let Ref::Value(i, _) = r {
+        match arm[i as usize] {
+            Some(Ref::Input(_)) if main && p.insts[i as usize].pure => break,
+            Some(a) => r = a,
+            None => break,
+        }
+    }
+    r
+}

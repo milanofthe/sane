@@ -30,7 +30,7 @@
 use rayon::prelude::*;
 use rsdag::node::{BinOp, CmpOp, ReduceOp, UnaryOp};
 use rsdag::tape::input_index;
-use rsdag::{ExternBundle, Tape};
+use rsdag::{ExternBundle, Instances, Tape};
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
@@ -111,6 +111,9 @@ struct NativeBody {
     /// The pure-argument flags of the body it replaces: its prolog runs on
     /// those, the rest NaN.
     pure: Vec<bool>,
+    /// Per argument, its rank among the pure ones (a prolog's arguments
+    /// are those alone).
+    rank: Vec<Option<usize>>,
     batch: Batch,
 }
 
@@ -190,6 +193,9 @@ struct LaneCode {
     tape: NativeTape,
     /// What a block of it costs per phase (see [`lane_costs`]).
     block: [usize; 3],
+    /// The inputs each phase reads, in the order of [`Phase`]: what moves
+    /// into the lanes.
+    reads: [Vec<u32>; 3],
 }
 
 impl LaneCode {
@@ -232,7 +238,7 @@ impl NativeBody {
         &self,
         phase: Phase,
         n: usize,
-        mut run: impl FnMut(&NativeTape, std::ops::Range<usize>),
+        mut run: impl FnMut(&LaneCode, std::ops::Range<usize>),
     ) -> usize {
         let (k, one) = (phase as usize, self.scalar[phase as usize]);
         let pays = |lc: &&LaneCode| lc.pays(k, one);
@@ -241,7 +247,7 @@ impl NativeBody {
         };
         let full = n / widest.tape.lanes * widest.tape.lanes;
         if full > 0 {
-            run(&widest.tape, 0..full);
+            run(widest, 0..full);
         }
         // The rest, fewer than a block: `best[m]` the cheapest way to take
         // `m` of it, and the lane code it starts with (`None`: scalar).
@@ -261,7 +267,7 @@ impl NativeBody {
             match best[m].1 {
                 Some(i) => {
                     let w = self.lanes[i].tape.lanes.min(m);
-                    run(&self.lanes[i].tape, g..g + w);
+                    run(&self.lanes[i], g..g + w);
                     g += w;
                     m -= w;
                 }
@@ -271,108 +277,87 @@ impl NativeBody {
         g
     }
 
-    /// The instances `groups` through the lane code, its width at a time:
-    /// lane `l` of every slot and input is the block's instance `l` (a
-    /// short last block repeats its last instance, whose copies are
-    /// dropped). A
-    /// prolog's arguments are the pure ones, completed with NaN as
-    /// [`prolog_into`](ExternBundle::prolog_into) completes them, and
+    /// The instances `at` lists at positions `block` through the lane
+    /// code `lc`, its width at a time: lane `l` of every slot and input is
+    /// the block's instance `l` (a short last block repeats its last
+    /// instance, whose copies are dropped). A prolog's arguments are the
+    /// pure ones, completed with NaN as
+    /// [`prolog_into`](ExternBundle::prolog_into) completes them, and it
     /// writes `states`; a main phase reads `states`; a main phase or a
     /// whole run writes `out`.
     #[allow(clippy::too_many_arguments)]
     fn run_lanes(
         &self,
-        lt: &NativeTape,
+        lc: &LaneCode,
         phase: Phase,
         args: &[f64],
-        groups: std::ops::Range<usize>,
-        n_args: usize,
+        at: &Instances,
+        block: std::ops::Range<usize>,
         states: Option<&[f64]>,
-        states_out: Option<&mut [f64]>,
-        out: Option<&mut [f64]>,
+        mut states_out: Option<&mut [f64]>,
+        mut out: Option<&mut [f64]>,
     ) {
-        let l = lt.lanes;
-        let sl = self.tape.state_len;
+        let lt = &lc.tape;
+        let (l, sl, n_out) = (lt.lanes, self.tape.state_len, self.n_out);
+        let (n_args, stride) = (at.n_args, at.stride);
         let n_in = lt.n_inputs.max(n_args).max(self.pure.len());
-        let mut states_out = states_out;
-        let mut out = out;
-        let n_out = self.n_out;
         // Only the inputs the phase reads move into the lanes; a prolog's
         // arguments are the pure ones, input `k` the pure argument of its
         // rank among them.
-        let read: Vec<u32> = match phase {
-            Phase::Prolog => lt.reads[0].clone(),
-            Phase::Main => lt.reads[1].clone(),
-            Phase::Whole => {
-                let mut r = [lt.reads[0].as_slice(), lt.reads[1].as_slice()].concat();
-                r.sort_unstable();
-                r.dedup();
-                r
-            }
+        let read = &lc.reads[phase as usize];
+        let range = match phase {
+            Phase::Prolog => 0..lt.prolog_chunks,
+            Phase::Main => lt.prolog_chunks..lt.chunks.len(),
+            Phase::Whole => 0..lt.chunks.len(),
         };
-        let rank: Vec<Option<usize>> = if phase == Phase::Prolog {
-            let mut next = 0;
-            self.pure
-                .iter()
-                .map(|&p| {
-                    p.then(|| {
-                        next += 1;
-                        next - 1
-                    })
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
-        rsdag::scratch::with::<Vec<f64>, _>(|work| {
-            work.resize(lt.layout.total, 0.0);
-            let mut ins = vec![f64::NAN; n_in * l];
-            let end = groups.end;
-            for c in groups.step_by(l) {
-                for lane in 0..l {
-                    let g = (c + lane).min(end - 1);
-                    let a = &args[g * n_args..(g + 1) * n_args];
-                    for &k in &read {
-                        let k = k as usize;
-                        ins[k * l + lane] = if phase == Phase::Prolog {
-                            rank.get(k).copied().flatten().map_or(f64::NAN, |r| a[r])
-                        } else {
-                            a.get(k).copied().unwrap_or(f64::NAN)
-                        };
-                    }
-                    if let Some(st) = states {
-                        for s in 0..sl {
-                            work[s * l + lane] = st[g * sl + s];
-                        }
-                    }
-                }
-                let range = match phase {
-                    Phase::Prolog => 0..lt.prolog_chunks,
-                    Phase::Main => lt.prolog_chunks..lt.chunks.len(),
-                    Phase::Whole => 0..lt.chunks.len(),
-                };
-                lt.run(range, &ins, work);
-                for lane in 0..l.min(end - c) {
-                    let g = c + lane;
-                    if let Some(st) = states_out.as_deref_mut() {
-                        for s in 0..sl {
-                            st[g * sl + s] = work[s * l + lane];
-                        }
-                    }
-                    if let Some(o) = out.as_deref_mut() {
-                        for (k, &slot) in lt.outputs[..n_out].iter().enumerate() {
-                            o[g * n_out + k] = match input_index(slot) {
-                                Some(i) => args
-                                    .get(g * n_args + i as usize)
+        rsdag::scratch::with_len(lt.layout.total, 0.0, |work: &mut [f64]| {
+            rsdag::scratch::with_len(n_in * l, f64::NAN, |ins: &mut [f64]| {
+                let end = block.end;
+                for c in block.step_by(l) {
+                    for lane in 0..l {
+                        let g = at.at((c + lane).min(end - 1));
+                        let a = &args[g * n_args..(g + 1) * n_args];
+                        for &k in read {
+                            let k = k as usize;
+                            ins[k * l + lane] = if phase == Phase::Prolog {
+                                self.rank
+                                    .get(k)
                                     .copied()
-                                    .filter(|_| (i as usize) < n_args)
-                                    .unwrap_or(f64::NAN),
-                                None => work[slot as usize * l + lane],
+                                    .flatten()
+                                    .map_or(f64::NAN, |r| a[r])
+                            } else {
+                                a.get(k).copied().unwrap_or(f64::NAN)
                             };
                         }
+                        if let Some(st) = states {
+                            for s in 0..sl {
+                                work[s * l + lane] = st[g * stride + s];
+                            }
+                        }
+                    }
+                    lt.run(range.clone(), ins, work);
+                    for lane in 0..l.min(end - c) {
+                        let g = at.at(c + lane);
+                        if let Some(st) = states_out.as_deref_mut() {
+                            for s in 0..sl {
+                                st[g * stride + s] = work[s * l + lane];
+                            }
+                        }
+                        if let Some(o) = out.as_deref_mut() {
+                            for (k, &slot) in lt.outputs[..n_out].iter().enumerate() {
+                                o[g * n_out + k] = match input_index(slot) {
+                                    Some(i) => args
+                                        .get(g * n_args + i as usize)
+                                        .copied()
+                                        .filter(|_| (i as usize) < n_args)
+                                        .unwrap_or(f64::NAN),
+                                    None => work[slot as usize * l + lane],
+                                };
+                            }
+                        }
                     }
                 }
-            }
+            })
         });
     }
 }
@@ -406,11 +391,13 @@ impl ExternBundle for NativeBody {
             };
         }
         self.tape.run(0..self.tape.prolog_chunks, a, w);
-        state.copy_from_slice(&w[..state.len()]);
+        let sl = self.tape.state_len;
+        state[..sl].copy_from_slice(&w[..sl]);
     }
     fn main_into(&self, args: &[f64], state: &[f64], work: &mut [f64], out: &mut [f64]) {
         let w = &mut work[..self.tape.layout.total];
-        w[..state.len()].copy_from_slice(state);
+        let sl = self.tape.state_len;
+        w[..sl].copy_from_slice(&state[..sl]);
         self.tape
             .run(self.tape.prolog_chunks..self.tape.chunks.len(), args, w);
         for (k, &slot) in self.tape.outputs[..self.n_out].iter().enumerate() {
@@ -420,71 +407,54 @@ impl ExternBundle for NativeBody {
             };
         }
     }
-    fn prolog_batch(&self, pure: &[f64], n_groups: usize, n_pure: usize, states: &mut [f64]) {
-        let g0 = self.lanes_first(Phase::Prolog, n_groups, |lt, r| {
+    fn prolog_batch(&self, pure: &[f64], states: &mut [f64], at: &Instances) {
+        let k0 = self.lanes_first(Phase::Prolog, at.len(), |lc, r| {
             self.run_lanes(
-                lt,
+                lc,
                 Phase::Prolog,
                 pure,
+                at,
                 r,
-                n_pure,
                 None,
                 Some(&mut *states),
                 None,
             )
         });
-        let sl = self.tape.state_len;
-        rsdag::scratch::with::<Vec<f64>, _>(|w| {
-            w.resize(self.work_len(), 0.0);
-            for g in g0..n_groups {
-                let p = &pure[g * n_pure..(g + 1) * n_pure];
-                self.prolog_into(p, w, &mut states[g * sl..(g + 1) * sl]);
+        let (na, sl, st) = (at.n_args, self.tape.state_len, at.stride);
+        rsdag::scratch::with_len(self.work_len(), 0.0, |w| {
+            for g in (k0..at.len()).map(|k| at.at(k)) {
+                let p = &pure[g * na..(g + 1) * na];
+                self.prolog_into(p, w, &mut states[g * st..g * st + sl]);
             }
         });
     }
-    fn main_batch(
-        &self,
-        args: &[f64],
-        states: &[f64],
-        n_groups: usize,
-        n_args: usize,
-        out: &mut [f64],
-    ) {
-        let g0 = self.lanes_first(Phase::Main, n_groups, |lt, r| {
+    fn main_batch(&self, args: &[f64], states: &[f64], out: &mut [f64], at: &Instances) {
+        let k0 = self.lanes_first(Phase::Main, at.len(), |lc, r| {
             self.run_lanes(
-                lt,
+                lc,
                 Phase::Main,
                 args,
+                at,
                 r,
-                n_args,
                 Some(states),
                 None,
                 Some(&mut *out),
             )
         });
-        let (sl, no) = (self.tape.state_len, self.n_out);
-        rsdag::scratch::with::<Vec<f64>, _>(|w| {
-            w.resize(self.work_len(), 0.0);
-            for g in g0..n_groups {
-                let a = &args[g * n_args..(g + 1) * n_args];
-                let st = &states[g * sl..(g + 1) * sl];
-                self.main_into(a, st, w, &mut out[g * no..(g + 1) * no]);
+        let (na, sl, st, no) = (at.n_args, self.tape.state_len, at.stride, self.n_out);
+        rsdag::scratch::with_len(self.work_len(), 0.0, |w| {
+            for g in (k0..at.len()).map(|k| at.at(k)) {
+                let a = &args[g * na..(g + 1) * na];
+                let s = &states[g * st..g * st + sl];
+                self.main_into(a, s, w, &mut out[g * no..(g + 1) * no]);
             }
         });
     }
     fn call_batch(&self, args: &[f64], n_groups: usize, n_args: usize, out: &mut [f64]) {
         if self.batch == Batch::Serial {
-            let g0 = self.lanes_first(Phase::Whole, n_groups, |lt, r| {
-                self.run_lanes(
-                    lt,
-                    Phase::Whole,
-                    args,
-                    r,
-                    n_args,
-                    None,
-                    None,
-                    Some(&mut *out),
-                )
+            let at = Instances::first(n_groups, n_args, 0);
+            let g0 = self.lanes_first(Phase::Whole, n_groups, |lc, r| {
+                self.run_lanes(lc, Phase::Whole, args, &at, r, None, None, Some(&mut *out))
             });
             rsdag::scratch::with::<Vec<f64>, _>(|work| {
                 self.run_groups(work, args, n_args, out, g0..n_groups)
@@ -519,8 +489,62 @@ impl ExternBundle for NativeBody {
     }
 }
 
-/// The options a native body was emitted under, as a key of the body's
-/// backend cache.
+/// `body` as native code behind the bundle interface ([`NativeBody`]), with
+/// its lane form where that pays.
+fn native_body(
+    body: &Tape,
+    pure: &[bool],
+    no: usize,
+    opts: &Options,
+) -> Result<Arc<dyn ExternBundle>, JitError> {
+    let sl = body.state_len();
+    let lanes = match opts.lanes {
+        Lanes::Never => Vec::new(),
+        _ => NativeTape::compile_lanes(body),
+    };
+    // Forced, the scalar code is never the cheaper way.
+    let mut scalar = [usize::MAX / 16; 3];
+    let lanes: Vec<LaneCode> = lanes
+        .into_iter()
+        .map(|lt| {
+            let (block, one) = lane_costs(&lt, sl, no);
+            if opts.lanes == Lanes::Auto {
+                scalar = one;
+            }
+            let mut whole = [lt.reads[0].as_slice(), lt.reads[1].as_slice()].concat();
+            whole.sort_unstable();
+            whole.dedup();
+            let reads = [lt.reads[0].clone(), lt.reads[1].clone(), whole];
+            LaneCode {
+                tape: lt,
+                block,
+                reads,
+            }
+        })
+        .collect();
+    let lanes = lanes
+        .into_iter()
+        .filter(|lc| (0..3).any(|k| lc.pays(k, scalar[k])))
+        .collect();
+    Ok(Arc::new(NativeBody {
+        tape: NativeTape::compile_opts(body, opts, &[])?,
+        lanes,
+        scalar,
+        n_out: no,
+        pure: pure.to_vec(),
+        rank: pure
+            .iter()
+            .scan(0, |next, &p| {
+                *next += usize::from(p);
+                Some(p.then(|| *next - 1))
+            })
+            .collect(),
+        batch: opts.batch,
+    }))
+}
+
+/// The options a native body's code was emitted under, as a key of the
+/// body's backend cache.
 fn options_key(opts: &Options) -> u64 {
     let batch = match opts.batch {
         Batch::Serial => 0,
@@ -621,52 +645,41 @@ impl NativeTape {
         {
             return Err(JitError::Unsupported);
         }
-        // Function bodies that are tapes become native bodies of their own.
+        // Function bodies that are tapes become native bodies of their own,
+        // emitted once per body and options and shared by every program that
+        // calls it; a body with tapes of its own (per-binding variants) has
+        // them compiled the same way.
+        let o = *opts;
+        let backend = rsdag::BodyBackend {
+            compile: Some(Arc::new(move |t: &Tape, pure: &[bool], n_out: usize| {
+                native_body(t, pure, n_out, &o).ok()
+            })),
+            key: options_key(opts),
+            submit: opts
+                .background
+                .then(|| -> rsdag::Submit { Arc::new(crate::background::submit) }),
+            variants: None,
+        };
         let bundles: Result<Bundles, JitError> = tape
             .bundles()
             .iter()
-            .map(|b| match b.body() {
-                Some(body) => {
-                    // Emitted once per body and options, shared by every
-                    // program that calls it; with its lane form when it has
-                    // one.
-                    let make = || -> Result<Arc<dyn ExternBundle>, JitError> {
-                        let (sl, no) = (body.state_len(), b.n_outputs());
-                        let lanes = match opts.lanes {
-                            Lanes::Never => Vec::new(),
-                            _ => NativeTape::compile_lanes(body),
-                        };
-                        // Forced, the scalar code is never the cheaper way.
-                        let mut scalar = [usize::MAX / 16; 3];
-                        let lanes: Vec<LaneCode> = lanes
-                            .into_iter()
-                            .map(|lt| {
-                                let (block, one) = lane_costs(&lt, sl, no);
-                                if opts.lanes == Lanes::Auto {
-                                    scalar = one;
-                                }
-                                LaneCode { tape: lt, block }
-                            })
-                            .collect();
-                        let lanes = lanes
-                            .into_iter()
-                            .filter(|lc| (0..3).any(|k| lc.pays(k, scalar[k])))
-                            .collect();
-                        Ok(Arc::new(NativeBody {
-                            tape: NativeTape::compile_opts(body, opts, &[])?,
-                            lanes,
-                            scalar,
-                            n_out: no,
-                            pure: b.pure_args().to_vec(),
-                            batch: opts.batch,
-                        }))
-                    };
-                    match b.backend_cache() {
-                        Some(cache) => cache.get_or_try_insert(options_key(opts), make),
-                        None => make(),
+            .map(|b| {
+                let make = || -> Result<Arc<dyn ExternBundle>, JitError> {
+                    if let Some(v) = b.with_backend(&backend) {
+                        return Ok(v);
                     }
+                    match b.body() {
+                        Some(body) => native_body(body, b.pure_args(), b.n_outputs(), opts),
+                        None => Ok(b.clone()),
+                    }
+                };
+                // The form of the bundle the program runs: its code by the
+                // options, and where its work goes.
+                let key = options_key(opts) ^ (u64::from(opts.background) << 61);
+                match b.backend_cache() {
+                    Some(cache) => cache.get_or_try_insert(key, make),
+                    None => make(),
                 }
-                None => Ok(b.clone()),
             })
             .collect();
         let bundles = bundles?;
@@ -865,6 +878,12 @@ impl NativeTape {
             Some(i) => inputs.get(i as usize).copied().unwrap_or(f64::NAN),
             None => work[s as usize],
         }));
+    }
+
+    /// The bundles the calls call, by index, each as this backend runs it;
+    /// mirrors [`Tape::bundles`].
+    pub fn bundles(&self) -> &[Arc<dyn ExternBundle>] {
+        &self.bundles
     }
 
     /// Evaluate the parameter-pure prolog into `work` (grown here to the

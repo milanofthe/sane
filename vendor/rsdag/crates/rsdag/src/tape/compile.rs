@@ -104,7 +104,8 @@ impl Tape {
         }
         timed("tape fuse", || program.fuse_accumulators(pure_inputs));
         let order = timed("tape schedule", || program.schedule());
-        let mut tape = timed("tape emit", || program.emit(&order, pure_inputs.is_some()));
+        let split = pure_inputs.is_some();
+        let mut tape = timed("tape emit", || program.emit(&order, split));
         tape.n_inputs = input_syms.len();
         tape
     }
@@ -1739,7 +1740,7 @@ impl Forest {
         // others (a model card bound to every instance) are not gathered
         // per evaluation.
         let reads: Option<Arc<[u32]>> = stateful
-            .then(|| b.body().map(|t| t.main_reads()))
+            .then(|| b.main_reads())
             .flatten()
             .filter(|r| r.len() < n_args as usize)
             .map(Into::into);

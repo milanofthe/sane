@@ -23,6 +23,27 @@ impl Model {
         samples: Option<usize>,
         continuation: Option<bool>,
     ) -> Result<(Vec<Vec<(f64, f64)>>, bool, usize, f64, f64, f64, f64), ModelError> {
+        if let Some(o) = self.restructured_at(&p)? {
+            let x0 = x0.map(|x| o.state(&x, 0.0));
+            let (spectra, conv, iters, res, a, b, c) = o.model.solve_hb(
+                o.p(),
+                f0,
+                harmonics,
+                x0,
+                oversample,
+                tol,
+                max_iter,
+                samples,
+                continuation,
+            )?;
+            let row = spectra.first().map_or(0, Vec::len);
+            let spectra = o.layout.pick(
+                &spectra,
+                vec![(0.0, 0.0); row],
+                vec![(f64::NAN, f64::NAN); row],
+            );
+            return Ok((spectra, conv, iters, res, a, b, c));
+        }
         self.ensure_no_delays("harmonic balance")?;
         // Infer the fundamental from a periodic source when the caller passes
         // f0 <= 0 (a SIN's frequency, a PULSE train's 1/period).
@@ -139,6 +160,7 @@ impl Model {
         oversample: usize,
         samples: Option<usize>,
     ) -> Result<Vec<Vec<(String, f64, f64)>>, ModelError> {
+        self.inner.bound(&p)?;
         self.ensure_no_delays("hb_gradient")?;
         let mut task = log::task("SENS-HB", "sens_hb", &format!("(harmonics: {harmonics})"));
         if !(f0 > 0.0) {
@@ -197,6 +219,7 @@ impl Model {
         oversample: usize,
         samples: Option<usize>,
     ) -> Result<Vec<Vec<(f64, f64)>>, ModelError> {
+        self.inner.bound(&p)?;
         let _g = log::scope("sens/hb_hessian");
         if !(f0 > 0.0) {
             return Err(ModelError::Numeric("hb_hessian needs f0 > 0".to_string()));

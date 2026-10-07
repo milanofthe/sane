@@ -26,6 +26,7 @@ pub(crate) mod parser;
 pub(crate) mod preprocessor;
 mod template;
 pub(crate) mod token;
+mod topology;
 
 // Curated public surface.
 pub use ast::Module;
@@ -298,9 +299,8 @@ mod tests {
         let np = em.ports.len();
         let tv: Vec<rsdag::ExprId> = (1..=np).map(|k| ctx.sym(&format!("v{k}"))).collect();
         let mut lo = sane_device::Lowerer::new(ctx);
-        let pv = std::collections::HashMap::default();
         let given = std::collections::HashSet::default();
-        super::lower::lower_analog(&em, "X1", &pv, &given, 1.0, &mut lo, &tv).expect("lower")
+        super::lower::lower_analog(&em, "X1", &given, &Default::default(), 1.0, &mut lo, &tv).expect("lower")
     }
 
     #[test]
@@ -432,20 +432,23 @@ mod tests {
 
     #[test]
     fn static_zero_potential_collapses_nodes() {
-        // `if (sw==1) V(mid,b) <+ 0;` with sw=1 (default): mid collapses onto
-        // port b -- no internal unknown, no source branch; the module IS a
-        // resistor a-b. With sw=0 the else-arm makes it two series resistors.
+        // `V(mid,b) <+ 0` reached unconditionally -- the condition around it
+        // folds, `$param_given(Rs)` being a fact of the instance -- merges mid
+        // onto port b: no internal unknown, no source branch; the module IS a
+        // resistor a-b. With Rs given, `Rs > 0` is a condition over a
+        // parameter that decides the topology: it folds at the instance's
+        // Rs, mid stays, and the model asserts that Rs stays positive.
         let src = r#"
             module m(a,b);
               inout a,b; electrical a,b,mid;
               parameter real R = 1k;
-              parameter integer sw = 1;
+              parameter real Rs = 0;
               analog begin
                 I(a,mid) <+ V(a,mid)/R;
-                if (sw == 1)
-                  V(mid,b) <+ 0;
+                if ($param_given(Rs) && (Rs > 0))
+                  I(mid,b) <+ V(mid,b)/Rs;
                 else
-                  I(mid,b) <+ V(mid,b)/R;
+                  V(mid,b) <+ 0;
               end
             endmodule
         "#;
@@ -455,12 +458,12 @@ mod tests {
         let mut ctx = Graph::new();
         let mut cn = Circuit::new();
         cn.voltage_source("V1", 1, 0).resistor("R1", 1, 0);
-        let native = assemble_dae(&mut ctx, &cn, &[]);
+        let native = assemble_dae(&mut ctx, &cn, &[]).unwrap();
         let dev = VerilogADevice::new("R1", em.clone());
         let mut cv = Circuit::new();
         cv.voltage_source("V1", 1, 0);
         let devs = vec![DeviceInstance::new(Box::new(dev), vec![1, 0])];
-        let va = assemble_dae(&mut ctx, &cv, &devs);
+        let va = assemble_dae(&mut ctx, &cv, &devs).unwrap();
         assert_eq!(
             va.unknowns, native.unknowns,
             "collapse removes the internal node and the source branch"
@@ -471,7 +474,6 @@ mod tests {
                 ("V1", 2.0),
                 ("R1", 1000.0),
                 ("R1.R", 1000.0),
-                ("R1.sw", 1.0),
                 ("v1", 2.0),
                 ("i_V1", -0.002),
                 ("t", 0.0),
@@ -479,18 +481,22 @@ mod tests {
         );
         assert_dae_match(&ctx, &native, &va, &env);
 
-        // Non-collapsed variant (sw=0): the internal node survives.
+        // Rs given: the short depends on its value, the structure.
         let mut dev2 = VerilogADevice::new("R2", em);
-        dev2.params.insert("sw".into(), 0.0);
+        dev2.params.insert("Rs".into(), 500.0);
+        dev2.given.insert("Rs".into());
         let mut cv2 = Circuit::new();
         cv2.voltage_source("V1", 1, 0);
         let devs2 = vec![DeviceInstance::new(Box::new(dev2), vec![1, 0])];
-        let va2 = assemble_dae(&mut ctx, &cv2, &devs2);
+        let va2 = assemble_dae(&mut ctx, &cv2, &devs2).unwrap();
         assert!(
-            va2.unknowns.iter().any(|u| u.contains("mid")),
-            "sw=0 keeps the internal node: {:?}",
+            va2.unknowns.iter().any(|u| u.contains("mid"))
+                && !va2.unknowns.iter().any(|u| u.contains("sw_")),
+            "Rs given keeps the internal node, its branch open: {:?}",
             va2.unknowns
         );
+        assert_eq!(va2.structure.len(), 1, "Rs > 0 is the structure");
+        assert!(va2.assertions.is_empty(), "no assertion on values");
     }
 
     #[test]
@@ -517,7 +523,8 @@ mod tests {
             &mut ctx,
             &cv,
             &[DeviceInstance::new(Box::new(dev), vec![1, 0])],
-        );
+        )
+        .unwrap();
         assert_eq!(
             va.unknowns,
             vec!["v1", "i_V1"],
@@ -546,7 +553,8 @@ mod tests {
             &mut ctx2,
             &cv2,
             &[DeviceInstance::new(Box::new(dev2), vec![1, 0])],
-        );
+        )
+        .unwrap();
         assert!(
             va2.unknowns.iter().any(|u| u.contains("mid")),
             "probed zero branch keeps its unknown: {:?}",
@@ -579,7 +587,7 @@ mod tests {
         };
         let (sa, sc) = (sym(&ctx, va), sym(&ctx, vc));
         let mut lo = sane_device::Lowerer::new(&mut ctx);
-        let frag = dev.lower_behavioral(&mut lo, &[va, vc], &[]);
+        let frag = dev.lower_behavioral(&mut lo, &[va, vc], &[]).unwrap();
         assert_eq!(frag.limits.len(), 1, "one recorded limit");
         assert_eq!(frag.limits[0].hi, Some(sa));
         assert_eq!(frag.limits[0].lo, Some(sc));
@@ -587,9 +595,12 @@ mod tests {
     }
 
     #[test]
-    fn while_loop_bound_analyses_lower() {
-        // Pattern 1: the HiSIM2 goto-emulation -- nested same-flag whiles with
-        // a counter-capped re-trigger. Must lower via the shared budget.
+    fn while_loops_over_the_solution_need_a_folding_bound() {
+        // Loops whose condition reads the solution are unrolled gated by it,
+        // so a loop is exact wherever it ends within the unrolled iterations;
+        // one whose condition never folds cannot be lowered exactly and is
+        // rejected. Pattern 1: the HiSIM2 goto-emulation, nested same-flag
+        // whiles with a counter-capped re-trigger on the solution.
         let flag_nest = r#"
             module m(a,b); inout a,b; electrical a,b;
               parameter real R = 1k;
@@ -610,12 +621,13 @@ mod tests {
               end
             endmodule
         "#;
-        VerilogADevice::new("X", elab(flag_nest))
+        let e = VerilogADevice::new("X", elab(flag_nest))
             .validate()
-            .expect("flag nest lowers");
+            .unwrap_err();
+        assert!(e.contains("depends on the solution"), "clear diagnostic: {e}");
 
-        // Pattern 2: a runtime descent loop bounded by an enclosing guard fact
-        // (the HiSIM2 exp-reduction idiom).
+        // Pattern 2: a descent loop on the solution, bounded only by an
+        // enclosing guard (the HiSIM2 exp-reduction idiom).
         let descent = r#"
             module m(a,b); inout a,b; electrical a,b;
               parameter real R = 1k;
@@ -635,11 +647,12 @@ mod tests {
               end
             endmodule
         "#;
-        VerilogADevice::new("X", elab(descent))
+        let e = VerilogADevice::new("X", elab(descent))
             .validate()
-            .expect("descent loop lowers");
+            .unwrap_err();
+        assert!(e.contains("depends on the solution"), "clear diagnostic: {e}");
 
-        // A genuinely unbounded loop must still be rejected with a clear error.
+        // A genuinely unbounded loop likewise.
         let unbounded = r#"
             module m(a,b); inout a,b; electrical a,b;
               real t;
@@ -653,10 +666,7 @@ mod tests {
         let e = VerilogADevice::new("X", elab(unbounded))
             .validate()
             .unwrap_err();
-        assert!(
-            e.contains("no static iteration bound"),
-            "clear diagnostic: {e}"
-        );
+        assert!(e.contains("depends on the solution"), "clear diagnostic: {e}");
     }
 
     #[test]
@@ -757,7 +767,7 @@ mod tests {
         let mut ctx = Graph::new();
         let mut cn = Circuit::new();
         cn.voltage_source("V1", 1, 0).resistor("R1", 1, 0);
-        let native = assemble_dae(&mut ctx, &cn, &[]);
+        let native = assemble_dae(&mut ctx, &cn, &[]).unwrap();
 
         let src = "module res(p,n); inout p,n; electrical p,n; \
                    parameter real R = 1000.0; analog I(p,n) <+ V(p,n)/R; endmodule";
@@ -765,7 +775,7 @@ mod tests {
         let mut cv = Circuit::new();
         cv.voltage_source("V1", 1, 0);
         let devs = vec![DeviceInstance::new(Box::new(dev), vec![1, 0])];
-        let va = assemble_dae(&mut ctx, &cv, &devs);
+        let va = assemble_dae(&mut ctx, &cv, &devs).unwrap();
 
         let env = env_of(
             &mut ctx,
@@ -791,7 +801,7 @@ mod tests {
             Box::new(crate::builtin_device("sane_diode", "D1", &[])),
             vec![2, 0],
         )];
-        let native = assemble_dae(&mut ctx, &cn, &nd);
+        let native = assemble_dae(&mut ctx, &cn, &nd).unwrap();
 
         // The VA diode uses the built-in thermal voltage `$vt = k*T/q`, exactly
         // as the native diode now does, so the two agree (rather than hard-coding
@@ -803,7 +813,7 @@ mod tests {
         let mut cv = Circuit::new();
         cv.voltage_source("V1", 1, 0).resistor("R1", 1, 2);
         let vd = vec![DeviceInstance::new(Box::new(dev), vec![2, 0])];
-        let va = assemble_dae(&mut ctx, &cv, &vd);
+        let va = assemble_dae(&mut ctx, &cv, &vd).unwrap();
 
         let env = env_of(
             &mut ctx,
@@ -840,7 +850,7 @@ mod tests {
         let mut ctx = Graph::new();
         let mut cn = Circuit::new();
         cn.voltage_source("V1", 1, 0).resistor("R1", 1, 0);
-        let native = assemble_dae(&mut ctx, &cn, &[]);
+        let native = assemble_dae(&mut ctx, &cn, &[]).unwrap();
         let src = "module res(p,n); inout p,n; electrical p,n; parameter real R = 1000.0; \
                    analog function real recip; input x; real x; recip = 1.0/x; endfunction \
                    analog begin real g; g = recip(R); \
@@ -850,7 +860,7 @@ mod tests {
         let mut cv = Circuit::new();
         cv.voltage_source("V1", 1, 0);
         let devs = vec![DeviceInstance::new(Box::new(dev), vec![1, 0])];
-        let va = assemble_dae(&mut ctx, &cv, &devs);
+        let va = assemble_dae(&mut ctx, &cv, &devs).unwrap();
         let env = resistor_env(&mut ctx);
         assert_dae_match(&ctx, &native, &va, &env);
     }
@@ -860,7 +870,7 @@ mod tests {
         let mut ctx = Graph::new();
         let mut cn = Circuit::new();
         cn.voltage_source("V1", 1, 0).resistor("R1", 1, 0);
-        let native = assemble_dae(&mut ctx, &cn, &[]);
+        let native = assemble_dae(&mut ctx, &cn, &[]).unwrap();
         let src = "module res(p,n); inout p,n; electrical p,n; parameter real R = 1000.0; \
                    analog begin real g; integer k; g = 0.0; \
                    for (k = 0; k < 4; k = k + 1) g = g + 1.0/(4.0*R); \
@@ -869,7 +879,7 @@ mod tests {
         let mut cv = Circuit::new();
         cv.voltage_source("V1", 1, 0);
         let devs = vec![DeviceInstance::new(Box::new(dev), vec![1, 0])];
-        let va = assemble_dae(&mut ctx, &cv, &devs);
+        let va = assemble_dae(&mut ctx, &cv, &devs).unwrap();
         let env = resistor_env(&mut ctx);
         assert_dae_match(&ctx, &native, &va, &env);
     }
@@ -1135,9 +1145,8 @@ mod tests {
             let mut ctx = Graph::new();
             let term_v: Vec<ExprId> = (1..=np).map(|k| ctx.sym(&format!("v{k}"))).collect();
             let mut lo = Lowerer::new(&mut ctx);
-            let pv = std::collections::HashMap::default();
             let given = std::collections::HashSet::default();
-            match lower_analog(&em, "X1", &pv, &given, 1.0, &mut lo, &term_v) {
+            match lower_analog(&em, "X1", &given, &Default::default(), 1.0, &mut lo, &term_v) {
                 Ok(frag) => println!(
                     "{label}: LOWERED ok ({} terminals, {} rows, {} extras)",
                     frag.terminal_currents.len(),
@@ -1234,9 +1243,8 @@ mod tests {
             let mut ctx = Graph::new();
             let tv: Vec<ExprId> = (1..=np).map(|k| ctx.sym(&format!("v{k}"))).collect();
             let mut lo = Lowerer::new(&mut ctx);
-            let pv = std::collections::HashMap::default();
             let given = std::collections::HashSet::default();
-            let _ = lower_analog(&em, "X1", &pv, &given, 1.0, &mut lo, &tv);
+            let _ = lower_analog(&em, "X1", &given, &Default::default(), 1.0, &mut lo, &tv);
             println!("{label}: lowered (see VA non-finite const warnings above)");
         }
     }
@@ -1283,9 +1291,8 @@ mod tests {
         let mut ctx = Graph::new();
         let tv: Vec<ExprId> = (1..=np).map(|k| ctx.sym(&format!("v{k}"))).collect();
         let mut lo = Lowerer::new(&mut ctx);
-        let pv = std::collections::HashMap::default();
         let given = std::collections::HashSet::default();
-        let frag = lower_analog(&em, "X1", &pv, &given, 1.0, &mut lo, &tv).expect("lower");
+        let frag = lower_analog(&em, "X1", &given, &Default::default(), 1.0, &mut lo, &tv).expect("lower");
         let resids = frag.currents.clone();
         drop(lo);
 

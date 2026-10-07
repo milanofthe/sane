@@ -22,7 +22,10 @@ module sane_vswitch(a, b, cp, cn);
     real u, s, g;
 
     analog begin
-        if (Vh > 0) begin
+        if (Vh <= 0) begin
+            g = (V(cp, cn) > Vt) ? 1.0/Ron : 1.0/Roff;
+            @(cross(V(cp, cn) - Vt, 0));
+        end else begin
             u = (V(cp, cn) - (Vt - Vh)) / (2.0 * Vh);
             u = (u > 0) ? u : 0.0;
             u = (u < 1) ? u : 1.0;
@@ -33,9 +36,6 @@ module sane_vswitch(a, b, cp, cn);
             // the window edges are the surfaces where the conductance kinks
             @(cross(V(cp, cn) - (Vt - Vh), 0));
             @(cross(V(cp, cn) - (Vt + Vh), 0));
-        end else begin
-            g = (V(cp, cn) > Vt) ? 1.0/Ron : 1.0/Roff;
-            @(cross(V(cp, cn) - Vt, 0));
         end
         I(a, b) <+ g * V(a, b);
     end

@@ -49,7 +49,7 @@ fn inline_veriloga_diode_parses_and_binds() {
 fn inline_veriloga_diode_assembles_dae() {
     let p = parse(DECK).expect("deck parses");
     let mut ctx = Graph::new();
-    let dae = p.assemble(&mut ctx);
+    let dae = p.assemble(&mut ctx).unwrap();
     // nodes v1, v2 + branch i_V1.
     assert!(dae.dim() >= 3, "dim {}", dae.dim());
     assert!(dae.unknowns.iter().any(|u| u == "v2"));
@@ -100,7 +100,7 @@ fn switch_branch_lowers_per_instance() {
     let p = parse(SWITCH).expect("parse");
     assert_eq!(p.devices.len(), 2);
     let mut ctx = Graph::new();
-    let dae = p.assemble(&mut ctx);
+    let dae = p.assemble(&mut ctx).unwrap();
     // The shorted instance mints a branch-current unknown (voltage source);
     // the resistor instance mints none -> at least one extra branch unknown.
     assert!(dae.dim() >= 3, "dim {}", dae.dim());
@@ -123,14 +123,14 @@ fn multiple_modules_per_block() {
     let p = parse(MULTI).expect("parse");
     assert_eq!(p.devices.len(), 2);
     let mut ctx = Graph::new();
-    let dae = p.assemble(&mut ctx);
+    let dae = p.assemble(&mut ctx).unwrap();
     assert!(dae.unknowns.iter().any(|u| u == "v2"));
 }
 
-// Correctness: a model using an unsupported construct must fail at PARSE time
-// (via the device's trial-lowering), not silently produce wrong results.
+// Correctness: a model using an unsupported construct must fail to assemble,
+// naming the instance and the module, not silently produce wrong results.
 #[test]
-fn unsupported_construct_errors_at_parse() {
+fn unsupported_construct_errors_at_assembly() {
     let deck = "\
 .veriloga
 module bad(a, b); inout a,b; electrical a,b;
@@ -140,11 +140,13 @@ endmodule
 N1 1 0 bad
 .end
 ";
-    let e = parse(deck).unwrap_err();
+    let p = parse(deck).expect("the deck parses");
+    let Err(e) = p.assemble(&mut Graph::new()) else {
+        panic!("an unsupported construct assembled");
+    };
     assert!(
-        e.msg.contains("not supported"),
-        "expected unsupported error, got: {}",
-        e.msg
+        e.contains("not supported") && e.contains("N1") && e.contains("'bad'"),
+        "expected unsupported error, got: {e}"
     );
 }
 
@@ -167,7 +169,7 @@ R2 out 0 1k
     let p = parse(deck).expect("current-controlled model parses + lowers");
     assert_eq!(p.devices.len(), 1);
     let mut ctx = Graph::new();
-    let dae = p.assemble(&mut ctx);
+    let dae = p.assemble(&mut ctx).unwrap();
     assert!(
         dae.unknowns.iter().any(|u| u.contains("flow_")),
         "promoted current unknown: {:?}",
@@ -207,7 +209,7 @@ N1 d d 0 0 ekv26_va W=10u L=1u
         "model default VTO"
     );
     let mut ctx = Graph::new();
-    let dae = p.assemble(&mut ctx);
+    let dae = p.assemble(&mut ctx).unwrap();
     // node d (index 1 -> "v1") + branch i_V1.
     assert!(dae.dim() >= 2, "dim {}", dae.dim());
     assert!(
@@ -273,7 +275,7 @@ fn compact_level_card_routes_to_va_via_model_alias() {
     );
     // It actually assembles into a DAE (the device lowered).
     let mut ctx = Graph::new();
-    let dae = p.assemble(&mut ctx);
+    let dae = p.assemble(&mut ctx).unwrap();
     assert!(
         dae.unknowns.iter().any(|u| u == "v1"),
         "node d present: {:?}",
@@ -492,9 +494,9 @@ V1 1 0 1
     let doubled = format!("{module}N1 1 0 vres mult2=2\n.end\n");
     let mut ctx = Graph::new();
     let p1 = parse(&base).expect("base parses");
-    let d1 = p1.assemble(&mut ctx);
+    let d1 = p1.assemble(&mut ctx).unwrap();
     let p2 = parse(&doubled).expect("doubled parses");
-    let d2 = p2.assemble(&mut ctx);
+    let d2 = p2.assemble(&mut ctx).unwrap();
     // Evaluate the node-1 KCL residual at the same point: the m=2 device
     // contributes exactly twice the branch current.
     let mut env = std::collections::HashMap::new();

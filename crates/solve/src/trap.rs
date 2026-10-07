@@ -177,7 +177,12 @@ impl CompiledDc {
         if !ws.fac.solve_into(&ws.rhs, &mut ws.step) {
             return None;
         }
-        let (err, _) = ws_error_norm(ws, x, &ws.step, 1.0);
+        let (mut err, _) = ws_error_norm(ws, x, &ws.step, 1.0, &[]);
+        // Rejected for truncation error only, not for the corrector's
+        // rounding: the estimate moves by `k` times its floor.
+        if err > 1.0 && self.rounding_floor(ws, x, 0.5 * h, k_milne.abs()) {
+            (err, _) = ws_error_norm(ws, x, &ws.step, 1.0, &ws.floor);
+        }
         Some(err.max(IRK_ERR_FLOOR))
     }
 }

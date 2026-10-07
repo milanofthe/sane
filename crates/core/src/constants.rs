@@ -66,10 +66,12 @@ pub const VERILOGA_K_OVER_Q: f64 = 8.617_333_262e-5;
 /// Cap on `for`-loop unrolling iterations (runaway guard).
 pub const MAX_UNROLL: usize = 100_000;
 
-/// Cap on `while`-loop unrolling iterations. Bounded fixed-point/Newton loops in
-/// compact models converge in a handful of steps; a loop with no static counter
-/// bound hits this cap and errors (it cannot be lowered to a static DAG).
-pub const WHILE_MAX_UNROLL: usize = 1_000;
+/// Iterations a Verilog-A loop whose condition does not fold to a constant
+/// unrolls, each gated by its condition. A loop over a parameter (`for (i = 0;
+/// i < nf; ...)`) still running after these ends there, with an assertion
+/// that it does for the parameter values in use; one over the solution
+/// cannot be lowered.
+pub const VA_LOOP_GATED_CAP: usize = 64;
 
 /// Preprocessor: maximum macro-expansion / include nesting depth (recursion guard).
 pub const PREPROCESSOR_MAX_DEPTH: usize = 256;
@@ -365,13 +367,14 @@ pub const IRK_STAGE_MAX_ITER: usize = 25;
 /// Newton error far below the local error buys nothing, and a stage solved
 /// to the rounding of its charges cannot get below it.
 pub const IRK_STAGE_TOL_MAX: f64 = 0.03;
-/// IRK inner stage Newton: a stage whose every residual row is within this
-/// many rounding units of the magnitudes it is computed from (`|J| |x|` and
-/// the charge terms) is solved to machine precision, whatever the update (a
-/// charge difference `Q(X) - Q(xn)` of a large capacitor rounds at
-/// `ulp(Q)`, which a weakly determined direction turns into a visible,
-/// meaningless update).
-pub const IRK_STAGE_ROUNDOFF: f64 = 64.0;
+/// Newton (DC and transient stage): a system whose every residual row is
+/// within this many rounding units of the magnitudes it is computed from
+/// (`|J| |x|`, and a stage's charge terms) is solved to machine precision,
+/// whatever the update: rounding in the rows becomes a visible, meaningless
+/// update along a weakly determined direction (a node held by gmin alone, a
+/// charge difference `Q(X) - Q(xn)` of a large capacitor rounding at
+/// `ulp(Q)`).
+pub const NEWTON_ROUNDOFF: f64 = 64.0;
 /// IRK modified-Newton: refresh the frozen Jacobian when the update fails to
 /// contract by at least this factor (convergence rate θ = ‖Δₖ‖/‖Δₖ₋₁‖ too high).
 /// Loose, so the frozen factorization is genuinely reused on stiff stages (a few

@@ -23,6 +23,17 @@ impl Model {
         atol: f64,
         values: Option<HashMap<String, f64>>,
     ) -> Result<(usize, Vec<Vec<f64>>), ModelError> {
+        let p = self.binding_of(values.as_ref());
+        if let Some(o) = self.restructured_at(&p)? {
+            let (m, traj) =
+                o.model
+                    .transient_sensitivity(subset, t_eval, rtol, atol, Some(o.values()))?;
+            // The state, then one block per parameter, each in this layout.
+            let rows = (traj.iter())
+                .map(|r| r.chunks(m).flat_map(|b| o.layout.map(b)).collect())
+                .collect();
+            return Ok((self.dim(), rows));
+        }
         self.ensure_no_delays("transient_sensitivity")?;
         let mut task = log::task(
             "SENS-TRANSIENT",
@@ -122,6 +133,18 @@ impl Model {
         t_eval: Vec<f64>,
         dc_guess: Option<Vec<f64>>,
     ) -> Result<Vec<Vec<f64>>, ModelError> {
+        if let Some(o) = self.restructured_at(&p)? {
+            let x0 = x0.map(|x| o.state(&x, 0.0));
+            let guess = dc_guess.map(|x| o.state(&x, 0.0));
+            return Ok(o.rows(o.model.solve_transient_grid(o.p(), x0, t_eval, guess)?));
+        }
+        // As `solve_transient`: the operating point at `p` unless the caller
+        // gives a start or a guess for one.
+        let x0 = match (x0, &dc_guess) {
+            (Some(x0), _) => Some(x0),
+            (None, None) => self.inner.transient_start(&p),
+            (None, Some(_)) => None,
+        };
         self.cdc()
             .solve_transient_grid(
                 &p,
@@ -151,6 +174,17 @@ impl Model {
         values: Option<HashMap<String, f64>>,
         dc_guess: Option<Vec<f64>>,
     ) -> Result<(Vec<String>, Vec<f64>), ModelError> {
+        let p = self.binding_of(values.as_ref());
+        if let Some(o) = self.restructured_at(&p)? {
+            let m = o.model.dim();
+            let cot = cotangent.iter().map(|c| o.layout.pull(c, m)).collect();
+            let guess = dc_guess.map(|x| o.state(&x, 0.0));
+            let (names, g) = o
+                .model
+                .transient_adjoint(t_eval, cot, Some(o.values()), guess)?;
+            let mine = self.params().to_vec();
+            return Ok((mine.clone(), o.by_name(&names, &g, &mine)));
+        }
         self.ensure_no_delays("transient_adjoint")?;
         let mut task = log::task(
             "TRANSIENT-ADJOINT",
@@ -177,6 +211,21 @@ impl Model {
             .map_err(ModelError::Numeric)?;
         task.finish(format!("params: {}", pnames.len()));
         Ok((pnames, g))
+    }
+
+    /// The parameter vector of `values` over the bound ones, the way the
+    /// transient sensitivities and adjoint bind (a parameter neither gives
+    /// is zero).
+    fn binding_of(&self, values: Option<&HashMap<String, f64>>) -> Vec<f64> {
+        let bound = self.values();
+        (self.params().iter())
+            .map(|nm| {
+                values
+                    .and_then(|v| v.get(nm).copied())
+                    .or_else(|| bound.get(nm).copied())
+                    .unwrap_or(0.0)
+            })
+            .collect()
     }
 
     /// Append the topological cause to a transient failure, when there is one.
@@ -208,7 +257,18 @@ impl Model {
         atol: f64,
         dt_max: Option<f64>,
     ) -> Result<Vec<Vec<f64>>, ModelError> {
-        let x0 = x0.unwrap_or_default();
+        if let Some(o) = self.restructured_at(&p)? {
+            let x0 = x0.map(|x| o.state(&x, 0.0));
+            let rows = o
+                .model
+                .solve_transient(method, o.p(), t_eval, x0, rtol, atol, dt_max)?;
+            return Ok(o.rows(rows));
+        }
+        // Without a start of the caller's, the operating point at `p`: the one
+        // an operating point or an earlier transient there already solved.
+        let x0 = x0
+            .or_else(|| self.inner.transient_start(&p))
+            .unwrap_or_default();
         self.cdc()
             .solve_transient(method, &p, &x0, &t_eval, rtol, atol, dt_max)
             // a step-size failure on an index-2 deck has a topological cause;

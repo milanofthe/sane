@@ -28,6 +28,7 @@ impl Model {
         p: Vec<f64>,
         freq: f64,
     ) -> Result<(f64, Vec<(String, f64)>), ModelError> {
+        self.inner.bound(&p)?;
         let _g = log::scope("sens/noise_gradient");
         let n = self.dae().dim();
         let w = 2.0 * PI * freq;
@@ -87,7 +88,7 @@ impl Model {
         let flat = self.dae().observers.flatten(c);
         for (ns, level) in flat.noise.iter().zip(levels) {
             // Tabular sources: not yet in the gradient.
-            let Some((sp, fexp)) = level else {
+            let sane_dae::NoiseLevel::Spectral { psd: sp, fexp } = level else {
                 continue;
             };
             if !sp.is_finite() || sp <= 0.0 || !fexp.is_finite() {
@@ -181,6 +182,7 @@ impl Model {
         fstop: f64,
         points: usize,
     ) -> Result<(Vec<f64>, Vec<f64>), ModelError> {
+        self.inner.bound(&p)?;
         self.ensure_no_delays("noise")?;
         let arc = self.context_arc();
         let mut c = arc.lock().unwrap();

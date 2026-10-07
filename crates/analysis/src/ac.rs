@@ -113,7 +113,7 @@ mod sparse_ac_equiv {
         let net = "V1 in 0 1\nR1 in a 100\nL1 a out 1m\nC1 out 0 1u\nR2 out 0 1k\n";
         let parsed = parse(net).unwrap();
         let mut ctx = Graph::new();
-        let dae = parsed.assemble(&mut ctx);
+        let dae = parsed.assemble(&mut ctx).unwrap();
         let cdc = CompiledDc::new(&mut ctx, &dae);
         let pnames = cdc.param_names(&ctx);
         let p: Vec<f64> = parsed.pvec(&pnames);

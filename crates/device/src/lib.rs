@@ -57,9 +57,37 @@ pub struct NoiseSource {
     pub lo: Option<SymbolId>,
     pub psd: ExprId,
     pub flicker_exp: ExprId,
-    /// Tabular noise: `(frequency, psd)` points, linearly interpolated. Empty for
-    /// white (`flicker_exp == 0`) / flicker sources, which use `psd`.
-    pub table: Vec<(f64, f64)>,
+    /// Tabular noise: `(frequency, psd)` points, linearly interpolated, each an
+    /// expression evaluated at the operating point like `psd`. Empty for white
+    /// (`flicker_exp == 0`) / flicker sources, which use `psd`.
+    pub table: Vec<(ExprId, ExprId)>,
+}
+
+impl NoiseSource {
+    /// Every expression of the source: its PSD, its flicker exponent, then
+    /// its table point by point.
+    pub fn exprs(&self) -> Vec<ExprId> {
+        let table = self.table.iter().flat_map(|&(f, p)| [f, p]);
+        [self.psd, self.flicker_exp].into_iter().chain(table).collect()
+    }
+
+    /// This source across `hi`/`lo`, its expressions the next of `exprs` in
+    /// the order [`exprs`](Self::exprs) gives them.
+    pub fn with_exprs(
+        &self,
+        hi: Option<SymbolId>,
+        lo: Option<SymbolId>,
+        exprs: &mut impl Iterator<Item = ExprId>,
+    ) -> NoiseSource {
+        let mut next = || exprs.next().expect("one per expression of the source");
+        NoiseSource {
+            hi,
+            lo,
+            psd: next(),
+            flicker_exp: next(),
+            table: self.table.iter().map(|_| (next(), next())).collect(),
+        }
+    }
 }
 
 /// An operating-point variable a device exports: a named, documented internal
@@ -88,6 +116,11 @@ pub struct FragmentLimit {
     pub hi: Option<SymbolId>,
     pub lo: Option<SymbolId>,
     pub kind: LimitKind,
+    /// The condition over the parameters the device declares the limit
+    /// under (a polarity's orientation); `None` for always. A limit only
+    /// shapes the Newton path, so a model keeps those of the parameters it
+    /// is built at.
+    pub when: Option<ExprId>,
 }
 
 /// What an unknown physically is. `assemble_dae` mints them in blocks -- node
@@ -143,6 +176,28 @@ pub struct BehavioralFragment {
     pub op_vars: Vec<OpVar>,
     /// Controlling-voltage Newton limits (`$limit` sites; empty for most devices).
     pub limits: Vec<FragmentLimit>,
+    /// What must hold of the instance's parameters for the fragment to be the
+    /// device's (empty for most devices).
+    pub assertions: Vec<Assertion>,
+    /// What the fragment's structure rests on, as assertions over the
+    /// instance's parameters: an integer mode selector, a condition on
+    /// parameters that decides the topology, folded at the instance's
+    /// values. A binding where one fails is another fragment, built anew.
+    pub structural: Vec<Assertion>,
+    /// The internal nodes the structure merged onto another node (a branch
+    /// shorted), by the name their unknown would have, with the voltage
+    /// they take: what a model of another structure reports for them.
+    pub collapsed: Vec<(String, ExprId)>,
+}
+
+/// A predicate over parameters that must hold for a lowered model to be the
+/// model it was lowered from: a loop unrolled only so far, an `$error` its
+/// author put on some parameter values. Nonzero where it holds.
+#[derive(Clone, Debug)]
+pub struct Assertion {
+    pub holds: ExprId,
+    /// What fails when it does not hold.
+    pub message: String,
 }
 
 /// A nonlinear device: lowers to a DAE fragment over its terminal voltages.
@@ -247,13 +302,14 @@ pub trait DeviceModel: Send + Sync {
     /// for voltage contributions, `idt`/laplace states); `terminal_v` are the
     /// device's terminal node-voltage expressions; `control_i` holds the
     /// controlling branch currents (aligned with
-    /// [`control_currents`](Self::control_currents)).
+    /// [`control_currents`](Self::control_currents)). An error names what
+    /// the model cannot lower (an unsupported construct of its source).
     fn lower_behavioral(
         &self,
         lo: &mut Lowerer,
         terminal_v: &[ExprId],
         control_i: &[ExprId],
-    ) -> BehavioralFragment;
+    ) -> Result<BehavioralFragment, String>;
 }
 
 /// A placement of a device: its model and the node indices wired to its

@@ -8,80 +8,210 @@
 //! d/dt q = 0`): `ddt(q)` puts `q` into the charge and reads zero in the
 //! current.
 //!
-//! Procedural control flow is flattened to dataflow: the mutable lowering
-//! [`State`] (variable values + node-current accumulators) is cloned across an
-//! `if`/`case`'s arms and merged with `select` on the condition; `for` loops
-//! with constant bounds are unrolled; `analog function`s are inlined. Minting a
-//! DAE unknown (a voltage-source branch or an `idt` state) is only allowed at
-//! the top level, not inside a conditional (the rare "switch branch" idiom is
-//! deferred); attempting it is a clear error.
+//! The lowering is exact: the graph is the one evaluator of the module, and
+//! a parameter is a symbol of it, never a value. A condition the graph folds
+//! to a constant (literals, loop counters, string parameters, `$param_given`)
+//! takes its arm; any other condition, a parameter's included, keeps both
+//! arms and merges what they write with `select` on it. Which arm a binding of
+//! the parameters takes is the backend's to decide (rsdag specializes a body
+//! per binding), so the lowered model is the module for every parameter
+//! value. Only the structure is the instance's: its integer parameters (mode
+//! selectors) and a condition on parameters with a potential contribution in
+//! an arm (a branch shorted or a source, its topology) fold at the instance's
+//! values, each with an assertion that a binding keeps them. Loops unroll:
+//! an iteration whose condition folds runs or ends the loop, any other runs
+//! gated by its condition; a loop still running after [`VA_LOOP_GATED_CAP`]
+//! gated iterations ends there with an assertion, over the parameters, that
+//! it does. `analog function`s are inlined.
 
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use rsdag::{differentiate, CmpOp, Crossing, ExprId, Node, SymbolId};
-use sane_core::constants::{MAX_UNROLL, VERILOGA_K_OVER_Q, WHILE_MAX_UNROLL};
+use sane_core::constants::{MAX_UNROLL, VA_LOOP_GATED_CAP, VERILOGA_K_OVER_Q};
 use sane_core::Graph;
 use sane_device::{
-    BehavioralFragment, FragmentEvent, FragmentLimit, LimitKind, LoweredDelay, Lowerer,
-    NoiseSource, OpVar,
+    Assertion, BehavioralFragment, FragmentEvent, FragmentLimit, LimitKind, LoweredDelay,
+    Lowerer, NoiseSource, OpVar,
 };
 
 use crate::ast::{Access, BinOp, Expr, Stmt, UnOp};
-use crate::elaborate::{bool_f64, const_builtin, const_eval_with, ElaboratedModule};
+use crate::elaborate::{bool_f64, ElaboratedModule};
 
+/// Lower `em`'s analog block as instance `inst` (its parameters the symbols
+/// `inst.name`), `given` the parameters the deck set (for `$param_given`).
+///
+/// A branch shorted for good, a potential contribution of the constant zero
+/// reached unconditionally (`V(a, ai) <+ 0` where the condition around it
+/// folds), merges its nodes: the block is lowered again over one node where
+/// the first lowering found two, so the short costs no unknown. The nodes a
+/// short merges are found by the lowering itself, so whether a branch is
+/// shorted is decided exactly as everything else. That first lowering, the
+/// topology pass, lowers only what the branches depend on (the topology
+/// slice, see [`crate::topology`]); a module without a potential
+/// contribution has nothing to find and is lowered once.
 pub fn lower_analog(
     em: &ElaboratedModule,
     inst: &str,
-    param_values: &HashMap<String, f64>,
     given: &HashSet<String>,
+    values: &HashMap<String, f64>,
     mfactor: f64,
     lo: &mut Lowerer,
     terminal_v: &[ExprId],
 ) -> Result<BehavioralFragment, String> {
-    lower_analog_structural(em, inst, param_values, given, mfactor, lo, terminal_v)
-        .map(|(frag, _)| frag)
+    let none = HashSet::default();
+    if !em.analog.iter().any(contributes_potential) {
+        let l = walk(
+            em,
+            inst,
+            given,
+            values,
+            mfactor,
+            lo,
+            terminal_v,
+            Branches::default(),
+            &none,
+        )?;
+        return l.finish();
+    }
+    let skip = crate::topology::outside_slice(em);
+    let (shorts, found) = topology_pass(em, inst, given, values, mfactor, lo, terminal_v, skip)?;
+    let alias = node_aliases(em, &shorts);
+    // The branches a potential contribution reaches under a condition that
+    // does not fold, over the merged nodes: the ones that switch.
+    let mut switched: Vec<(String, String)> = Vec::new();
+    for (a, b) in &found {
+        let at = |n: &String| alias.get(n).unwrap_or(n).clone();
+        let (a, b) = (at(a), at(b));
+        let key = canon(&a, &b).0;
+        if a != b && !switched.contains(&key) {
+            switched.push(key);
+        }
+    }
+    let exact = Branches {
+        alias,
+        switched: Some(switched),
+    };
+    walk(
+        em, inst, given, values, mfactor, lo, terminal_v, exact, &none,
+    )?
+    .finish()
 }
 
-/// [`lower_analog`], and the parameters whose values fixed the fragment's
-/// structure: an instance agreeing on those lowers to the same graph up to
-/// its leaf symbols (the others are symbols in it, bound at run time).
-#[allow(clippy::too_many_arguments)]
-pub fn lower_analog_structural(
+/// The topology pass of [`lower_analog`] over the block, the statements
+/// `skip` names left out: the branches shorted for good, and those a
+/// potential contribution reaches under a condition that does not fold.
+/// What it mints is dropped again.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub(crate) fn topology_pass(
     em: &ElaboratedModule,
     inst: &str,
-    param_values: &HashMap<String, f64>,
     given: &HashSet<String>,
+    values: &HashMap<String, f64>,
     mfactor: f64,
     lo: &mut Lowerer,
     terminal_v: &[ExprId],
-) -> Result<(BehavioralFragment, std::collections::BTreeSet<String>), String> {
-    // Compile-time environment for structural decisions (switch branches,
-    // loop bounds): module defaults overridden by the instance's bound values.
-    let mut param_env: HashMap<String, f64> = em
-        .params
-        .iter()
-        .map(|p| (p.name.clone(), p.default))
-        .collect();
-    for (k, v) in param_values {
-        param_env.insert(k.clone(), *v);
+    skip: &HashSet<usize>,
+) -> Result<(Vec<(String, String)>, Vec<(String, String)>), String> {
+    let (extras, delays) = (lo.extras.len(), lo.delays.len());
+    let found = {
+        let l = walk(
+            em,
+            inst,
+            given,
+            values,
+            mfactor,
+            lo,
+            terminal_v,
+            Branches::default(),
+            skip,
+        )?;
+        let shorts: Vec<(String, String)> = (l.shorts.iter())
+            .filter(|k| !l.open.contains(*k))
+            .cloned()
+            .collect();
+        (shorts, l.switched)
+    };
+    lo.extras.truncate(extras);
+    lo.delays.truncate(delays);
+    Ok(found)
+}
+
+/// What a lowering knows of the branches before it starts (see
+/// [`lower_analog`]): the merged nodes, and the branches that switch
+/// (`None`: every one a potential contribution reaches in a conditional).
+#[derive(Default)]
+struct Branches {
+    alias: HashMap<String, String>,
+    switched: Option<Vec<(String, String)>>,
+}
+
+/// The nodes the shorts `shorts` merge, each onto its representative: a
+/// port or ground where the merged set has one (they keep their identity),
+/// else its first internal node in declaration order.
+fn node_aliases(em: &ElaboratedModule, shorts: &[(String, String)]) -> HashMap<String, String> {
+    let mut parent: HashMap<String, String> = HashMap::default();
+    fn find(parent: &HashMap<String, String>, n: &str) -> String {
+        let mut n = n.to_string();
+        while let Some(p) = parent.get(&n) {
+            n = p.clone();
+        }
+        n
     }
-    // Node collapsing: statically-reached `V(a,b) <+ 0` shorts merge their
-    // nodes before lowering (see `compute_node_collapses`).
-    let (node_alias, collapse_reads) = compute_node_collapses(em, &param_env, given);
+    let rank = |n: &str| -> (usize, usize) {
+        match em.ports.iter().position(|p| p == n) {
+            _ if n == "0" => (0, 0),
+            Some(k) => (1, k),
+            None => (2, em.internal_nodes.iter().position(|p| p == n).unwrap_or(usize::MAX)),
+        }
+    };
+    for (a, b) in shorts {
+        let (ra, rb) = (find(&parent, a), find(&parent, b));
+        if ra == rb {
+            continue;
+        }
+        let (keep, merge) = if rank(&ra) <= rank(&rb) { (ra, rb) } else { (rb, ra) };
+        if rank(&merge).0 < 2 {
+            continue; // two ports, or a port and ground: a source, not a short
+        }
+        parent.insert(merge, keep);
+    }
+    let nodes: Vec<String> = parent.keys().cloned().collect();
+    nodes.into_iter().map(|n| (n.clone(), find(&parent, &n))).collect()
+}
+
+/// One lowering over what `branches` knows of the branches.
+#[allow(clippy::too_many_arguments)]
+/// The block lowered as instance `inst` over the branches `branches`, the
+/// statements `skip` names left out (see [`lower_analog`]).
+fn walk<'a, 'b>(
+    em: &'a ElaboratedModule,
+    inst: &str,
+    given: &HashSet<String>,
+    values: &HashMap<String, f64>,
+    mfactor: f64,
+    lo: &'a mut Lowerer<'b>,
+    terminal_v: &[ExprId],
+    branches: Branches,
+    skip: &'a HashSet<usize>,
+) -> Result<Lower<'a, 'b>, String> {
     let mut l = Lower {
         em,
         inst: inst.to_string(),
         lo,
-        node_alias,
+        node_alias: branches.alias,
+        shorts: Vec::new(),
+        open: HashSet::default(),
+        switched: Vec::new(),
         node_v: HashMap::default(),
-        param_env,
-        structural: std::cell::RefCell::new(collapse_reads),
-        collect: std::cell::RefCell::new(None),
         param_syms: HashMap::default(),
         given: given.clone(),
+        values: values.clone(),
+        structure: Vec::new(),
         internal_resid_nodes: Vec::new(),
         branch_resid: Vec::new(),
         cond_depth: 0,
+        path: Vec::new(),
+        assertions: Vec::new(),
         st: State::default(),
         noise: Vec::new(),
         events: Vec::new(),
@@ -97,21 +227,15 @@ pub fn lower_analog_structural(
         mfactor,
         ddts: Vec::new(),
         journal: Vec::new(),
-        facts: Vec::new(),
-        flag_budget: HashMap::default(),
+        skip,
     };
-    l.setup(terminal_v);
-    // Verilog-A variables default to 0 (LRM 2.4.0 §3.3.1). Seed every declared
-    // variable with that default so a read before its first assignment -- or on a
-    // path where its guarding branch was not taken -- yields 0 and folds
-    // structural `if`/loop decisions, instead of raising "unknown identifier".
-    // Real compact models (BSIM3, MVSG) read config flags that are only assigned
-    // inside a guarded block or later in source order. A variable assigned before
-    // use simply overwrites this seed, so already-lowering models are unaffected.
+    l.setup(terminal_v, branches.switched);
+    // Verilog-A variables default to 0 (LRM 2.4.0 §3.3.1): a read before the
+    // first assignment, or on a path whose assigning branch was not taken,
+    // reads 0.
     let zero = l.ctx().zero();
     for (name, _ty) in &em.vars {
         l.st.vars.insert(name.clone(), zero);
-        l.st.const_vars.insert(name.clone(), CVal::lit(0.0));
     }
     // `em` is a shared reference independent of `l`'s mutable borrow, so the
     // analog block can be walked in place without cloning the whole AST.
@@ -122,31 +246,7 @@ pub fn lower_analog_structural(
         // committed writes journaled with no rewind -- drop them (never undone).
         l.journal.clear();
     }
-    let structural = l.structural.take();
-    Ok((l.finish()?, structural))
-}
-
-/// The parameters a compile-time value was folded from.
-type Deps = std::rc::Rc<std::collections::BTreeSet<String>>;
-
-/// A compile-time value of a variable and the parameters it was folded
-/// from, so a structural decision that reads it knows which parameter
-/// values it depends on (see [`Lower::structural`]).
-#[derive(Clone)]
-struct CVal {
-    v: f64,
-    deps: Deps,
-}
-
-impl CVal {
-    /// A value no parameter went into (a literal, a loop counter the loop's
-    /// own decisions already account for).
-    fn lit(v: f64) -> CVal {
-        CVal {
-            v,
-            deps: Deps::default(),
-        }
-    }
+    Ok(l)
 }
 
 /// Mutable lowering state affected by control flow (everything cloned/merged
@@ -158,11 +258,6 @@ struct State {
     vars: HashMap<String, ExprId>,
     /// node name -> accumulated current leaving the node into the device.
     node_cur: HashMap<String, ExprId>,
-    /// compile-time-constant shadow of `vars`: a variable currently holding a
-    /// value foldable from parameters/literals (e.g. an integer assigned a
-    /// parameter) maps to that value, enabling structural loop bounds and `if`
-    /// decisions through variables. Dropped when a variable becomes runtime.
-    const_vars: HashMap<String, CVal>,
 }
 
 /// One undoable write to [`State`], journaled while lowering inside a conditional
@@ -171,7 +266,6 @@ struct State {
 enum Undo {
     Var(String, Option<ExprId>),
     NodeCur(String, Option<ExprId>),
-    Const(String, Option<CVal>),
 }
 
 /// What a conditional arm changed, relative to the pre-branch state: only the
@@ -180,32 +274,39 @@ enum Undo {
 struct Writes {
     vars: HashMap<String, ExprId>,
     node_cur: HashMap<String, ExprId>,
-    /// Final compile-time-const state per touched key (`None` = became runtime).
-    const_vars: HashMap<String, Option<CVal>>,
 }
 
 struct Lower<'a, 'b> {
     em: &'a ElaboratedModule,
+    /// The statements of the block this lowering leaves out (the topology
+    /// pass's, see [`lower_analog`]).
+    skip: &'a HashSet<usize>,
     inst: String,
     lo: &'a mut Lowerer<'b>,
-    /// Collapsed-node aliases (node -> representative), from the static
-    /// `V(a,b) <+ 0` pre-scan; applied by [`Self::resolve_pair`].
+    /// Merged nodes (node -> representative), from the shorts a lowering
+    /// before this one found (see [`lower_analog`]).
     node_alias: HashMap<String, String>,
+    /// Branches (canonical) a potential contribution of the constant zero
+    /// shorts unconditionally, and those something else keeps open (another
+    /// potential contribution, a probe, a conditional one).
+    shorts: Vec<(String, String)>,
+    open: HashSet<(String, String)>,
+    /// Branches a potential contribution reached under a condition that does
+    /// not fold (in reach order).
+    switched: Vec<(String, String)>,
     node_v: HashMap<String, ExprId>,
-    /// Compile-time parameter environment (defaults + instance overrides) for
-    /// folding structural conditions and loop bounds.
-    param_env: HashMap<String, f64>,
-    /// The parameters whose values a structural decision read: an instance
-    /// with the same values on these lowers to the same graph, whatever its
-    /// other parameters (they stay symbols, bound per instance at run time).
-    structural: std::cell::RefCell<std::collections::BTreeSet<String>>,
-    /// While a shadow assignment evaluates: the parameters it reads, which
-    /// are not structural (yet).
-    collect: std::cell::RefCell<Option<std::collections::BTreeSet<String>>>,
     /// Parameter symbols this instance's expressions reference, by name.
     param_syms: HashMap<String, SymbolId>,
     /// Parameter names the deck/instance explicitly set (for `$param_given`).
     given: HashSet<String>,
+    /// The instance's parameter values. Its integer parameters (mode
+    /// selectors) fold, and so does a condition on parameters that decides
+    /// the topology: both are the structure of the instance, like `given`
+    /// (see `template`).
+    values: HashMap<String, f64>,
+    /// What the structure folded rests on, as assertions over the
+    /// parameters: a binding where one fails needs another lowering.
+    structure: Vec<Assertion>,
     internal_resid_nodes: Vec<String>,
     branch_resid: Vec<ExprId>,
     /// The `ddt` placeholders and their charges (see [`Lower::ddt`]).
@@ -213,15 +314,20 @@ struct Lower<'a, 'b> {
     /// >0 while lowering inside a conditional / loop / function (minting an
     /// > unknown is then forbidden).
     cond_depth: usize,
+    /// The conditions of the conditional arms being lowered, outermost first:
+    /// the path a statement is reached on is their conjunction.
+    path: Vec<ExprId>,
+    /// What must hold of the parameters for the lowered model to be the
+    /// module's (see [`Assertion`]).
+    assertions: Vec<Assertion>,
     st: State,
     /// Collected small-signal noise sources.
     noise: Vec<NoiseSource>,
     /// Switching surfaces declared by `@(cross ...)` / `@(above ...)`.
     events: Vec<FragmentEvent>,
     /// Controlling-voltage Newton limits, recorded at each `$limit(V(a,b),
-    /// "pnjlim"/"fetlim", ...)` site actually lowered -- a `$limit` in a
-    /// structurally dead (parameter-folded) conditional arm contributes none,
-    /// so polarity-switched models declare exactly their live orientation.
+    /// "pnjlim"/"fetlim", ...)` site lowered (a limit only shapes the Newton
+    /// path, so one in an arm a binding does not take is harmless).
     limits: Vec<FragmentLimit>,
     /// The (hi, lo) node voltage symbols of the contribution currently being
     /// lowered, so a `white_noise`/`flicker_noise` in its RHS attaches to it.
@@ -259,16 +365,6 @@ struct Lower<'a, 'b> {
     /// arm can be rewound to its pre-branch state and only the written variables
     /// merged (pruned-SSA-style). Empty at the top level.
     journal: Vec<Undo>,
-    /// Comparison facts known on the current conditional path (`expr OP const`),
-    /// pushed per `if` arm. Read by the while-loop bound analysis: the HiSIM2
-    /// exp-reduction loop `while (t >= 60) t = t - 60;` is bounded because the
-    /// enclosing guard proves `t < 500`.
-    facts: Vec<(ExprId, CmpOp, f64)>,
-    /// Shared unroll budget per flag for NESTED same-flag while loops (the
-    /// HiSIM2 goto-emulation `while(f){while(f){while(f){...}}}`): the
-    /// outermost loop's bound analysis sizes it, inner loops draw from it
-    /// instead of re-analysing against a by-then non-constant counter.
-    flag_budget: HashMap<String, usize>,
 }
 
 impl<'a, 'b> Lower<'a, 'b> {
@@ -319,7 +415,7 @@ impl<'a, 'b> Lower<'a, 'b> {
         Ok((rsdag::substitute(ctx, rows, &rest), charges))
     }
 
-    fn setup(&mut self, terminal_v: &[ExprId]) {
+    fn setup(&mut self, terminal_v: &[ExprId], switched: Option<Vec<(String, String)>>) {
         let zero = self.ctx().zero();
         self.node_v.insert("0".to_string(), zero);
         for (k, port) in self.em.ports.iter().enumerate() {
@@ -327,7 +423,7 @@ impl<'a, 'b> Lower<'a, 'b> {
         }
         for node in &self.em.internal_nodes {
             if self.node_alias.contains_key(node) {
-                continue; // collapsed onto its representative: no unknown
+                continue; // merged onto its representative: no unknown
             }
             let v = self.lo.internal_node_of(&self.inst, node);
             self.node_v.insert(node.clone(), v);
@@ -352,10 +448,13 @@ impl<'a, 'b> Lower<'a, 'b> {
         // Pre-scan for switch branches (a potential contribution inside a
         // conditional); mint each one's current unknown unconditionally (after
         // the probes). A branch already promoted as a probe keeps the probe path.
-        let mut sw_keys: Vec<(String, String)> = Vec::new();
-        for s in &em.analog {
-            collect_switch_keys(self, s, false, &mut sw_keys);
-        }
+        let sw_keys = switched.unwrap_or_else(|| {
+            let mut keys: Vec<(String, String)> = Vec::new();
+            for s in &em.analog {
+                collect_switch_keys(self, s, false, &mut keys);
+            }
+            keys
+        });
         for key in sw_keys {
             if self.probe_of.contains_key(&key) {
                 continue;
@@ -474,7 +573,7 @@ impl<'a, 'b> Lower<'a, 'b> {
         let observed: Vec<ExprId> = op_vars
             .iter()
             .map(|v| v.value)
-            .chain(noise.iter().flat_map(|n| [n.psd, n.flicker_exp]))
+            .chain(noise.iter().flat_map(|n| n.exprs()))
             .chain(events.iter().map(|e| e.g))
             .collect();
         let zero = self.ctx().zero();
@@ -484,13 +583,17 @@ impl<'a, 'b> Lower<'a, 'b> {
             v.value = observed.next().expect("one per op-var");
         }
         for n in &mut noise {
-            (n.psd, n.flicker_exp) = (observed.next().unwrap(), observed.next().unwrap());
+            *n = n.with_exprs(n.hi, n.lo, &mut observed);
         }
         for e in &mut events {
             e.g = observed.next().expect("one per event");
         }
         let mut param_syms: Vec<(String, SymbolId)> = self.param_syms.into_iter().collect();
         param_syms.sort();
+        let mut collapsed: Vec<(String, ExprId)> = (self.node_alias.iter())
+            .map(|(node, rep)| (node.clone(), self.node_v[rep]))
+            .collect();
+        collapsed.sort();
         Ok(BehavioralFragment {
             terminal_currents,
             currents,
@@ -501,6 +604,9 @@ impl<'a, 'b> Lower<'a, 'b> {
             param_syms,
             op_vars,
             limits: self.limits,
+            assertions: self.assertions,
+            structural: self.structure,
+            collapsed,
         })
     }
 
@@ -526,7 +632,7 @@ impl<'a, 'b> Lower<'a, 'b> {
                 lo.clone().unwrap_or_else(|| "0".to_string()),
             )
         };
-        // Collapsed nodes resolve to their representative everywhere: probes,
+        // Merged nodes resolve to their representative everywhere: probes,
         // contributions and KCL accumulation all see one node.
         let ch = self.node_alias.get(&h).cloned().unwrap_or(h);
         let cl = self.node_alias.get(&l).cloned().unwrap_or(l);
@@ -561,26 +667,6 @@ impl<'a, 'b> Lower<'a, 'b> {
         self.st.vars.insert(key, val);
     }
 
-    fn set_const(&mut self, key: String, val: CVal) {
-        if self.cond_depth > 0 {
-            self.journal.push(Undo::Const(
-                key.clone(),
-                self.st.const_vars.get(&key).cloned(),
-            ));
-        }
-        self.st.const_vars.insert(key, val);
-    }
-
-    fn drop_const(&mut self, key: &str) {
-        if self.cond_depth > 0 {
-            self.journal.push(Undo::Const(
-                key.to_string(),
-                self.st.const_vars.get(key).cloned(),
-            ));
-        }
-        self.st.const_vars.remove(key);
-    }
-
     /// Capture the keys (and their current values) written since `mark`.
     fn collect_writes(&self, mark: usize) -> Writes {
         let mut w = Writes::default();
@@ -593,11 +679,6 @@ impl<'a, 'b> Lower<'a, 'b> {
                     w.node_cur
                         .entry(k.clone())
                         .or_insert_with(|| self.st.node_cur[k]);
-                }
-                Undo::Const(k, _) => {
-                    w.const_vars
-                        .entry(k.clone())
-                        .or_insert_with(|| self.st.const_vars.get(k).cloned());
                 }
             }
         }
@@ -622,14 +703,6 @@ impl<'a, 'b> Lower<'a, 'b> {
                     }
                     None => {
                         self.st.node_cur.remove(&k);
-                    }
-                },
-                Undo::Const(k, old) => match old {
-                    Some(v) => {
-                        self.st.const_vars.insert(k, v);
-                    }
-                    None => {
-                        self.st.const_vars.remove(&k);
                     }
                 },
             }
@@ -668,11 +741,10 @@ impl<'a, 'b> Lower<'a, 'b> {
     }
 
     /// Lower a diagnostic system task (`$warning`/`$error`/`$fatal`/`$finish`),
-    /// issue #41. The lowerer statically takes compile-time-constant guards and
-    /// only descends runtime guards at `cond_depth > 0`, so reaching a task at
-    /// `cond_depth == 0` means it is unconditional or inside a guard that folded
-    /// TRUE for this instance's parameters -- exactly when the author wants it to
-    /// fire.
+    /// issue #41. Where it is reached is the conjunction of the conditions
+    /// of the arms around it ([`Self::path`]): constant, it fires or not;
+    /// over the parameters only, an `$error` is an assertion that its path
+    /// does not hold; over the solution, a runtime check SANE does not make.
     fn sys_task(
         &mut self,
         name: &str,
@@ -689,23 +761,30 @@ impl<'a, 'b> Lower<'a, 'b> {
                 ));
                 Ok(())
             }
-            // $error/$fatal reached unconditionally (or under a compile-time-true
-            // guard) is the author rejecting this configuration: hard load failure.
-            // Under a runtime guard it is an assertion SANE's single symbolic model
-            // cannot enforce -- do not drop it silently, note it at load time.
+            // $error/$fatal reached unconditionally is the author rejecting this
+            // configuration: a hard load failure. Reached on a path over the
+            // parameters, it rejects the bindings that take the path.
             "error" | "fatal" => {
-                if self.cond_depth == 0 {
-                    Err(format!(
-                        "${name} (module {}, line {}): {}",
-                        self.em.name, span.line, msg
-                    ))
-                } else {
-                    sane_core::log::warn_captured(&format!(
-                        "${name} (module {}, line {}) is a runtime assertion SANE cannot enforce; \
-                         the model is solved without it: {}",
-                        self.em.name, span.line, msg
-                    ));
-                    Ok(())
+                let reached = self.reached();
+                let text = format!("${name} (module {}, line {}): {}", self.em.name, span.line, msg);
+                match self.ctx().const_f64(reached) {
+                    Some(r) if r != 0.0 => Err(text),
+                    Some(_) => Ok(()),
+                    None if self.over_params(reached) => {
+                        let holds = self.not(reached);
+                        self.assertions.push(Assertion {
+                            holds,
+                            message: text,
+                        });
+                        Ok(())
+                    }
+                    None => {
+                        sane_core::log::warn_captured(&format!(
+                            "{text} (a runtime assertion SANE does not enforce; the model is \
+                             solved without it)"
+                        ));
+                        Ok(())
+                    }
                 }
             }
             // $finish ends a simulation run; it has no load-time residual meaning.
@@ -725,6 +804,9 @@ impl<'a, 'b> Lower<'a, 'b> {
     }
 
     fn stmt(&mut self, s: &Stmt) -> Result<(), String> {
+        if !self.skip.is_empty() && self.skip.contains(&crate::topology::at(s)) {
+            return Ok(());
+        }
         match s {
             Stmt::Block(ss) => {
                 for s in ss {
@@ -752,34 +834,23 @@ impl<'a, 'b> Lower<'a, 'b> {
             }
             Stmt::Assign { lhs, rhs, .. } => {
                 let v = self.expr(rhs)?;
-                self.set_var(lhs.clone(), v);
-                // Maintain the compile-time-constant shadow, with the
-                // parameters it came from (not a structural read).
-                match self.const_of_expr_deps(rhs) {
-                    Some((c, deps)) => {
-                        // A non-finite compile-time-constant assignment is baked
-                        // into the residual as a bias-independent NaN/Inf that
-                        // poisons every Newton step. Surface it UNCONDITIONALLY as
-                        // a captured warning (re-raised as a catchable
-                        // SaneConvergenceWarning regardless of the log level, #41),
-                        // since the first non-finite variable is the root cause.
-                        // `SANE_VA_TRACE_NAN` adds extra per-assignment verbosity.
-                        if !c.is_finite() {
-                            sane_core::log::warn_captured(&format!(
-                                "VA non-finite constant baked into '{lhs}' = {c} (module {}); it \
-                                 poisons every Newton step of this model",
-                                self.em.name
-                            ));
-                            if sane_core::config().va_trace_nan {
-                                sane_core::log::warning(&format!(
-                                    "VA non-finite const: {lhs} = {c}"
-                                ));
-                            }
-                        }
-                        self.set_const(lhs.clone(), CVal { v: c, deps })
+                // A non-finite constant is baked into the residual as a
+                // bias-independent NaN/Inf that poisons every Newton step.
+                // Surface it UNCONDITIONALLY as a captured warning (re-raised
+                // as a catchable SaneConvergenceWarning regardless of the log
+                // level, #41), since the first non-finite variable is the root
+                // cause. `SANE_VA_TRACE_NAN` adds per-assignment verbosity.
+                if let Some(c) = self.ctx().const_f64(v).filter(|c| !c.is_finite()) {
+                    sane_core::log::warn_captured(&format!(
+                        "VA non-finite constant baked into '{lhs}' = {c} (module {}); it \
+                         poisons every Newton step of this model",
+                        self.em.name
+                    ));
+                    if sane_core::config().va_trace_nan {
+                        sane_core::log::warning(&format!("VA non-finite const: {lhs} = {c}"));
                     }
-                    None => self.drop_const(lhs),
                 }
+                self.set_var(lhs.clone(), v);
                 Ok(())
             }
             Stmt::Contribution {
@@ -804,43 +875,151 @@ impl<'a, 'b> Lower<'a, 'b> {
                 cond,
                 step,
                 body,
-            } => self.lower_for(init, cond, step, body),
-            Stmt::While { cond, body } => self.lower_while(cond, body),
+            } => {
+                self.stmt(init)?;
+                self.lower_loop(cond, body, Some(step))
+            }
+            Stmt::While { cond, body } => self.lower_loop(cond, body, None),
         }
     }
 
     fn lower_if(&mut self, cond: &Expr, then: &Stmt, els: Option<&Stmt>) -> Result<(), String> {
-        // If the condition is compile-time constant (a parameter-gated structural
-        // decision, e.g. a switch branch), take that arm statically -- no merge,
-        // and a voltage contribution inside it stays top-level.
-        if let Some(c) = self.const_of_expr(cond) {
-            if c != 0.0 {
+        let c = self.expr(cond)?;
+        // A condition the graph folds (literals, string parameters,
+        // `$param_given`) takes its arm statically: no merge, and a voltage
+        // contribution inside it stays top-level.
+        if let Some(v) = self.ctx().const_f64(c) {
+            if v != 0.0 {
                 return self.stmt(then);
             } else if let Some(e) = els {
                 return self.stmt(e);
             }
             return Ok(());
         }
-        let c = self.expr(cond)?;
-        // Lower each arm against the live state, recording only what it writes,
-        // then rewind to the pre-branch state. No environment clone. Each arm
-        // additionally knows the comparison facts its guard implies (see
-        // `facts`), for the while-loop bound analysis.
-        let mark = self.facts.len();
-        self.cond_facts(cond, true)?;
-        let then_w = self.lower_branch(then)?;
-        self.facts.truncate(mark);
+        // A condition on the parameters that decides the topology (an arm
+        // contributes a potential, a branch shorted or a source) takes its
+        // arm by the instance's values, as structure.
+        if let Some(v) = self.topology(c, then, els) {
+            return match (v, els) {
+                (true, _) => self.stmt(then),
+                (false, Some(e)) => self.stmt(e),
+                (false, None) => Ok(()),
+            };
+        }
+        // Lower each arm against the live state, recording only what it
+        // writes, then rewind to the pre-branch state. No environment clone.
+        let then_w = self.lower_branch(c, |l| l.stmt(then))?;
         let else_w = match els {
             Some(e) => {
-                self.cond_facts(cond, false)?;
-                let w = self.lower_branch(e)?;
-                self.facts.truncate(mark);
-                w
+                let nc = self.not(c);
+                self.lower_branch(nc, |l| l.stmt(e))?
             }
             None => Writes::default(),
         };
         self.merge_writes(c, &then_w, &else_w);
         Ok(())
+    }
+
+    /// Where `c` reads the parameters only and an arm of `then` / `els`
+    /// contributes a potential, `c`'s truth at the instance's values,
+    /// recorded as structure; else `None`.
+    fn topology(&mut self, c: ExprId, then: &Stmt, els: Option<&Stmt>) -> Option<bool> {
+        if !contributes_potential(then) && !els.is_some_and(contributes_potential) {
+            return None;
+        }
+        let free = self.lo.ctx().free_symbols(c);
+        let mut env = std::collections::HashMap::new();
+        let mut names = Vec::new();
+        for (name, &s) in &self.param_syms {
+            if free.contains(&s) {
+                env.insert(s, *self.values.get(name)?);
+                names.push(name.clone());
+            }
+        }
+        if env.len() != free.len() {
+            return None; // reads something else too (the temperature)
+        }
+        let v = rsdag::eval::<f64, _>(self.lo.ctx(), &[c], &env)[0];
+        if !v.is_finite() {
+            return None;
+        }
+        names.sort();
+        let holds = if v != 0.0 { c } else { self.not(c) };
+        let holds = {
+            let ctx = self.ctx();
+            let zero = ctx.zero();
+            ctx.cmp(CmpOp::Ne, holds, zero)
+        };
+        self.structure.push(Assertion {
+            holds,
+            message: format!(
+                "{} {} structural: the topology of module {} depends on {}; build the model \
+                 at the new value to change it",
+                names.join(", "),
+                if names.len() == 1 { "is" } else { "are" },
+                self.em.name,
+                if names.len() == 1 { "it" } else { "them" },
+            ),
+        });
+        Some(v != 0.0)
+    }
+
+    /// Integer parameter `name`'s value, folded as structure.
+    fn int_value(&mut self, name: &str) -> Option<ExprId> {
+        let p = self.em.params.iter().find(|p| p.name == name)?;
+        if p.ty != crate::ast::VarType::Integer {
+            return None;
+        }
+        let v = *self.values.get(name)?;
+        let sym = format!("{}.{}", self.inst, name);
+        let ctx = self.ctx();
+        let (e, k) = (ctx.sym(&sym), ctx.konst_f64(v));
+        if let Some(s) = sym_of(self.ctx(), e) {
+            if self.param_syms.insert(name.to_string(), s).is_none() {
+                let holds = self.ctx().cmp(CmpOp::Eq, e, k);
+                self.structure.push(Assertion {
+                    holds,
+                    message: format!(
+                        "{name} is structural (built at {v}); build the model with the new \
+                         value to change it"
+                    ),
+                });
+            }
+        }
+        Some(k)
+    }
+
+    /// The conjunction of the conditions the statement being lowered is
+    /// reached under (`1` at the top level).
+    fn reached(&mut self) -> ExprId {
+        let path = self.path.clone();
+        let ctx = self.ctx();
+        let one = ctx.one();
+        path.into_iter().fold(one, |acc, c| {
+            let zero = ctx.zero();
+            let nz = ctx.cmp(CmpOp::Ne, c, zero);
+            ctx.mul(acc, nz)
+        })
+    }
+
+    /// Logical negation (`!c`, as Verilog-A reads a truth).
+    fn not(&mut self, c: ExprId) -> ExprId {
+        let ctx = self.ctx();
+        let zero = ctx.zero();
+        ctx.cmp(CmpOp::Eq, c, zero)
+    }
+
+    /// Whether `e` reads the instance's parameters (and the temperature) only:
+    /// a value fixed by a binding.
+    fn over_params(&mut self, e: ExprId) -> bool {
+        let temp = self.ctx().sym(sane_core::constants::TEMP_SYMBOL);
+        let temp = sym_of(self.lo.ctx(), temp);
+        let params: HashSet<SymbolId> = self.param_syms.values().copied().collect();
+        self.lo
+            .ctx()
+            .free_symbols(e)
+            .iter()
+            .all(|s| params.contains(s) || Some(*s) == temp)
     }
 
     /// `@(cross(expr, dir))` / `@(above(expr))`: declare a switching surface
@@ -887,18 +1066,33 @@ impl<'a, 'b> Lower<'a, 'b> {
         let g = self.expr(surface)?;
         let dir = match args.get(1) {
             None => default_dir,
-            Some(d) => match self.const_of_expr(d) {
-                Some(c) if c > 0.0 => Crossing::Rising,
-                Some(c) if c < 0.0 => Crossing::Falling,
-                Some(_) => Crossing::Either,
-                None => {
-                    return Err(format!(
-                        "'@({control} ...)' direction must be a compile-time constant (module {}, \
-                         line {})",
-                        self.em.name, line
-                    ))
+            Some(d) => {
+                let d = self.expr(d)?;
+                match self.ctx().const_f64(d) {
+                    Some(c) if c > 0.0 => Crossing::Rising,
+                    Some(c) if c < 0.0 => Crossing::Falling,
+                    Some(_) => Crossing::Either,
+                    None => {
+                        return Err(format!(
+                            "'@({control} ...)' direction must be a compile-time constant \
+                             (module {}, line {})",
+                            self.em.name, line
+                        ))
+                    }
                 }
-            },
+            }
+        };
+        // A surface on a path the parameters decide exists only where the
+        // path is taken: elsewhere it is held off zero and never crosses.
+        let reached = self.reached();
+        let g = match self.ctx().const_f64(reached) {
+            Some(r) if r != 0.0 => g,
+            Some(_) => return Ok(()),
+            None if self.over_params(reached) => {
+                let one = self.ctx().one();
+                self.ctx().select(reached, g, one)
+            }
+            None => g,
         };
         let ev = FragmentEvent { g, dir };
         if !self.events.contains(&ev) {
@@ -907,68 +1101,19 @@ impl<'a, 'b> Lower<'a, 'b> {
         Ok(())
     }
 
-    /// Extract the comparison facts a guard implies on the taken (`positive`)
-    /// or not-taken arm: conjunctions decompose on the taken side, disjunctions
-    /// on the negated side (`!(a||b) = !a && !b`). Each fact is
-    /// `lowered-expr OP constant`; the expression side is hash-consed, so a
-    /// later occurrence of the same source expression compares equal by id.
-    fn cond_facts(&mut self, cond: &Expr, positive: bool) -> Result<(), String> {
-        match cond {
-            Expr::Binary {
-                op: BinOp::And,
-                lhs,
-                rhs,
-                ..
-            } if positive => {
-                self.cond_facts(lhs, true)?;
-                self.cond_facts(rhs, true)
-            }
-            Expr::Binary {
-                op: BinOp::Or,
-                lhs,
-                rhs,
-                ..
-            } if !positive => {
-                self.cond_facts(lhs, false)?;
-                self.cond_facts(rhs, false)
-            }
-            Expr::Unary {
-                op: UnOp::Not, arg, ..
-            } => self.cond_facts(arg, !positive),
-            Expr::Binary { op, lhs, rhs, .. } => {
-                let cmp = match op {
-                    BinOp::Lt => Some(CmpOp::Lt),
-                    BinOp::Le => Some(CmpOp::Le),
-                    BinOp::Gt => Some(CmpOp::Gt),
-                    BinOp::Ge => Some(CmpOp::Ge),
-                    _ => None,
-                };
-                let Some(mut cmp) = cmp else { return Ok(()) };
-                // Normalise to `expr OP const`.
-                let (e, c) = if let Some(c) = self.const_of_expr(rhs) {
-                    (lhs, c)
-                } else if let Some(c) = self.const_of_expr(lhs) {
-                    cmp = mirror_cmp(cmp);
-                    (rhs, c)
-                } else {
-                    return Ok(());
-                };
-                let cmp = if positive { cmp } else { negate_cmp(cmp) };
-                let id = self.expr(e)?;
-                self.facts.push((id, cmp, c));
-                Ok(())
-            }
-            _ => Ok(()),
-        }
-    }
-
-    /// Lower a conditional arm at `cond_depth + 1` (so its writes are journaled
-    /// and minting an unknown is forbidden), capture what it wrote, then rewind
-    /// the state to before the arm.
-    fn lower_branch(&mut self, s: &Stmt) -> Result<Writes, String> {
+    /// Lower a conditional arm, reached when `c` holds, at `cond_depth + 1`
+    /// (so its writes are journaled and minting an unknown is forbidden),
+    /// capture what it wrote, then rewind the state to before the arm.
+    fn lower_branch(
+        &mut self,
+        c: ExprId,
+        arm: impl FnOnce(&mut Self) -> Result<(), String>,
+    ) -> Result<Writes, String> {
         let mark = self.journal.len();
         self.cond_depth += 1;
-        let r = self.stmt(s);
+        self.path.push(c);
+        let r = arm(self);
+        self.path.pop();
         self.cond_depth -= 1;
         r?;
         let w = self.collect_writes(mark);
@@ -978,8 +1123,7 @@ impl<'a, 'b> Lower<'a, 'b> {
 
     /// Merge the two arms' writes into the (pre-branch) state with `select(c,..)`,
     /// touching only variables an arm actually wrote. A key unwritten by an arm
-    /// keeps its pre-branch value; a variable runtime in either arm (or whose
-    /// arms disagree on a constant) loses its constant shadow.
+    /// keeps its pre-branch value.
     fn merge_writes(&mut self, c: ExprId, then_w: &Writes, else_w: &Writes) {
         let zero = self.ctx().zero();
         let union = |a: &Writes, b: &Writes, pick: fn(&Writes) -> Vec<String>| {
@@ -1019,27 +1163,6 @@ impl<'a, 'b> Lower<'a, 'b> {
             }
             self.st.node_cur.insert(k, v);
         }
-        // constant shadow: a variable stays constant only if both arms agree on
-        // the same constant value; otherwise it becomes runtime.
-        for k in union(then_w, else_w, |w| w.const_vars.keys().cloned().collect()) {
-            let base = self.st.const_vars.get(&k).cloned();
-            let t = then_w.const_vars.get(&k).cloned().unwrap_or(base.clone());
-            let e = else_w.const_vars.get(&k).cloned().unwrap_or(base);
-            match (t, e) {
-                (Some(tv), Some(ev)) if tv.v == ev.v => {
-                    let deps: std::collections::BTreeSet<String> =
-                        tv.deps.iter().chain(ev.deps.iter()).cloned().collect();
-                    self.set_const(
-                        k,
-                        CVal {
-                            v: tv.v,
-                            deps: Deps::new(deps),
-                        },
-                    )
-                }
-                _ => self.drop_const(&k),
-            }
-        }
     }
 
     fn lower_case(
@@ -1052,617 +1175,64 @@ impl<'a, 'b> Lower<'a, 'b> {
         self.stmt(&chain)
     }
 
-    fn lower_for(
-        &mut self,
-        init: &Stmt,
-        cond: &Expr,
-        step: &Stmt,
-        body: &Stmt,
-    ) -> Result<(), String> {
-        // Constant-bounds unrolling. The loop variable is tracked numerically
-        // (for the condition) and exposed to the body as a constant.
-        let (var, init_rhs) = as_assign(init)?;
-        let (svar, step_rhs) = as_assign(step)?;
-        let mut val = self.eval_num(&init_rhs, &var, None)?;
-        let mut iters = 0;
+    /// A loop, its init run: `while (cond) { body; step }`. An iteration
+    /// whose condition the graph folds runs or ends the loop; any other runs
+    /// gated by its condition, as `if (cond) { body; step }`, so the unrolled
+    /// loop is the module's wherever the loop ends within the iterations
+    /// unrolled. Past [`VA_LOOP_GATED_CAP`] gated iterations the loop ends:
+    /// with an assertion that it does when the condition reads parameters
+    /// only, else it cannot be lowered.
+    fn lower_loop(&mut self, cond: &Expr, body: &Stmt, step: Option<&Stmt>) -> Result<(), String> {
+        let (mut iters, mut gated) = (0usize, 0usize);
         loop {
-            if self.eval_num(cond, &var, Some(val))? == 0.0 {
-                break;
+            let c = self.expr(cond)?;
+            match self.ctx().const_f64(c) {
+                Some(0.0) => return Ok(()),
+                Some(_) => {
+                    self.stmt(body)?;
+                    if let Some(st) = step {
+                        self.stmt(st)?;
+                    }
+                }
+                None if gated == VA_LOOP_GATED_CAP => {
+                    if !self.over_params(c) {
+                        return Err(format!(
+                            "loop condition depends on the solution and does not settle \
+                             within {VA_LOOP_GATED_CAP} iterations (module {})",
+                            self.em.name
+                        ));
+                    }
+                    let holds = self.not(c);
+                    self.assertions.push(Assertion {
+                        holds,
+                        message: format!(
+                            "a loop of module {} runs more than {VA_LOOP_GATED_CAP} \
+                             iterations for these parameters",
+                            self.em.name
+                        ),
+                    });
+                    return Ok(());
+                }
+                None => {
+                    gated += 1;
+                    let w = self.lower_branch(c, |l| {
+                        l.stmt(body)?;
+                        match step {
+                            Some(st) => l.stmt(st),
+                            None => Ok(()),
+                        }
+                    })?;
+                    self.merge_writes(c, &w, &Writes::default());
+                }
             }
-            let kv = self.ctx().konst_f64(val);
-            self.set_var(var.clone(), kv);
-            self.set_const(var.clone(), CVal::lit(val));
-            self.cond_depth += 1;
-            self.stmt(body)?;
-            self.cond_depth -= 1;
-            val = self.eval_num(&step_rhs, &svar, Some(val))?;
             iters += 1;
             if iters > MAX_UNROLL {
-                return Err("for-loop exceeded unroll cap (non-constant bounds?)".into());
-            }
-        }
-        Ok(())
-    }
-
-    fn lower_while(&mut self, cond: &Expr, body: &Stmt) -> Result<(), String> {
-        // Unroll a while-loop whose termination is bounded by an integer counter.
-        // We iterate as long as the condition is NOT provably false: runtime
-        // (voltage-dependent) predicates are treated as "keep iterating", so a
-        // guard like `(niter<=4) && (abs(dx)>tol)` stops exactly when the counter
-        // expires. This is exact for fixed-point/Newton convergence loops -- once
-        // the runtime early-exit would have fired, the fixed point is reached and
-        // any further unrolled iterations are no-ops producing the same value.
-        //
-        // Loops whose condition never becomes provably false get a bound from
-        // one of two structural analyses before erroring out:
-        //
-        // 1. Flag loops (HiSIM2 SCE): `while (flag)` where the body clears the
-        //    flag and every re-trigger `flag = 1` sits under a guard conjunct
-        //    `counter < C` with `counter` counting monotonically up from a
-        //    known start. The trigger budget bounds the iterations; after
-        //    unrolling that many, the flag is PROVABLY zero, so it is reset to
-        //    a constant (which also terminates enclosing loops on the same
-        //    flag -- the nested-idential-while continue idiom).
-        // 2. Descent loops (HiSIM2 exp reduction): `while (v >= C)` where the
-        //    body only decrements `v` by a constant and an enclosing guard
-        //    proves an upper bound on `v`'s start value (see `facts`).
-        //
-        // Each unrolled iteration is guarded by the (runtime) condition through
-        // the normal select-merge machinery, so unrolling the BOUND is exact:
-        // real executions run <= bound iterations, and the extra unrolled ones
-        // reproduce the settled state.
-        if matches!(self.partial_cond(cond), Some(c) if c == 0.0) {
-            return Ok(());
-        }
-        if let Expr::Ident(flag, _) = cond {
-            // Inner same-flag loop: draw from the enclosing loop's budget.
-            // Every level exits either because the flag is provably clear or
-            // because the shared budget (an upper bound on the TOTAL number of
-            // per-level iterations across the nest) is exhausted -- in both
-            // cases the flag is provably zero afterwards.
-            if self.flag_budget.contains_key(flag) {
-                loop {
-                    if matches!(self.partial_cond(cond), Some(c) if c == 0.0) {
-                        break;
-                    }
-                    match self.flag_budget.get_mut(flag) {
-                        Some(b) if *b > 0 => *b -= 1,
-                        _ => break,
-                    }
-                    self.cond_depth += 1;
-                    let r = self.stmt(body);
-                    self.cond_depth -= 1;
-                    r?;
-                }
-                let z = self.ctx().zero();
-                self.set_var(flag.clone(), z);
-                self.set_const(flag.clone(), CVal::lit(0.0));
-                return Ok(());
-            }
-            if let Some(bound) = self.while_flag_bound(flag, body) {
-                // Each level of a same-flag nest re-enters only on a fresh
-                // trigger, so per level the iterations are <= bound; the shared
-                // budget bound*levels covers the whole nest.
-                let levels = 1 + count_same_flag_whiles(body, flag);
-                self.flag_budget.insert(flag.clone(), bound * levels);
-                loop {
-                    if matches!(self.partial_cond(cond), Some(c) if c == 0.0) {
-                        break;
-                    }
-                    match self.flag_budget.get_mut(flag.as_str()) {
-                        Some(b) if *b > 0 => *b -= 1,
-                        _ => break,
-                    }
-                    self.cond_depth += 1;
-                    let r = self.stmt(body);
-                    self.cond_depth -= 1;
-                    r?;
-                }
-                self.flag_budget.remove(flag.as_str());
-                // Trigger budget exhausted: the flag is provably clear.
-                let z = self.ctx().zero();
-                self.set_var(flag.clone(), z);
-                self.set_const(flag.clone(), CVal::lit(0.0));
-                return Ok(());
-            }
-        }
-        if let Some(bound) = self.while_descent_bound(cond, body) {
-            for _ in 0..bound {
-                self.cond_depth += 1;
-                let r = self.stmt(body);
-                self.cond_depth -= 1;
-                r?;
-            }
-            return Ok(());
-        }
-        let mut iters = 0;
-        while !matches!(self.partial_cond(cond), Some(c) if c == 0.0) {
-            self.cond_depth += 1;
-            let r = self.stmt(body);
-            self.cond_depth -= 1;
-            r?;
-            iters += 1;
-            if iters > WHILE_MAX_UNROLL {
-                let what = match cond {
-                    Expr::Ident(n, _) => format!("flag '{n}'"),
-                    Expr::Binary { op, lhs, .. } => match &**lhs {
-                        Expr::Ident(n, _) => format!("'{n}' {op:?} ..."),
-                        _ => format!("{op:?} expression"),
-                    },
-                    _ => "complex condition".to_string(),
-                };
                 return Err(format!(
-                    "while-loop has no static iteration bound (cannot lower; condition: {what})"
+                    "loop exceeded the unroll cap of {MAX_UNROLL} iterations (module {})",
+                    self.em.name
                 ));
             }
         }
-        Ok(())
-    }
-
-    /// Bound analysis for flag loops (pattern 1 above). Returns the iteration
-    /// bound, or `None` when the pattern does not apply.
-    fn while_flag_bound(&self, flag: &str, body: &Stmt) -> Option<usize> {
-        /// One candidate counter comparison from a trigger site's guard stack.
-        struct Cand {
-            counter: String,
-            limit: f64,
-            inclusive: bool,
-        }
-        /// A `flag = <nonzero>` site: every counter-comparison candidate found
-        /// in the positive guard conjuncts above it. Which candidate is a real
-        /// counter is decided after the scan (increment validation).
-        struct Site {
-            candidates: Vec<Cand>,
-        }
-        struct Scan<'a, 'b, 'c> {
-            l: &'a Lower<'b, 'c>,
-            flag: &'a str,
-            /// (counter name, limit, inclusive) per trigger site; None = a
-            /// trigger without a usable counter guard (pattern fails).
-            sites: Option<Vec<Site>>,
-            /// increments applied to counters (name -> min positive step);
-            /// a non-increment assignment poisons the counter.
-            incs: HashMap<String, Option<f64>>,
-        }
-        impl Scan<'_, '_, '_> {
-            fn fail(&mut self) {
-                self.sites = None;
-            }
-            /// `counter < limit` / `counter <= limit` in a guard conjunct.
-            fn counter_guard(&self, e: &Expr) -> Option<Cand> {
-                if let Expr::Binary { op, lhs, rhs, .. } = e {
-                    let (name, lim, op) = match (&**lhs, &**rhs) {
-                        (Expr::Ident(n, _), r) => (n, self.l.const_of_expr(r)?, *op),
-                        (l, Expr::Ident(n, _)) => {
-                            let m = match op {
-                                BinOp::Lt => BinOp::Gt,
-                                BinOp::Le => BinOp::Ge,
-                                BinOp::Gt => BinOp::Lt,
-                                BinOp::Ge => BinOp::Le,
-                                o => *o,
-                            };
-                            (n, self.l.const_of_expr(l)?, m)
-                        }
-                        _ => return None,
-                    };
-                    let inclusive = match op {
-                        BinOp::Lt => false,
-                        BinOp::Le => true,
-                        _ => return None,
-                    };
-                    return Some(Cand {
-                        counter: name.clone(),
-                        limit: lim,
-                        inclusive,
-                    });
-                }
-                None
-            }
-            fn guards_site(&self, guards: &[&Expr]) -> Option<Site> {
-                // Collect every counter-shaped comparison on the guard stack;
-                // region guards over runtime variables (`Vgs < 0`) also match
-                // here and are weeded out later by the increment validation.
-                let mut candidates = Vec::new();
-                for g in guards {
-                    let mut stack = vec![*g];
-                    while let Some(e) = stack.pop() {
-                        if let Expr::Binary {
-                            op: BinOp::And,
-                            lhs,
-                            rhs,
-                            ..
-                        } = e
-                        {
-                            stack.push(lhs);
-                            stack.push(rhs);
-                            continue;
-                        }
-                        if let Some(c) = self.counter_guard(e) {
-                            candidates.push(c);
-                        }
-                    }
-                }
-                (!candidates.is_empty()).then_some(Site { candidates })
-            }
-            fn stmt<'e>(&mut self, s: &'e Stmt, guards: &mut Vec<&'e Expr>) {
-                if self.sites.is_none() {
-                    return;
-                }
-                match s {
-                    Stmt::Block(ss) => ss.iter().for_each(|x| self.stmt(x, guards)),
-                    Stmt::Assign { lhs, rhs, .. } => {
-                        if lhs == self.flag {
-                            match self.l.const_of_expr(rhs) {
-                                Some(0.0) => {}
-                                _ => match self.guards_site(guards) {
-                                    Some(site) => {
-                                        if let Some(v) = &mut self.sites {
-                                            v.push(site);
-                                        }
-                                    }
-                                    None => self.fail(),
-                                },
-                            }
-                            return;
-                        }
-                        // counter increment tracking: `c = c + d` (d const > 0)
-                        let inc = match rhs {
-                            Expr::Binary {
-                                op: BinOp::Add,
-                                lhs: a,
-                                rhs: b,
-                                ..
-                            } => match (&**a, &**b) {
-                                (Expr::Ident(n, _), d) if n == lhs => self.l.const_of_expr(d),
-                                (d, Expr::Ident(n, _)) if n == lhs => self.l.const_of_expr(d),
-                                _ => None,
-                            },
-                            _ => None,
-                        };
-                        let entry = self.incs.entry(lhs.clone()).or_insert(Some(f64::INFINITY));
-                        match (inc, entry.as_mut()) {
-                            (Some(d), Some(cur)) if d > 0.0 => *cur = cur.min(d),
-                            _ => *entry = None, // non-increment write poisons it
-                        }
-                    }
-                    Stmt::If { cond, then, els } => {
-                        guards.push(cond);
-                        self.stmt(then, guards);
-                        guards.pop();
-                        if let Some(e) = els {
-                            self.stmt(e, guards);
-                        }
-                    }
-                    Stmt::Case {
-                        sel: _,
-                        items,
-                        default,
-                    } => {
-                        for (_, b) in items {
-                            self.stmt(b, guards);
-                        }
-                        if let Some(d) = default {
-                            self.stmt(d, guards);
-                        }
-                    }
-                    Stmt::For {
-                        init, step, body, ..
-                    } => {
-                        self.stmt(init, guards);
-                        self.stmt(step, guards);
-                        self.stmt(body, guards);
-                    }
-                    Stmt::While { body, .. } => self.stmt(body, guards),
-                    Stmt::InitialStep(b) | Stmt::Event { body: b, .. } => self.stmt(b, guards),
-                    Stmt::Contribution { .. }
-                    | Stmt::Indirect { .. }
-                    | Stmt::Call { .. }
-                    | Stmt::SysTask { .. }
-                    | Stmt::Empty
-                    | Stmt::IgnoredCall => {}
-                }
-            }
-        }
-        let dbg = sane_core::config().va_debug_while;
-        let mut sc = Scan {
-            l: self,
-            flag,
-            sites: Some(Vec::new()),
-            incs: HashMap::default(),
-        };
-        let mut guards: Vec<&Expr> = Vec::new();
-        sc.stmt(body, &mut guards);
-        if dbg {
-            eprintln!(
-                "[while_flag_bound] flag={flag} sites={:?}",
-                sc.sites.as_ref().map(|v| v
-                    .iter()
-                    .map(|st| st
-                        .candidates
-                        .iter()
-                        .map(|c| format!(
-                            "{}<{}{}",
-                            c.counter,
-                            if c.inclusive { "=" } else { "" },
-                            c.limit
-                        ))
-                        .collect::<Vec<_>>())
-                    .collect::<Vec<_>>()),
-            );
-        }
-        let sites = sc.sites?;
-        if sites.is_empty() {
-            // No re-trigger at all: the body clears the flag, one pass suffices.
-            return Some(1);
-        }
-        let mut bound = 1usize;
-        for site in &sites {
-            // A candidate is a real counter iff its only writes in the body are
-            // constant positive increments and its pre-loop value is constant.
-            let site_bound = site
-                .candidates
-                .iter()
-                .filter_map(|c| {
-                    let delta = (*sc.incs.get(&c.counter)?)?;
-                    if !(delta > 0.0) || !delta.is_finite() {
-                        return None;
-                    }
-                    let start = self.const_lookup(&c.counter)?;
-                    let span = c.limit - start + if c.inclusive { delta } else { 0.0 };
-                    if span <= 0.0 {
-                        return Some(0); // this guard can never fire again
-                    }
-                    Some((span / delta).ceil() as usize)
-                })
-                .min();
-            match site_bound {
-                Some(t) => bound = bound.max(t + 1),
-                None => {
-                    if dbg {
-                        eprintln!("[while_flag_bound] trigger site without a valid counter guard");
-                    }
-                    return None;
-                }
-            }
-        }
-        (bound <= 64).then_some(bound)
-    }
-
-    /// Bound analysis for descent loops (pattern 2 above):
-    /// `while (v >= C)` / `while (v > C)` where the body's only writes to `v`
-    /// subtract a positive constant, and a path fact (see `cond_facts`) proves
-    /// an upper bound on `v`'s current (runtime) value.
-    fn while_descent_bound(&mut self, cond: &Expr, body: &Stmt) -> Option<usize> {
-        let (var, floor) = match cond {
-            Expr::Binary {
-                op: BinOp::Ge | BinOp::Gt,
-                lhs,
-                rhs,
-                ..
-            } => match &**lhs {
-                Expr::Ident(n, _) => (n.clone(), self.const_of_expr(rhs)?),
-                _ => return None,
-            },
-            _ => return None,
-        };
-        // Every write to `var` in the body must be `var = var - d`, d const > 0.
-        fn min_decrement(l: &Lower, var: &str, s: &Stmt, dec: &mut Option<f64>) -> bool {
-            match s {
-                Stmt::Block(ss) => ss.iter().all(|x| min_decrement(l, var, x, dec)),
-                Stmt::Assign { lhs, rhs, .. } if lhs == var => {
-                    let d = match rhs {
-                        Expr::Binary {
-                            op: BinOp::Sub,
-                            lhs: a,
-                            rhs: b,
-                            ..
-                        } => match &**a {
-                            Expr::Ident(n, _) if n == var => l.const_of_expr(b),
-                            _ => None,
-                        },
-                        _ => None,
-                    };
-                    match d {
-                        Some(d) if d > 0.0 => {
-                            *dec = Some(dec.map_or(d, |cur: f64| cur.min(d)));
-                            true
-                        }
-                        _ => false,
-                    }
-                }
-                Stmt::Assign { .. } | Stmt::Contribution { .. } | Stmt::Indirect { .. } => true,
-                Stmt::If { then, els, .. } => {
-                    min_decrement(l, var, then, dec)
-                        && els.as_deref().is_none_or(|e| min_decrement(l, var, e, dec))
-                }
-                Stmt::Case { items, default, .. } => {
-                    items.iter().all(|(_, b)| min_decrement(l, var, b, dec))
-                        && default
-                            .as_deref()
-                            .is_none_or(|d| min_decrement(l, var, d, dec))
-                }
-                Stmt::For { body, .. } | Stmt::While { body, .. } => {
-                    min_decrement(l, var, body, dec)
-                }
-                Stmt::InitialStep(b) | Stmt::Event { body: b, .. } => min_decrement(l, var, b, dec),
-                Stmt::Call { .. } | Stmt::SysTask { .. } | Stmt::Empty | Stmt::IgnoredCall => true,
-            }
-        }
-        let mut dec = None;
-        if !min_decrement(self, &var, body, &mut dec) {
-            return None;
-        }
-        let delta = dec?;
-        // Upper bound of the loop variable's CURRENT value from the path facts.
-        let v0 = *self.st.vars.get(&var)?;
-        let upper = self
-            .facts
-            .iter()
-            .filter(|(e, op, _)| *e == v0 && matches!(op, CmpOp::Lt | CmpOp::Le))
-            .map(|(_, _, c)| *c)
-            .fold(f64::INFINITY, f64::min);
-        if !upper.is_finite() {
-            return None;
-        }
-        let span = upper - floor;
-        if span <= 0.0 {
-            return Some(1); // provably below the floor after at most one test
-        }
-        let bound = (span / delta).ceil() as usize + 1;
-        (bound <= 64).then_some(bound)
-    }
-
-    /// Partial evaluation of a while-condition over currently-constant values:
-    /// parameters and any loop variable that presently holds a constant node.
-    /// Returns `Some(0.0)`/`Some(non-zero)` when determined, `None` when it
-    /// depends on runtime (voltage) values. `&&`/`||` short-circuit so a counter
-    /// bound conjoined with a runtime predicate is still decidable once the
-    /// counter expires.
-    fn partial_cond(&mut self, e: &Expr) -> Option<f64> {
-        match e {
-            Expr::Num(n) => Some(*n),
-            Expr::Str(_) | Expr::Array(_) => None,
-            Expr::Ident(name, _) => {
-                if let Some(v) = self.const_lookup(name) {
-                    return Some(v);
-                }
-                let id = *self.st.vars.get(name)?;
-                self.lo.ctx().const_f64(id)
-            }
-            Expr::Unary { op, arg, .. } => {
-                let v = self.partial_cond(arg)?;
-                Some(match op {
-                    UnOp::Neg => -v,
-                    UnOp::Not => bool_f64(v == 0.0),
-                })
-            }
-            Expr::Binary { op, lhs, rhs, .. } => match op {
-                BinOp::And => {
-                    let a = self.partial_cond(lhs);
-                    if matches!(a, Some(x) if x == 0.0) {
-                        return Some(0.0);
-                    }
-                    let b = self.partial_cond(rhs);
-                    if matches!(b, Some(x) if x == 0.0) {
-                        return Some(0.0);
-                    }
-                    match (a, b) {
-                        (Some(_), Some(_)) => Some(1.0),
-                        _ => None,
-                    }
-                }
-                BinOp::Or => {
-                    let a = self.partial_cond(lhs);
-                    if matches!(a, Some(x) if x != 0.0) {
-                        return Some(1.0);
-                    }
-                    let b = self.partial_cond(rhs);
-                    if matches!(b, Some(x) if x != 0.0) {
-                        return Some(1.0);
-                    }
-                    match (a, b) {
-                        (Some(_), Some(_)) => Some(0.0),
-                        _ => None,
-                    }
-                }
-                _ => {
-                    let a = self.partial_cond(lhs)?;
-                    let b = self.partial_cond(rhs)?;
-                    Some(match op {
-                        BinOp::Add => a + b,
-                        BinOp::Sub => a - b,
-                        BinOp::Mul => a * b,
-                        BinOp::Div => a / b,
-                        BinOp::Mod => a - b * (a / b).trunc(),
-                        BinOp::Pow => a.powf(b),
-                        BinOp::Lt => bool_f64(a < b),
-                        BinOp::Gt => bool_f64(a > b),
-                        BinOp::Le => bool_f64(a <= b),
-                        BinOp::Ge => bool_f64(a >= b),
-                        BinOp::Eq => bool_f64(a == b),
-                        BinOp::Ne => bool_f64(a != b),
-                        BinOp::And | BinOp::Or => unreachable!(),
-                    })
-                }
-            },
-            Expr::Ternary {
-                cond, then, els, ..
-            } => {
-                if self.partial_cond(cond)? != 0.0 {
-                    self.partial_cond(then)
-                } else {
-                    self.partial_cond(els)
-                }
-            }
-            Expr::Call { name, args, .. } => {
-                let v: Vec<f64> = args
-                    .iter()
-                    .map(|a| self.partial_cond(a))
-                    .collect::<Option<_>>()?;
-                const_builtin(name, &v)
-            }
-            // `$param_given` is a compile-time fact of the instance binding.
-            Expr::SysFn { name, args, .. } if name == "param_given" => Some(bool_f64(
-                matches!(args.first(), Some(Expr::Ident(p, _)) if self.given.contains(p)),
-            )),
-            Expr::Access { .. } | Expr::SysFn { .. } => None,
-        }
-    }
-
-    /// Evaluate a compile-time-constant expression over the parameter defaults
-    /// plus an optional bound loop variable.
-    fn eval_num(&self, e: &Expr, var: &str, val: Option<f64>) -> Result<f64, String> {
-        const_eval_with(e, &|n| {
-            if let Some(v) = val {
-                if n == var {
-                    return Some(v);
-                }
-            }
-            self.const_lookup(n)
-        })
-        .ok_or_else(|| "for-loop bound/step is not a compile-time constant".to_string())
-    }
-
-    /// Resolve an identifier to its compile-time value: a constant-shadowed
-    /// variable (latest assignment) overrides a parameter default. The
-    /// pseudo-name `$given(X)` (from `$param_given`, see `const_eval_with`)
-    /// resolves to whether the instance/deck explicitly set parameter `X`.
-    fn const_lookup(&self, name: &str) -> Option<f64> {
-        if let Some(p) = name
-            .strip_prefix("$given(")
-            .and_then(|s| s.strip_suffix(')'))
-        {
-            return Some(bool_f64(self.given.contains(p)));
-        }
-        if let Some(c) = self.st.const_vars.get(name) {
-            self.note(c.deps.iter().cloned());
-            return Some(c.v);
-        }
-        let v = self.param_env.get(name).copied();
-        if v.is_some() {
-            self.note(std::iter::once(name.to_string()));
-        }
-        v
-    }
-
-    /// Record parameters a compile-time value was read from: into the
-    /// collection a shadow assignment runs, or else as structural (a
-    /// decision's input: a branch, a bound, a short, a baked constant).
-    fn note(&self, names: impl Iterator<Item = String>) {
-        match &mut *self.collect.borrow_mut() {
-            Some(set) => set.extend(names),
-            None => self.structural.borrow_mut().extend(names),
-        }
-    }
-
-    /// [`const_of_expr`](Self::const_of_expr) for a shadow assignment: the
-    /// value and the parameters it came from, none of them recorded as
-    /// structural (only a later decision that reads the variable makes them so).
-    fn const_of_expr_deps(&self, e: &Expr) -> Option<(f64, Deps)> {
-        let outer = self.collect.replace(Some(Default::default()));
-        let v = self.const_of_expr_raw(e);
-        let deps = std::mem::replace(&mut *self.collect.borrow_mut(), outer).unwrap_or_default();
-        v.map(|v| (v, Deps::new(deps)))
     }
 
     /// Compile-time value of a string expression: a literal, or a string
@@ -1691,25 +1261,6 @@ impl<'a, 'b> Lower<'a, 'b> {
         Some(bool_f64(if matches!(op, BinOp::Eq) { eq } else { !eq }))
     }
 
-    /// Compile-time-constant value of an expression in the current scope, if any.
-    fn const_of_expr(&self, e: &Expr) -> Option<f64> {
-        // The parameters an evaluation read count only when it succeeds: a
-        // condition that turns out runtime decided nothing at compile time.
-        let (v, deps) = self.const_of_expr_deps(e)?;
-        self.note(deps.iter().cloned());
-        Some(v)
-    }
-
-    /// The evaluation itself; lookups go wherever `collect` points.
-    fn const_of_expr_raw(&self, e: &Expr) -> Option<f64> {
-        if let Expr::Binary { op, lhs, rhs, .. } = e {
-            if let Some(v) = self.fold_str_cmp(*op, lhs, rhs) {
-                return Some(v);
-            }
-        }
-        const_eval_with(e, &|n| self.const_lookup(n))
-    }
-
     fn contribute(
         &mut self,
         access: &Access,
@@ -1718,16 +1269,17 @@ impl<'a, 'b> Lower<'a, 'b> {
         rhs: &Expr,
     ) -> Result<(), String> {
         let (hn, ln) = self.resolve_pair(hi, lo);
-        // A self-branch (both endpoints the same node, typically via a
-        // collapse): a zero potential contribution IS the collapse (no-op); a
-        // flow contribution circulates within one node (no-op); any other
-        // potential contribution is inconsistent (excluded by the pre-scan,
-        // kept as a defensive error).
+        // A self-branch (both endpoints the same node): a zero potential
+        // contribution is a no-op, as is a flow circulating within one node;
+        // any other potential contribution is inconsistent.
         if hn == ln {
-            if is_potential(access) && self.const_of_expr(rhs) != Some(0.0) {
-                return Err(format!(
-                    "potential contribution on collapsed branch ({hn},{ln}) is not zero"
-                ));
+            if is_potential(access) {
+                let v = self.expr(rhs)?;
+                if self.ctx().const_f64(v) != Some(0.0) {
+                    return Err(format!(
+                        "potential contribution on the self-branch ({hn},{ln}) is not zero"
+                    ));
+                }
             }
             return Ok(());
         }
@@ -1753,6 +1305,21 @@ impl<'a, 'b> Lower<'a, 'b> {
         // `finish` emits the merged constraint as this branch's residual. This is
         // what makes a `V(..) <+ ..` inside a conditional lowerable.
         let (skey, ssign) = canon(&hn, &ln);
+        if is_potential(access) {
+            if self.cond_depth > 0 && !self.switched.contains(&skey) {
+                self.switched.push(skey.clone());
+            }
+            let short = self.cond_depth == 0
+                && !self.probe_of.contains_key(&skey)
+                && self.ctx().const_f64(val) == Some(0.0);
+            if short {
+                if !self.shorts.contains(&skey) {
+                    self.shorts.push(skey.clone());
+                }
+            } else {
+                self.open.insert(skey.clone());
+            }
+        }
         if let Some(&i) = self.switch_of.get(&skey) {
             // Reserved pseudo-variable names carry the per-branch residual / flow.
             let resid_key = switch_resid_key(&skey);
@@ -1914,6 +1481,9 @@ impl<'a, 'b> Lower<'a, 'b> {
                 if let Some(v) = self.st.vars.get(name) {
                     return Ok(*v);
                 }
+                if let Some(v) = self.int_value(name) {
+                    return Ok(v);
+                }
                 if self.em.params.iter().any(|p| &p.name == name) {
                     let sym = format!("{}.{}", self.inst, name);
                     let e = self.ctx().sym(&sym);
@@ -1979,21 +1549,25 @@ impl<'a, 'b> Lower<'a, 'b> {
             Expr::Ternary {
                 cond, then, els, ..
             } => {
-                // A compile-time-constant condition (a parameter-gated
-                // structural decision, e.g. a polarity fold `type > 0 ? ..`)
-                // takes its arm statically, exactly like `lower_if` -- the
-                // discarded arm never enters the graph.
-                if let Some(c) = self.const_of_expr(cond) {
-                    return if c != 0.0 {
+                // A condition the graph folds takes its arm statically, as in
+                // `lower_if`: the discarded arm never enters the graph.
+                let c = self.expr(cond)?;
+                if let Some(v) = self.ctx().const_f64(c) {
+                    return if v != 0.0 {
                         self.expr(then)
                     } else {
                         self.expr(els)
                     };
                 }
-                let c = self.expr(cond)?;
-                let t = self.expr(then)?;
-                let e = self.expr(els)?;
-                Ok(self.ctx().select(c, t, e))
+                // Each arm on its path, as an `if`'s.
+                self.path.push(c);
+                let t = self.expr(then);
+                self.path.pop();
+                let nc = self.not(c);
+                self.path.push(nc);
+                let e = self.expr(els);
+                self.path.pop();
+                Ok(self.ctx().select(c, t?, e?))
             }
             Expr::Call { name, args, .. } => self.call(name, args),
             Expr::SysFn { name, args, .. } => self.sysfn(name, args),
@@ -2001,39 +1575,34 @@ impl<'a, 'b> Lower<'a, 'b> {
     }
 
     fn binary(&mut self, op: BinOp, a: ExprId, b: ExprId) -> ExprId {
-        // Whether we are lowering inside a conditional arm (both arms of a
-        // ternary / `if` are lowered eagerly, so a divide in the not-taken arm
-        // must stay finite). Read before borrowing the context (issue #43).
-        let in_cond = self.cond_depth > 0;
+        // Both arms of a conditional are lowered, so a divide on a path not
+        // taken must stay finite: its divisor is 1 off the path. Exact on it,
+        // and finite off it, residual and derivatives alike (an `inf` there
+        // would leak as `NaN` through `0 * inf` in a derivative product,
+        // issue #43). Where a binding decides the path, its variant drops the
+        // guard with the arm.
+        if op == BinOp::Div && !self.path.is_empty() && !self.ctx().is_zero(b) {
+            let reached = self.reached();
+            let ctx = self.ctx();
+            let one = ctx.one();
+            let b = ctx.select(reached, b, one);
+            return ctx.div(a, b);
+        }
         let ctx = self.lo.ctx();
         match op {
             BinOp::Add => ctx.add(a, b),
             BinOp::Sub => ctx.sub(a, b),
             BinOp::Mul => ctx.mul(a, b),
-            // Guard the divisor. A constant-zero divisor folds to 0 (both arms of a
-            // ternary / if are lowered eagerly, so a guarded `x/y` in the not-taken
-            // arm where y folds to 0 must not hit `recip(0)`, which panics; the
-            // `select` discards this value anyway). A RUNTIME divisor inside a
-            // conditional can hit 0 in the not-taken arm at some operating point,
-            // producing an `inf` that leaks as `NaN` through `0*inf` in derivative
-            // products; clamp its magnitude away from zero (sign-preserving, finite
-            // derivative), so the discarded arm's residual AND Jacobian stay finite
-            // while the taken arm (|y| >= floor) is exact (issue #43).
+            // A constant-zero divisor folds to 0: `recip(0)` would panic, and
+            // such a divide sits on a path a constant decided not to take.
             BinOp::Div => {
                 if ctx.is_zero(b) {
                     ctx.konst_f64(0.0)
-                } else if in_cond {
-                    let safe = guarded_denom(ctx, b);
-                    ctx.div(a, safe)
                 } else {
                     ctx.div(a, b)
                 }
             }
-            BinOp::Pow => {
-                let la = ctx.ln(a);
-                let bla = ctx.mul(b, la);
-                ctx.exp(bla)
-            }
+            BinOp::Pow => sane_core::mathfn::pow(ctx, a, b),
             BinOp::Mod => {
                 if ctx.is_zero(b) {
                     ctx.konst_f64(0.0)
@@ -2143,21 +1712,29 @@ impl<'a, 'b> Lower<'a, 'b> {
                         "fetlim" => Some(LimitKind::Fet),
                         _ => None,
                     };
-                    if let Some(kind) = kind {
+                    // Declared on a path over the parameters, the limit holds
+                    // where the path does; on one over the solution, always.
+                    let reached = self.reached();
+                    let when = match self.ctx().const_f64(reached) {
+                        Some(r) => (r != 0.0).then_some(None),
+                        None if self.over_params(reached) => Some(Some(reached)),
+                        None => Some(None),
+                    };
+                    if let (Some(kind), Some(when)) = (kind, when) {
                         let (hn, ln) = self.resolve_pair(hi, lo);
                         let vhi = self.node_voltage(&hn)?;
                         let vlo = self.node_voltage(&ln)?;
                         let (hi_s, lo_s) = (sym_of(self.lo.ctx(), vhi), sym_of(self.lo.ctx(), vlo));
-                        if !self
-                            .limits
-                            .iter()
-                            .any(|l| l.hi == hi_s && l.lo == lo_s && l.kind == kind)
-                        {
-                            self.limits.push(FragmentLimit {
-                                hi: hi_s,
-                                lo: lo_s,
-                                kind,
-                            });
+                        let limit = FragmentLimit {
+                            hi: hi_s,
+                            lo: lo_s,
+                            kind,
+                            when,
+                        };
+                        if !self.limits.iter().any(|l| {
+                            (l.hi, l.lo, l.kind, l.when) == (limit.hi, limit.lo, limit.kind, limit.when)
+                        }) {
+                            self.limits.push(limit);
                         }
                     }
                 }
@@ -2198,6 +1775,9 @@ impl<'a, 'b> Lower<'a, 'b> {
                 self.ctx().zero()
             };
             if let Some((hi, lo)) = self.cur_branch {
+                // A source on a conditional path is there where the path is.
+                let reached = self.reached();
+                let psd = self.ctx().mul(psd, reached);
                 self.noise.push(NoiseSource {
                     hi,
                     lo,
@@ -2214,14 +1794,19 @@ impl<'a, 'b> Lower<'a, 'b> {
             if args.is_empty() {
                 return Err(format!("{name} expects a coefficient array argument"));
             }
-            let flat = self.const_array(&args[0])?;
-            let table: Vec<(f64, f64)> = flat
+            let flat = self.coeffs(&args[0])?;
+            let table: Vec<(ExprId, ExprId)> = flat
                 .as_chunks::<2>()
                 .0
                 .iter()
                 .map(|c| (c[0], c[1]))
                 .collect();
             if let Some((hi, lo)) = self.cur_branch {
+                let reached = self.reached();
+                let table = table
+                    .into_iter()
+                    .map(|(f, p)| (f, self.ctx().mul(p, reached)))
+                    .collect();
                 let psd = self.ctx().zero();
                 let flicker_exp = self.ctx().zero();
                 self.noise.push(NoiseSource {
@@ -2245,8 +1830,8 @@ impl<'a, 'b> Lower<'a, 'b> {
                 return Err("laplace_nd expects (input, num_coeffs, den_coeffs)".into());
             }
             let u = self.expr(&args[0])?;
-            let num = self.const_array(&args[1])?;
-            let den = self.const_array(&args[2])?;
+            let num = self.coeffs(&args[1])?;
+            let den = self.coeffs(&args[2])?;
             return self.lower_laplace_nd(u, &num, &den);
         }
         if name == "ddx" {
@@ -2288,7 +1873,8 @@ impl<'a, 'b> Lower<'a, 'b> {
             // (issue #43).
             let mut dc_seed = None;
             if args.len() >= 2 {
-                match self.const_of_expr(&args[1]) {
+                let ic = self.expr(&args[1])?;
+                match self.ctx().const_f64(ic) {
                     Some(c) if c != 0.0 => dc_seed = Some(c),
                     Some(_) => {}
                     None => sane_core::log::warn_captured(&format!(
@@ -2396,20 +1982,15 @@ impl<'a, 'b> Lower<'a, 'b> {
             ));
         }
         let mut argmap: HashMap<String, ExprId> = HashMap::default();
-        let mut cargmap: HashMap<String, CVal> = HashMap::default();
         for (p, e) in func.args.iter().zip(args) {
             let v = self.expr(e)?;
             argmap.insert(p.clone(), v);
-            if let Some((c, deps)) = self.const_of_expr_deps(e) {
-                cargmap.insert(p.clone(), CVal { v: c, deps });
-            }
         }
         let saved = std::mem::replace(
             &mut self.st,
             State {
                 vars: argmap,
                 node_cur: HashMap::default(),
-                const_vars: cargmap,
             },
         );
         self.cond_depth += 1;
@@ -2427,14 +2008,13 @@ impl<'a, 'b> Lower<'a, 'b> {
         self.cond_depth -= 1;
         // Capture `output`/`inout` argument final values to write back to the
         // caller's variables (the actual args must be plain identifiers).
-        let mut writebacks: Vec<(String, ExprId, Option<CVal>)> = Vec::new();
+        let mut writebacks: Vec<(String, ExprId)> = Vec::new();
         for out in &func.outputs {
             if let Some(idx) = func.args.iter().position(|a| a == out) {
                 if let (Some(Expr::Ident(caller, _)), Some(&v)) =
                     (args.get(idx), self.st.vars.get(out))
                 {
-                    let c = self.st.const_vars.get(out).cloned();
-                    writebacks.push((caller.clone(), v, c));
+                    writebacks.push((caller.clone(), v));
                 }
             }
         }
@@ -2445,12 +2025,8 @@ impl<'a, 'b> Lower<'a, 'b> {
         self.journal.truncate(jmark);
         // Apply the write-backs to the caller through the journaled helpers, so an
         // enclosing conditional can rewind them like any other write.
-        for (caller, v, c) in writebacks {
-            self.set_var(caller.clone(), v);
-            match c {
-                Some(c) => self.set_const(caller, c),
-                None => self.drop_const(&caller),
-            }
+        for (caller, v) in writebacks {
+            self.set_var(caller, v);
         }
         if let Some(e) = err {
             return Err(e);
@@ -2463,38 +2039,47 @@ impl<'a, 'b> Lower<'a, 'b> {
         })
     }
 
-    fn const_array(&self, e: &Expr) -> Result<Vec<f64>, String> {
+    /// A coefficient vector `{e0, e1, ...}`, each entry lowered.
+    fn coeffs(&mut self, e: &Expr) -> Result<Vec<ExprId>, String> {
         match e {
-            Expr::Array(elems) => elems
-                .iter()
-                .map(|x| {
-                    self.const_of_expr(x).ok_or_else(|| {
-                        "laplace coefficient is not a compile-time constant".to_string()
-                    })
-                })
-                .collect(),
+            Expr::Array(elems) => elems.iter().map(|x| self.expr(x)).collect(),
             _ => Err("expected a coefficient vector {..}".into()),
         }
     }
 
+
     /// Lower H(s)=N(s)/D(s) (coefficient vectors, ascending powers of s) to a
     /// controllable-canonical state space: states s_i = w^(i) where D(s)w = u,
     /// output y = sum_i num_i * w^(i). One differential unknown per denominator
-    /// order; the integrator chain and the defining equation are residual rows.
-    fn lower_laplace_nd(&mut self, u: ExprId, num: &[f64], den: &[f64]) -> Result<ExprId, String> {
-        let k = match den.iter().rposition(|&x| x != 0.0) {
-            Some(k) => k,
-            None => return Err("laplace_nd denominator is empty or all zero".into()),
+    /// order (its trailing coefficients that are the constant zero dropped);
+    /// the integrator chain and the defining equation are residual rows. The
+    /// coefficients are expressions, a parameter's included.
+    fn lower_laplace_nd(
+        &mut self,
+        u: ExprId,
+        num: &[ExprId],
+        den: &[ExprId],
+    ) -> Result<ExprId, String> {
+        let zero_coeff = |l: &mut Self, c: ExprId| l.ctx().const_f64(c) == Some(0.0);
+        let Some(k) = (0..den.len()).rev().find(|&i| !zero_coeff(self, den[i])) else {
+            return Err("laplace_nd denominator is empty or all zero".into());
         };
-        if num.len() > k + 1 {
+        let n_num = (0..num.len())
+            .rev()
+            .find(|&i| !zero_coeff(self, num[i]))
+            .map_or(0, |i| i + 1);
+        if n_num > k + 1 {
             return Err(
                 "laplace_nd with numerator order > denominator order is not supported".into(),
             );
         }
+        let coeff = |i: usize| num.get(i).copied().filter(|_| i < n_num);
         if k == 0 {
-            let g = num.first().copied().unwrap_or(0.0) / den[0];
-            let kg = self.ctx().konst_f64(g);
-            return Ok(self.ctx().mul(kg, u));
+            let Some(b0) = coeff(0) else {
+                return Ok(self.ctx().zero());
+            };
+            let g = self.ctx().div(b0, den[0]);
+            return Ok(self.ctx().mul(g, u));
         }
         let base = self.lo.extras.len();
         let mut s = Vec::with_capacity(k);
@@ -2510,38 +2095,21 @@ impl<'a, 'b> Lower<'a, 'b> {
             self.branch_resid.push(r);
         }
         // a_k * s_{k-1}' + sum_{i<k} a_i s_i - u = 0
-        let mut acc = {
-            let a0 = self.ctx().konst_f64(den[0]);
-            self.ctx().mul(a0, s[0])
-        };
-        for i in 1..k {
-            let ai = self.ctx().konst_f64(den[i]);
-            let t = self.ctx().mul(ai, s[i]);
-            acc = self.ctx().add(acc, t);
-        }
-        let last = {
-            let akc = self.ctx().konst_f64(den[k]);
-            let lead = self.ctx().mul(akc, sdot[k - 1]);
-            let s1 = self.ctx().add(lead, acc);
-            self.ctx().sub(s1, u)
-        };
+        let ctx = self.ctx();
+        let mut terms: Vec<ExprId> = (0..k).map(|i| ctx.mul(den[i], s[i])).collect();
+        terms.push(ctx.mul(den[k], sdot[k - 1]));
+        let lhs = ctx.reduce(rsdag::ReduceOp::Sum, terms);
+        let last = ctx.sub(lhs, u);
         self.branch_resid.push(last);
         // output y = sum_{i<k} b_i s_i (+ b_k * s_{k-1}' if deg num == k)
-        let mut y = self.ctx().zero();
-        for i in 0..k {
-            let bi = *num.get(i).unwrap_or(&0.0);
-            if bi != 0.0 {
-                let bic = self.ctx().konst_f64(bi);
-                let t = self.ctx().mul(bic, s[i]);
-                y = self.ctx().add(y, t);
-            }
+        let ctx = self.lo.ctx();
+        let mut terms: Vec<ExprId> = (0..k)
+            .filter_map(|i| coeff(i).map(|b| ctx.mul(b, s[i])))
+            .collect();
+        if let Some(bk) = coeff(k) {
+            terms.push(ctx.mul(bk, sdot[k - 1]));
         }
-        if num.len() == k + 1 && num[k] != 0.0 {
-            let bkc = self.ctx().konst_f64(num[k]);
-            let t = self.ctx().mul(bkc, sdot[k - 1]);
-            y = self.ctx().add(y, t);
-        }
-        Ok(y)
+        Ok(ctx.reduce(rsdag::ReduceOp::Sum, terms))
     }
 
     fn builtin(&mut self, name: &str, a: &[ExprId]) -> Result<ExprId, String> {
@@ -2598,7 +2166,7 @@ fn collect_switch_keys(l: &Lower, s: &Stmt, cond: bool, out: &mut Vec<(String, S
             if cond && is_potential(access) {
                 let (hn, ln) = l.resolve_pair(hi, lo);
                 if hn == ln {
-                    return; // collapsed self-branch: nothing to switch
+                    return; // self-branch: nothing to switch
                 }
                 let (key, _) = canon(&hn, &ln);
                 if !out.contains(&key) {
@@ -2630,305 +2198,8 @@ fn collect_switch_keys(l: &Lower, s: &Stmt, cond: bool, out: &mut Vec<(String, S
     }
 }
 
-/// Node collapsing (OpenVAF-style, static per instance): a potential
-/// contribution `V(a,b) <+ 0` that is statically reached under this instance's
-/// parameters shorts its two nodes -- the compact-model geometry-switch idiom
-/// (PSP/HiSIM `SWGEO` variants) that removes unused internal nodes. Instead of
-/// minting a branch-current unknown plus a `V(a)-V(b)=0` constraint row, the
-/// two nodes become ONE node before lowering: smaller systems and no
-/// near-singular source rows. Conservative by construction: a branch is only
-/// collapsed when every potential contribution it receives is a
-/// statically-reached constant zero, it is never current-probed, and at least
-/// one endpoint is an internal node (ports keep their identity).
-///
-/// Returns the flattened alias map `node -> representative`.
-fn compute_node_collapses(
-    em: &ElaboratedModule,
-    param_env: &HashMap<String, f64>,
-    given: &HashSet<String>,
-) -> (HashMap<String, String>, std::collections::BTreeSet<String>) {
-    // Escape hatch and differential reference (`Config::node_collapse`): with
-    // collapsing off, every static zero-volt branch lowers as an explicit
-    // source (flow unknown + constraint row).
-    if !sane_core::config().node_collapse {
-        return (HashMap::default(), Default::default());
-    }
-    struct Scan<'a> {
-        em: &'a ElaboratedModule,
-        param_env: &'a HashMap<String, f64>,
-        /// explicitly-set parameter names (for `$param_given` folding).
-        given: &'a HashSet<String>,
-        /// compile-time-constant variable shadow (mirrors the lowering's),
-        /// with the parameters each value came from.
-        shadow: HashMap<String, (f64, Deps)>,
-        /// Parameters a decision of the scan read (see `Lower::structural`).
-        structural: std::cell::RefCell<std::collections::BTreeSet<String>>,
-        /// While a shadow assignment evaluates, the parameters it reads.
-        collect: std::cell::RefCell<Option<std::collections::BTreeSet<String>>>,
-        /// statically-reached `V(hi,lo) <+ 0` pairs, in reach order.
-        zero: Vec<(String, String)>,
-        /// canonical branch keys that must NOT collapse.
-        blocked: HashSet<(String, String)>,
-    }
-    impl Scan<'_> {
-        fn raw_pair(&self, hi: &str, lo: &Option<String>) -> (String, String) {
-            if lo.is_none() {
-                if let Some((bh, bl)) = self.em.branches.get(hi) {
-                    return (bh.clone(), bl.clone());
-                }
-            }
-            (
-                hi.to_string(),
-                lo.clone().unwrap_or_else(|| "0".to_string()),
-            )
-        }
-        fn ckey(&self, hi: &str, lo: &Option<String>) -> (String, String) {
-            let (h, l) = self.raw_pair(hi, lo);
-            canon(&h, &l).0
-        }
-        /// Compile-time value over parameters + the constant shadow, with
-        /// string-parameter comparison folding (mirrors `Lower::const_of_expr`):
-        /// a decision, so the parameters it read are structural, when it
-        /// succeeds.
-        fn ceval(&self, e: &Expr) -> Option<f64> {
-            let (v, deps) = self.ceval_deps(e)?;
-            match &mut *self.collect.borrow_mut() {
-                Some(set) => set.extend(deps.iter().cloned()),
-                None => self.structural.borrow_mut().extend(deps.iter().cloned()),
-            }
-            Some(v)
-        }
-        fn ceval_raw(&self, e: &Expr) -> Option<f64> {
-            if let Expr::Binary { op, lhs, rhs, .. } = e {
-                if matches!(op, BinOp::Eq | BinOp::Ne) {
-                    fn cs<'x>(em: &'x ElaboratedModule, x: &'x Expr) -> Option<&'x str> {
-                        match x {
-                            Expr::Str(s) => Some(s.as_str()),
-                            Expr::Ident(n, _) => em.string_params.get(n).map(String::as_str),
-                            _ => None,
-                        }
-                    }
-                    if let (Some(a), Some(b)) = (cs(self.em, lhs), cs(self.em, rhs)) {
-                        let eq = a == b;
-                        return Some(bool_f64(if matches!(op, BinOp::Eq) { eq } else { !eq }));
-                    }
-                }
-            }
-            const_eval_with(e, &|n| {
-                if let Some(p) = n.strip_prefix("$given(").and_then(|s| s.strip_suffix(')')) {
-                    return Some(bool_f64(self.given.contains(p)));
-                }
-                let note =
-                    |names: &mut dyn Iterator<Item = String>| match &mut *self.collect.borrow_mut()
-                    {
-                        Some(set) => set.extend(names),
-                        None => self.structural.borrow_mut().extend(names),
-                    };
-                if let Some((v, deps)) = self.shadow.get(n) {
-                    note(&mut deps.iter().cloned());
-                    return Some(*v);
-                }
-                let v = self.param_env.get(n).copied();
-                if v.is_some() {
-                    note(&mut std::iter::once(n.to_string()));
-                }
-                v
-            })
-        }
-        /// [`ceval_raw`](Self::ceval_raw) with the parameters it read, not
-        /// recorded as structural.
-        fn ceval_deps(&self, e: &Expr) -> Option<(f64, Deps)> {
-            let outer = self.collect.replace(Some(Default::default()));
-            let v = self.ceval_raw(e);
-            let deps =
-                std::mem::replace(&mut *self.collect.borrow_mut(), outer).unwrap_or_default();
-            v.map(|v| (v, Deps::new(deps)))
-        }
-        /// Block every current-probed branch (`I(a,b)` in an expression).
-        fn block_probes(&mut self, e: &Expr) {
-            match e {
-                Expr::Access { access, hi, lo, .. } => {
-                    if !is_potential(access) {
-                        let k = self.ckey(hi, lo);
-                        self.blocked.insert(k);
-                    }
-                }
-                Expr::Unary { arg, .. } => self.block_probes(arg),
-                Expr::Binary { lhs, rhs, .. } => {
-                    self.block_probes(lhs);
-                    self.block_probes(rhs);
-                }
-                Expr::Ternary {
-                    cond, then, els, ..
-                } => {
-                    self.block_probes(cond);
-                    self.block_probes(then);
-                    self.block_probes(els);
-                }
-                Expr::Call { args, .. } | Expr::SysFn { args, .. } | Expr::Array(args) => {
-                    args.iter().for_each(|a| self.block_probes(a));
-                }
-                Expr::Num(_) | Expr::Str(_) | Expr::Ident(_, _) => {}
-            }
-        }
-        /// Walk statements. `decided`: this statement is statically reached
-        /// under the instance parameters (no runtime guard above it).
-        fn stmt(&mut self, s: &Stmt, decided: bool) {
-            match s {
-                Stmt::Block(ss) => ss.iter().for_each(|x| self.stmt(x, decided)),
-                Stmt::Contribution {
-                    access,
-                    hi,
-                    lo,
-                    rhs,
-                    ..
-                } => {
-                    self.block_probes(rhs);
-                    if is_potential(access) {
-                        let is_zero = self.ceval(rhs) == Some(0.0);
-                        if decided && is_zero {
-                            self.zero.push(self.raw_pair(hi, lo));
-                        } else {
-                            let k = self.ckey(hi, lo);
-                            self.blocked.insert(k);
-                        }
-                    }
-                }
-                Stmt::Indirect {
-                    access,
-                    hi,
-                    lo,
-                    lhs,
-                    rhs,
-                    ..
-                } => {
-                    self.block_probes(lhs);
-                    self.block_probes(rhs);
-                    if is_potential(access) {
-                        let k = self.ckey(hi, lo);
-                        self.blocked.insert(k);
-                    }
-                }
-                Stmt::Assign { lhs, rhs, .. } => {
-                    self.block_probes(rhs);
-                    match (decided, self.ceval_deps(rhs)) {
-                        (true, Some(c)) => {
-                            self.shadow.insert(lhs.clone(), c);
-                        }
-                        _ => {
-                            self.shadow.remove(lhs);
-                        }
-                    }
-                }
-                Stmt::If { cond, then, els } => {
-                    self.block_probes(cond);
-                    match self.ceval(cond) {
-                        Some(c) if c != 0.0 => self.stmt(then, decided),
-                        Some(_) => {
-                            if let Some(e) = els {
-                                self.stmt(e, decided);
-                            }
-                        }
-                        None => {
-                            self.stmt(then, false);
-                            if let Some(e) = els {
-                                self.stmt(e, false);
-                            }
-                        }
-                    }
-                }
-                Stmt::Case {
-                    sel,
-                    items,
-                    default,
-                } => {
-                    let chain = case_to_if_chain(sel, items, default.as_deref());
-                    self.stmt(&chain, decided);
-                }
-                Stmt::For {
-                    init,
-                    cond,
-                    step,
-                    body,
-                } => {
-                    self.block_probes(cond);
-                    self.stmt(init, false);
-                    self.stmt(step, false);
-                    self.stmt(body, false);
-                }
-                Stmt::While { cond, body } => {
-                    self.block_probes(cond);
-                    self.stmt(body, false);
-                }
-                Stmt::InitialStep(b) => self.stmt(b, decided),
-                Stmt::Event { body, .. } => self.stmt(body, false),
-                Stmt::Call { args, .. } | Stmt::SysTask { args, .. } => {
-                    args.iter().for_each(|a| self.block_probes(a));
-                }
-                Stmt::Empty | Stmt::IgnoredCall => {}
-            }
-        }
-    }
-
-    let mut sc = Scan {
-        em,
-        param_env,
-        given,
-        shadow: HashMap::default(),
-        structural: Default::default(),
-        collect: Default::default(),
-        zero: Vec::new(),
-        blocked: HashSet::default(),
-    };
-    // Analog functions may contain contributions? (not legal VA; ignore.)
-    for s in &em.analog {
-        sc.stmt(s, true);
-    }
-
-    // Union the surviving zero pairs, ground/ports as preferred representatives.
-    let rank = |n: &str| -> u8 {
-        if n == "0" {
-            0
-        } else if em.ports.iter().any(|p| p == n) {
-            1
-        } else {
-            2
-        }
-    };
-    let mut alias: HashMap<String, String> = HashMap::default();
-    fn find(alias: &HashMap<String, String>, n: &str) -> String {
-        let mut cur = n.to_string();
-        while let Some(next) = alias.get(&cur) {
-            cur = next.clone();
-        }
-        cur
-    }
-    for (h, l) in &sc.zero {
-        let key = canon(h, l).0;
-        if sc.blocked.contains(&key) {
-            continue;
-        }
-        let (a, b) = (find(&alias, h), find(&alias, l));
-        if a == b {
-            continue;
-        }
-        // Collapse the internal node into the lower-ranked (more "external")
-        // representative; never merge two ports (or a port into ground).
-        let (keep, gone) = if rank(&a) <= rank(&b) { (a, b) } else { (b, a) };
-        if rank(&gone) < 2 {
-            continue; // both endpoints are ports/ground: keep the source branch
-        }
-        alias.insert(gone, keep);
-    }
-    // Flatten chains so lookups are single-step.
-    let flat: HashMap<String, String> =
-        alias.keys().map(|k| (k.clone(), find(&alias, k))).collect();
-    (flat, sc.structural.into_inner())
-}
-
 /// Desugar a `case` statement to a nested if-chain
-/// `if (sel==l0 || ...) body0 else if ... else default` -- shared by the
-/// lowering and the node-collapse pre-scan so both fold identically.
+/// `if (sel==l0 || ...) body0 else if ... else default`.
 fn case_to_if_chain(sel: &Expr, items: &[(Vec<Expr>, Stmt)], default: Option<&Stmt>) -> Stmt {
     let mut acc: Stmt = default.cloned().unwrap_or(Stmt::Empty);
     for (labels, body) in items.iter().rev() {
@@ -2960,36 +2231,6 @@ fn case_to_if_chain(sel: &Expr, items: &[(Vec<Expr>, Stmt)], default: Option<&St
     acc
 }
 
-/// Number of `while (<flag>)` loops nested anywhere inside `s` (the same-flag
-/// goto-emulation nest depth, for sizing the shared unroll budget).
-fn count_same_flag_whiles(s: &Stmt, flag: &str) -> usize {
-    match s {
-        Stmt::Block(ss) => ss.iter().map(|x| count_same_flag_whiles(x, flag)).sum(),
-        Stmt::If { then, els, .. } => {
-            count_same_flag_whiles(then, flag)
-                + els
-                    .as_deref()
-                    .map_or(0, |e| count_same_flag_whiles(e, flag))
-        }
-        Stmt::Case { items, default, .. } => {
-            items
-                .iter()
-                .map(|(_, b)| count_same_flag_whiles(b, flag))
-                .sum::<usize>()
-                + default
-                    .as_deref()
-                    .map_or(0, |d| count_same_flag_whiles(d, flag))
-        }
-        Stmt::For { body, .. } => count_same_flag_whiles(body, flag),
-        Stmt::While { cond, body } => {
-            let own = matches!(cond, Expr::Ident(n, _) if n == flag) as usize;
-            own + count_same_flag_whiles(body, flag)
-        }
-        Stmt::InitialStep(b) | Stmt::Event { body: b, .. } => count_same_flag_whiles(b, flag),
-        _ => 0,
-    }
-}
-
 /// Is an event body free of model semantics (see `Lower::event`)?
 fn passive_event_body(s: &Stmt) -> bool {
     match s {
@@ -2997,29 +2238,6 @@ fn passive_event_body(s: &Stmt) -> bool {
         Stmt::Block(ss) => ss.iter().all(passive_event_body),
         Stmt::SysTask { name, .. } => matches!(name.as_str(), "discontinuity" | "bound_step"),
         _ => false,
-    }
-}
-
-/// Mirror a comparison across its operands (`c OP e` -> `e OP' c`).
-fn mirror_cmp(op: CmpOp) -> CmpOp {
-    match op {
-        CmpOp::Lt => CmpOp::Gt,
-        CmpOp::Le => CmpOp::Ge,
-        CmpOp::Gt => CmpOp::Lt,
-        CmpOp::Ge => CmpOp::Le,
-        other => other,
-    }
-}
-
-/// Logical negation of a comparison.
-fn negate_cmp(op: CmpOp) -> CmpOp {
-    match op {
-        CmpOp::Lt => CmpOp::Ge,
-        CmpOp::Le => CmpOp::Gt,
-        CmpOp::Gt => CmpOp::Le,
-        CmpOp::Ge => CmpOp::Lt,
-        CmpOp::Eq => CmpOp::Ne,
-        CmpOp::Ne => CmpOp::Eq,
     }
 }
 
@@ -3120,7 +2338,28 @@ fn collect_expr_probes(l: &Lower, e: &Expr, out: &mut Vec<(String, String)>) {
 /// This is what makes electrical and thermal (and other conservative
 /// disciplines) lower uniformly: a potential contribution is a source branch, a
 /// flow contribution stamps into the node balance.
-fn is_potential(a: &Access) -> bool {
+/// Whether `s` contributes a potential anywhere, whatever its branches
+/// merge to (a short already merged reads as a self-branch).
+fn contributes_potential(s: &Stmt) -> bool {
+    match s {
+        Stmt::Contribution { access, .. } => is_potential(access),
+        Stmt::Block(ss) => ss.iter().any(contributes_potential),
+        Stmt::If { then, els, .. } => {
+            contributes_potential(then) || els.as_deref().is_some_and(contributes_potential)
+        }
+        Stmt::Case { items, default, .. } => {
+            items.iter().any(|(_, b)| contributes_potential(b))
+                || default.as_deref().is_some_and(contributes_potential)
+        }
+        Stmt::For { body, .. }
+        | Stmt::While { body, .. }
+        | Stmt::InitialStep(body)
+        | Stmt::Event { body, .. } => contributes_potential(body),
+        _ => false,
+    }
+}
+
+pub(crate) fn is_potential(a: &Access) -> bool {
     match a {
         Access::V => true,
         Access::I => false,
@@ -3128,41 +2367,9 @@ fn is_potential(a: &Access) -> bool {
     }
 }
 
-/// Magnitude floor for a runtime divisor lowered inside a conditional arm. Small
-/// enough to leave every physical divisor untouched, large enough that `1/floor`
-/// (`1e30`) stays a finite `f64` rather than an `inf` (issue #43).
-const VA_DENOM_FLOOR: f64 = 1e-30;
-
-/// Clamp a divisor's magnitude to `VA_DENOM_FLOOR` away from zero, preserving its
-/// sign, so an eagerly-lowered not-taken conditional arm can never divide by a
-/// runtime zero. Exact for `|b| >= floor`; within the tiny band the value
-/// saturates to `±floor` (a flat clamp, so the derivative is 0 there), keeping
-/// both the residual and the Jacobian finite. Every piece is a `select`/`cmp`
-/// with a well-defined subgradient, so autodiff stays consistent.
-fn guarded_denom(ctx: &mut Graph, b: ExprId) -> ExprId {
-    let zero = ctx.zero();
-    let floor = ctx.konst_f64(VA_DENOM_FLOOR);
-    let nfloor = ctx.konst_f64(-VA_DENOM_FLOOR);
-    // b >= 0: clamp up to +floor;  b < 0: clamp down to -floor.
-    let ge_floor = ctx.cmp(CmpOp::Ge, b, floor);
-    let hi = ctx.select(ge_floor, b, floor);
-    let le_nfloor = ctx.cmp(CmpOp::Le, b, nfloor);
-    let lo = ctx.select(le_nfloor, b, nfloor);
-    let pos = ctx.cmp(CmpOp::Ge, b, zero);
-    ctx.select(pos, hi, lo)
-}
-
 pub(crate) fn sym_of(ctx: &Graph, e: ExprId) -> Option<SymbolId> {
     match ctx.node(e) {
         Node::Symbol(s) => Some(*s),
         _ => None,
-    }
-}
-
-/// Destructure a `var = expr` assignment statement.
-fn as_assign(s: &Stmt) -> Result<(String, Expr), String> {
-    match s {
-        Stmt::Assign { lhs, rhs, .. } => Ok((lhs.clone(), rhs.clone())),
-        _ => Err("for-loop init/step must be an assignment".into()),
     }
 }

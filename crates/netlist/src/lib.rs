@@ -14,7 +14,7 @@
 //! .end
 //! ```
 
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rustc_hash::FxHashMap as HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -100,11 +100,42 @@ impl std::fmt::Debug for ParsedCircuit {
     }
 }
 
+impl Default for ParsedCircuit {
+    fn default() -> Self {
+        ParsedCircuit::new()
+    }
+}
+
 impl ParsedCircuit {
+    /// An empty circuit, ground alone: the start of one built in memory.
+    pub fn new() -> ParsedCircuit {
+        ParsedCircuit {
+            circuit: Circuit::new(),
+            devices: Vec::new(),
+            instances: Vec::new(),
+            node_index: [("0".to_string(), 0)].into_iter().collect(),
+            node_names: vec!["0".to_string()],
+            values: HashMap::default(),
+            ports: Vec::new(),
+            report: CompatReport::default(),
+        }
+    }
+
     /// The circuit's DAE: the top level assembled, every subcircuit instance
-    /// a call of its body's function.
-    pub fn assemble(&self, ctx: &mut sane_core::Graph) -> sane_dae::Dae {
+    /// a call of its body's function. An error names the device whose model
+    /// does not lower.
+    pub fn assemble(&self, ctx: &mut sane_core::Graph) -> Result<sane_dae::Dae, String> {
         sane_dae::assemble(ctx, &self.circuit, &self.devices, &self.instances)
+    }
+
+    /// [`assemble`](Self::assemble) with the devices' structure decided at
+    /// `values` (by parameter symbol name) where those set a parameter.
+    pub fn assemble_at(
+        &self,
+        ctx: &mut sane_core::Graph,
+        values: &dyn Fn(&str) -> Option<f64>,
+    ) -> Result<sane_dae::Dae, String> {
+        sane_dae::assemble_at(ctx, &self.circuit, &self.devices, &self.instances, values)
     }
 
     /// Every placed device, subcircuit bodies' included, under its name in
@@ -309,7 +340,6 @@ fn parse_impl(text: &str, base_dir: Option<&Path>) -> Result<ParsedCircuit, Pars
         circuit: Circuit::new(),
         devices: Vec::new(),
         values: HashMap::default(),
-        validated: HashSet::default(),
         report: CompatReport::default(),
         ports: Vec::new(),
         params: &params,
@@ -467,7 +497,6 @@ impl Placer<'_> {
             circuit: Circuit::new(),
             devices: Vec::new(),
             values: HashMap::default(),
-            validated: std::mem::take(&mut self.validated),
             report: CompatReport::default(),
             ports: Vec::new(),
             params: self.params,
@@ -480,7 +509,6 @@ impl Placer<'_> {
             bodies: std::mem::take(&mut self.bodies),
         };
         let instances = body.place_items(items, base_dir);
-        self.validated = std::mem::take(&mut body.validated);
         self.bodies = std::mem::take(&mut body.bodies);
         #[cfg(not(target_arch = "wasm32"))]
         {

@@ -13,49 +13,74 @@ use crate::{model_reduce_on_dae, state_space_on_dae, temp_sweep_on_dae};
 
 impl Model {
     /// The currents `I(x, p, t)`. Every row reads `I(x, t) + d/dt Q(x)`.
-    pub fn currents(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> Vec<f64> {
-        self.cdc().currents(&x, &p, t)
+    pub fn currents(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> Result<Vec<f64>, ModelError> {
+        self.inner.bound(&p)?;
+        Ok(self.cdc().currents(&x, &p, t))
     }
 
     /// The charges `Q(x, p)`.
-    pub fn charges(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> Vec<f64> {
-        self.cdc().charges(&x, &p, t)
+    pub fn charges(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> Result<Vec<f64>, ModelError> {
+        self.inner.bound(&p)?;
+        Ok(self.cdc().charges(&x, &p, t))
     }
 
     /// The residual `F = I(x, t) + C(x) x'` at the state `x` moving at the
     /// rate `xdot`.
-    pub fn residual(&self, x: Vec<f64>, xdot: Vec<f64>, p: Vec<f64>, t: f64) -> Vec<f64> {
-        self.cdc().residual(&x, &xdot, &p, t)
+    pub fn residual(
+        &self,
+        x: Vec<f64>,
+        xdot: Vec<f64>,
+        p: Vec<f64>,
+        t: f64,
+    ) -> Result<Vec<f64>, ModelError> {
+        self.inner.bound(&p)?;
+        Ok(self.cdc().residual(&x, &xdot, &p, t))
     }
 
     /// `G = dI/dx` as a dense matrix.
-    pub fn jacobian_i_x(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> Vec<Vec<f64>> {
-        self.cdc().jacobian_i_x(&x, &p, t)
+    pub fn jacobian_i_x(
+        &self,
+        x: Vec<f64>,
+        p: Vec<f64>,
+        t: f64,
+    ) -> Result<Vec<Vec<f64>>, ModelError> {
+        self.inner.bound(&p)?;
+        Ok(self.cdc().jacobian_i_x(&x, &p, t))
     }
 
     /// `C = dQ/dx` as a dense matrix.
-    pub fn jacobian_q_x(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> Vec<Vec<f64>> {
-        self.cdc().jacobian_q_x(&x, &p, t)
+    pub fn jacobian_q_x(
+        &self,
+        x: Vec<f64>,
+        p: Vec<f64>,
+        t: f64,
+    ) -> Result<Vec<Vec<f64>>, ModelError> {
+        self.inner.bound(&p)?;
+        Ok(self.cdc().jacobian_q_x(&x, &p, t))
     }
 
     /// Sparse `G = dI/dx` as `(rows, cols, values)` (COO).
-    pub fn jacobian_i_x_sparse(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> Coo {
-        self.cdc().jacobian_i_x_sparse(&x, &p, t)
+    pub fn jacobian_i_x_sparse(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> Result<Coo, ModelError> {
+        self.inner.bound(&p)?;
+        Ok(self.cdc().jacobian_i_x_sparse(&x, &p, t))
     }
 
     /// Sparse `C = dQ/dx` as `(rows, cols, values)` (COO).
-    pub fn jacobian_q_x_sparse(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> Coo {
-        self.cdc().jacobian_q_x_sparse(&x, &p, t)
+    pub fn jacobian_q_x_sparse(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> Result<Coo, ModelError> {
+        self.inner.bound(&p)?;
+        Ok(self.cdc().jacobian_q_x_sparse(&x, &p, t))
     }
 
     /// Sparse `dI/dp` as `(rows, cols, values)` (COO).
-    pub fn jacobian_i_p_sparse(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> Coo {
-        self.jacobian_p_sparse(&x, &p, t).0
+    pub fn jacobian_i_p_sparse(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> Result<Coo, ModelError> {
+        self.inner.bound(&p)?;
+        Ok(self.jacobian_p_sparse(&x, &p, t).0)
     }
 
     /// Sparse `dQ/dp` as `(rows, cols, values)` (COO).
-    pub fn jacobian_q_p_sparse(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> Coo {
-        self.jacobian_p_sparse(&x, &p, t).1
+    pub fn jacobian_q_p_sparse(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> Result<Coo, ModelError> {
+        self.inner.bound(&p)?;
+        Ok(self.jacobian_p_sparse(&x, &p, t).1)
     }
 
     /// `(dI/dp, dQ/dp)`, the parameter Jacobian built on first use.
@@ -85,6 +110,7 @@ impl Model {
         p: Vec<f64>,
         t: f64,
     ) -> Result<Vec<f64>, ModelError> {
+        self.inner.bound(&p)?;
         let arc = self.context_arc();
         let mut c = arc.lock().unwrap();
         let dae = self.dae();
@@ -106,6 +132,7 @@ impl Model {
         p: Vec<f64>,
         t: f64,
     ) -> Result<(Vec<String>, Vec<f64>), ModelError> {
+        self.inner.bound(&p)?;
         self.ensure_no_delays("sensitivity")?;
         let metric = self
             .dae()
@@ -137,6 +164,7 @@ impl Model {
         p: Vec<f64>,
         t: f64,
     ) -> Result<Vec<Vec<f64>>, ModelError> {
+        self.inner.bound(&p)?;
         let metric = self
             .dae()
             .unknowns
@@ -186,6 +214,34 @@ impl Model {
         abstol: Option<f64>,
         vntol: Option<f64>,
     ) -> Result<Vec<f64>, ModelError> {
+        // A binding of another structure solves there (see `restructure`).
+        if let Some(o) = self.restructured_at(&p)? {
+            let x0 = x0.map(|x| o.state(&x, 0.0));
+            let nodeset = nodeset.map(|ns| {
+                (ns.into_iter())
+                    .filter_map(|(k, v)| o.layout.index(k).map(|j| (j, v)))
+                    .collect()
+            });
+            let x = o.model.solve_dc(
+                o.p(),
+                x0,
+                tol,
+                max_iter,
+                device_limiting,
+                line_search,
+                gmin_continuation,
+                source_continuation,
+                companion_continuation,
+                node_adaptive,
+                pseudo_transient,
+                partition,
+                nodeset,
+                reltol,
+                abstol,
+                vntol,
+            )?;
+            return Ok(o.layout.map(&x));
+        }
         let x0 = x0.unwrap_or_default();
         let mut tricks = sane_solve::SolverTricks::default();
         if let Some(v) = device_limiting {
@@ -247,9 +303,10 @@ impl Model {
         // Either cause -- held above the floor, or the floor sets an unknown's
         // value -- makes the point depend on the regularization; one flag for
         // callers who only ask that.
-        self.cdc().last_regularized_gmin().or_else(|| {
-            self.cdc()
-                .last_gmin_dominance()
+        let last = self.inner.last_solved();
+        let cdc = last.as_ref().map_or(&self.inner.cdc, |(m, _)| &m.cdc);
+        cdc.last_regularized_gmin().or_else(|| {
+            cdc.last_gmin_dominance()
                 .map(|_| sane_core::constants::GMIN_DC)
         })
     }
@@ -260,7 +317,13 @@ impl Model {
     /// says the answer depends on the regularization, this one says which node
     /// and by how much removing the shunt would move it.
     pub fn gmin_dominance(&self) -> Option<(usize, f64)> {
-        self.cdc().last_gmin_dominance()
+        match self.inner.last_solved() {
+            None => self.cdc().last_gmin_dominance(),
+            Some((m, l)) => {
+                let (j, share) = m.cdc.last_gmin_dominance()?;
+                l.preimage(j).map(|k| (k, share))
+            }
+        }
     }
 
     /// Linearised descriptor state-space `(states, E, A, B, C, D)` at `(x, p)`.
@@ -271,19 +334,23 @@ impl Model {
         out_idx: usize,
         x: Vec<f64>,
         p: Vec<f64>,
-    ) -> (
-        Vec<String>,
-        Vec<Vec<f64>>,
-        Vec<Vec<f64>>,
-        Vec<f64>,
-        Vec<f64>,
-        f64,
-    ) {
+    ) -> Result<
+        (
+            Vec<String>,
+            Vec<Vec<f64>>,
+            Vec<Vec<f64>>,
+            Vec<f64>,
+            Vec<f64>,
+            f64,
+        ),
+        ModelError,
+    > {
+        self.inner.bound(&p)?;
         let arc = self.context_arc();
         let mut c = arc.lock().unwrap();
         let (e, a, b, cc, d) =
             state_space_on_dae(&mut c, self.dae(), self.cdc(), input, out_idx, &x, &p);
-        (self.dae().unknowns.clone(), e, a, b, cc, d)
+        Ok((self.dae().unknowns.clone(), e, a, b, cc, d))
     }
 
     /// Temperature sweep of the unknown at `out_idx` over `[tstart, tstop]` degC.
@@ -295,6 +362,7 @@ impl Model {
         tstop: f64,
         points: usize,
     ) -> Result<(Vec<f64>, Vec<f64>), ModelError> {
+        self.inner.bound(&p0)?;
         self.ensure_no_delays("temp_sweep")?;
         let arc = self.context_arc();
         let pnames = self.cdc().param_names(&arc.lock().unwrap());
@@ -326,6 +394,7 @@ impl Model {
         ),
         ModelError,
     > {
+        self.inner.bound(&p)?;
         let arc = self.context_arc();
         let mut c = arc.lock().unwrap();
         let (f, full, red, kp, kz, err) = model_reduce_on_dae(

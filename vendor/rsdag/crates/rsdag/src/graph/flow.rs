@@ -88,6 +88,17 @@ impl Set {
         }
     }
 
+    /// Whether `k` is a member.
+    pub(crate) fn contains(&self, k: u32) -> bool {
+        match &self.0 {
+            None => false,
+            Some(Ids::Bits(w)) => w
+                .get(k as usize / 64)
+                .is_some_and(|&b| b >> (k % 64) & 1 == 1),
+            Some(Ids::Sorted(v)) => v.binary_search(&k).is_ok(),
+        }
+    }
+
     /// The members, ascending.
     pub(crate) fn iter(&self) -> impl Iterator<Item = u32> + '_ {
         let (bits, sorted): (&[u64], &[u32]) = match &self.0 {
@@ -177,6 +188,8 @@ fn inert(node: &Node) -> usize {
 pub(crate) struct Flow<V> {
     at: Memo,
     vals: Vec<V>,
+    /// The nodes of the cone, in the order of `vals`.
+    nodes: Vec<ExprId>,
 }
 
 impl<V> Drop for Flow<V> {
@@ -190,6 +203,11 @@ impl<V> Flow<V> {
     /// The value of a node of the cone.
     pub(crate) fn get(&self, e: ExprId) -> &V {
         &self.vals[self.at.get(e).expect("a node of the cone").0 as usize]
+    }
+
+    /// Every node of the cone with its value.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (ExprId, &V)> {
+        self.nodes.iter().copied().zip(&self.vals)
     }
 }
 
@@ -367,7 +385,11 @@ impl<K: Field> Graph<K> {
             };
             vals.push(v);
         }
-        Flow { at, vals }
+        Flow {
+            at,
+            vals,
+            nodes: cone,
+        }
     }
 
     /// Per output of `f`, the parameters among `moving` (indices, ascending)

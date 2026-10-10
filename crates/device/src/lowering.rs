@@ -136,7 +136,12 @@ impl<'a> Lowerer<'a> {
     }
 
     /// Mint an extra unknown `{inst}.{suffix}` of an explicit kind.
-    pub fn unknown_kind_of(&mut self, inst: &str, suffix: &str, kind: crate::UnknownKind) -> ExprId {
+    pub fn unknown_kind_of(
+        &mut self,
+        inst: &str,
+        suffix: &str,
+        kind: crate::UnknownKind,
+    ) -> ExprId {
         let name = format!("{inst}.{suffix}");
         self.unknown_with_suffix(&name, suffix, kind)
     }
@@ -146,7 +151,12 @@ impl<'a> Lowerer<'a> {
         self.unknown_with_suffix(name, name, kind)
     }
 
-    fn unknown_with_suffix(&mut self, name: &str, suffix: &str, kind: crate::UnknownKind) -> ExprId {
+    fn unknown_with_suffix(
+        &mut self,
+        name: &str,
+        suffix: &str,
+        kind: crate::UnknownKind,
+    ) -> ExprId {
         let (value, value_sym) = mint(self.ctx, name);
         self.extras.push(LoweredUnknown {
             name: name.to_string(),

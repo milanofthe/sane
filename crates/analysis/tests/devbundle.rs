@@ -3,8 +3,7 @@
 //! cross-validate the bundle against the scalar path within one solve: any
 //! bundle defect shows up as a branch-1 vs branch-2/3 mismatch.
 
-use sane_analysis::Model;
-use sane_solve::TransientMethod;
+use sane_analysis::{Model, TransientOptions};
 
 const DECK_HEAD: &str = "\
 .veriloga
@@ -72,7 +71,10 @@ fn instances_call_one_function() {
 #[test]
 fn dc_scalar_vs_bundled_branches_agree() {
     let model = Model::from_netlist(&three_branch_deck("2.0")).expect("model");
-    let op = model.operating_point(&[]).expect("dc");
+    let op = model
+        .at(&[])
+        .and_then(|pt| pt.operating_point())
+        .expect("dc");
     let v = |n: &str| op.vector()[model.resolve(n).expect(n)];
     let (d1, d2, d3) = (v("d1"), v("d2"), v("d3"));
     assert!(d1 > 0.4 && d1 < 0.9, "diode drop plausible: {d1}");
@@ -86,11 +88,17 @@ fn dc_scalar_vs_bundled_branches_agree() {
 fn transient_scalar_vs_bundled_branches_agree() {
     let model = Model::from_netlist(&three_branch_deck("SIN(0.6 0.3 1Meg)")).expect("model");
     let t: Vec<f64> = (0..200).map(|k| 2e-6 * k as f64 / 199.0).collect();
+    let opts = TransientOptions {
+        rtol: 1e-6,
+        atol: 1e-9,
+        ..Default::default()
+    };
     let traj = model
-        .transient(TransientMethod::Esdirk32, &[], &t, 1e-6, 1e-9)
+        .at(&[])
+        .and_then(|pt| pt.transient(&t, &opts))
         .expect("transient");
     let (i1, i2) = (model.resolve("d1").unwrap(), model.resolve("d2").unwrap());
-    for (k, row) in traj.rows().iter().enumerate() {
+    for (k, row) in traj.x.outer_iter().enumerate() {
         assert!(
             (row[i1] - row[i2]).abs() < 1e-9,
             "t[{k}]: d1={} d2={}",
@@ -106,22 +114,15 @@ fn transient_scalar_vs_bundled_branches_agree() {
 #[test]
 fn sensitivity_wrt_bundled_device_param_matches_scalar() {
     let model = Model::from_netlist(&three_branch_deck("2.0")).expect("model");
-    let op = model.operating_point(&[]).expect("dc");
-    let x = op.vector().to_vec();
-    let p = model.pvec(&[]);
-    let canon = |node: &str| model.unknowns()[model.resolve(node).unwrap()].clone();
-    let (n1, g1) = model
-        .sensitivity(&canon("d1"), x.clone(), p.clone(), 0.0)
-        .expect("sens d1");
-    let (n2, g2) = model.sensitivity(&canon("d2"), x, p, 0.0).expect("sens d2");
-    let pick = |names: &[String], vals: &[f64], key: &str| -> f64 {
-        vals[names
-            .iter()
-            .position(|n| n == key)
-            .unwrap_or_else(|| panic!("param {key}"))]
-    };
-    let s1 = pick(&n1, &g1, "N1.Is");
-    let s2 = pick(&n2, &g2, "N2.Is");
+    let op = model
+        .at(&[])
+        .and_then(|pt| pt.operating_point())
+        .expect("dc");
+    let s = op
+        .sensitivity(&["d1", "d2"], &["N1.Is", "N2.Is"])
+        .expect("sensitivity");
+    let s1 = s.get("d1", "N1.Is").expect("N1.Is");
+    let s2 = s.get("d2", "N2.Is").expect("N2.Is");
     assert!(s1.abs() > 1e3, "sensitivity nonzero: {s1}");
     assert!(((s1 - s2) / s1).abs() < 1e-6, "scalar {s1} vs bundled {s2}");
 }
@@ -182,11 +183,21 @@ fn templates_are_shared_across_parameters() {
         (5, "TYPE=-1 Is=5e-14"),
     ];
     let model = Model::from_netlist(&switched_deck(&instances)).expect("model");
-    assert_eq!(called_functions(&model), 1, "one function for every binding");
-    let op = model.operating_point(&[]).expect("dc");
+    assert_eq!(
+        called_functions(&model),
+        1,
+        "one function for every binding"
+    );
+    let op = model
+        .at(&[])
+        .and_then(|pt| pt.operating_point())
+        .expect("dc");
     for &(k, params) in &instances {
         let alone = Model::from_netlist(&switched_deck(&[(k, params)])).expect("alone");
-        let op_alone = alone.operating_point(&[]).expect("dc alone");
+        let op_alone = alone
+            .at(&[])
+            .and_then(|pt| pt.operating_point())
+            .expect("dc alone");
         let node = format!("d{k}");
         let (shared, single) = (
             op.vector()[model.resolve(&node).unwrap()],

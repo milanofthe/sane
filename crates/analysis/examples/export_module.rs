@@ -20,7 +20,10 @@ fn main() {
     };
     let src = std::fs::read_to_string(&deck).expect("read the deck");
     let model = Model::from_netlist(&src).expect("build the model");
-    let op = model.operating_point(&[]).expect("operating point");
+    let op = model
+        .at(&[])
+        .and_then(|pt| pt.operating_point())
+        .expect("operating point");
     let p = model.pvec(&[]);
     let arc = model.context_arc();
     let mut ctx = arc.lock().unwrap();

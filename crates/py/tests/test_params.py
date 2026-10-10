@@ -8,7 +8,7 @@ import math
 import pytest
 
 import sane
-from sane.model import ParamNode
+from sane import ParamGroup as ParamNode
 
 # A subcircuit (rc divider) instantiated as X1, plus a nested subcircuit, so the
 # parameter tree has depth: V1, X1.R1, X1.R2, XN.XI.R3.
@@ -31,7 +31,7 @@ NET = (
 
 
 def _dae():
-    return sane.parse(NET).extract()
+    return sane.Model.from_netlist(NET)
 
 
 def test_read_leaves_hierarchically():
@@ -56,17 +56,17 @@ def test_leaf_is_a_plain_float():
 def test_mutation_drives_the_solve():
     dae = _dae()
     # Divider mid node: v = 5 * R2/(R1+R2) = 5*2/3.
-    op0 = dae.operating_point()
+    op0 = dae.at().operating_point()
     assert op0["X1.mid"] == pytest.approx(5 * 2e3 / 3e3, rel=1e-6)
     # Make the legs equal -> mid at half supply.
     dae.X1.R1 = 2e3
     assert dae.X1.R1 == pytest.approx(2e3)
-    op1 = dae.operating_point()
+    op1 = dae.at().operating_point()
     assert op1["X1.mid"] == pytest.approx(2.5, rel=1e-6)
     # reset() restores the netlist default and the original solution.
     dae.reset()
     assert dae.X1.R1 == pytest.approx(1e3)
-    op2 = dae.operating_point()
+    op2 = dae.at().operating_point()
     assert op2["X1.mid"] == pytest.approx(5 * 2e3 / 3e3, rel=1e-6)
 
 

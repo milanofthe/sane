@@ -34,8 +34,27 @@ impl CompiledDc {
         // Every row reads `I(x, t) + d/dt Q(x)`: the currents and charges,
         // and their Jacobians `G = dI/dx` and `C = dQ/dx`, one sparse
         // Jacobian over both.
+        time_stage!(prof, "at_rest", dae.at_rest(ctx));
         let ((jr, jc, je), (xr, xc, xe)) =
             time_stage!(prof, "jac_iq_coo", dae.jacobian_iq_coo(ctx));
+        // The rows' explicit time rates `dI/dt ++ dQ/dt`, by row (the
+        // charges' rows after the currents'), then how they move with the
+        // delayed signals, `dI/dhist ++ dQ/dhist`, by row and delay: a
+        // delayed signal moves in time at its history's rate.
+        let ((tr_i, _, te_i), (tr_q, _, te_q)) =
+            time_stage!(prof, "jac_t_coo", dae.jacobian_t_iq_coo(ctx));
+        let ((hr_i, hc_i, he_i), (hr_q, hc_q, he_q)) =
+            time_stage!(prof, "jac_hist_coo", dae.jacobian_hist_iq_coo(ctx));
+        let dt_rows: Vec<usize> = (tr_i.iter().copied())
+            .chain(tr_q.iter().map(|&r| r + dae.dim()))
+            .collect();
+        let dt_hist: Vec<(usize, usize)> = (hr_i.iter().copied().zip(hc_i))
+            .chain(hr_q.iter().map(|&r| r + dae.dim()).zip(hc_q))
+            .collect();
+        let dt_roots: Vec<ExprId> = (te_i.iter().chain(&te_q))
+            .chain(he_i.iter().chain(&he_q))
+            .copied()
+            .collect();
         let param_syms = time_stage!(prof, "params", dae.params(ctx));
 
         // The system as a function with roles; every program over it takes
@@ -43,7 +62,17 @@ impl CompiledDc {
         // delay histories. The solver also reads what a guard is, and which
         // way it has to cross, off the roles.
         let sys = time_stage!(prof, "register", dae.register_function(ctx, "dae"));
-        let sig = rsdag::Signature::of(ctx.func(sys));
+        // The noise generators are no input of a program: the rows it
+        // computes are at rest, and what the noise program reads (levels,
+        // where a generator enters) none carries.
+        let mut sig = rsdag::Signature::of(ctx.func(sys));
+        let quiet: Vec<bool> = (sig.roles.iter())
+            .map(|r| !matches!(r, rsdag::ParamRole::Noise { .. }))
+            .collect();
+        let mut keep = quiet.iter();
+        sig.syms.retain(|_| *keep.next().unwrap());
+        sig.roles
+            .retain(|r| !matches!(r, rsdag::ParamRole::Noise { .. }));
         let input_syms = sig.syms.clone();
         let mut n_param = 0;
         let input_src: Vec<InputSrc> = sig
@@ -65,7 +94,24 @@ impl CompiledDc {
             param_syms[..],
             "the parameters in the parameter vector's order"
         );
-        let delay_src: Vec<usize> = dae.delays.iter().map(|dl| dl.src).collect();
+        let delay_src = Self::delay_sources(ctx, dae, &input_syms);
+        // the Newton aids by unknown index: a limit's ends (ground, or a
+        // voltage no longer an unknown, reads zero), the companion network's
+        // entries over unknowns
+        let index: HashMap<SymbolId, usize> =
+            dae.x.iter().enumerate().map(|(i, &s)| (s, i)).collect();
+        let at = |s: Option<SymbolId>| s.and_then(|s| index.get(&s).copied());
+        let limits = (dae.limits.iter())
+            .map(|l| crate::limiting::Limit {
+                hi: at(l.hi),
+                lo: at(l.lo),
+                kind: l.kind,
+            })
+            .filter(|l| l.hi.is_some() || l.lo.is_some())
+            .collect();
+        let companion = (dae.companion.iter())
+            .filter_map(|&(r, c, g)| Some((*index.get(&r)?, *index.get(&c)?, g)))
+            .collect();
 
         let n_nodes = dae.n_nodes;
         let kinds = dae.unknown_kinds();
@@ -104,40 +150,45 @@ impl CompiledDc {
             .collect();
         // The programs, one per way an analysis evaluates the system: the DC
         // Newton `I` and `I ++ G`, the transient (and harmonic balance) `I ++ Q`
-        // and `I ++ Q ++ G ++ C`, and `C` alone for the state rates. They
-        // compile the hierarchy as it stands: a subcircuit body is a template
-        // appended per instance, and the device calls of every instance run as
-        // one batch, as in a flat circuit; everything symbolic stays on the
-        // hierarchy.
-        let n_rows = dae.currents.len();
-        let tran: Vec<ExprId> = (dae.currents.iter().chain(&dae.charges))
+        // and `I ++ Q ++ G ++ C`, `C` alone for the state rates, and the
+        // switching surfaces. They compile the hierarchy as it stands: a
+        // subcircuit body is a template appended per instance, and the device
+        // calls of every instance run as one batch, as in a flat circuit;
+        // everything symbolic stays on the hierarchy. All of them are views
+        // of one program lowered once, each scheduled alone and its device
+        // calls running the bodies of the outputs it reads.
+        // The rows at rest (every noise generator zero, as in every
+        // evaluation): what the programs compute.
+        let rest = dae.at_rest(ctx);
+        let (currents, charges) = (&rest.0, &rest.1);
+        let n_rows = currents.len();
+        let tran: Vec<ExprId> = (currents.iter().chain(charges))
             .chain(&je)
             .chain(&xe)
             .copied()
             .collect();
-        let step_dc: Vec<ExprId> = dae.currents.iter().chain(&je).copied().collect();
+        let step_dc: Vec<ExprId> = currents.iter().chain(&je).copied().collect();
         let taus: Vec<ExprId> = dae.delays.iter().map(|dl| dl.tau).collect();
-        let compile = |ctx: &mut Graph, roots: &[ExprId]| {
-            crate::eval::step_eval(Tape::compile_split(ctx, roots, &input_syms, &pure_inputs))
-        };
-        let tape_tau = (!taus.is_empty()).then(|| Tape::compile(ctx, &taus, &param_syms));
-        let tape_res_dc = time_stage!(prof, "tape_res_dc", compile(ctx, &dae.currents));
-        let tape_step_dc = time_stage!(prof, "tape_step_dc", compile(ctx, &step_dc));
-        let tape_tran_res = time_stage!(prof, "tape_tran_res", compile(ctx, &tran[..2 * n_rows]));
-        let tape_tran_step = time_stage!(prof, "tape_tran_step", compile(ctx, &tran));
-        let tape_c = time_stage!(
+        let all: Vec<ExprId> = (tran.iter().chain(&event_roots).chain(&dt_roots))
+            .copied()
+            .collect();
+        let lowered = time_stage!(
             prof,
-            "tape_c",
-            crate::eval::step_eval(Tape::compile(ctx, &xe, &input_syms))
+            "tape_lower",
+            rsdag::Lowered::new(&*ctx, &all, &input_syms, Some(&pure_inputs))
         );
+        let view = |roots: &[ExprId]| crate::eval::step_eval(lowered.tape(&*ctx, roots));
+        let tape_tau = (!taus.is_empty()).then(|| Tape::compile(ctx, &taus, &param_syms));
+        let tape_res_dc = time_stage!(prof, "tape_res_dc", view(currents));
+        let tape_step_dc = time_stage!(prof, "tape_step_dc", view(&step_dc));
+        let tape_tran_res = time_stage!(prof, "tape_tran_res", view(&tran[..2 * n_rows]));
+        let tape_tran_step = time_stage!(prof, "tape_tran_step", view(&tran));
+        let tape_c = time_stage!(prof, "tape_c", view(&xe));
+        let tape_dt = (!dt_roots.is_empty()).then(|| time_stage!(prof, "tape_dt", view(&dt_roots)));
         // The switching surfaces, evaluated once per candidate transient step.
-        let tape_event = (!event_roots.is_empty()).then(|| {
-            time_stage!(
-                prof,
-                "tape_event",
-                Tape::compile(ctx, &event_roots, &input_syms)
-            )
-        });
+        let tape_event = (!event_roots.is_empty())
+            .then(|| time_stage!(prof, "tape_event", lowered.tape(&*ctx, &event_roots)));
+        drop(lowered);
         let event_names: Vec<String> = dae.events.iter().map(|e| e.name.clone()).collect();
 
         // The parameter Jacobians and the Lagrangian-Hessian are only needed
@@ -185,7 +236,7 @@ impl CompiledDc {
             if jx_var.iter().any(|&v| v) {
                 let mut terms: Vec<ExprId> = Vec::new();
                 let mut rows: Vec<(usize, usize)> = Vec::with_capacity(n_nodes);
-                for &r in dae.currents.iter().take(n_nodes) {
+                for &r in currents.iter().take(n_nodes) {
                     let start = terms.len();
                     match ctx.node(r) {
                         Node::Reduce(ReduceOp::Sum, l) => terms.extend_from_slice(ctx.args(*l)),
@@ -276,17 +327,19 @@ impl CompiledDc {
             .enumerate()
             .map(|(i, &s)| (ctx.symbol_name(s).to_string(), i))
             .collect();
+        let index2 = crate::index2::index2_unknowns(n, (&jr, &jc), (&xr, &xc));
         let cdc = CompiledDc {
             n,
             hjac: std::sync::OnceLock::new(),
+            noise: std::sync::OnceLock::new(),
             delay_src,
             tape_tau,
             kinds,
             tape_event,
             event_dirs,
             event_names,
-            last_events: std::sync::Mutex::new(Vec::new()),
             nnz_x,
+            index2,
             jx_rows: jr,
             jx_cols: jc,
             diag_idx,
@@ -297,6 +350,9 @@ impl CompiledDc {
             tape_tran_res,
             tape_tran_step,
             tape_c,
+            tape_dt,
+            dt_rows,
+            dt_hist,
             pjac: std::sync::OnceLock::new(),
             input_x_slots: input_src
                 .iter()
@@ -327,11 +383,15 @@ impl CompiledDc {
             jxd_var,
             partition,
             chess: std::sync::OnceLock::new(),
+            frozen: std::sync::OnceLock::new(),
+            param_exprs: Default::default(),
+            sens_programs: Default::default(),
             base_inputs,
-            companion: dae.companion.clone(),
+            base_pure: pure_inputs.clone(),
+            companion,
             companion_symbolic: std::sync::OnceLock::new(),
             input_jacs: Default::default(),
-            limits: dae.limits.clone(),
+            limits,
             n_nodes,
             tape_iscale,
             iscale_rows,
@@ -344,6 +404,45 @@ impl CompiledDc {
             last_gmin_share: std::sync::atomic::AtomicU64::new(0),
         };
         (cdc, prof)
+    }
+
+    /// What the transport delays of `dae` delay (see
+    /// [`DelaySources`](crate::delay::DelaySources)): unknowns where every
+    /// source is one, else one tape over `input_syms`.
+    fn delay_sources(
+        ctx: &mut Graph,
+        dae: &Dae,
+        input_syms: &[SymbolId],
+    ) -> crate::delay::DelaySources {
+        let srcs: Vec<ExprId> = dae.delays.iter().map(|dl| dl.src).collect();
+        let index: HashMap<SymbolId, usize> =
+            dae.x.iter().enumerate().map(|(i, &s)| (s, i)).collect();
+        let unknowns: Option<Vec<usize>> = (srcs.iter())
+            .map(|&e| match *ctx.node(e) {
+                Node::Symbol(s) => index.get(&s).copied(),
+                _ => None,
+            })
+            .collect();
+        if let Some(ix) = unknowns {
+            return crate::delay::DelaySources::Unknowns(ix);
+        }
+        let mut roots = srcs.clone();
+        roots.extend(srcs.iter().map(|&e| rsdag::differentiate(ctx, e, dae.t)));
+        let mut jac = Vec::new();
+        for (k, row) in rsdag::sparse_jacobian(ctx, &srcs, &dae.x)
+            .into_iter()
+            .enumerate()
+        {
+            for (j, g) in row {
+                jac.push((k, j));
+                roots.push(g);
+            }
+        }
+        crate::delay::DelaySources::Exprs {
+            n: srcs.len(),
+            tape: Box::new(Tape::compile(ctx, &roots, input_syms)),
+            jac,
+        }
     }
 
     /// Build the reusable symbolic analysis over the augmented pattern

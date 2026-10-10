@@ -9,49 +9,8 @@ use rustc_hash::FxHashMap;
 use rsdag::{differentiate, ExprId, Node, ReduceOp, SymbolId};
 use sane_core::Graph;
 
-use crate::{Dae, Observers, UnknownKind};
-
-impl Dae {
-    /// A transformed copy of this DAE over a (possibly reduced) unknown layout
-    /// and new currents and charges. The analysis-only registries a graph
-    /// transform cannot preserve (delays, events, companion network, noise
-    /// sources, op-vars, device limits, source shapes) are cleared; the time
-    /// symbol carries over.
-    fn transformed(
-        &self,
-        n_nodes: usize,
-        currents: Vec<ExprId>,
-        charges: Vec<ExprId>,
-        unknowns: Vec<String>,
-        kinds: Vec<UnknownKind>,
-        x: Vec<SymbolId>,
-    ) -> Dae {
-        Dae {
-            currents,
-            charges,
-            assertions: self.assertions.clone(),
-            structure: self.structure.clone(),
-            aliases: self.aliases.clone(),
-            n_nodes,
-            param_defaults: self.param_defaults.clone(),
-            unknowns,
-            kinds,
-            x,
-            t: self.t,
-            events: Vec::new(),
-            delays: Vec::new(),
-            companion: Vec::new(),
-            observers: Observers::default(),
-            // Name-keyed: seeds of surviving unknowns stay valid, the rest are
-            // ignored at lookup.
-            dc_seeds: self.dc_seeds.clone(),
-            limits: Vec::new(),
-            sources: Vec::new(),
-            source_names: Vec::new(),
-            labels: Default::default(),
-        }
-    }
-}
+use crate::rewrite::Rewrite;
+use crate::Dae;
 
 /// A row's terms: the summands of a `Reduce(Sum)`, nothing for zero, else the
 /// row itself.
@@ -134,13 +93,14 @@ pub(crate) fn merge_nodes(
     }
 
     let n_nodes = survivors.iter().filter(|&&i| i < nn).count();
-    let reduced = dae.transformed(
-        n_nodes,
-        new_i,
-        new_q,
-        survivors.iter().map(|&i| dae.unknowns[i].clone()).collect(),
-        survivors.iter().map(|&i| dae.kinds[i]).collect(),
-        survivors.iter().map(|&i| dae.x[i]).collect(),
+    let reduced = dae.rewrite(
+        ctx,
+        Rewrite {
+            rows: Some((new_i, new_q)),
+            keep: survivors.clone(),
+            n_nodes,
+            subst: merge,
+        },
     );
     (reduced, survivors)
 }
@@ -168,9 +128,12 @@ pub fn eliminate_nodes(ctx: &mut Graph, dae: &Dae, keep: &HashSet<String>) -> (D
     let mut currents = dae.currents.clone();
     let mut charges = dae.charges.clone();
     let mut unknowns = dae.unknowns.clone();
-    let mut kinds = dae.kinds.clone();
     let mut x = dae.x.clone();
     let mut is_node: Vec<bool> = (0..x.len()).map(|i| i < nn).collect();
+    // the original index of each unknown left, and what each eliminated
+    // voltage is in the ones left
+    let mut left: Vec<usize> = (0..x.len()).collect();
+    let mut subst: FxHashMap<SymbolId, ExprId> = FxHashMap::default();
 
     // Branch-current symbols never change (we only remove node unknowns); a node
     // whose KCL touches one anchors a source or inductor and is not eliminable.
@@ -223,6 +186,11 @@ pub fn eliminate_nodes(ctx: &mut Graph, dae: &Dae, keep: &HashSet<String>) -> (D
         let v_expr = ctx.mul(nb, ainv);
         let inline: FxHashMap<SymbolId, ExprId> = [(vi, v_expr)].into_iter().collect();
         let inlined = rsdag::substitute(ctx, &currents, &inline);
+        // the voltages eliminated before, now in the ones left
+        let (syms, exprs): (Vec<SymbolId>, Vec<ExprId>) = subst.drain().unzip();
+        let exprs = rsdag::substitute(ctx, &exprs, &inline);
+        subst.extend(syms.into_iter().zip(exprs));
+        subst.insert(vi, v_expr);
         for (j, row) in currents.iter_mut().enumerate() {
             if j != i {
                 *row = inlined[j];
@@ -232,13 +200,21 @@ pub fn eliminate_nodes(ctx: &mut Graph, dae: &Dae, keep: &HashSet<String>) -> (D
         currents.remove(i);
         charges.remove(i);
         unknowns.remove(i);
-        kinds.remove(i);
         x.remove(i);
         is_node.remove(i);
+        left.remove(i);
     }
 
     let n_nodes = nn - eliminated.len();
-    let reduced = dae.transformed(n_nodes, currents, charges, unknowns, kinds, x);
+    let reduced = dae.rewrite(
+        ctx,
+        Rewrite {
+            rows: Some((currents, charges)),
+            keep: left,
+            n_nodes,
+            subst,
+        },
+    );
     (reduced, eliminated)
 }
 
@@ -293,9 +269,21 @@ fn branch_terms(
             for e in terms_of(ctx, row) {
                 let (i, g) = term_importance(ctx, e, x_set, env);
                 out.push(if charge {
-                    Term { e, charge, i: 0.0, g: 0.0, c: g }
+                    Term {
+                        e,
+                        charge,
+                        i: 0.0,
+                        g: 0.0,
+                        c: g,
+                    }
                 } else {
-                    Term { e, charge, i, g, c: 0.0 }
+                    Term {
+                        e,
+                        charge,
+                        i,
+                        g,
+                        c: 0.0,
+                    }
                 });
             }
         }
@@ -318,8 +306,17 @@ fn element_of(ctx: &Graph, dae: &Dae, t: ExprId, x_all: &HashSet<SymbolId>) -> S
 /// DC operating-point evaluation environment (`t = 0`): each state bound to
 /// its operating value, time to zero, and the given parameters. Shared by the
 /// graph-reduction passes.
-fn dc_op_env(dae: &Dae, x_op: &[f64], p: &[(SymbolId, f64)]) -> HashMap<SymbolId, f64> {
+fn dc_op_env(
+    ctx: &mut Graph,
+    dae: &Dae,
+    x_op: &[f64],
+    p: &[(SymbolId, f64)],
+) -> HashMap<SymbolId, f64> {
     let mut env: HashMap<SymbolId, f64> = HashMap::new();
+    // noise generators are zero in every evaluation
+    for g in dae.observers.generators(ctx) {
+        env.insert(g, 0.0);
+    }
     for (i, &s) in dae.x.iter().enumerate() {
         env.insert(s, x_op.get(i).copied().unwrap_or(0.0));
     }
@@ -351,7 +348,20 @@ pub(crate) fn prune_graph(
     omegas: &[f64],
     rel_tol: f64,
 ) -> (Dae, Vec<(String, f64)>) {
-    let env = dc_op_env(dae, x_op, p);
+    let env = dc_op_env(ctx, dae, x_op, p);
+    // The noise generators and the element each belongs to (`R1` of
+    // `R1#noise`, `M1` of `M1#noise2`).
+    let owner: HashMap<SymbolId, String> = (dae.observers.generators(ctx).into_iter())
+        .map(|g| {
+            let name = ctx.symbol_name(g);
+            (
+                g,
+                name.split_once("#noise")
+                    .map_or(name, |(o, _)| o)
+                    .to_string(),
+            )
+        })
+        .collect();
 
     // Admittance is differentiated only w.r.t. node voltages (not branch-current
     // unknowns, whose self-derivative would be a spurious conductance of 1).
@@ -416,19 +426,51 @@ pub(crate) fn prune_graph(
                     max_rel = max_rel.max(a / nscale[j][w].max(1e-300));
                 }
             }
-            // Never prune a term coupling a branch-current unknown.
-            let structural = ctx.free_symbols(t.e).iter().any(|s| branch_i.contains(s));
+            // Never prune a term coupling a branch-current unknown, nor a
+            // noise generator on its own (it goes with its element, below).
+            let structural = (ctx.free_symbols(t.e).iter())
+                .any(|s| branch_i.contains(s) || owner.contains_key(s));
             if max_rel < rel_tol && !structural {
                 drop.insert((r, t.charge, t.e));
                 if let Some(j) = other {
                     drop.insert((j, t.charge, nt));
                 }
                 let name = element_of(ctx, dae, t.e, &x_all);
-                let name = if name.is_empty() { "?".to_string() } else { name };
+                let name = if name.is_empty() {
+                    "?".to_string()
+                } else {
+                    name
+                };
                 pruned
                     .entry(name)
                     .and_modify(|v| *v = v.min(max_rel))
                     .or_insert(max_rel);
+            }
+        }
+    }
+    // A noise generator goes where its element went: out of every row the
+    // element's terms all left.
+    for (r, ts) in terms.iter().enumerate() {
+        for t in ts.iter().filter(|t| !t.charge) {
+            let fs = ctx.free_symbols(t.e);
+            let Some(o) = fs.iter().find_map(|s| owner.get(s)) else {
+                continue;
+            };
+            let of_owner = |u: &&Term| {
+                !u.charge
+                    && u.e != t.e
+                    && (ctx.free_symbols(u.e).iter())
+                        .filter(|s| !owner.contains_key(s))
+                        .any(|s| {
+                            let n = ctx.symbol_name(*s);
+                            n == o
+                                || n.strip_prefix(o.as_str())
+                                    .is_some_and(|rest| rest.starts_with('.'))
+                        })
+            };
+            let mut own = ts.iter().filter(of_owner).peekable();
+            if own.peek().is_some() && own.all(|u| drop.contains(&(r, false, u.e))) {
+                drop.insert((r, false, t.e));
             }
         }
     }
@@ -439,8 +481,14 @@ pub(crate) fn prune_graph(
     let [currents, charges] = [false, true].map(|charge| {
         (0..n)
             .map(|r| {
-                let row = if charge { dae.charges[r] } else { dae.currents[r] };
-                if !(terms[r].iter()).any(|t| t.charge == charge && drop.contains(&(r, charge, t.e))) {
+                let row = if charge {
+                    dae.charges[r]
+                } else {
+                    dae.currents[r]
+                };
+                if !(terms[r].iter())
+                    .any(|t| t.charge == charge && drop.contains(&(r, charge, t.e)))
+                {
                     return row;
                 }
                 let kept: Vec<ExprId> = (terms[r].iter())
@@ -452,13 +500,14 @@ pub(crate) fn prune_graph(
             .collect::<Vec<_>>()
     });
 
-    let reduced = dae.transformed(
-        dae.n_nodes,
-        currents,
-        charges,
-        dae.unknowns.clone(),
-        dae.kinds.clone(),
-        dae.x.clone(),
+    let reduced = dae.rewrite(
+        ctx,
+        Rewrite {
+            rows: Some((currents, charges)),
+            keep: (0..n).collect(),
+            n_nodes: dae.n_nodes,
+            subst: FxHashMap::default(),
+        },
     );
     (reduced, pruned)
 }
@@ -568,7 +617,7 @@ pub fn reduce_graph(
     // SHORT first: merge near-wire branches' nodes, so the remaining admittance
     // scales are sane before the OPEN pass (a wire would otherwise dominate a
     // node's scale and make every real branch there look negligible).
-    let env = dc_op_env(dae, x_op, p);
+    let env = dc_op_env(ctx, dae, x_op, p);
     let (pairs, short_names) = detect_shorts(ctx, dae, &env, omegas, rel_tol);
     let (merged, survivors) = merge_nodes(ctx, dae, &pairs);
     let x_merged: Vec<f64> = survivors

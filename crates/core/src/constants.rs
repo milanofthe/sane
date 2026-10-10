@@ -108,11 +108,6 @@ pub const NEWTON_STALL_WINDOW: usize = 24;
 // `NEWTON_STALL_WINDOW` and cost 26 and 41 iterations through the cascade.
 /// See [`NEWTON_STALL_WINDOW`].
 pub const NEWTON_STALL_FACTOR: f64 = 0.95;
-/// Stage-Newton tolerance (WRMS update norm) of the adjoint's fixed-grid
-/// forward solve. Far tighter than the production stage tolerance: the
-/// discrete adjoint assumes the stage residuals vanish EXACTLY, and whatever
-/// Newton leaves behind leaks first-order error into the gradient.
-pub const ADJOINT_STAGE_TOL: f64 = 1e-9;
 
 /// Line-search step reduction factor (alpha *= this).
 pub const LINE_SEARCH_SHRINK: f64 = 0.5;
@@ -306,13 +301,13 @@ pub const ADAPT_DIAG_FRAC: f64 = 1e-3;
 pub const ADAPT_MAX_ITER: usize = 300;
 
 // ===========================================================================
-// Transient: ESDIRK32 integration
+// Transient integration (Rodas4, see `sane_solve::rosenbrock`)
 // ===========================================================================
 
-/// Transient (ESDIRK32) integration: relative tolerance. SPICE-like (`reltol`); a
+/// Transient integration: relative tolerance. SPICE-like (`reltol`); a
 /// tighter value forces tiny steps across stiff junction switching.
 pub const TRANSIENT_RTOL: f64 = 1e-4;
-/// Transient (ESDIRK32) integration: absolute tolerance. Acts as the floor near zero
+/// Transient integration: absolute tolerance. Acts as the floor near zero
 /// crossings; too tight (e.g. 1e-9 on node voltages) stalls the step controller.
 pub const TRANSIENT_ATOL: f64 = 1e-7;
 
@@ -328,45 +323,15 @@ pub const TRANSIENT_SPAN_EPS_FRAC: f64 = 1e-12;
 /// that the charges stay where the state put them.
 pub const TRANSIENT_IC_STEP_FRAC: f64 = 1e-3;
 
-// ===========================================================================
-// Transient: ESDIRK32 implicit Runge-Kutta integrator
-// ===========================================================================
-// ESDIRK32: Kvaerno's ESDIRK 3/2 (A. Kvaerno, "Singly diagonally implicit
-// Runge-Kutta methods with an explicit first stage", BIT 44, 2004). Four
-// stages, explicit first stage, order 3 with an embedded order-2 estimate;
-// BOTH the method and the embedded method are stiffly accurate (rows 4 and 3
-// of `A` are `b` and `b̂`, `c_3 = c_4 = 1`) and L-stable, so the error
-// estimate compares two solutions that each satisfy the algebraic constraints.
-// Every abscissa lies in `[0, 1]`: no stage is evaluated beyond the step end,
-// which is what lets a step land exactly on a breakpoint or a switching
-// surface with all its stages in the old mode. γ is the L-stable root of
-// `γ³ − 3γ² + 3γ/2 − 1/6 = 0`; the other entries are closed forms in γ
-// (see `a_ij` in the solver), written out to double precision.
-
-/// ESDIRK32 diagonal coefficient γ (the repeated SDIRK diagonal of the Butcher
-/// `A`). Sets the Newton matrix shift `α = 1/(hγ)`.
-pub const ESDIRK32_GAMMA: f64 = 0.435_866_521_508_459;
-/// ESDIRK32 stage count (explicit first stage + 3 implicit stages).
-pub const ESDIRK32_STAGES: usize = 4;
-/// ESDIRK32 stage abscissae `c_i` (stage times `t + c_i·h`): `(0, 2γ, 1, 1)`.
-pub const ESDIRK32_C: [f64; ESDIRK32_STAGES] = [0.0, 2.0 * ESDIRK32_GAMMA, 1.0, 1.0];
-/// ESDIRK32 embedded error weights `b − b̂` (row 4 minus row 3 of `A`), used
-/// by the step controller.
-pub const ESDIRK32_TR: [f64; ESDIRK32_STAGES] = [
-    -0.181_753_418_445_034_04,
-    1.416_993_298_352_020_1,
-    -1.671_106_401_415_445,
-    ESDIRK32_GAMMA,
-];
-
-/// IRK inner stage Newton: per-stage iteration budget.
-pub const IRK_STAGE_MAX_ITER: usize = 25;
-/// IRK inner stage Newton: the update tolerance, as a fraction of the
+/// Implicit Euler stage Newton (the consistent start and restarts): the
+/// iteration budget.
+pub const STAGE_MAX_ITER: usize = 25;
+/// Implicit Euler stage Newton: the update tolerance, as a fraction of the
 /// integration tolerance (`wn` is scaled by it), is Hairer-Wanner's (RADAU5
-/// `fnewt`) `max(10 eps / rtol, min(IRK_STAGE_TOL_MAX, sqrt(rtol)))`: a
+/// `fnewt`) `max(10 eps / rtol, min(STAGE_TOL_MAX, sqrt(rtol)))`: a
 /// Newton error far below the local error buys nothing, and a stage solved
 /// to the rounding of its charges cannot get below it.
-pub const IRK_STAGE_TOL_MAX: f64 = 0.03;
+pub const STAGE_TOL_MAX: f64 = 0.03;
 /// Newton (DC and transient stage): a system whose every residual row is
 /// within this many rounding units of the magnitudes it is computed from
 /// (`|J| |x|`, and a stage's charge terms) is solved to machine precision,
@@ -375,41 +340,30 @@ pub const IRK_STAGE_TOL_MAX: f64 = 0.03;
 /// charge difference `Q(X) - Q(xn)` of a large capacitor rounding at
 /// `ulp(Q)`).
 pub const NEWTON_ROUNDOFF: f64 = 64.0;
-/// IRK modified-Newton: refresh the frozen Jacobian when the update fails to
-/// contract by at least this factor (convergence rate θ = ‖Δₖ‖/‖Δₖ₋₁‖ too high).
-/// Loose, so the frozen factorization is genuinely reused on stiff stages (a few
-/// extra iterations cost less than a refactor + dF/dx eval).
-pub const IRK_STALL_THETA: f64 = 0.9;
+/// Implicit Euler stage modified Newton: refresh the frozen Jacobian when the
+/// update fails to contract by at least this factor (convergence rate
+/// θ = ‖Δₖ‖/‖Δₖ₋₁‖ too high).
+pub const STAGE_STALL_THETA: f64 = 0.9;
 
-/// IRK step-size controller (fastsim/pathsim ARKODE-style): safety factor on the
-/// predicted step.
-pub const IRK_SAFETY_BETA: f64 = 0.9;
-/// IRK step-size controller: smallest allowed per-step rescale factor.
-pub const IRK_SCALE_MIN: f64 = 0.1;
-/// IRK step-size controller: largest allowed per-step rescale factor.
-pub const IRK_SCALE_MAX: f64 = 2.0;
-/// IRK step-size controller: order of the embedded error estimate (`m + 1`,
-/// `m = 2` for ESDIRK32), i.e. the exponent in the I-controller `β / err^(1/p)`.
-pub const IRK_ERR_ORDER: f64 = 3.0;
-/// IRK step-size controller: error-norm floor to keep the controller well-defined
+/// Step-size controller: safety factor on the predicted step.
+pub const STEP_SAFETY: f64 = 0.9;
+/// Step-size controller: smallest allowed per-step rescale factor.
+pub const STEP_SCALE_MIN: f64 = 0.1;
+/// Step-size controller: largest allowed per-step rescale factor.
+pub const STEP_SCALE_MAX: f64 = 2.0;
+/// Step-size controller: error-norm floor to keep the controller well-defined
 /// when the embedded estimate is (near) zero.
-pub const IRK_ERR_FLOOR: f64 = 1e-16;
-/// IRK driver: step shrink factor applied when a stage Newton diverges (a too-large
-/// step through a fast region; a smaller `h` recovers convergence).
-pub const IRK_STEP_SHRINK: f64 = 0.25;
-/// IRK PI controller (Gustafsson): integral exponent `kI/p` on the current
+pub const STEP_ERR_FLOOR: f64 = 1e-16;
+/// Step shrink factor applied when a step fails (a stage leaves the finite
+/// numbers, a singular stage matrix).
+pub const STEP_SHRINK: f64 = 0.25;
+/// PI controller (Gustafsson): integral exponent `kI/p` on the current
 /// error. With `kP` below, the pair smooths the accepted-step sequence and cuts
 /// the reject rate of the pure I-controller (Hairer & Wanner IV.2 values).
-pub const IRK_PI_KI: f64 = 0.7;
-/// IRK PI controller: proportional exponent `kP/p` on the previous accepted
+pub const STEP_PI_KI: f64 = 0.7;
+/// PI controller: proportional exponent `kP/p` on the previous accepted
 /// error.
-pub const IRK_PI_KP: f64 = 0.4;
-/// Carry the stage factorization into the next step only when this step's
-/// Newton needed at most this many iterations per implicit stage -- a slow
-/// step means the frozen Jacobian has gone stale and the trade (saved
-/// refactors vs. extra iterations) has flipped. Self-regulating: fast-moving
-/// circuits refactor per step (old behavior), settled ones coast.
-pub const IRK_CARRY_MAX_ITERS_PER_STAGE: usize = 3;
+pub const STEP_PI_KP: f64 = 0.4;
 
 /// Harmonic balance: a Newton step is retracted (backtracking) only when it
 /// grew the residual max-norm by more than this factor. Newton is not

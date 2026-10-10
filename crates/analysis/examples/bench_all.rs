@@ -16,7 +16,7 @@
 
 use std::time::Instant;
 
-use sane_analysis::Model;
+use sane_analysis::{Model, TransientOptions};
 use sane_core::profile::{self, Profile};
 
 /// Run `f` with profile collection active; return (wall ms, captured profile).
@@ -103,7 +103,7 @@ fn run_circuit(path: &str, input: &str, output: &str) {
     report("build", true, ms, &prof);
 
     // OP first: reused (x, p) for the point-wise sensitivities.
-    let (op, ms, prof) = timed(|| model.operating_point(&[]));
+    let (op, ms, prof) = timed(|| model.at(&[]).and_then(|pt| pt.operating_point()));
     let op = match op {
         Ok(o) => {
             report("op", true, ms, &prof);
@@ -119,32 +119,30 @@ fn run_circuit(path: &str, input: &str, output: &str) {
     let p = model.pvec(&[]);
 
     // AC sweep.
-    let (r, ms, prof) = timed(|| model.ac(&[], input, output, 1.0, 1e8, 2000));
+    let freqs = sane_analysis::log_grid(1.0, 1e8, 2000);
+    let (r, ms, prof) = timed(|| model.at(&[]).and_then(|pt| pt.ac(input, &[output], &freqs)));
     report("ac", r.is_ok(), ms, &prof);
 
     // Noise sweep.
-    let (r, ms, prof) = timed(|| model.noise(&[], output, 1.0, 1e8, 2000));
+    let (r, ms, prof) = timed(|| model.at(&[]).and_then(|pt| pt.noise(&[output], &freqs)));
     report("noise", r.is_ok(), ms, &prof);
 
     // Transient over a short window (exercises the BDF path + DC IC).
     let t_eval: Vec<f64> = (0..=200).map(|k| k as f64 * 1e-6 / 200.0).collect();
     let (r, ms, prof) = timed(|| {
-        model.transient(
-            sane_solve::TransientMethod::Esdirk32,
-            &[],
-            &t_eval,
-            1e-4,
-            1e-7,
-        )
+        (model.at(&[])).and_then(|pt| pt.transient(&t_eval, &TransientOptions::default()))
     });
     report("transient", r.is_ok(), ms, &prof);
 
     // Pole/zero.
-    let (r, ms, prof) = timed(|| model.poles_zeros(&[], input, output));
+    let (r, ms, prof) = timed(|| {
+        let pt = model.at(&[])?;
+        Ok::<_, sane_analysis::ModelError>((pt.poles()?, pt.zeros(input, &[output])?))
+    });
     report("poles_zeros", r.is_ok(), ms, &prof);
 
     // DC sensitivity (adjoint) at the solved point -- no re-solve.
-    let (r, ms, prof) = timed(|| op.sensitivity(output));
+    let (r, ms, prof) = timed(|| op.sensitivity(&[output], &[]));
     report("sensitivity", r.is_ok(), ms, &prof);
     let _ = (&x, &p);
 

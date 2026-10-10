@@ -1,33 +1,32 @@
 //! `Model` -- the embeddable, Rust-first analysis object.
 //!
 //! A `Model` owns a prepared circuit (symbolic context, DAE, compiled solver) plus
-//! a named parameter store, and exposes every analysis as a single call that
-//! takes value overrides and returns a result *handle*. The handle keeps the
-//! solved state in Rust, so derived analyses (`op.sensitivity(..)`) run without a
-//! re-solve and nothing crosses a language boundary. This is the one
-//! orchestration layer; the Python bindings and the netlist front end are thin
-//! wrappers over it.
+//! a named parameter store. [`Model::at`] binds its parameters to a [`Point`],
+//! and every analysis is a method of the point that returns a result *handle*.
+//! The handle keeps the solved state in Rust, so derived analyses
+//! (`op.sensitivity(..)`) run without a re-solve and nothing crosses a language
+//! boundary. This is the one orchestration layer; the Python bindings and the
+//! netlist front end are thin wrappers over it.
 //!
 //! ```no_run
 //! use sane_analysis::Model;
 //! let sim = Model::from_netlist("V1 in 0 5\nR1 in out 1k\nR2 out 0 1k\n.end").unwrap();
-//! let op = sim.operating_point(&[]).unwrap();
-//! assert!((op.get("out").unwrap() - 2.5).abs() < 1e-9);
-//! sim.set("R2", 3e3).unwrap();                 // mutate a named parameter
-//! let op = sim.operating_point(&[]).unwrap();  // re-solve picks it up
+//! let op = sim.at(&[]).unwrap().operating_point().unwrap();
+//! assert!((op.get("out").unwrap() - 2.5).abs() < 1e-6);
+//! sim.set("R2", 3e3).unwrap();                              // mutate a named parameter
+//! let op = sim.at(&[]).unwrap().operating_point().unwrap(); // the binding picks it up
 //! ```
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use rsdag::{Node, SymbolId};
-use sane_core::constants::{DC_OP_MAXIT, DC_OP_TOL};
+use ndarray::{Array2, Array3, ArrayView1};
+use sane_circuit::Circuit;
+use sane_core::constants::DC_OP_MAXIT;
 use sane_core::log_stage;
 use sane_core::Graph;
-use sane_dae::linearize::linearize;
-use sane_dae::{eliminate_nodes as dae_eliminate_nodes, reduce_graph};
-use sane_solve::{CompiledDc, Convergence, SolverTricks, TransientMethod};
+use sane_solve::{CompiledDc, Convergence, SolverTricks};
 
 use crate::{prepare, Prepared};
 
@@ -143,7 +142,7 @@ impl ParamStore {
         if pset.contains(name) {
             return Some(name.to_string());
         }
-        let r = sane_mna::value_symbol_name(name);
+        let r = sane_circuit::value_symbol_name(name);
         if pset.contains(&r) {
             Some(r)
         } else {
@@ -229,8 +228,8 @@ struct ModelInner {
     /// source cutsets), detected once at build time. Transient consults it:
     /// such a circuit's hidden constraint carries no truncation error, so the
     /// step controller has nothing to control and would otherwise stride past
-    /// the requested resolution. See `sane_mna::index2`.
-    index2: sane_mna::index2::Index2Report,
+    /// the requested resolution. See `sane_circuit::index2`.
+    index2: sane_circuit::index2::Index2Report,
     store: ParamStore,
     unknowns: Vec<String>,
     node_names: Vec<String>,
@@ -243,6 +242,8 @@ struct ModelInner {
     /// symbolic scaffolding built once per input, so the per-frequency work
     /// is pure evaluation (no context growth).
     ac_vjp_tapes: Mutex<HashMap<String, ac::AcVjpTape>>,
+    /// How its operating points are solved (see [`Model::dc_options`]).
+    dc: Mutex<DcOptions>,
     /// The devices' assertions (see [`sane_dae::Dae::assertions`]) compiled
     /// over the parameter vector, with their messages; `None` without any.
     assertions: Option<(rsdag::Tape, Vec<String>)>,
@@ -252,12 +253,11 @@ struct ModelInner {
     /// For a model built from a netlist, what it sets its other structures
     /// up from (see [`restructure`]).
     restructure: Option<restructure::Restructure>,
-    /// Last converged DC operating point `(p, x)`, so a run of analyses at the
-    /// same parameter point (op, then ac, noise, pole-zero, ...) solves the DC
-    /// once instead of per analysis. Keyed on the full parameter vector, so any
-    /// parameter change (override or `set`) is an automatic cache miss; a hit
-    /// returns exactly what a cold re-solve would, so results are unchanged.
-    op_cache: Mutex<Option<(Vec<f64>, Vec<f64>, Option<f64>)>>,
+    /// The circuit the model was set up from, or derives from.
+    circuit: Option<Arc<Circuit>>,
+    /// The transforms the model was derived by from the circuit's (see
+    /// [`transform`]); empty for the circuit's own.
+    lineage: Vec<transform::Transform>,
 }
 
 /// The embeddable analysis object. Cheap to clone (shares one inner via `Arc`).
@@ -271,10 +271,10 @@ struct ModelInner {
 /// elements responsible and points at `dt_max`, which already exists for
 /// bounding the step. It does not bound it on the caller's behalf.
 fn detect_index2(
-    elements: &[sane_mna::Element],
+    elements: &[sane_circuit::Element],
     terminals: &[Vec<usize>],
-) -> sane_mna::index2::Index2Report {
-    let rep = sane_mna::index2::detect(elements, terminals);
+) -> sane_circuit::index2::Index2Report {
+    let rep = sane_circuit::index2::detect(elements, terminals);
     if rep.is_index2() {
         sane_core::log::warn_captured(&format!(
             "index-2 topology ({}): its constraint carries no truncation error, so the adaptive transient step may stride past the resolution you asked for -- set dt_max if the trace looks coarse",
@@ -306,67 +306,62 @@ pub struct Model {
 }
 
 impl Model {
-    /// Build a `Model` from a SPICE-like netlist string.
+    /// Build a `Model` from a SPICE-like netlist string: the parsed
+    /// circuit's model (see [`new`](Self::new)).
     pub fn from_netlist(src: &str) -> Result<Model, ModelError> {
-        Model::build(src, &|_| None, true)
-    }
-
-    /// The model of `src` with its devices' structure decided at `values`
-    /// (by parameter name) where those set a parameter; a `root` keeps the
-    /// netlist to set its other structures up from (see [`restructure`]).
-    fn build(
-        src: &str,
-        values: &dyn Fn(&str) -> Option<f64>,
-        root: bool,
-    ) -> Result<Model, ModelError> {
-        let parsed = log_stage!("parse", sane_netlist::parse(src))
+        let circuit = log_stage!("parse", sane_netlist::parse(src))
             .map_err(|e| ModelError::Parse(format!("parse error: {e}")))?;
-        Model::set_up(&parsed, src, values, root)
+        Model::new(circuit)
     }
 
-    /// The model of a parsed (or built) circuit, its devices' structure at
-    /// its own values. `netlist` is the text it was parsed from, unedited
-    /// since: its `.nodeset` directives seed the operating point, and a
-    /// binding across a device topology sets the circuit up anew from it.
-    /// Without one, such a binding is refused.
-    pub fn from_parsed(
-        parsed: &sane_netlist::ParsedCircuit,
-        netlist: Option<&str>,
-    ) -> Result<Model, ModelError> {
-        Model::set_up(parsed, netlist.unwrap_or(""), &|_| None, netlist.is_some())
+    /// The model of a circuit, its devices' structure at the circuit's own
+    /// values. The model keeps the circuit: a binding across a device's
+    /// structure decision sets the circuit up anew at that binding (see
+    /// [`restructure`]), and [`circuit`](Self::circuit) hands it back to
+    /// build on.
+    pub fn new(circuit: impl Into<Arc<Circuit>>) -> Result<Model, ModelError> {
+        Model::set_up(circuit.into(), &|_| None, true)
     }
 
-    /// [`build`](Self::build) after the parse: `src` the netlist (empty for
-    /// a built circuit), a `root` setting its other structures up from it.
-    fn set_up(
-        parsed: &sane_netlist::ParsedCircuit,
-        src: &str,
+    /// The circuit this model was set up from; a transform's (see
+    /// [`fold`](Self::fold), [`linearize`](Self::linearize), ...) the one
+    /// it derives from.
+    pub fn circuit(&self) -> Option<&Arc<Circuit>> {
+        self.inner.circuit.as_ref()
+    }
+
+    /// The model of `circuit` with its devices' structure decided at
+    /// `values` (by parameter name) where those set a parameter; a `root`
+    /// sets its other structures up from the circuit (see [`restructure`]).
+    pub(super) fn set_up(
+        circuit: Arc<Circuit>,
         values: &dyn Fn(&str) -> Option<f64>,
         root: bool,
     ) -> Result<Model, ModelError> {
         let mut task = sane_core::log::task("EXTRACT", "extract", "");
-        let Prepared { ctx, dae, cdc } =
-            prepare(parsed, &crate::parse_nodeset(src), values).map_err(ModelError::Parse)?;
+        let Prepared { ctx, dae, cdc } = prepare(&circuit, values).map_err(ModelError::Parse)?;
         let pnames = cdc.param_names(&ctx);
         task.finish(format!("dim: {}, params: {}", dae.dim(), pnames.len()));
-        let (elements, terminals) =
-            sane_dae::topology(&parsed.circuit, &parsed.devices, &parsed.instances);
+        let (elements, terminals) = sane_circuit::topology(&circuit);
         let index2 = detect_index2(&elements, &terminals);
         let store = ParamStore::new(
             pnames,
-            parsed.values.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            circuit
+                .values
+                .iter()
+                .map(|(k, v)| (k.clone(), *v))
+                .collect(),
             column_defaults(&cdc, &dae),
         );
         let unknowns = dae.unknowns.clone();
-        let node_names = parsed.node_names.clone();
-        let ports = parsed
-            .ports
-            .iter()
+        let node_names = circuit.node_names();
+        let ports = (circuit.ports.iter())
             .map(|pt| (pt.name.clone(), pt.node.clone(), pt.z0))
             .collect();
         let assertions = assertion_tape(&ctx, &dae.assertions, &cdc);
         let structure = assertion_tape(&ctx, &dae.structure, &cdc);
-        let restructure = (root && structure.is_some()).then(|| restructure::Restructure::new(src));
+        let restructure = (root && structure.is_some()).then(restructure::Restructure::default);
+        let dc = Mutex::new(DcOptions::from_circuit(&circuit.dc));
         Ok(Model {
             inner: Arc::new(ModelInner {
                 ctx: Arc::new(Mutex::new(ctx)),
@@ -380,55 +375,24 @@ impl Model {
                 assertions,
                 structure,
                 restructure,
+                circuit: Some(circuit),
+                lineage: Vec::new(),
                 ac_vjp_tapes: Mutex::new(HashMap::new()),
-                op_cache: Mutex::new(None),
+                dc,
             }),
         })
     }
 
-    /// Build a `Model` from already-compiled parts that **share** an existing
-    /// symbolic context (e.g. a graph transform: prune / eliminate / linearize
-    /// produces a new DAE on the same arena). The shared `Arc<Mutex<Graph>>`
-    /// keeps symbol ids consistent, so expression handles interoperate.
-    pub fn from_parts(
-        ctx: Arc<Mutex<Graph>>,
-        dae: sane_dae::Dae,
-        cdc: CompiledDc,
-        values: HashMap<String, f64>,
-        node_names: Vec<String>,
-        // the element graph the DAE came from and its devices' terminals
-        // (they conduct, so they break cutsets), in the top frame (see
-        // `sane_dae::topology`), for topological index detection; None for
-        // models assembled without one
-        topology: Option<(&[sane_mna::Element], &[Vec<usize>])>,
-    ) -> Model {
-        let pnames = {
-            let c = ctx.lock().unwrap();
-            cdc.param_names(&c)
-        };
-        let store = ParamStore::new(pnames, values, column_defaults(&cdc, &dae));
-        let unknowns = dae.unknowns.clone();
-        let assertions = assertion_tape(&ctx.lock().unwrap(), &dae.assertions, &cdc);
-        let structure = assertion_tape(&ctx.lock().unwrap(), &dae.structure, &cdc);
-        Model {
-            inner: Arc::new(ModelInner {
-                structure,
-                restructure: None,
-                ctx,
-                dae,
-                cdc,
-                index2: topology
-                    .map(|(e, t)| detect_index2(e, t))
-                    .unwrap_or_default(),
-                store,
-                unknowns,
-                node_names,
-                ports: Vec::new(),
-                assertions,
-                ac_vjp_tapes: Mutex::new(HashMap::new()),
-                op_cache: Mutex::new(None),
-            }),
-        }
+    /// How the operating points of this model are solved: its deck's
+    /// `.option reltol/abstol/vntol/itl1` over the defaults, unless set.
+    pub fn dc_options(&self) -> DcOptions {
+        *self.inner.dc.lock().unwrap()
+    }
+
+    /// Solve the operating points of the points taken from now on as `opts`
+    /// says (a point keeps the options it was taken with).
+    pub fn set_dc_options(&self, opts: DcOptions) {
+        *self.inner.dc.lock().unwrap() = opts;
     }
 
     // --- introspection ---
@@ -503,19 +467,6 @@ impl Model {
             .unwrap_or(0.0)
     }
 
-    /// The circuit temperature `$temp` [K] (deck `.temp`, defaulting to nominal).
-    /// Drives resistor thermal noise even when no device makes it a DC parameter.
-    pub(crate) fn temp_k(&self) -> f64 {
-        self.inner
-            .store
-            .values
-            .lock()
-            .unwrap()
-            .get(sane_core::constants::TEMP_SYMBOL)
-            .copied()
-            .unwrap_or(sane_core::constants::TEMP_NOMINAL_K)
-    }
-
     // --- parameter store ---
 
     /// Read a parameter's bound value (or `0.0` if unset); `None` if not a parameter.
@@ -564,9 +515,13 @@ impl Model {
     pub fn is_group(&self, name: &str) -> bool {
         self.inner.store.prefixes.contains(name)
     }
-    /// Direct children (next path segment) of a parameter group, sorted.
+    /// Direct children (next path segment) of a parameter group (`""` for
+    /// the top level), sorted.
     pub fn children(&self, prefix: &str) -> Vec<String> {
-        let pre = format!("{prefix}.");
+        let pre = match prefix {
+            "" => String::new(),
+            p => format!("{p}."),
+        };
         let mut kids = HashSet::new();
         for p in &self.inner.store.pnames {
             if let Some(rest) = p.strip_prefix(&pre) {
@@ -590,649 +545,44 @@ impl Model {
     }
 
     // --- analyses ---
+}
 
-    /// Solve the DC operating point with optional per-call value overrides.
-    pub fn operating_point(&self, overrides: &[(&str, f64)]) -> Result<OperatingPoint, ModelError> {
-        if let Some(o) = self.restructured(overrides)? {
-            let op = o.model.operating_point(&o.overrides())?;
-            let shown = o.layout.map(&op.x);
-            return Ok(OperatingPoint {
-                shown: Some((self.inner.clone(), shown)),
-                ..op
-            });
-        }
-        let mut task = sane_core::log::task("DC", "dc", &format!("(dim: {})", self.dim()));
-        let (x, p, regularized_at_gmin) = self.inner.solve_dc_reg(overrides)?;
-        task.finish(match regularized_at_gmin {
-            Some(g) => format!("converged: True, gmin-regularized: {g:.1e}"),
-            None => "converged: True".to_string(),
-        });
-        Ok(OperatingPoint {
-            sim: self.inner.clone(),
-            x,
-            p,
-            regularized_at_gmin,
-            shown: None,
-        })
-    }
-
-    /// Transient response over `t_eval`, labeled. The ergonomic Rust entry: a thin
-    /// convenience over the single [`Model::solve_transient`] engine path --
-    /// resolve `overrides` to the parameter vector, integrate with `method` from
-    /// the consistent DC start, and label the rows.
-    pub fn transient(
+impl ModelInner {
+    /// The symbols the source `input` drives the small-signal response
+    /// through (see [`crate::drive_params`]).
+    pub(crate) fn drive(
         &self,
-        method: TransientMethod,
-        overrides: &[(&str, f64)],
-        t_eval: &[f64],
-        rtol: f64,
-        atol: f64,
-    ) -> Result<Trajectory, ModelError> {
-        if let Some(o) = self.restructured(overrides)? {
-            let tr = o
-                .model
-                .transient(method, &o.overrides(), t_eval, rtol, atol)?;
-            let shown = Some(o.rows(tr.rows.clone()));
-            return Ok(Trajectory { shown, ..tr });
-        }
-        let p = self.inner.checked_pvec(overrides)?;
-        let rows = self.solve_transient(method, p, t_eval.to_vec(), None, rtol, atol, None)?;
-        Ok(Trajectory {
-            sim: self.inner.clone(),
-            t: t_eval.to_vec(),
-            rows,
-            shown: None,
-        })
-    }
-
-    /// The switching events of the most recent transient (any entry path):
-    /// `(surface name, time, direction)`, direction `+1` for the surface
-    /// expression rising through zero, `-1` falling. Surfaces are declared by
-    /// the devices (Verilog-A `@(cross ...)`, switch thresholds).
-    pub fn transient_events(&self) -> Vec<(String, f64, i8)> {
-        let last = self.inner.last_solved();
-        let cdc = last.as_ref().map_or(&self.inner.cdc, |(m, _)| &m.cdc);
-        let names = cdc.event_names();
-        cdc.last_transient_events()
-            .into_iter()
-            .map(|e| (names[e.index].clone(), e.t, e.direction))
-            .collect()
-    }
-
-    /// Small-signal noise spectrum at `output` over `[fstart, fstop]`, linearised
-    /// at the operating point (returns frequencies and total output noise PSD).
-    pub fn noise(
-        &self,
-        overrides: &[(&str, f64)],
-        output: &str,
-        fstart: f64,
-        fstop: f64,
-        points: usize,
-    ) -> Result<NoiseSpectrum, ModelError> {
-        if let Some(o) = self.restructured(overrides)? {
-            return o.model.noise(&o.overrides(), output, fstart, fstop, points);
-        }
-        let (x, p) = self.inner.solve_dc(overrides)?;
-        let out_idx = self
-            .resolve(output)
-            .ok_or_else(|| ModelError::UnknownRef(output.to_string()))?;
-        let temp_k = self.temp_k();
-        let mut ctx = self.inner.ctx.lock().unwrap();
-        let (freqs, psd) = crate::noise_on_dae(
-            &mut ctx,
-            &self.inner.dae,
-            &self.inner.cdc,
-            out_idx,
-            &x,
-            &p,
-            fstart,
-            fstop,
-            points,
-            temp_k,
-        )
-        .map_err(ModelError::Numeric)?;
-        Ok(NoiseSpectrum { freqs, psd })
-    }
-    /// Linearised descriptor state-space `(E, A, B, C, D)` at the operating point:
-    /// `E x' = A x + B u`, `y = C x + D u`.
-    pub fn state_space(
-        &self,
-        overrides: &[(&str, f64)],
+        c: &mut Graph,
         input: &str,
-        output: &str,
-    ) -> Result<StateSpace, ModelError> {
-        if let Some(o) = self.restructured(overrides)? {
-            return o.model.state_space(&o.overrides(), input, output);
-        }
-        let (x, p) = self.inner.solve_dc(overrides)?;
-        let out_idx = self
-            .resolve(output)
-            .ok_or_else(|| ModelError::UnknownRef(output.to_string()))?;
-        let mut ctx = self.inner.ctx.lock().unwrap();
-        let (e, a, b, c, d) = crate::state_space_on_dae(
-            &mut ctx,
-            &self.inner.dae,
-            &self.inner.cdc,
-            input,
-            out_idx,
-            &x,
-            &p,
-        );
-        Ok(StateSpace {
-            e,
-            a,
-            b,
-            c,
-            d,
-            input: input.to_string(),
-            output: output.to_string(),
-        })
-    }
-
-    /// Sweep `output` over temperature `[t0, t1]` (deg C), re-solving the
-    /// operating point at each step. Returns only converged points.
-    pub fn temp_sweep(
-        &self,
-        overrides: &[(&str, f64)],
-        output: &str,
-        t0: f64,
-        t1: f64,
-        points: usize,
-    ) -> Result<TempSweep, ModelError> {
-        // The temperature decides no structure (a topology condition reads
-        // parameters only), so the sweep stays in the binding's.
-        if let Some(o) = self.restructured(overrides)? {
-            return o.model.temp_sweep(&o.overrides(), output, t0, t1, points);
-        }
-        let p0 = self.inner.checked_pvec(overrides)?;
-        let out_idx = self
-            .resolve(output)
-            .ok_or_else(|| ModelError::UnknownRef(output.to_string()))?;
-        let (temps, values) = crate::temp_sweep_on_dae(
-            &self.inner.cdc,
-            &self.inner.store.pnames,
-            out_idx,
-            &p0,
-            t0,
-            t1,
-            points,
-        )
-        .map_err(ModelError::Numeric)?;
-        Ok(TempSweep {
-            temps,
-            values,
-            output: output.to_string(),
-        })
-    }
-
-    /// Balanced/pole-residue reduced model of `output/input` to `order`, fit over
-    /// `[fstart, fstop]`. Returns the magnitude response of full vs reduced and
-    /// the kept poles/zeros.
-    pub fn model_reduce(
-        &self,
-        overrides: &[(&str, f64)],
-        input: &str,
-        output: &str,
-        order: usize,
-        fstart: f64,
-        fstop: f64,
-        points: usize,
-    ) -> Result<ReducedModel, ModelError> {
-        if let Some(o) = self.restructured(overrides)? {
-            return o.model.model_reduce(
-                &o.overrides(),
-                input,
-                output,
-                order,
-                fstart,
-                fstop,
-                points,
-            );
-        }
-        let (x, p) = self.inner.solve_dc(overrides)?;
-        let out_idx = self
-            .resolve(output)
-            .ok_or_else(|| ModelError::UnknownRef(output.to_string()))?;
-        let mut ctx = self.inner.ctx.lock().unwrap();
-        let (freqs, full_db, red_db, poles, zeros, max_err_db) = crate::model_reduce_on_dae(
-            &mut ctx,
-            &self.inner.dae,
-            &self.inner.cdc,
-            input,
-            out_idx,
-            &x,
-            &p,
-            order,
-            fstart,
-            fstop,
-            points,
-        )
-        .map_err(ModelError::Numeric)?;
-        Ok(ReducedModel {
-            freqs,
-            full_db,
-            red_db,
-            poles,
-            zeros,
-            max_err_db,
-        })
-    }
-
-    /// Sweep a source (or any parameter) linearly over `[start, stop]` in `step`
-    /// increments, re-solving the DC operating point at each value. Warm-starts
-    /// each point from the previous solution (falling back to a cold solve on
-    /// non-convergence) so a nonlinear sweep converges in a few iterations per
-    /// point while matching the cold result. Non-converging points are dropped;
-    /// the returned [`DcSweep`] carries only the converged sweep values and the
-    /// labeled state at each.
-    pub fn dc_sweep(
-        &self,
-        source: &str,
-        start: f64,
-        stop: f64,
-        step: f64,
-    ) -> Result<DcSweep, ModelError> {
-        if step == 0.0 || (stop - start).signum() != step.signum() {
-            return Err(ModelError::Numeric(
-                "DC sweep needs a non-zero step in the start->stop direction".into(),
-            ));
-        }
-        let col = self
-            .param_col(source)
-            .ok_or_else(|| ModelError::UnknownParam(source.to_string()))?;
-        let base = self.inner.store.pvec(&[]);
-        let n = self.dim();
-        let npts = (((stop - start) / step).abs().round() as usize).min(100_000) + 1;
-        let mut sweep = Vec::new();
-        let mut rows: Vec<Vec<f64>> = Vec::new();
-        let mut solved = Vec::new();
-        // Warm start from the previous converged point; a warm point that fails
-        // retries cold before being dropped, so results match a cold sweep.
-        let mut warm: Vec<f64> = Vec::new();
-        for k in 0..npts {
-            let v = start + step * k as f64;
-            let mut p = base.clone();
-            p[col] = v;
-            // Each point is a binding: checked, and solved in its structure.
-            let other = self.restructured_at(&p)?;
-            // The point in its model: the state there, and here.
-            let solve = |warm: &[f64]| match &other {
-                None => {
-                    let (x, conv, _) = self.inner.cdc.solve_dc(&p, warm, DC_OP_TOL, DC_OP_MAXIT);
-                    (x, None, conv)
-                }
-                Some(o) => {
-                    let warm = if warm.len() == n {
-                        o.state(warm, 0.0)
-                    } else {
-                        Vec::new()
-                    };
-                    let (x, conv, _) =
-                        o.model
-                            .inner
-                            .cdc
-                            .solve_dc(&o.p(), &warm, DC_OP_TOL, DC_OP_MAXIT);
-                    (o.layout.map(&x), Some((o.model.inner.clone(), x)), conv)
-                }
-            };
-            let (mut x, mut there, mut conv) = solve(&warm);
-            if !conv && !warm.is_empty() {
-                (x, there, conv) = solve(&[]);
-            }
-            if !conv {
-                warm.clear();
-                continue;
-            }
-            warm = x.clone();
-            sweep.push(v);
-            rows.push(x);
-            solved.push(there);
-        }
-        if sweep.is_empty() {
-            return Err(ModelError::Numeric(
-                "DC sweep did not converge at any point".into(),
-            ));
-        }
-        Ok(DcSweep {
-            sim: self.inner.clone(),
-            sweep,
-            rows,
-            solved,
-        })
-    }
-
-    /// Small-signal AC magnitude/phase response of `output` to source `input`,
-    /// swept logarithmically over `[fstart, fstop]`, linearised at the OP.
-    pub fn ac(
-        &self,
-        overrides: &[(&str, f64)],
-        input: &str,
-        output: &str,
-        fstart: f64,
-        fstop: f64,
-        points: usize,
-    ) -> Result<AcResponse, ModelError> {
-        if let Some(o) = self.restructured(overrides)? {
-            return o
-                .model
-                .ac(&o.overrides(), input, output, fstart, fstop, points);
-        }
-        let (x, p) = self.inner.solve_dc(overrides)?;
-        let out_idx = self
-            .resolve(output)
-            .ok_or_else(|| ModelError::UnknownRef(output.to_string()))?;
-        let (freqs, mag_db, phase_deg) =
-            self.ac_sweep(input, out_idx, x, p, fstart, fstop, points)?;
-        Ok(AcResponse {
-            freqs,
-            mag_db,
-            phase_deg,
-            input: input.to_string(),
-            output: output.to_string(),
-        })
-    }
-
-    /// Scattering parameters over the deck's `P` power ports (deck order).
-    ///
-    /// Each port is the Thevenin form the `P` element lowers to: an ideal
-    /// drive source behind its `z0` series resistor, port node on the network
-    /// side. Then `S_ij = 2*sqrt(z0_j/z0_i) * V_i - delta_ij` under unit drive
-    /// of source j, so each column is one complex AC sweep with every other
-    /// port source dead. Returns the sweep as `(freqs, s, port_names, z0)`
-    /// with `s[k]` the flattened row-major `n x n` matrix at `freqs[k]`.
-    pub fn sp_sweep(
-        &self,
-        overrides: &[(&str, f64)],
-        freqs_hz: Vec<f64>,
-    ) -> Result<SpSweep, ModelError> {
-        if let Some(o) = self.restructured(overrides)? {
-            return o.model.sp_sweep(&o.overrides(), freqs_hz);
-        }
-        let ports = self.inner.ports.clone();
-        if ports.is_empty() {
-            return Err(ModelError::Numeric(
-                "sp: the deck has no P port elements (e.g. `P1 in 0 Z0=50`)".into(),
-            ));
-        }
-        let (x, p) = self.inner.solve_dc(overrides)?;
-        let mut spec = Vec::with_capacity(ports.len());
-        for (src, node, z0) in &ports {
-            let idx = self
-                .resolve(node)
-                .ok_or_else(|| ModelError::UnknownRef(node.clone()))?;
-            spec.push((src.clone(), idx, *z0));
-        }
-        let s = self.sp_response(&spec, x, p, freqs_hz.clone())?;
-        Ok(SpSweep {
-            freqs: freqs_hz,
-            s,
-            port_names: ports.iter().map(|p| p.0.clone()).collect(),
-            z0: ports.iter().map(|p| p.2).collect(),
-        })
-    }
-
-    /// Poles (natural frequencies of the small-signal pencil `G + sC`) and, if
-    /// `input`/`output` are given, the transmission zeros from input to output.
-    pub fn poles_zeros(
-        &self,
-        overrides: &[(&str, f64)],
-        input: &str,
-        output: &str,
-    ) -> Result<PoleZero, ModelError> {
-        if let Some(o) = self.restructured(overrides)? {
-            return o.model.poles_zeros(&o.overrides(), input, output);
-        }
-        if self.cdc().has_delays() {
-            return Err(ModelError::Numeric(
-                "poles_zeros: transport delays (tline/absdelay) are not supported yet".into(),
-            ));
-        }
-        let mut task = sane_core::log::task("PZ", "pz", &format!("(dim: {})", self.dim()));
-        let (x, p) = self.inner.solve_dc(overrides)?;
-        let n = self.dim();
-        let mut ctx = self.inner.ctx.lock().unwrap();
-        let g = self.inner.cdc.system_matrix_dc(&x, &p, 0.0);
-        let c = self.inner.cdc.jacobian_q_x(&x, &p, 0.0);
-        let poles = crate::finite_pencil_roots(&g, &c).map_err(ModelError::Numeric)?;
-        let mut zeros = Vec::new();
-        if !input.trim().is_empty() && !output.trim().is_empty() {
-            if let (Some(out_idx), Some(b_real)) = (
-                resolve_ref(&self.inner.unknowns, &self.inner.node_names, output),
-                crate::input_vector(
-                    &mut ctx,
-                    &self.inner.dae,
-                    &self.inner.store.pnames,
-                    &p,
-                    &x,
-                    input,
-                ),
-            ) {
-                let mut m = vec![vec![0.0; n + 1]; n + 1];
-                let mut nn = vec![vec![0.0; n + 1]; n + 1];
-                for i in 0..n {
-                    for j in 0..n {
-                        m[i][j] = g[i][j];
-                        nn[i][j] = c[i][j];
-                    }
-                    m[i][n] = b_real[i];
-                    m[n][i] = if i == out_idx { 1.0 } else { 0.0 };
-                }
-                if let Ok(zs) = crate::finite_pencil_roots(&m, &nn) {
-                    zeros = zs;
-                }
-            }
-        }
-        task.finish(format!("poles: {}, zeros: {}", poles.len(), zeros.len()));
-        Ok(PoleZero { poles, zeros })
-    }
-
-    /// Single-tone harmonic balance at fundamental `f0` (Hz) with `harmonics`
-    /// harmonics (AFT). The periodic drive comes from a `SIN` source in the deck;
-    /// passing `f0 <= 0` infers the fundamental from that source.
-    pub fn harmonic_balance(
-        &self,
-        overrides: &[(&str, f64)],
-        f0: f64,
-        harmonics: usize,
-        x0: Option<&[f64]>,
-    ) -> Result<HarmonicBalance, ModelError> {
-        if let Some(o) = self.restructured(overrides)? {
-            // Its spectra are read by name, in the model they were solved in.
-            let x0 = x0.map(|x| o.state(x, 0.0));
-            return o
-                .model
-                .harmonic_balance(&o.overrides(), f0, harmonics, x0.as_deref());
-        }
-        if self.inner.cdc.has_delays() {
-            return Err(ModelError::Numeric(
-                "harmonic_balance: transport delays (tline/absdelay) are not supported yet".into(),
-            ));
-        }
-        // A caller-supplied operating point (e.g. a node-set basin for a
-        // multi-solution circuit such as an auto-zeroing chopper) seeds the HB DC
-        // and its first Newton iterate, instead of a fresh cold DC solve that may
-        // land in the wrong basin.
-        let (x_dc, p) = match x0 {
-            Some(v) if v.len() == self.inner.dae.dim() => {
-                (v.to_vec(), self.inner.checked_pvec(overrides)?)
-            }
-            _ => self.inner.solve_dc(overrides)?,
+    ) -> Result<Vec<rsdag::SymbolId>, ModelError> {
+        let own = self.store.resolve(input);
+        let names = match &own {
+            Some(own) => std::slice::from_ref(own),
+            None => &self.store.pnames[..],
         };
-        // Default the fundamental to the circuit's own periodic source (a SIN's
-        // frequency, a PULSE train's 1/period) when the caller does not pin one.
-        let f0 = if f0 > 0.0 {
-            f0
-        } else {
-            self.inner.cdc.source_fundamental(&p).ok_or_else(|| {
-                ModelError::Numeric(
-                    "harmonic balance needs f0 > 0 (no periodic source to infer it from)".into(),
-                )
-            })?
-        };
-        let mut task = sane_core::log::task(
-            "HB",
-            "hb",
-            &format!(
-                "(f0: {f0:.4e}, harmonics: {harmonics}, dim: {})",
-                self.dim()
-            ),
-        );
-        let ctx = self.inner.ctx.lock().unwrap();
-        let nl = self.inner.dae.nonlinearity(&ctx);
-        let m = sane_solve::hb::hb_samples(&nl, harmonics, 16);
-        let hb = log_stage!(
-            "hb/setup",
-            sane_solve::hb::CompiledHb::new(&self.inner.cdc, harmonics, m).ok_or_else(|| {
-                ModelError::Numeric("harmonic balance setup failed (need samples >= 2*K)".into())
-            })
-        )?;
-        let res = log_stage!(
-            "hb/solve",
-            hb.solve(&p, &x_dc, 2.0 * std::f64::consts::PI * f0, 1e-10, 60)
-        );
-        // Per-unknown magnitude/phase spectra (index 0 = DC, 1 = fundamental, ...).
-        let mag: Vec<Vec<f64>> = res
-            .spectra
-            .iter()
-            .map(|r| r.iter().map(|c| c.norm()).collect())
-            .collect();
-        let phase: Vec<Vec<f64>> = res
-            .spectra
-            .iter()
-            .map(|r| r.iter().map(|c| c.arg().to_degrees()).collect())
-            .collect();
-        task.finish(format!(
-            "converged: {}, iters: {}, residual: {:.2e}",
-            res.converged, res.iters, res.residual_norm
-        ));
-        Ok(HarmonicBalance {
-            sim: self.inner.clone(),
-            mag,
-            phase,
-            converged: res.converged,
+        crate::drive_syms(c, names, input).ok_or_else(|| {
+            ModelError::Invalid(format!(
+                "'{input}' drives nothing: neither its value nor its waveform's level is a parameter of the model (a folded source drives nothing)"
+            ))
         })
     }
 
-    /// Column index of a parameter in the engine's order, or `None`.
-    fn param_col(&self, name: &str) -> Option<usize> {
-        let canon = self.inner.store.resolve(name)?;
-        self.inner.store.pnames.iter().position(|n| *n == canon)
+    /// The column of the parameter `name` (or its reserved-namespace form).
+    pub(crate) fn column(&self, name: &str) -> Option<usize> {
+        let canon = self.store.resolve(name)?;
+        self.store.pnames.iter().position(|n| *n == canon)
     }
 
-    // --- graph transforms (return a new Model sharing this context) --------
-
-    /// Operating-point-guided graph reduction at `(x, p)`: drop branch
-    /// contributions negligible (conductance/capacitance) at the given angular
-    /// frequencies. Returns a reduced `Model` sharing this context and the pruned
-    /// `(branch, node)` pairs.
-    pub fn prune_graph(
-        &self,
-        rel_tol: f64,
-        x: &[f64],
-        p: &[f64],
-        omegas: &[f64],
-    ) -> (Model, Vec<(String, String)>) {
-        let mut c = self.inner.ctx.lock().unwrap();
-        let pnames = self.inner.cdc.param_names(&c);
-        let mut p_pairs = Vec::with_capacity(pnames.len());
-        for (j, name) in pnames.iter().enumerate() {
-            let e = c.sym(name);
-            if let Node::Symbol(s) = c.node(e) {
-                p_pairs.push((*s, p.get(j).copied().unwrap_or(0.0)));
-            }
-        }
-        let (reduced, pruned) = reduce_graph(&mut c, &self.inner.dae, x, &p_pairs, omegas, rel_tol);
-        let cdc = CompiledDc::new(&mut c, &reduced);
-        drop(c);
-        let model = Model::from_parts(
-            self.inner.ctx.clone(),
-            reduced,
-            cdc,
-            self.values(),
-            self.inner.node_names.clone(),
-            // a transformed DAE has no element graph of its own
-            None,
-        );
-        (model, pruned)
-    }
-
-    /// Exactly eliminate internal resistive nodes (Schur/series reduction).
-    /// `keep` protects node-unknown names. Returns the reduced `Model` and the
-    /// eliminated node names, in order.
-    pub fn eliminate_nodes(&self, keep: &[String]) -> (Model, Vec<String>) {
-        let keep_set: HashSet<String> = keep.iter().cloned().collect();
-        let mut c = self.inner.ctx.lock().unwrap();
-        let (reduced, gone) = dae_eliminate_nodes(&mut c, &self.inner.dae, &keep_set);
-        let cdc = CompiledDc::new(&mut c, &reduced);
-        drop(c);
-        let model = Model::from_parts(
-            self.inner.ctx.clone(),
-            reduced,
-            cdc,
-            self.values(),
-            self.inner.node_names.clone(),
-            // a transformed DAE has no element graph of its own
-            None,
-        );
-        (model, gone)
-    }
-
-    /// Linearise about the operating point into the small-signal mass-matrix DAE
-    /// `G dx + d/dt (C dx) = 0`, sharing this context. Returns the linearised
-    /// `Model`.
-    pub fn linearize(&self) -> Model {
-        let mut c = self.inner.ctx.lock().unwrap();
-        let lin = linearize(&mut c, &self.inner.dae);
-        let cdc = CompiledDc::new(&mut c, &lin);
-        drop(c);
-        Model::from_parts(
-            self.inner.ctx.clone(),
-            lin,
-            cdc,
-            self.values(),
-            self.inner.node_names.clone(),
-            None,
-        )
-    }
-
-    /// Fold a set of parameters to their current values: each becomes a constant
-    /// in a derived `Model` (sharing this context). Its now-constant subexpressions
-    /// collapse (smaller graph / faster eval) and it leaves the parameter set
-    /// (`params()` shrinks -> no `dF/dp` column, no sensitivity). A `path` is either
-    /// a single parameter (`X1.R1`, `nmos.vth0`) or a group prefix (`X1` -> all
-    /// `X1.*`, recursively). Same transform family as `linearize` /
-    /// `eliminate_nodes`; the master `Model` is unchanged.
-    pub fn fold(&self, paths: &[&str]) -> Result<Model, ModelError> {
-        let names = self.resolve_paths(paths)?;
-        self.fold_names(&names)
-    }
-
-    /// [`fold`](Self::fold) every parameter except those under `paths`: the
-    /// named ones stay symbolic, the rest become constants. A source driven
-    /// as an AC input has to be kept.
-    pub fn keep(&self, paths: &[&str]) -> Result<Model, ModelError> {
-        let kept = self.resolve_paths(paths)?;
-        let names: HashSet<String> = self
-            .inner
-            .store
-            .pnames
-            .iter()
-            .filter(|n| !kept.contains(*n))
-            .cloned()
-            .collect();
-        self.fold_names(&names)
-    }
-
-    /// The canonical parameter names under `paths`: a leaf parameter, or every
-    /// parameter under a group prefix.
-    fn resolve_paths(&self, paths: &[&str]) -> Result<HashSet<String>, ModelError> {
+    /// The canonical parameter names under `paths`: a leaf parameter, or
+    /// every parameter under a group prefix.
+    pub(crate) fn paths(&self, paths: &[&str]) -> Result<HashSet<String>, ModelError> {
         let mut names: HashSet<String> = HashSet::new();
         for &path in paths {
-            if let Some(canon) = self.inner.store.resolve(path) {
+            if let Some(canon) = self.store.resolve(path) {
                 names.insert(canon);
-            } else if self.is_group(path) {
+            } else if self.store.prefixes.contains(path) {
                 let pre = format!("{path}.");
-                for n in &self.inner.store.pnames {
+                for n in &self.store.pnames {
                     if n.starts_with(&pre) {
                         names.insert(n.clone());
                     }
@@ -1244,136 +594,32 @@ impl Model {
         Ok(names)
     }
 
-    /// The derived `Model` with the parameters `names` folded to their values.
-    fn fold_names(&self, names: &HashSet<String>) -> Result<Model, ModelError> {
-        let mut c = self.inner.ctx.lock().unwrap();
-        // (param symbol, frozen current value) pairs for the substitution.
-        let mut fold: Vec<(SymbolId, f64)> = Vec::with_capacity(names.len());
-        for name in names {
-            let val = self.inner.store.get(name).unwrap_or(0.0);
-            let e = c.sym(name);
-            if let Node::Symbol(s) = c.node(e) {
-                fold.push((*s, val));
-            }
+    /// The columns derivatives are taken by: the parameters under `wrt`
+    /// (names or groups, see [`paths`](Self::paths)), all of them for none,
+    /// in column order.
+    pub(crate) fn columns(&self, wrt: &[&str]) -> Result<Vec<usize>, ModelError> {
+        if wrt.is_empty() {
+            return Ok((0..self.store.pnames.len()).collect());
         }
-        let folded = self.inner.dae.fold_params(&mut c, &fold);
-        let cdc = CompiledDc::new(&mut c, &folded);
-        drop(c);
-
-        // The folded parameters are constants now: drop them from the value store.
-        let mut values = self.values();
-        for name in names {
-            values.remove(name);
-        }
-        Ok(Model::from_parts(
-            self.inner.ctx.clone(),
-            folded,
-            cdc,
-            values,
-            self.inner.node_names.clone(),
-            // folding parameters keeps the topology, but not the graph object
-            None,
-        ))
-    }
-}
-
-/// Small-signal AC response: magnitude (dB) and phase (deg) over frequency.
-/// An S-parameter sweep over the deck's `P` ports: `s[k]` is the flattened
-/// row-major `n x n` scattering matrix at `freqs[k]`, entries as `(re, im)`.
-pub struct SpSweep {
-    pub freqs: Vec<f64>,
-    pub s: Vec<Vec<(f64, f64)>>,
-    pub port_names: Vec<String>,
-    pub z0: Vec<f64>,
-}
-
-pub struct AcResponse {
-    pub freqs: Vec<f64>,
-    pub mag_db: Vec<f64>,
-    pub phase_deg: Vec<f64>,
-    pub input: String,
-    pub output: String,
-}
-
-/// Poles and (optionally) transmission zeros, each `[re, im]` in rad/s.
-pub struct PoleZero {
-    pub poles: Vec<[f64; 2]>,
-    pub zeros: Vec<[f64; 2]>,
-}
-
-/// Periodic steady-state spectra (per unknown, index 0 = DC, 1 = fundamental).
-pub struct HarmonicBalance {
-    sim: Arc<ModelInner>,
-    mag: Vec<Vec<f64>>,
-    phase: Vec<Vec<f64>>,
-    pub converged: bool,
-}
-
-impl HarmonicBalance {
-    /// Magnitude spectrum of a node / unknown / branch-current reference.
-    pub fn magnitude(&self, reference: &str) -> Option<&[f64]> {
-        let i = self.sim.resolve(reference)?;
-        self.mag.get(i).map(|v| v.as_slice())
-    }
-    /// Phase spectrum (degrees) of a reference.
-    pub fn phase(&self, reference: &str) -> Option<&[f64]> {
-        let i = self.sim.resolve(reference)?;
-        self.phase.get(i).map(|v| v.as_slice())
-    }
-}
-
-/// Descriptor state-space realisation `E x' = A x + B u`, `y = C x + D u`.
-pub struct StateSpace {
-    pub e: Vec<Vec<f64>>,
-    pub a: Vec<Vec<f64>>,
-    pub b: Vec<f64>,
-    pub c: Vec<f64>,
-    pub d: f64,
-    pub input: String,
-    pub output: String,
-}
-
-/// Output value versus temperature (deg C).
-pub struct TempSweep {
-    pub temps: Vec<f64>,
-    pub values: Vec<f64>,
-    pub output: String,
-}
-
-/// Reduced-order model: magnitude (dB) of full vs reduced over frequency, plus
-/// the kept poles/zeros `[re, im]` and the worst-case fit error (dB).
-pub struct ReducedModel {
-    pub freqs: Vec<f64>,
-    pub full_db: Vec<f64>,
-    pub red_db: Vec<f64>,
-    pub poles: Vec<[f64; 2]>,
-    pub zeros: Vec<[f64; 2]>,
-    pub max_err_db: f64,
-}
-
-impl ModelInner {
-    /// Build `p` from the store + overrides and solve the DC operating point,
-    /// reusing the cached operating point when the parameter vector is unchanged.
-    fn solve_dc(&self, overrides: &[(&str, f64)]) -> Result<(Vec<f64>, Vec<f64>), ModelError> {
-        let (x, p, _reg) = self.solve_dc_reg(overrides)?;
-        Ok((x, p))
+        let names = self.paths(wrt)?;
+        Ok((0..self.store.pnames.len())
+            .filter(|&k| names.contains(&self.store.pnames[k]))
+            .collect())
     }
 
-    /// As [`solve_dc`](Self::solve_dc), but also returns the gmin-regularization
-    /// flag for the operating point: `Some(g)` when it converged only under a
-    /// raised shunt (a physically suspect, regularized solution), else `None`.
-    /// Cached alongside the point so a cache hit reports the same status (#54).
+    /// The outputs `outputs` (nodes, unknowns, branch currents) as indices.
+    pub(crate) fn outputs(&self, outputs: &[&str]) -> Result<Vec<usize>, ModelError> {
+        (outputs.iter())
+            .map(|o| {
+                self.resolve(o)
+                    .ok_or_else(|| ModelError::UnknownRef(o.to_string()))
+            })
+            .collect()
+    }
+
     /// The parameter vector of `overrides` over the bound values, checked
-    /// against the devices' assertions: an analysis runs only where the model
-    /// is the circuit's.
-    fn checked_pvec(&self, overrides: &[(&str, f64)]) -> Result<Vec<f64>, ModelError> {
-        let p = self.valued_pvec(overrides)?;
-        self.structure_at(&p).map_err(ModelError::Invalid)?;
-        Ok(p)
-    }
-
-    /// [`checked_pvec`](Self::checked_pvec) against the assertions on
-    /// values only: a binding of another structure passes.
+    /// against the devices' assertions on values only: a binding of another
+    /// structure passes.
     fn valued_pvec(&self, overrides: &[(&str, f64)]) -> Result<Vec<f64>, ModelError> {
         let p = self.store.pvec(overrides);
         self.values_hold(&p)?;
@@ -1414,43 +660,35 @@ impl ModelInner {
             .or_else(|| self.resolve_unknown(reference).flatten())
     }
 
-    fn solve_dc_reg(
-        &self,
-        overrides: &[(&str, f64)],
-    ) -> Result<(Vec<f64>, Vec<f64>, Option<f64>), ModelError> {
-        let p = self.checked_pvec(overrides)?;
-        self.dc_at(p)
-    }
-
-    /// Where a transient at `p` starts: the operating point, solved once per
-    /// `p` and shared with every other analysis there, when it is the
-    /// circuit's own (not held by the regularization, which is no
-    /// consistent state to integrate from); `None` leaves the integrator to
-    /// find its start.
-    fn transient_start(&self, p: &[f64]) -> Option<Vec<f64>> {
-        match self.dc_at(p.to_vec()) {
-            Ok((x, _, None)) => Some(x),
-            _ => None,
-        }
-    }
-
-    /// The DC operating point at the parameter vector `p` (see
-    /// [`solve_dc_reg`](Self::solve_dc_reg)), kept for the next analysis at
-    /// the same `p`.
-    fn dc_at(&self, p: Vec<f64>) -> Result<(Vec<f64>, Vec<f64>, Option<f64>), ModelError> {
-        if let Some((cp, cx, creg)) = self.op_cache.lock().unwrap().as_ref() {
-            if cp == &p {
-                return Ok((cx.clone(), p, *creg));
-            }
-        }
-        // Cold solve on a miss (identical to no-cache behaviour); cache the result.
-        let (mut x, conv, _it) = self.cdc.solve_dc_conv_with(
-            &p,
-            &[],
-            Convergence::default(),
-            100,
+    /// One DC solve at `p` as `dc` says, from `x0` (cold where empty): the
+    /// state, and whether it converged.
+    fn solve_from(&self, p: &[f64], dc: &DcOptions, x0: &[f64]) -> (Vec<f64>, bool) {
+        let (x, conv, _) = (self.cdc).solve_dc_conv_with(
+            p,
+            x0,
+            dc.convergence(),
+            dc.max_iter,
             SolverTricks::default(),
         );
+        (x, conv)
+    }
+
+    /// The DC operating point at the parameter vector `p`, solved as `dc`
+    /// says, from `seed` where one is given (a cold start where it is empty
+    /// or does not converge); and how the gmin regularization holds it where
+    /// it does (converged only under a raised shunt, or with the floor setting
+    /// a node: physically suspect, #54).
+    fn solve_op(
+        &self,
+        p: &[f64],
+        dc: &DcOptions,
+        seed: &[f64],
+    ) -> Result<(Vec<f64>, Option<Regularization>), ModelError> {
+        let solve = |x0: &[f64]| self.solve_from(p, dc, x0);
+        let (mut x, mut conv) = solve(seed);
+        if !conv && !seed.is_empty() {
+            (x, conv) = solve(&[]);
+        }
         if !conv {
             return Err(ModelError::NoConverge);
         }
@@ -1470,23 +708,12 @@ impl ModelInner {
             // empty x0: let the integrator build its own consistent start (the
             // raw regularized vector is not differential-consistent and makes
             // the first step underflow)
-            if let Ok(rows) = self.cdc.solve_transient(
-                sane_solve::TransientMethod::default(),
-                &p,
-                &[],
-                &[0.0, 0.06],
-                1e-4,
-                1e-7,
-                None,
-            ) {
-                if let Some(xs) = rows.last() {
-                    let (x2, conv2, _) = self.cdc.solve_dc_conv_with(
-                        &p,
-                        xs,
-                        Convergence::default(),
-                        100,
-                        SolverTricks::default(),
-                    );
+            if let Ok(run) = self
+                .cdc
+                .solve_transient(&p, &[], &[0.0, 0.06], 1e-4, 1e-7, None)
+            {
+                if let Some(xs) = run.rows.last() {
+                    let (x2, conv2) = solve(xs);
                     if conv2 && self.cdc.last_regularized_gmin().is_none() {
                         x = x2;
                         reg = None;
@@ -1498,13 +725,20 @@ impl ModelInner {
         // the caller. The settle fallback above keys off the hold alone -- it
         // exists to escape a basin, and dominance is not one -- but what gets
         // reported covers both.
-        let reg = reg.or_else(|| {
-            self.cdc
-                .last_gmin_dominance()
-                .map(|_| sane_core::constants::GMIN_DC)
+        let dominant = (self.cdc.last_gmin_dominance()).map(|(j, shift)| {
+            let u = &self.unknowns[j];
+            let node = (u.strip_prefix('v').and_then(|k| k.parse::<usize>().ok()))
+                .and_then(|k| self.node_names.get(k));
+            (node.unwrap_or(u).clone(), shift)
         });
-        *self.op_cache.lock().unwrap() = Some((p.clone(), x.clone(), reg));
-        Ok((x, p, reg))
+        let reg = match (reg, dominant) {
+            (None, None) => None,
+            (gmin, dominant) => Some(Regularization {
+                gmin: gmin.unwrap_or(sane_core::constants::GMIN_DC),
+                dominant,
+            }),
+        };
+        Ok((x, reg))
     }
 }
 
@@ -1514,10 +748,9 @@ pub struct OperatingPoint {
     sim: Arc<ModelInner>,
     x: Vec<f64>,
     p: Vec<f64>,
-    /// `Some(g)` if this operating point is gmin-regularized (held only at shunt
-    /// `g`, never reaching the `GMIN_DC` floor) -- converged=true but physically
-    /// suspect; `None` for a true DC solution (issue #54).
-    regularized_at_gmin: Option<f64>,
+    /// How the gmin regularization holds the point, where it does: converged,
+    /// but physically suspect (issue #54); `None` for a true DC solution.
+    pub regularization: Option<Regularization>,
     /// Where the point was solved in a model of another structure (see
     /// [`restructure`]): the asking model and the state in its layout.
     shown: Option<(Arc<ModelInner>, Vec<f64>)>,
@@ -1533,6 +766,16 @@ impl OperatingPoint {
         }
     }
 
+    /// Rejects transport delays, which the DC adjoints do not carry yet.
+    fn no_delays(&self, what: &str) -> Result<(), ModelError> {
+        match self.sim.cdc.has_delays() {
+            true => Err(ModelError::Numeric(format!(
+                "{what}: transport delays (tline/absdelay) are not supported in this analysis yet"
+            ))),
+            false => Ok(()),
+        }
+    }
+
     /// The model the state is shown in, and the state there.
     fn view(&self) -> (&ModelInner, &[f64]) {
         match &self.shown {
@@ -1540,11 +783,7 @@ impl OperatingPoint {
             None => (&self.sim, &self.x),
         }
     }
-    /// The gmin at which this operating point held, if it is a gmin-regularized
-    /// (physically suspect) solution rather than a true DC floor point (#54).
-    pub fn regularized_at_gmin(&self) -> Option<f64> {
-        self.regularized_at_gmin
-    }
+
     /// The value at a node / unknown / branch-current reference.
     pub fn get(&self, reference: &str) -> Option<f64> {
         self.sim.resolve(reference).map(|i| self.x[i])
@@ -1555,20 +794,36 @@ impl OperatingPoint {
         m.unknowns.iter().cloned().zip(x.iter().copied()).collect()
     }
 
-    /// First-order sensitivity `dy/dp` of `output` over every parameter, by one
-    /// adjoint solve at this point (no re-solve).
-    pub fn sensitivity(&self, output: &str) -> Result<Sensitivity, ModelError> {
-        let metric =
-            (self.sim.resolve(output)).ok_or_else(|| ModelError::UnknownRef(output.to_string()))?;
+    /// First-order sensitivities `d output / d param` of `outputs` by the
+    /// parameters under `wrt` (all for none), one adjoint solve per output
+    /// at this point.
+    pub fn sensitivity(&self, outputs: &[&str], wrt: &[&str]) -> Result<Sensitivity, ModelError> {
+        self.no_delays("sensitivity")?;
+        let rows = self.sim.outputs(outputs)?;
+        let cols = self.sim.columns(wrt)?;
         let mut ctx = self.sim.ctx.lock().unwrap();
         self.sim.cdc.ensure_param_jac(&mut ctx, &self.sim.dae);
-        let grad = self.sim.cdc.sensitivity(metric, &self.x, &self.p, 0.0);
-        let names = self.sim.cdc.param_names(&ctx);
+        let mut grad = Array2::zeros((rows.len(), cols.len()));
+        for (i, &r) in rows.iter().enumerate() {
+            let g = self.sim.cdc.sensitivity(r, &self.x, &self.p, 0.0);
+            if g.is_empty() {
+                return Err(ModelError::Numeric(
+                    "the operating point's Jacobian is singular".into(),
+                ));
+            }
+            for (j, &c) in cols.iter().enumerate() {
+                grad[[i, j]] = g[c];
+            }
+        }
         Ok(Sensitivity {
-            names,
+            outputs: outputs.iter().map(|o| o.to_string()).collect(),
+            params: cols
+                .iter()
+                .map(|&c| self.sim.store.pnames[c].clone())
+                .collect(),
+            values: rows.iter().map(|&r| self.x[r]).collect(),
+            param_values: cols.iter().map(|&c| self.p[c]).collect(),
             grad,
-            output: output.to_string(),
-            value: self.x[metric],
         })
     }
 
@@ -1581,14 +836,14 @@ impl OperatingPoint {
             return Vec::new();
         }
         let mut ctx = self.sim.ctx.lock().unwrap();
-        let flat = dae.observers.flatten(&mut ctx);
+        let op_vars = dae.observers.op_vars(&mut ctx);
         let pnames = self.sim.cdc.param_names(&ctx);
         let env = crate::op_env(&mut ctx, dae, &pnames, &self.x, &self.p, 0.0);
         // One arena sweep: an op-var is a call into its device's template
         // function (evaluated once per instance) or a plain expression.
-        let roots: Vec<_> = flat.op_vars.iter().map(|v| v.value).collect();
+        let roots: Vec<_> = op_vars.iter().map(|v| v.value).collect();
         let vals = rsdag::eval(&ctx, &roots, &env);
-        flat.op_vars
+        op_vars
             .iter()
             .zip(vals)
             .map(|(v, value)| OpVarValue {
@@ -1600,33 +855,118 @@ impl OperatingPoint {
             .collect()
     }
 
-    /// Sparse second-order sensitivity (Hessian) of `output` w.r.t. the parameter
-    /// subset `wrt`, by the second-order adjoint at this point (no re-solve).
-    /// Returns the dense symmetric `len(wrt) x len(wrt)` matrix.
-    pub fn hessian(&self, output: &str, wrt: &[&str]) -> Result<Vec<Vec<f64>>, ModelError> {
-        let metric =
-            (self.sim.resolve(output)).ok_or_else(|| ModelError::UnknownRef(output.to_string()))?;
+    /// Second-order sensitivities (Hessians) of `outputs` by the parameters
+    /// under `wrt` (all for none), by the second-order adjoint at this
+    /// point.
+    pub fn hessian(&self, outputs: &[&str], wrt: &[&str]) -> Result<Hessian, ModelError> {
+        self.no_delays("hessian")?;
+        let rows = self.sim.outputs(outputs)?;
+        let cols = self.sim.columns(wrt)?;
         let mut ctx = self.sim.ctx.lock().unwrap();
-        let pnames = self.sim.cdc.param_names(&ctx);
-        let mut cols = Vec::with_capacity(wrt.len());
-        for name in wrt {
-            let canon = self
-                .sim
-                .store
-                .resolve(name)
-                .ok_or_else(|| ModelError::UnknownParam(name.to_string()))?;
-            let col = pnames
-                .iter()
-                .position(|n| *n == canon)
-                .ok_or_else(|| ModelError::UnknownParam(name.to_string()))?;
-            cols.push(col);
-        }
         self.sim.cdc.ensure_hessian(&mut ctx, &self.sim.dae);
-        let h = self.sim.cdc.hessian(metric, &cols, &self.x, &self.p, 0.0);
-        if h.is_empty() {
-            return Err(ModelError::NoConverge);
+        let mut h = Array3::zeros((rows.len(), cols.len(), cols.len()));
+        for (i, &r) in rows.iter().enumerate() {
+            let hr = self.sim.cdc.hessian(r, &cols, &self.x, &self.p, 0.0);
+            if hr.is_empty() {
+                return Err(ModelError::Numeric(
+                    "the operating point's Jacobian is singular".into(),
+                ));
+            }
+            for (a, row) in hr.iter().enumerate() {
+                for (b, &v) in row.iter().enumerate() {
+                    h[[i, a, b]] = v;
+                }
+            }
         }
-        Ok(h)
+        Ok(Hessian {
+            outputs: outputs.iter().map(|o| o.to_string()).collect(),
+            params: cols
+                .iter()
+                .map(|&c| self.sim.store.pnames[c].clone())
+                .collect(),
+            values: rows.iter().map(|&r| self.x[r]).collect(),
+            param_values: cols.iter().map(|&c| self.p[c]).collect(),
+            h,
+        })
+    }
+}
+
+/// How operating points are solved (see [`Model::dc_options`]): the Newton
+/// convergence criterion per unknown (relative, and absolute for currents and
+/// voltages) and the iteration budget.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DcOptions {
+    pub reltol: f64,
+    /// The absolute floor of a current (A).
+    pub abstol: f64,
+    /// The absolute floor of a voltage (V).
+    pub vntol: f64,
+    pub max_iter: usize,
+}
+
+impl Default for DcOptions {
+    fn default() -> Self {
+        let c = Convergence::default();
+        DcOptions {
+            reltol: c.reltol,
+            abstol: c.abstol,
+            vntol: c.vntol,
+            max_iter: DC_OP_MAXIT,
+        }
+    }
+}
+
+impl DcOptions {
+    /// The defaults with what a circuit states (a deck's `.option`).
+    fn from_circuit(s: &sane_circuit::DcSettings) -> Self {
+        let d = DcOptions::default();
+        DcOptions {
+            reltol: s.reltol.unwrap_or(d.reltol),
+            abstol: s.abstol.unwrap_or(d.abstol),
+            vntol: s.vntol.unwrap_or(d.vntol),
+            max_iter: s.max_iter.unwrap_or(d.max_iter),
+        }
+    }
+
+    pub(crate) fn convergence(&self) -> Convergence {
+        Convergence {
+            reltol: self.reltol,
+            abstol: self.abstol,
+            vntol: self.vntol,
+        }
+    }
+}
+
+/// How the gmin regularization holds an operating point (issue #54): the
+/// point converged, but depends on the shunt rather than on the circuit alone.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Regularization {
+    /// The shunt to ground (S) the point held at.
+    pub gmin: f64,
+    /// Where the solve reached the floor and the floor still sets a node:
+    /// that node (or unknown), and the relative first-order shift removing
+    /// the shunt would cause.
+    pub dominant: Option<(String, f64)>,
+}
+
+impl std::fmt::Display for Regularization {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.dominant {
+            Some((unknown, shift)) => write!(
+                f,
+                "removing the gmin={:.1e} shunt to ground would shift '{unknown}' by {:.1}% \
+                 (first order), so its voltage is the regularization's answer rather than \
+                 the circuit's (that node needs a real path to ground)",
+                self.gmin,
+                100.0 * shift
+            ),
+            None => write!(
+                f,
+                "it held only at gmin={:.1e} and never reached the true DC floor \
+                 (a high-impedance node is unstable at the floor)",
+                self.gmin
+            ),
+        }
     }
 }
 
@@ -1641,44 +981,18 @@ pub struct OpVarValue {
     pub value: f64,
 }
 
-/// A transient solution: state versus time, with labeled access (the ergonomic
-/// Rust return for [`Model::transient`]; the Python layer labels rows itself).
-pub struct Trajectory {
-    /// The model it was integrated in, and its states there.
-    sim: Arc<ModelInner>,
-    pub t: Vec<f64>,
-    rows: Vec<Vec<f64>>,
-    /// Integrated in a model of another structure (see [`restructure`]):
-    /// the states in the asking model's layout.
-    shown: Option<Vec<Vec<f64>>>,
-}
-
-impl Trajectory {
-    /// The time series of a node / unknown / branch-current reference.
-    pub fn signal(&self, reference: &str) -> Option<Vec<f64>> {
-        let i = self.sim.resolve(reference)?;
-        Some(
-            self.rows
-                .iter()
-                .map(|r| r.get(i).copied().unwrap_or(0.0))
-                .collect(),
-        )
-    }
-    /// All rows (state per time point), in unknown/column order of the
-    /// model the analysis was asked of.
-    pub fn rows(&self) -> &[Vec<f64>] {
-        self.shown.as_deref().unwrap_or(&self.rows)
-    }
-}
-
-/// A DC sweep solution: the converged sweep values and the state at each, with
-/// labeled access (the ergonomic Rust return for [`Model::dc_sweep`]).
+/// A DC sweep (see [`Point::dc_sweep`]): the state at every swept value.
 pub struct DcSweep {
     sim: Arc<ModelInner>,
-    /// The source values that converged, in sweep order.
-    pub sweep: Vec<f64>,
-    /// `rows[k]` is the operating point at `sweep[k]`, in unknown/column order.
-    rows: Vec<Vec<f64>>,
+    /// The swept parameter.
+    pub param: String,
+    /// The swept values.
+    pub values: Vec<f64>,
+    /// Whether the point at `values[k]` converged.
+    pub converged: Vec<bool>,
+    /// `x[[k, i]]` is unknown `i` at `values[k]` (`NaN` where that point
+    /// did not converge).
+    pub x: Array2<f64>,
     /// Per point solved in a model of another structure (see
     /// [`restructure`]), that model and the point there.
     solved: Vec<Option<(Arc<ModelInner>, Vec<f64>)>>,
@@ -1691,43 +1005,174 @@ impl DcSweep {
     pub fn signal(&self, reference: &str) -> Option<Vec<f64>> {
         let at = |k: usize| -> Option<f64> {
             match &self.solved[k] {
-                None => self.sim.resolve(reference).map(|i| self.rows[k][i]),
+                None => self.sim.resolve(reference).map(|i| self.x[[k, i]]),
                 Some((m, x)) => m.resolve(reference).map(|i| x[i]),
             }
         };
-        let vals: Vec<Option<f64>> = (0..self.rows.len()).map(at).collect();
+        let vals: Vec<Option<f64>> = (0..self.values.len()).map(at).collect();
         vals.iter()
             .any(Option::is_some)
             .then(|| vals.iter().map(|v| v.unwrap_or(f64::NAN)).collect())
     }
-    /// All rows (state per swept point).
-    pub fn rows(&self) -> &[Vec<f64>] {
-        &self.rows
+}
+
+/// First-order sensitivities of outputs by parameters: `grad[[i, j]]` is
+/// `d outputs[i] / d params[j]`.
+#[derive(Clone, Debug)]
+pub struct Sensitivity {
+    pub outputs: Vec<String>,
+    pub params: Vec<String>,
+    /// The outputs' values.
+    pub values: Vec<f64>,
+    /// The parameters' values.
+    pub param_values: Vec<f64>,
+    pub grad: Array2<f64>,
+}
+
+impl Sensitivity {
+    /// The derivatives of `output` by every parameter.
+    pub fn of(&self, output: &str) -> Option<ArrayView1<'_, f64>> {
+        let i = self.outputs.iter().position(|o| o == output)?;
+        Some(self.grad.row(i))
+    }
+
+    /// `d output / d param`.
+    pub fn get(&self, output: &str, param: &str) -> Option<f64> {
+        let j = self.params.iter().position(|p| p == param)?;
+        self.of(output).map(|g| g[j])
+    }
+
+    /// The dimensionless sensitivities `d ln output / d ln param =
+    /// grad * param / output` (zero where the parameter or the output is).
+    pub fn relative(&self) -> Array2<f64> {
+        Array2::from_shape_fn(self.grad.dim(), |(i, j)| {
+            let (p, y) = (self.param_values[j], self.values[i]);
+            match p != 0.0 && y != 0.0 {
+                true => self.grad[[i, j]] * p / y,
+                false => 0.0,
+            }
+        })
+    }
+
+    /// The parameters by the magnitude of `output`'s sensitivity to them
+    /// (relative, or raw), largest first.
+    pub fn ranked(&self, output: &str, relative: bool) -> Option<Vec<(String, f64)>> {
+        let i = self.outputs.iter().position(|o| o == output)?;
+        let vals = if relative {
+            self.relative()
+        } else {
+            self.grad.clone()
+        };
+        let mut out: Vec<(String, f64)> = (self.params.iter().cloned())
+            .zip(vals.row(i).iter().copied())
+            .collect();
+        out.sort_by(|a, b| b.1.abs().total_cmp(&a.1.abs()));
+        Some(out)
+    }
+
+    /// `output`'s sensitivities rolled up to the devices and subcircuits
+    /// they belong to (the dotted prefix of a parameter, `X1.Q3.bf` ->
+    /// `X1.Q3`): the 2-norm of each one's, largest first.
+    pub fn rollup(&self, output: &str, relative: bool) -> Option<Vec<(String, f64)>> {
+        let ranked = self.ranked(output, relative)?;
+        let mut groups: Vec<(String, f64)> = Vec::new();
+        for (name, v) in ranked {
+            let comp = name
+                .rsplit_once('.')
+                .map_or(name.as_str(), |(c, _)| c)
+                .to_string();
+            match groups.iter_mut().find(|(c, _)| *c == comp) {
+                Some((_, s)) => *s += v * v,
+                None => groups.push((comp, v * v)),
+            }
+        }
+        for g in &mut groups {
+            g.1 = g.1.sqrt();
+        }
+        groups.sort_by(|a, b| b.1.total_cmp(&a.1));
+        Some(groups)
     }
 }
 
-/// Output-referred noise spectrum: PSD over frequency.
-pub struct NoiseSpectrum {
-    pub freqs: Vec<f64>,
-    pub psd: Vec<f64>,
+/// Warns (captured, see [`sane_core::log::warn_numerical`]) where the
+/// small-signal system `G + jwC` of `what` was singular: at the frequencies
+/// `bad` marks, its result is `NaN`.
+pub(crate) fn warn_singular(what: &str, freqs: &[f64], bad: &[bool]) {
+    let fs: Vec<f64> = (freqs.iter().zip(bad))
+        .filter(|(_, &b)| b)
+        .map(|(&f, _)| f)
+        .collect();
+    if fs.is_empty() {
+        return;
+    }
+    let msg = if fs.len() == freqs.len() {
+        format!(
+            "{what}: G + jwC is singular at all {} frequencies, the result is NaN.              This is a structural singularity: check for floating nodes, an ideal              VCVS/inductor loop, or a bad DC operating point.",
+            fs.len()
+        )
+    } else {
+        let shown: Vec<String> = fs.iter().take(5).map(|f| format!("{f}")).collect();
+        let more = if fs.len() > 5 { " ..." } else { "" };
+        format!(
+            "{what}: G + jwC is singular at {} of {} frequencies [{}{more}] Hz, the result is NaN there.",
+            fs.len(),
+            freqs.len(),
+            shown.join(", ")
+        )
+    };
+    sane_core::log::warn_numerical(&msg);
 }
 
-/// First-order sensitivity result: `grad[i] = d(output)/d(names[i])`.
-pub struct Sensitivity {
-    pub names: Vec<String>,
+/// `rows` (each of `cols` entries) as one array.
+pub(crate) fn stack<T: Clone>(rows: &[Vec<T>], cols: usize) -> ndarray::Array2<T> {
+    let flat: Vec<T> = rows.iter().flat_map(|r| r.iter().cloned()).collect();
+    ndarray::Array2::from_shape_vec((rows.len(), cols), flat).expect("rows of equal length")
+}
+
+/// The gradient of a scalar by every parameter.
+#[derive(Clone, Debug)]
+pub struct Gradient {
+    pub params: Vec<String>,
     pub grad: Vec<f64>,
-    pub output: String,
-    pub value: f64,
+}
+
+impl Gradient {
+    /// From `(parameter, derivative)` pairs.
+    pub(crate) fn from_pairs(pairs: Vec<(String, f64)>) -> Gradient {
+        let (params, grad) = pairs.into_iter().unzip();
+        Gradient { params, grad }
+    }
+}
+
+/// Second-order sensitivities of outputs by parameters: `h[[i, a, b]]` is
+/// `d^2 outputs[i] / d params[a] d params[b]`.
+#[derive(Clone, Debug)]
+pub struct Hessian {
+    pub outputs: Vec<String>,
+    pub params: Vec<String>,
+    pub values: Vec<f64>,
+    pub param_values: Vec<f64>,
+    pub h: Array3<f64>,
 }
 
 // Analysis methods by domain, one module each; shared guards live below.
 mod ac;
 mod hb;
+mod lti;
 mod noise;
 mod num;
+mod point;
 mod pz;
+
+pub use ac::{AcHessian, AcResponse, AcSensitivity, SParameters, SpSensitivity};
+pub use hb::{HarmonicBalance, HbHessian, HbOptions, HbSensitivity};
+pub use lti::{Poles, ReducedModel, RootSensitivity, StateSpace, Zeros};
+pub use noise::{NoiseSensitivity, NoiseSpectrum};
+pub use point::Point;
+pub use tran::{Event, Trajectory, TrajectorySensitivity, TransientOptions};
 mod restructure;
 mod tran;
+mod transform;
 
 impl Model {
     /// Reject analyses that have no transport-delay support yet: silent
@@ -1763,11 +1208,21 @@ impl Model {
         if !self.cdc().has_delays() {
             return (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         }
+        // dI/dhist_k times the delayed signal's gradient: the coupling of the
+        // signal's unknowns, delayed by tau_k
         let taus = self.cdc().delay_taus(p);
-        let src = self.cdc().delay_sources();
-        let (rows, dcols, vals) = self.cdc().hist_jac_sparse(x, p);
-        let cols: Vec<usize> = dcols.iter().map(|&k| src[k]).collect();
-        let tau: Vec<f64> = dcols.iter().map(|&k| taus[k]).collect();
+        let src = self.cdc().delay_source_jac(x, p, 0.0);
+        let (hrows, hcols, hvals) = self.cdc().hist_jac_sparse(x, p);
+        let (mut rows, mut cols, mut vals, mut tau) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for ((&i, &k), &v) in hrows.iter().zip(&hcols).zip(&hvals) {
+            for &(_, j, w) in src.iter().filter(|e| e.0 == k) {
+                rows.push(i);
+                cols.push(j);
+                vals.push(v * w);
+                tau.push(taus[k]);
+            }
+        }
         (rows, cols, vals, tau)
     }
 }

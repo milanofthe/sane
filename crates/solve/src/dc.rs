@@ -8,8 +8,8 @@ use sane_core::constants::*;
 use sane_core::log_stage;
 
 use crate::{
-    limiting, newton, sparse, CompiledDc, Convergence, LinCache, PrologToken, SolverTricks,
-    StepEval, Symbolic,
+    newton, sparse, CompiledDc, Convergence, LinCache, PrologToken, SolverTricks, StepEval,
+    Symbolic,
 };
 
 /// A `.nodeset` pin: stiff springs `g*(x_i - target_i)` on selected unknown rows
@@ -106,19 +106,6 @@ impl CompiledDc {
         sparse::factor_triplets(n, &rows, &cols, &vals)?.solve(rhs)
     }
 
-    /// Residual half of the convergence test: every row's residual `F_i + gmin*x_i`
-    /// is within its absolute floor -- `abstol` (current) on a KCL node row,
-    /// `vntol` (voltage) on a KVL branch row. `res` is the raw residual `F(x)`.
-    pub(crate) fn residual_converged(
-        &self,
-        res: &[f64],
-        x: &[f64],
-        gmin: f64,
-        c: &Convergence,
-    ) -> bool {
-        self.criterion(c).residual_ok(res, x, gmin)
-    }
-
     /// The shared convergence contract over this system's unknown kinds (see
     /// [`newton::Criterion`]).
     pub(crate) fn criterion<'a>(&'a self, c: &Convergence) -> newton::Criterion<'a> {
@@ -165,13 +152,6 @@ impl CompiledDc {
         self.kinds[i] == sane_dae::UnknownKind::NodeVoltage
     }
 
-    /// Update half of the convergence test: every unknown's Newton step is within
-    /// `reltol*|x_i| + floor`, the floor being `vntol` (voltage) for a node-voltage
-    /// unknown and `abstol` (current) for a branch-current unknown.
-    fn update_converged(&self, dx: &[f64], x: &[f64], c: &Convergence) -> bool {
-        self.criterion(c).update_ok(dx, x)
-    }
-
     /// Damped Newton at a fixed `gmin` (at rest, `t = 0`), warm-started from
     /// `x_init`. Returns `(x, converged, iterations)`. `tricks` gates the per-step
     /// shaping (uniform clamp, device limiting, line search, partitioning).
@@ -202,225 +182,31 @@ impl CompiledDc {
         (rounded, norm2(terms))
     }
 
+    /// The DC Newton under the shunt `gmin` from `x_init` (cold where empty):
+    /// the Newton core on the shunted system, with the line search, the
+    /// composite step and device limiting as `tricks` say.
     fn newton(
         &self,
-        p: &[f64],
+        p: &Binding<'_>,
         x_init: &[f64],
         gmin: f64,
         conv: &Convergence,
         max_iter: usize,
         tricks: SolverTricks,
     ) -> (Vec<f64>, bool, usize) {
-        let n = self.n;
-        let mut x = if x_init.len() == n {
-            x_init.to_vec()
+        let tries = if tricks.line_search {
+            LINE_SEARCH_TRIES
         } else {
-            vec![0.0; n]
+            1
         };
-
-        let (mut inputs, mut work, mut out) = (Vec::new(), Vec::new(), Vec::new());
-        let (mut inb, mut wb, mut ob) = (Vec::new(), Vec::new(), Vec::new()); // line search
-        let mut valbuf = Vec::new();
-        // Per-iteration scratch reused across the whole solve (no realloc per step).
-        let mut rhs = vec![0.0; n];
-        let mut dx = vec![0.0; n];
-        let mut step = vec![0.0; n];
-        let mut trial = vec![0.0; n];
-        // KLU factorization cache: full pivoting on the first iteration, frozen
-        // pivot replay (numeric-only refactor) on the rest of this Newton loop.
-        let mut fac: Option<sparse::Refactorable> = None;
-
-        // Cached linear-block factorization for this (fixed) gmin, built lazily
-        // on the first iteration once we have the Jacobian values.
-        let mut lin_cache: Option<LinCache> = None;
-        let mut use_partition = self.partition.is_some() && tricks.partition;
-
-        // Diagnostic: per-iteration residual / largest-step trace, for
-        // classifying non-convergence (overshoot vs oscillation vs stall).
-        let trace = sane_core::config().dc_trace;
-
-        // Prolog split: the parameter vector is fixed across this Newton loop,
-        // so the tapes' parameter-pure prefixes are evaluated once here and
-        // only the main phase runs per iteration (the prolog reads no state,
-        // so the initial `x` in `inputs` is irrelevant to it). The tokens pin
-        // each buffer's backend for the episode.
-        self.fill_inputs(&x, p, 0.0, &mut inputs);
-        let mut step_tok = self.tape_step_dc.eval_prolog(&inputs, &mut work);
-        let mut res_tok = self.tape_res_dc.eval_prolog(&inputs, &mut wb);
-        let mut stall = newton::StallGuard::new();
-        let mut terms = Vec::new();
-
-        for it in 0..max_iter {
-            self.fill_inputs(&x, p, 0.0, &mut inputs);
-            self.tape_step_dc
-                .eval_main(&mut step_tok, &inputs, &mut work, &mut out);
-            // Residual of the *homotopy* system F(x) + gmin*x: the diagonal
-            // gmin term must enter the norm so the line search measures the
-            // problem we are actually solving.
-            let fnorm = shunted_norm(&out[..n], &x, gmin);
-            // Per-component residual test (the update half is checked once the
-            // step is known, below). `fnorm` is kept for the line search and
-            // the stall guard.
-            let res_ok = self.residual_converged(&out[..n], &x, gmin, conv);
-            // Solved to machine precision: no step reduces a row further, it
-            // would only move what the rows hold weakly by their rounding.
-            let (rounded, floor) = self.rounding(&out[..n], &out[n..], &x, gmin, &mut terms);
-            if rounded {
-                return (x, true, it);
-            }
-            if !res_ok && stall.stalled(fnorm) {
-                if trace {
-                    sane_core::log::debug(&format!("DCTRACE stalled at it={it} fnorm={fnorm:.3e}"));
-                }
-                return (x, false, it);
-            }
-
-            // Newton step: (J + gmin*I) dx = F + gmin*x. With a large constant
-            // linear block, solve via the cached-factorization Schur complement
-            // (build the cache once for this gmin); otherwise a plain sparse LU.
-            for i in 0..n {
-                rhs[i] = out[i] + gmin * x[i];
-            }
-            // Early acceptance without a fresh factorization: once the residual
-            // half passes, probe the update half with the PREVIOUS iteration's
-            // factors -- one cheap substitution, no refactor. For a linear
-            // system the probe step is the exact Newton step; near a nonlinear
-            // solution the Jacobian differs by O(|dx|) from the fresh one, the
-            // same staleness SPICE's classic last-step update test accepts.
-            // This removes the redundant end-of-solve factorization every
-            // convergent Newton run otherwise pays (and, together with the
-            // identity fast path in `sparse::Refactorable`, halves purely
-            // linear solves). The residual test above always judges the true
-            // tape residual, so acceptance quality is unchanged.
-            if res_ok
-                && fac.as_mut().is_some_and(|f| f.solve_into(&rhs, &mut dx))
-                && self.update_converged(&dx, &x, conv)
-            {
-                return (x, true, it);
-            }
-            let partitioned = use_partition && {
-                let part = self.partition.as_ref().unwrap();
-                if lin_cache.is_none() {
-                    lin_cache = self.build_lin_cache(part, &out[n..], gmin);
-                    if lin_cache.is_none() {
-                        use_partition = false; // degenerate: fall back to full LU
-                    }
-                }
-                lin_cache
-                    .as_ref()
-                    .and_then(|cache| self.solve_partitioned(cache, part, &out[n..], &rhs))
-                    .map(|d| dx.copy_from_slice(&d))
-                    .is_some()
-            };
-            if !partitioned
-                && !self.solve_step(&out[n..], gmin, &rhs, &mut dx, &mut valbuf, &mut fac)
-            {
-                return (x, res_ok, it);
-            }
-
-            // Converged when both the residual and the proposed update are small.
-            // Near the solution the limiting and line search below are inactive, so
-            // the raw step `dx` is the applied update -- using it here is exact.
-            // The fast path keeps the STRICT (absolute) residual floor: routine
-            // solves must converge to a bit-reproducible point so finite-difference
-            // derivatives stay smooth. The SPICE-faithful *relative* acceptance is a
-            // last-resort, applied only in the node-adaptive fallback once the strict
-            // cascade has stalled (see `adaptive_newton`).
-            if res_ok && self.update_converged(&dx, &x, conv) {
-                return (x, true, it);
-            }
-
-            if trace {
-                let (idx, mx) =
-                    dx.iter()
-                        .enumerate()
-                        .fold((0usize, 0.0f64), |(bi, bm), (i, &v)| {
-                            if v.abs() > bm {
-                                (i, v.abs())
-                            } else {
-                                (bi, bm)
-                            }
-                        });
-                sane_core::log::debug(&format!(
-                    "DCTRACE gmin={gmin:.1e} it={it} fnorm={fnorm:.3e} maxdx={mx:.3e}@{idx} x@={:.4}",
-                    x.get(idx).copied().unwrap_or(0.0)
-                ));
-            }
-
-            // No solver-side step limiting: an absolute bound in volts is
-            // meaningless for a 400 V converter, for a current, or for a
-            // Verilog-A state, and clamping components one by one bends the
-            // Newton direction rather than shortening the step. Globalization
-            // is the homotopy ladder below; limiting, where a device needs it,
-            // belongs in the model (`$limit`, on the device's own scale) --
-            // the division VACASK draws.
-            step[..n].copy_from_slice(&dx[..n]);
-
-            // Curve-aware per-device limiting (`pnjlim`/`fetlim`): pull the
-            // proposed full step back along each controlling voltage's own curve
-            // so a junction / channel current cannot overshoot. Path-only -- it
-            // redefines the step direction; the line search and convergence test
-            // below are unchanged, so the converged fixed point is identical.
-            if tricks.device_limiting && !self.limits.is_empty() {
-                newton::limit_step(&self.limits, &x, &mut step[..n]);
-            }
-
-            // Backtracking line search on |F + gmin*x|: accept the first step
-            // that reduces the residual norm. With line search off, take the full
-            // (limited) step directly.
-            let tries = if tricks.line_search {
-                LINE_SEARCH_TRIES
-            } else {
-                1
-            };
-            let alpha =
-                newton::backtrack(&mut x, &step, &mut trial, fnorm, floor, tries, |trial| {
-                    self.fill_inputs(trial, p, 0.0, &mut inb);
-                    self.tape_res_dc
-                        .eval_main(&mut res_tok, &inb, &mut wb, &mut ob);
-                    shunted_norm(&ob, trial, gmin)
-                });
-            // Composite (Traub) step: a full Newton step was taken, so the
-            // iterate is in the contracting regime; one chord step on the
-            // factorization just built, from the residual at the new iterate,
-            // makes the pair third-order. Residual-only tape, no Jacobian.
-            if tricks.composite_step && alpha == 1.0 {
-                if let Some(f) = fac.as_mut() {
-                    let res_norm = |ob: &[f64], xx: &[f64]| shunted_norm(ob, xx, gmin);
-                    // The line search's last probe is the new iterate, so
-                    // `ob` holds its residual already.
-                    let f1 = res_norm(&ob, &x);
-                    for i in 0..n {
-                        rhs[i] = ob[i] + gmin * x[i];
-                    }
-                    // Taken whenever it contracts the residual; gating it on
-                    // the contraction regime was measured and declined (see
-                    // the constants module).
-                    if f.solve_into(&rhs, &mut dx) {
-                        for i in 0..n {
-                            trial[i] = x[i] - dx[i];
-                        }
-                        if tricks.device_limiting && !self.limits.is_empty() {
-                            limiting::apply_in_place(&self.limits, &x, &mut trial);
-                        }
-                        self.fill_inputs(&trial, p, 0.0, &mut inb);
-                        self.tape_res_dc
-                            .eval_main(&mut res_tok, &inb, &mut wb, &mut ob);
-                        let f2 = res_norm(&ob, &trial);
-                        if trace {
-                            sane_core::log::debug(&format!(
-                                "DCTRACE composite it={it} fnorm={fnorm:.3e} f1={f1:.3e} f2={f2:.3e} {}",
-                                if f2 < f1 { "taken" } else { "rejected" }
-                            ));
-                        }
-                        if f2 < f1 {
-                            std::mem::swap(&mut x, &mut trial);
-                        }
-                    }
-                }
-            }
-        }
-        (x, false, max_iter)
+        let policy = newton::Policy {
+            globalization: newton::Globalization::LineSearch { tries },
+            limiting: tricks.device_limiting,
+            composite: tricks.composite_step,
+            ..self.policy(max_iter)
+        };
+        let sys = Dc::new(self, p, Shunt::Uniform(gmin), tricks);
+        self.run(sys, x_init, conv, true, &policy)
     }
 
     /// Damped Newton with **node-adaptive diagonal loading**: each iteration the
@@ -429,124 +215,24 @@ impl CompiledDc {
     /// their otherwise-huge oscillating Newton step is damped while well-coupled
     /// unknowns keep full Newton. The loading is matrix-only (the residual still
     /// uses just `GMIN_DC*x`), so the converged fixed point `F + GMIN_DC*x = 0` is
-    /// unshifted -- the damping shapes only the iteration path. Cold-started.
+    /// unshifted -- the damping shapes only the iteration path. Cold-started;
+    /// the residual half also holds where the SPICE-relative test does, and
+    /// where it does not converge the lowest-residual iterate is returned.
     fn adaptive_newton(
         &self,
-        p: &[f64],
+        p: &Binding<'_>,
         conv: &Convergence,
-        mut iters: usize,
+        iters: usize,
     ) -> (Vec<f64>, bool, usize) {
-        let n = self.n;
-        // Diagonal position of each node within the Jacobian value array, fixed
-        // by the sparsity pattern and precomputed once in `CompiledDc`.
-        let diag_idx = &self.diag_idx;
-        let mut x = vec![0.0; n];
-        // One Jacobian and one residual episode: `p` is fixed over the solve.
-        let (mut sb, mut rb) = (TapeBufs::default(), TapeBufs::default());
-        let mut valbuf = Vec::new();
-        let mut jacbuf: Vec<f64> = Vec::new();
-        let mut terms = Vec::new();
-        // Per-iteration scratch reused across the whole solve (no realloc per step).
-        let mut rhs = vec![0.0; n];
-        let mut dx = vec![0.0; n];
-        let mut step = vec![0.0; n];
-        let mut trial = vec![0.0; n];
-        let mut fac: Option<sparse::Refactorable> = None;
-        let (mut iterms, mut iwork) = (Vec::new(), Vec::new());
-        let trace = sane_core::config().dc_trace;
-        // Keep the lowest-residual iterate: once damping has decayed the last step
-        // may drift slightly back up, so the best point (not the last) is returned.
-        let (mut best_x, mut best_fnorm) = (x.clone(), f64::INFINITY);
-
-        for _ in 0..ADAPT_MAX_ITER {
-            iters += 1;
-            self.eval_episode(&self.tape_step_dc, &x, p, &mut sb);
-            let out = &sb.out;
-            let fnorm = shunted_norm(&out[..n], &x, GMIN_DC);
-            if fnorm < best_fnorm {
-                best_fnorm = fnorm;
-                best_x.clone_from(&x);
-            }
-            if trace {
-                sane_core::log::debug(&format!("DCADAPT it={iters} fnorm={fnorm:.3e}"));
-            }
-            // Residual half now; the update half is checked on the (damped) step.
-            let res_ok = self.residual_converged(&out[..n], &x, GMIN_DC, conv);
-            // Load weak diagonals (matrix only) up to a fraction of the strongest.
-            let mut maxd = 0.0f64;
-            for &di in diag_idx.iter().flatten() {
-                maxd = maxd.max(out[n + di].abs());
-            }
-            // Decay the damping with the residual: strong far from the solution
-            // (stabilizes the weak nodes into the right basin), vanishing linearly
-            // as `fnorm -> 0` so the last mile recovers full Newton and closes
-            // (a slower `sqrt` decay keeps too much damping to close on these amps).
-            let floor = ADAPT_DIAG_FRAC * maxd * fnorm.min(1.0);
-            jacbuf.clear();
-            jacbuf.extend_from_slice(&out[n..]);
-            for &di in diag_idx.iter().flatten() {
-                let jii = jacbuf[di].abs();
-                if jii < floor {
-                    jacbuf[di] += floor - jii; // positive diagonal loading (damping)
-                }
-            }
-            for i in 0..n {
-                rhs[i] = out[i] + GMIN_DC * x[i];
-            }
-            // Early acceptance with the previous iteration's factors (see the
-            // fast-path Newton): probe the update half before refactoring.
-            if res_ok
-                && fac.as_mut().is_some_and(|f| f.solve_into(&rhs, &mut dx))
-                && self.update_converged(&dx, &x, conv)
-            {
-                return (x, true, iters);
-            }
-            if !self.solve_step(&jacbuf, GMIN_DC, &rhs, &mut dx, &mut valbuf, &mut fac) {
-                return (x, res_ok, iters);
-            }
-            if self.update_converged(&dx, &x, conv) {
-                if res_ok {
-                    return (x, true, iters);
-                }
-                // Last-resort SPICE-faithful acceptance: the strict cascade has
-                // stalled, so accept if the KCL imbalance is small relative to the
-                // node branch-current scale (not just the absolute floor).
-                if let Some(tape) = &self.tape_iscale {
-                    tape.eval(&sb.inputs, &mut iwork, &mut iterms);
-                    if self.residual_relative_ok(&out[..n], &iterms, &x, GMIN_DC, conv) {
-                        return (x, true, iters);
-                    }
-                }
-            }
-            step[..n].copy_from_slice(&dx[..n]);
-            // Curve-aware per-device limiting (`pnjlim`/`fetlim`), on the
-            // device's own scale. This is the engine's only limiting now that
-            // the solver-side clamp is gone, so it applies here too -- in the
-            // first Newton, where a junction runaway actually happens. VACASK
-            // draws the same line: the model limits on every evaluation, the
-            // solver never does.
-            if !self.limits.is_empty() {
-                newton::limit_step(&self.limits, &x, &mut step[..n]);
-            }
-            // Backtracking line search on the (true) residual norm.
-            let (_, floor) = self.rounding(&out[..n], &out[n..], &x, GMIN_DC, &mut terms);
-            newton::backtrack(
-                &mut x,
-                &step,
-                &mut trial,
-                fnorm,
-                floor,
-                LINE_SEARCH_TRIES,
-                |trial| {
-                    self.eval_episode(&self.tape_res_dc, trial, p, &mut rb);
-                    let ob = &rb.out;
-                    shunted_norm(&ob, trial, GMIN_DC)
-                },
-            );
-        }
-        // Not converged to tol: return the best (lowest-residual) iterate, which a
-        // late drift after the damping decayed would otherwise have spoiled.
-        (best_x, false, iters)
+        let policy = newton::Policy {
+            stall: false,
+            composite: false,
+            keep_best: true,
+            ..self.policy(ADAPT_MAX_ITER)
+        };
+        let sys = Dc::new(self, p, Shunt::Uniform(GMIN_DC), self.tricks).adaptive(*conv);
+        let (x, conv, it) = self.run(sys, &[], conv, true, &policy);
+        (x, conv, iters + it)
     }
 
     /// Solve the DC operating point (at rest, `t = 0`) with sparse LU and the
@@ -592,7 +278,8 @@ impl CompiledDc {
         tricks: SolverTricks,
     ) -> (Vec<f64>, bool, usize) {
         let _stage = sane_core::log::scope("dc");
-        if self.delay_src.is_empty() {
+        let p = &Binding::new(p);
+        if !self.has_delays() {
             let (x, ok, its) = self.dc_cascade(p, x0, conv, max_iter, tricks, &self.nodeset);
             self.record_gmin_dominance(&x, p, ok, conv.vntol);
             return (x, ok, its);
@@ -602,12 +289,10 @@ impl CompiledDc {
         // around the Newton cascade (damped fixed point, exact at the fixed
         // point); e.g. an ideal line's fixed point is the transparent
         // connection v1 = v2, i1 = -i2.
-        let m = self.delay_src.len();
-        let mut hist = vec![0.0; m];
+        let mut hist = vec![0.0; self.delay_count()];
+        let mut target = Vec::new();
         if x0.len() == self.n {
-            for (h, &src) in hist.iter_mut().zip(&self.delay_src) {
-                *h = x0[src];
-            }
+            self.delay_values(x0, p, 0.0, &mut hist);
         }
         let mut x = x0.to_vec();
         let (mut cc, mut it_total) = (false, 0usize);
@@ -621,11 +306,11 @@ impl CompiledDc {
                 break;
             }
             let mut delta: f64 = 0.0;
-            for (k, &src) in self.delay_src.iter().enumerate() {
-                let target = x[src];
-                delta = delta.max((target - hist[k]).abs() / (1.0 + target.abs()));
+            self.delay_values(&x, p, 0.0, &mut target);
+            for (h, &target) in hist.iter_mut().zip(&target) {
+                delta = delta.max((target - *h).abs() / (1.0 + target.abs()));
                 // damped relaxation: stable through |reflection| = 1 corners
-                hist[k] += DELAY_DC_DAMPING * (target - hist[k]);
+                *h += DELAY_DC_DAMPING * (target - *h);
             }
             if delta < conv.reltol.max(1e-12) {
                 break;
@@ -730,7 +415,7 @@ impl CompiledDc {
     /// selection reaches every stage rather than only the cold-start seed.
     fn dc_cascade(
         &self,
-        p: &[f64],
+        p: &Binding<'_>,
         x0: &[f64],
         conv: Convergence,
         max_iter: usize,
@@ -748,16 +433,7 @@ impl CompiledDc {
         // gmin-stepping branch of `source_continuation` below sets it (issue #54).
         self.last_gmin_hold
             .store(0, std::sync::atomic::Ordering::Relaxed);
-        // The fast path limits whenever the devices declare junction limits: a
-        // Newton step shortened to the junction bound (`limiting::apply`) is
-        // what lets an exponential device converge plainly from a cold start
-        // instead of oscillating into the cascade (fixture corpus: 1851 -> 172
-        // Newton iterations, ua741 816 -> 61). The trick flag gates only the
-        // continuation correctors.
-        let fast = SolverTricks {
-            device_limiting: !self.limits.is_empty(),
-            ..tricks
-        };
+
         // A `.nodeset` seeds every *cold* solve: phase 1 stiff-pins the
         // node-set unknowns onto their targets (symmetry breaking), and the cascade
         // below warm-starts from that point. A warm `x0` supersedes the node-set.
@@ -784,7 +460,7 @@ impl CompiledDc {
         // shunt `GMIN_DC` on every node (never solved at exactly gmin = 0).
         let (x, cc, it) = log_stage!(
             "dc/newton",
-            self.newton(p, &seed, GMIN_DC, &conv, max_iter, fast)
+            self.newton(p, &seed, GMIN_DC, &conv, max_iter, tricks)
         );
         let it = it + it0;
         if cc {
@@ -943,7 +619,7 @@ impl CompiledDc {
     /// the floor finishes the job.
     fn pseudo_transient_rescue(
         &self,
-        p: &[f64],
+        p: &Binding<'_>,
         x_from: &[f64],
         conv: &Convergence,
         mut iters: usize,
@@ -1063,6 +739,7 @@ impl CompiledDc {
         tricks: SolverTricks,
     ) -> (Vec<f64>, bool, usize) {
         use sane_core::log;
+        let p = &Binding::new(p);
         if nodeset.is_empty() {
             return self.dc_cascade(p, &[], conv, max_iter, tricks, &self.nodeset);
         }
@@ -1082,47 +759,34 @@ impl CompiledDc {
     ///
     ///   `F(x) + GMIN_DC*x + g_set * S * (x - target) = 0`
     ///
-    /// where `S` selects the node-set rows. Self-contained (its own triplet LU,
-    /// like [`companion_solve`](Self::companion_solve)) so the fast-path
-    /// [`newton`](Self::newton), `solve_step`, and the Schur partition stay
-    /// untouched -- the pin is a one-off symmetry-breaking phase, not a hot path.
+    /// where `S` selects the node-set rows, each spring stiff enough to
+    /// dominate its row's own couplings at the start point. Residual within
+    /// `g * vntol` of the pin on a pinned row: within `vntol` of it.
     fn newton_pinned(
         &self,
-        p: &[f64],
+        p: &Binding<'_>,
         x_init: &[f64],
         pin: &Pin,
         conv: &Convergence,
         max_iter: usize,
     ) -> (Vec<f64>, bool, usize) {
         let n = self.n;
-        let mut x = if x_init.len() == n {
-            x_init.to_vec()
-        } else {
-            vec![0.0; n]
+        let x0 = match x_init.len() == n {
+            true => x_init.to_vec(),
+            false => vec![0.0; n],
         };
-        // One Jacobian and one residual episode: `p` is fixed over the solve.
-        let (mut sb, mut rb) = (TapeBufs::default(), TapeBufs::default());
-        // The pinned matrix is `G + diag(GMIN_DC + g on the pinned rows)` -- the
-        // pin entries land on the augmented diagonal, so its pattern is exactly the
-        // precomputed `self.symbolic` (G nonzeros + full diagonal). Reuse that
-        // symbolic every iteration (refill values, one numeric LU) instead of a fresh
-        // AMD ordering per step (#52). Precompute the constant diagonal shunt once.
         // Per-row spring stiffness: `pin.g` is sized for MNA node rows; a pinned
         // row of a different physical scale (an `idt` state residual, say) can
         // dwarf it, leaving the pin soft and the pinned system ill-conditioned.
         // Rescale each pinned row's spring to dominate that row's own couplings
         // at the start point (one extra tape evaluation).
         let gpin: Vec<f64> = {
-            self.eval_episode(&self.tape_step_dc, &x, p, &mut sb);
-            let out = &sb.out;
-            let jac = &out[n..];
-            pin.idx
-                .iter()
+            let mut tapes = p.tapes.borrow_mut();
+            self.eval_episode(&self.tape_step_dc, &x0, p, &mut tapes.step);
+            let jac = &tapes.step.out[n..];
+            (pin.idx.iter())
                 .map(|&i| {
-                    let rownorm = self
-                        .jx_rows
-                        .iter()
-                        .zip(jac)
+                    let rownorm = (self.jx_rows.iter().zip(jac))
                         .filter(|(&r, _)| r == i)
                         .map(|(_, v)| v.abs())
                         .fold(0.0f64, f64::max);
@@ -1130,68 +794,33 @@ impl CompiledDc {
                 })
                 .collect()
         };
-        let mut diag = vec![GMIN_DC; n];
-        let mut row_floor = vec![0.0; n];
+        let (mut diag, mut anchor, mut row_floor) = (vec![GMIN_DC; n], vec![0.0; n], vec![0.0; n]);
         for (k, &i) in pin.idx.iter().enumerate() {
             diag[i] += gpin[k];
+            anchor[i] = gpin[k] * pin.target[k];
             row_floor[i] = gpin[k] * conv.vntol;
         }
-        let mut valbuf: Vec<f64> = Vec::new();
-        // KLU factorization cache: full pivoting on the first iteration, frozen
-        // pivot replay (numeric-only refactor) afterwards.
-        let mut fac: Option<sparse::Refactorable> = None;
-        // Pinned residual `F + GMIN_DC*x + g*(x - target)` on the pinned rows.
-        let pin_res = |x: &[f64], res: &[f64], h: &mut Vec<f64>| {
-            h.clear();
-            h.extend((0..n).map(|i| res[i] + GMIN_DC * x[i]));
-            for (k, &i) in pin.idx.iter().enumerate() {
-                h[i] += gpin[k] * (x[i] - pin.target[k]);
-            }
+        let contract = newton::Contract {
+            criterion: self.criterion(conv).with_row_floor(&row_floor),
+            residual: true,
+            update: Some(1.0),
         };
-        let (mut h, mut dx, mut trial) = (Vec::new(), vec![0.0; n], vec![0.0; n]);
-        let mut terms = Vec::new();
-
-        let mut stall = newton::StallGuard::new();
-        for it in 0..max_iter {
-            self.eval_episode(&self.tape_step_dc, &x, p, &mut sb); // residual ++ jac-x
-            let out = &sb.out;
-            pin_res(&x, &out[..n], &mut h);
-            let fnorm = norm2(&h);
-            if stall.stalled(fnorm) {
-                return (x, false, it);
-            }
-            // The shared contract, with the anchor term's own floor on every
-            // pinned row: `g * vntol` is "within vntol of the pin", the
-            // meaningful residual scale there (unreachable at the raw floor
-            // for a large `g`, and pointless: the released solve polishes).
-            let crit = self.criterion(conv).with_row_floor(&row_floor);
-            let res_ok = crit.residual_ok(&h, &x, 0.0);
-            // J + GMIN_DC*I + g_set on the pinned diagonals (duplicates summed).
-            let diag = diag.iter().copied();
-            if !self.solve_with_diag(&out[n..], diag, &h, &mut dx, &mut valbuf, &mut fac) {
-                return (x, false, it);
-            }
-            if res_ok && crit.update_ok(&dx, &x) {
-                return (x, true, it);
-            }
-            // Backtracking line search on the pinned residual norm.
-            let (_, floor) = self.rounding(&out[..n], &out[n..], &x, GMIN_DC, &mut terms);
-            newton::backtrack(
-                &mut x,
-                &dx,
-                &mut trial,
-                fnorm,
-                floor,
-                LINE_SEARCH_TRIES,
-                |trial| {
-                    self.eval_episode(&self.tape_res_dc, trial, p, &mut rb);
-                    let ob = &rb.out;
-                    pin_res(trial, &ob, &mut h);
-                    norm2(&h)
-                },
-            );
-        }
-        (x, false, max_iter)
+        let policy = newton::Policy {
+            limiting: false,
+            early_accept: false,
+            composite: false,
+            ..self.policy(max_iter)
+        };
+        let mut sys = Dc::new(self, p, Shunt::Pinned { diag, anchor }, self.tricks);
+        let mut x = x0;
+        let out = newton::solve(
+            &mut sys,
+            &mut x,
+            &contract,
+            &policy,
+            &mut newton::Scratch::default(),
+        );
+        (x, out.converged, out.iters)
     }
 
     /// Source-stepping continuation (predictor-corrector). The homotopy ramps the
@@ -1203,7 +832,7 @@ impl CompiledDc {
     /// high-gain feedback (op-amps), where the gmin shunt alone breaks the loop.
     fn source_continuation(
         &self,
-        p: &[f64],
+        p: &Binding<'_>,
         conv: &Convergence,
         mut iters: usize,
         tricks: SolverTricks,
@@ -1222,7 +851,7 @@ impl CompiledDc {
         // lambda = 0: the unexcited circuit (its devices may have small offsets,
         // so solve rather than assume all-zero).
         let (mut x, c0, it0) = self.newton(
-            &p_zero,
+            &Binding::new(&p_zero),
             &[],
             SOURCE_GMIN,
             conv,
@@ -1271,7 +900,7 @@ impl CompiledDc {
 
             let ps = scaled(target);
             let (xc, cc, it) = self.newton(
-                &ps,
+                &Binding::new(&ps),
                 &x_pred,
                 SOURCE_GMIN,
                 conv,
@@ -1344,7 +973,7 @@ impl CompiledDc {
     /// held (regularized) point is left to the later stages to improve on.
     fn gmin_stepping(
         &self,
-        p: &[f64],
+        p: &Binding<'_>,
         seed: &[f64],
         conv: &Convergence,
         mut iters: usize,
@@ -1373,7 +1002,7 @@ impl CompiledDc {
     /// and the gmin it held at.
     fn gmin_step_down(
         &self,
-        p: &[f64],
+        p: &Binding<'_>,
         x: Vec<f64>,
         from: f64,
         conv: &Convergence,
@@ -1438,24 +1067,6 @@ impl CompiledDc {
             .episode
             .get_or_insert_with(|| tape.eval_prolog(&tb.inputs, &mut tb.work));
         tape.eval_main(ep, &tb.inputs, &mut tb.work, &mut tb.out);
-    }
-
-    /// Companion residual `H = F(x) + (1 - lambda)*G_comp*x` at `(x, lambda)`.
-    fn companion_residual(&self, x: &[f64], p: &[f64], lambda: f64, tb: &mut TapeBufs) {
-        let n = self.n;
-        self.eval_episode(&self.tape_res_dc, x, p, tb);
-        let h = &mut tb.out;
-        let s = 1.0 - lambda;
-        for &(r, c, g) in &self.companion {
-            h[r] += s * g * x[c];
-        }
-        // Ground baseline on node rows so the lambda = 0 network is regular even
-        // when a device cluster has no companion path to ground (the star links
-        // terminals, not ground); fades with lambda. Branch/internal rows are
-        // constraints, not KCL -- a shunt there would corrupt them.
-        for i in (0..n).filter(|&i| self.is_node(i)) {
-            h[i] += s * GMIN_START * x[i];
-        }
     }
 
     /// Solve `[J(x) + (1-lambda)*G_comp + GMIN_DC*I] dx = rhs` (the augmented
@@ -1528,70 +1139,85 @@ impl CompiledDc {
             .as_ref()
     }
 
-    /// Damped Newton on the companion-augmented system at a fixed `lambda`.
-    /// `tricks` gates the per-step shaping (uniform clamp, device limiting, line
-    /// search), exactly as in [`newton`](Self::newton).
-    #[allow(clippy::too_many_arguments)]
+    /// Damped Newton on the companion-augmented system at a fixed `lambda`,
+    /// to the residual half alone: an intermediate continuation point is a
+    /// waypoint, and demanding the update half there changed which point the
+    /// polish started from (measured as termination noise in a
+    /// finite-difference check); the final polish in `newton` enforces both
+    /// halves. `tricks` gates the line search and device limiting as in
+    /// [`newton`](Self::newton).
     fn companion_newton(
         &self,
-        p: &[f64],
+        p: &Binding<'_>,
         x_init: &[f64],
         lambda: f64,
         conv: &Convergence,
         max_iter: usize,
         tricks: SolverTricks,
-        (res, jac): &mut (TapeBufs, TapeBufs),
     ) -> (Vec<f64>, bool, usize) {
-        let n = self.n;
-        let mut x = if x_init.len() == n {
-            x_init.to_vec()
+        let tries = if tricks.line_search {
+            LINE_SEARCH_TRIES
         } else {
-            vec![0.0; n]
+            1
         };
-        let (mut step, mut trial) = (vec![0.0; n], vec![0.0; n]);
-        // Companion-pattern factorization cache for this lambda's corrector.
-        let mut fac: Option<sparse::Refactorable> = None;
-        let mut stall = newton::StallGuard::new();
-        for it in 0..max_iter {
-            self.companion_residual(&x, p, lambda, res);
-            let h = &res.out;
-            let fnorm = norm2(h);
-            if stall.stalled(fnorm) {
-                return (x, false, it);
-            }
-            // `h` already folds in the companion and gmin terms, so test it
-            // directly (per component) with no extra shunt. The intermediate
-            // continuation points need only the residual half; the final polish
-            // in `newton` enforces the full residual+update criterion.
-            // The residual half of the shared contract only: an intermediate
-            // continuation point is a waypoint, and demanding the update half
-            // there changed which point the polish started from (measured as
-            // termination noise in a finite-difference check); the final
-            // polish in `newton` enforces both halves.
-            if self.residual_converged(h, &x, 0.0, conv) {
-                return (x, true, it);
-            }
-            if !self.companion_solve(&x, p, lambda, h, &mut step, jac, &mut fac) {
-                return (x, false, it);
-            }
-            // Curve-aware per-device limiting (path-only; see `newton`).
-            if tricks.device_limiting && !self.limits.is_empty() {
-                newton::limit_step(&self.limits, &x, &mut step[..n]);
-            }
-            // Backtracking line search on |H|.
-            let tries = if tricks.line_search {
-                LINE_SEARCH_TRIES
-            } else {
-                1
-            };
-            // Its waypoints take the residual half alone, which the rounding
-            // never keeps from passing: no floor needed.
-            newton::backtrack(&mut x, &step, &mut trial, fnorm, 0.0, tries, |trial| {
-                self.companion_residual(trial, p, lambda, res);
-                norm2(&res.out)
-            });
+        let policy = newton::Policy {
+            globalization: newton::Globalization::LineSearch { tries },
+            limiting: tricks.device_limiting,
+            early_accept: false,
+            composite: false,
+            ..self.policy(max_iter)
+        };
+        let sys = Dc::new(self, p, Shunt::Companion(lambda), tricks);
+        self.run(sys, x_init, conv, false, &policy)
+    }
+
+    /// The Newton policy of the DC loops: the full Jacobian, the line search
+    /// with every probe, device limiting, the stall rule, the early
+    /// acceptance and the composite step.
+    fn policy(&self, max_iter: usize) -> newton::Policy {
+        newton::Policy {
+            max_iter,
+            jacobian: newton::Jacobian::Full,
+            globalization: newton::Globalization::LineSearch {
+                tries: LINE_SEARCH_TRIES,
+            },
+            limiting: self.tricks.device_limiting,
+            stall: true,
+            early_accept: true,
+            composite: self.tricks.composite_step,
+            keep_best: false,
+            trace: sane_core::config().dc_trace,
         }
-        (x, false, max_iter)
+    }
+
+    /// The Newton core on `sys` from `x_init` (cold where empty), to the
+    /// contract over this system's unknowns: the residual half, and the
+    /// update half where `update`.
+    fn run(
+        &self,
+        mut sys: Dc<'_, '_>,
+        x_init: &[f64],
+        conv: &Convergence,
+        update: bool,
+        policy: &newton::Policy,
+    ) -> (Vec<f64>, bool, usize) {
+        let mut x = match x_init.len() == self.n {
+            true => x_init.to_vec(),
+            false => vec![0.0; self.n],
+        };
+        let contract = newton::Contract {
+            criterion: self.criterion(conv),
+            residual: true,
+            update: update.then_some(1.0),
+        };
+        let out = newton::solve(
+            &mut sys,
+            &mut x,
+            &contract,
+            policy,
+            &mut newton::Scratch::default(),
+        );
+        (x, out.converged, out.iters)
     }
 
     /// Per-device companion homotopy continuation (predictor-corrector). Deforms
@@ -1603,7 +1229,7 @@ impl CompiledDc {
     /// shunt to ground), which suits strongly nonlinear blocks.
     pub(crate) fn companion_continuation(
         &self,
-        p: &[f64],
+        p: &Binding<'_>,
         conv: &Convergence,
         mut iters: usize,
         tricks: SolverTricks,
@@ -1612,12 +1238,9 @@ impl CompiledDc {
             return (vec![0.0; self.n], false, iters);
         }
         let n = self.n;
-        // lambda = 0: the companion-dominated linear network.
-        // One residual and one Jacobian episode for the whole ramp: `p` is
-        // fixed along it, so the tapes' prologs run once.
-        let mut bufs = (TapeBufs::default(), TapeBufs::default());
-        let (mut x, c0, it0) =
-            self.companion_newton(p, &[], 0.0, conv, GMIN_STEP_MAX_ITER, tricks, &mut bufs);
+        // lambda = 0: the companion-dominated linear network. The binding's
+        // episodes serve the whole ramp: its prologs ran once.
+        let (mut x, c0, it0) = self.companion_newton(p, &[], 0.0, conv, GMIN_STEP_MAX_ITER, tricks);
         iters += it0;
         if !c0 {
             return (x, false, iters);
@@ -1640,22 +1263,25 @@ impl CompiledDc {
                 rhs_t[r] += g * x[c];
             }
             let dl = target - lambda;
-            let solved =
-                self.companion_solve(&x, p, lambda, &rhs_t, &mut tangent, &mut bufs.1, &mut fac_t);
+            let solved = {
+                let mut tapes = p.tapes.borrow_mut();
+                self.companion_solve(
+                    &x,
+                    p,
+                    lambda,
+                    &rhs_t,
+                    &mut tangent,
+                    &mut tapes.step,
+                    &mut fac_t,
+                )
+            };
             let x_pred: Vec<f64> = if solved {
                 (0..n).map(|i| x[i] + tangent[i] * dl).collect()
             } else {
                 x.clone()
             };
-            let (xc, cc, it) = self.companion_newton(
-                p,
-                &x_pred,
-                target,
-                conv,
-                GMIN_STEP_MAX_ITER,
-                tricks,
-                &mut bufs,
-            );
+            let (xc, cc, it) =
+                self.companion_newton(p, &x_pred, target, conv, GMIN_STEP_MAX_ITER, tricks);
             iters += it;
             sane_core::log::debug(&format!(
                 "companion: lambda {lambda:.4} -> {target:.4} {} ({it} iters)",
@@ -1717,6 +1343,308 @@ impl Ramp {
     }
 }
 
+/// What a DC Newton adds to `F(x)` to make its system: a shunt to ground,
+/// pin springs, or the companion homotopy.
+enum Shunt {
+    /// `gmin x` on every unknown.
+    Uniform(f64),
+    /// `diag x - anchor`: `GMIN_DC` on every unknown and a spring
+    /// `g_k (x_k - t_k)` on each pinned one (the node-set phase, the
+    /// pseudo-transient anchor).
+    Pinned { diag: Vec<f64>, anchor: Vec<f64> },
+    /// The companion homotopy at `lambda`: `(1 - lambda) (G_comp x +
+    /// GMIN_START x)` on the node rows; `GMIN_DC` regularizes the matrix only.
+    Companion(f64),
+}
+
+/// The DC system at a binding as the Newton core solves it (see
+/// [`newton::System`]): `F(x)` and its Jacobian from the binding's episodes
+/// (the step tape for both, the residual tape for the probes), what the
+/// [`Shunt`] adds, the reused symbolic pattern refactored in place (or the
+/// cached Schur partition of a large mostly-linear system, or a one-shot
+/// triplet LU on a degenerate pattern), and the rounding the residual rows
+/// sum.
+struct Dc<'a, 'b> {
+    cdc: &'a CompiledDc,
+    p: &'a Binding<'b>,
+    shunt: Shunt,
+    tapes: std::cell::RefMut<'a, Episodes>,
+    valbuf: Vec<f64>,
+    fac: Option<sparse::Refactorable<'a>>,
+    /// The cached linear block of the partition, built at the first factor.
+    lin: Option<LinCache>,
+    partition: bool,
+    terms: Vec<f64>,
+    /// Load the weak diagonals of the matrix (the node-adaptive fallback):
+    /// each up to `ADAPT_DIAG_FRAC` of the strongest, decaying with the
+    /// residual norm.
+    load_weak: bool,
+    /// Grant the residual half where the SPICE-relative test holds (see
+    /// [`CompiledDc::residual_relative_ok`]).
+    relative: Option<Convergence>,
+    /// The residual norm at the last Jacobian evaluation.
+    fnorm: f64,
+    iscale: (Vec<f64>, Vec<f64>),
+}
+
+impl<'a, 'b> Dc<'a, 'b> {
+    fn new(cdc: &'a CompiledDc, p: &'a Binding<'b>, shunt: Shunt, tricks: SolverTricks) -> Self {
+        let partition =
+            matches!(shunt, Shunt::Uniform(_)) && cdc.partition.is_some() && tricks.partition;
+        Dc {
+            cdc,
+            p,
+            shunt,
+            tapes: p.tapes.borrow_mut(),
+            valbuf: Vec::new(),
+            fac: None,
+            lin: None,
+            partition,
+            terms: Vec::new(),
+            load_weak: false,
+            relative: None,
+            fnorm: f64::INFINITY,
+            iscale: (Vec::new(), Vec::new()),
+        }
+    }
+
+    /// The node-adaptive form: weak diagonals loaded, the relative test
+    /// granted, no partition.
+    fn adaptive(mut self, conv: Convergence) -> Self {
+        self.load_weak = true;
+        self.relative = Some(conv);
+        self.partition = false;
+        self
+    }
+
+    /// The Jacobian nonzeros of the last Jacobian evaluation.
+    fn jac(&self) -> &[f64] {
+        &self.tapes.step.out[self.cdc.n..]
+    }
+
+    /// The diagonal the shunt puts on the matrix, row `i`.
+    fn diag(&self, i: usize) -> f64 {
+        match &self.shunt {
+            Shunt::Uniform(g) => *g,
+            Shunt::Pinned { diag, .. } => diag[i],
+            Shunt::Companion(l) => {
+                let base = if self.cdc.is_node(i) {
+                    (1.0 - l) * GMIN_START
+                } else {
+                    0.0
+                };
+                base + GMIN_DC
+            }
+        }
+    }
+
+    /// The companion entries `(row, col, value)` the homotopy puts on the
+    /// matrix (none outside it).
+    fn extra(&self) -> Vec<(usize, usize, f64)> {
+        match self.shunt {
+            Shunt::Companion(l) => (self.cdc.companion.iter())
+                .map(|&(r, c, g)| (r, c, (1.0 - l) * g))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+}
+
+impl newton::System<f64> for Dc<'_, '_> {
+    fn eval(&mut self, x: &[f64], jacobian: bool, res: &mut [f64]) -> bool {
+        let (cdc, p) = (self.cdc, self.p);
+        let tb = match jacobian {
+            true => &mut self.tapes.step,
+            false => &mut self.tapes.res,
+        };
+        let tape = if jacobian {
+            &cdc.tape_step_dc
+        } else {
+            &cdc.tape_res_dc
+        };
+        cdc.eval_episode(tape, x, p, tb);
+        let f = &tb.out;
+        match &self.shunt {
+            Shunt::Uniform(g) => {
+                for (i, r) in res.iter_mut().enumerate() {
+                    *r = f[i] + g * x[i];
+                }
+            }
+            Shunt::Pinned { diag, anchor } => {
+                for (i, r) in res.iter_mut().enumerate() {
+                    *r = f[i] + diag[i] * x[i] - anchor[i];
+                }
+            }
+            Shunt::Companion(l) => {
+                let s = 1.0 - l;
+                for (i, r) in res.iter_mut().enumerate() {
+                    *r = f[i]
+                        + if cdc.is_node(i) {
+                            s * GMIN_START * x[i]
+                        } else {
+                            0.0
+                        };
+                }
+                for &(r, c, g) in &cdc.companion {
+                    res[r] += s * g * x[c];
+                }
+            }
+        }
+        if jacobian {
+            self.fnorm = norm2(res);
+        }
+        true
+    }
+
+    fn factor(&mut self) -> bool {
+        let cdc = self.cdc;
+        let n = cdc.n;
+        if self.partition {
+            if let Shunt::Uniform(g) = self.shunt {
+                if self.lin.is_none() {
+                    let part = cdc.partition.as_ref().unwrap();
+                    self.lin = cdc.build_lin_cache(part, self.jac(), g);
+                }
+            }
+            if self.lin.is_some() {
+                return true;
+            }
+            self.partition = false; // degenerate: the full LU
+        }
+        let companion = matches!(self.shunt, Shunt::Companion(_));
+        let sym = match companion {
+            true => cdc.companion_symbolic(),
+            false => cdc.symbolic.as_ref(),
+        };
+        let Some(sym) = sym else {
+            return true; // the triplet fallback factors as it solves
+        };
+        // values: the Jacobian nonzeros, the companion entries, the diagonal
+        let mut vals = std::mem::take(&mut self.valbuf);
+        vals.clear();
+        vals.extend_from_slice(self.jac());
+        if self.load_weak {
+            let out = &self.tapes.step.out;
+            let maxd = (cdc.diag_idx.iter().flatten())
+                .map(|&di| out[n + di].abs())
+                .fold(0.0f64, f64::max);
+            // strong far from the solution, vanishing as the residual does
+            let floor = ADAPT_DIAG_FRAC * maxd * self.fnorm.min(1.0);
+            for &di in cdc.diag_idx.iter().flatten() {
+                let jii = vals[di].abs();
+                if jii < floor {
+                    vals[di] += floor - jii;
+                }
+            }
+        }
+        vals.extend(self.extra().into_iter().map(|(_, _, v)| v));
+        vals.extend((0..n).map(|i| self.diag(i)));
+        let f = self.fac.get_or_insert_with(|| sym.pattern.factorizer());
+        let ok = f.factor(&vals, cdc.tricks.row_equilibration);
+        self.valbuf = vals;
+        ok
+    }
+
+    fn solve(&mut self, rhs: &[f64], dx: &mut [f64]) -> bool {
+        let cdc = self.cdc;
+        if self.partition {
+            let (part, lin) = (cdc.partition.as_ref().unwrap(), self.lin.as_ref().unwrap());
+            return (cdc.solve_partitioned(lin, part, self.jac(), rhs))
+                .map(|d| dx.copy_from_slice(&d))
+                .is_some();
+        }
+        if let Some(f) = &mut self.fac {
+            return f.solve_into(rhs, dx);
+        }
+        let diag: Vec<f64> = (0..cdc.n).map(|i| self.diag(i)).collect();
+        (cdc.solve_triplets(self.jac(), &self.extra(), &diag, rhs))
+            .map(|d| dx.copy_from_slice(&d))
+            .is_some()
+    }
+
+    fn probe(&mut self, rhs: &[f64], dx: &mut [f64]) -> bool {
+        match (&mut self.fac, self.partition) {
+            (Some(f), false) => f.solve_into(rhs, dx),
+            _ => false,
+        }
+    }
+
+    fn chord(&mut self, rhs: &[f64], dx: &mut [f64]) -> bool {
+        self.probe(rhs, dx)
+    }
+
+    fn rounding(&mut self, x: &[f64], _res: &[f64]) -> (bool, f64) {
+        let n = self.cdc.n;
+        let out = &self.tapes.step.out;
+        match self.shunt {
+            Shunt::Uniform(g) => self
+                .cdc
+                .rounding(&out[..n], &out[n..], x, g, &mut self.terms),
+            // the rounding of `F + GMIN_DC x`: a floor for the line search,
+            // no acceptance (the spring rows sum terms it does not count)
+            Shunt::Pinned { .. } => (
+                false,
+                self.cdc
+                    .rounding(&out[..n], &out[n..], x, GMIN_DC, &mut self.terms)
+                    .1,
+            ),
+            // waypoints take the residual half alone, which the rounding
+            // never keeps from passing
+            Shunt::Companion(_) => (false, 0.0),
+        }
+    }
+
+    fn accept_residual(&mut self, x: &[f64], _res: &[f64]) -> bool {
+        let (Some(conv), Some(tape)) = (self.relative, &self.cdc.tape_iscale) else {
+            return false;
+        };
+        let (work, terms) = &mut self.iscale;
+        let step = &self.tapes.step;
+        tape.eval(&step.inputs, work, terms);
+        let n = self.cdc.n;
+        self.cdc
+            .residual_relative_ok(&step.out[..n], terms, x, GMIN_DC, &conv)
+    }
+
+    fn limit(&self, x: &[f64], step: &mut [f64]) -> f64 {
+        newton::limit_step(&self.cdc.limits, x, step)
+    }
+}
+
+/// The binding a DC solve runs at, and its tapes' episodes there: the
+/// parameter vector is fixed across the whole solve, so each tape's
+/// parameter-pure prolog runs once and every Newton loop of the cascade (each
+/// homotopy level, each continuation step) evaluates only the main phase.
+/// Reads as the parameter vector.
+pub(crate) struct Binding<'a> {
+    p: &'a [f64],
+    tapes: std::cell::RefCell<Episodes>,
+}
+
+impl<'a> Binding<'a> {
+    pub(crate) fn new(p: &'a [f64]) -> Self {
+        Binding {
+            p,
+            tapes: Default::default(),
+        }
+    }
+}
+
+impl std::ops::Deref for Binding<'_> {
+    type Target = [f64];
+    fn deref(&self) -> &[f64] {
+        self.p
+    }
+}
+
+/// The step (residual and Jacobian) and the residual tapes' buffers at one
+/// binding.
+#[derive(Default)]
+struct Episodes {
+    step: TapeBufs,
+    res: TapeBufs,
+}
+
 /// One tape evaluation site's buffers, and the factor values built from its
 /// outputs: kept by a Newton loop across its iterations. The buffers belong
 /// to one tape at one parameter binding: the first evaluation runs the
@@ -1733,20 +1661,4 @@ struct TapeBufs {
 
 fn norm2(v: &[f64]) -> f64 {
     v.iter().map(|x| x * x).sum::<f64>().sqrt()
-}
-
-/// The 2-norm of the shunted residual `F + gmin * x` (`gmin = 0` is the raw
-/// residual): the scalar the line searches and the stall guard read.
-fn shunted_norm(res: &[f64], x: &[f64], gmin: f64) -> f64 {
-    if gmin == 0.0 {
-        return norm2(res);
-    }
-    res.iter()
-        .zip(x)
-        .map(|(r, xi)| {
-            let v = r + gmin * xi;
-            v * v
-        })
-        .sum::<f64>()
-        .sqrt()
 }

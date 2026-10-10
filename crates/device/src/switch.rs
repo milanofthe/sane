@@ -92,6 +92,7 @@ impl DeviceModel for CSwitch {
     ) -> Result<BehavioralFragment, String> {
         let (terminal_currents, events) = self.lower(lo.ctx(), terminal_v, control_i);
         Ok(BehavioralFragment {
+            noise_rows: Vec::new(),
             param_syms: Vec::new(),
             structural: Vec::new(),
             collapsed: Vec::new(),

@@ -30,8 +30,8 @@ use rsdag::{differentiate, CmpOp, Crossing, ExprId, Node, SymbolId};
 use sane_core::constants::{MAX_UNROLL, VA_LOOP_GATED_CAP, VERILOGA_K_OVER_Q};
 use sane_core::Graph;
 use sane_device::{
-    Assertion, BehavioralFragment, FragmentEvent, FragmentLimit, LimitKind, LoweredDelay,
-    Lowerer, NoiseSource, OpVar,
+    Assertion, BehavioralFragment, FragmentEvent, FragmentLimit, LimitKind, LoweredDelay, Lowerer,
+    NoiseSource, OpVar,
 };
 
 use crate::ast::{Access, BinOp, Expr, Stmt, UnOp};
@@ -161,7 +161,13 @@ fn node_aliases(em: &ElaboratedModule, shorts: &[(String, String)]) -> HashMap<S
         match em.ports.iter().position(|p| p == n) {
             _ if n == "0" => (0, 0),
             Some(k) => (1, k),
-            None => (2, em.internal_nodes.iter().position(|p| p == n).unwrap_or(usize::MAX)),
+            None => (
+                2,
+                em.internal_nodes
+                    .iter()
+                    .position(|p| p == n)
+                    .unwrap_or(usize::MAX),
+            ),
         }
     };
     for (a, b) in shorts {
@@ -169,14 +175,21 @@ fn node_aliases(em: &ElaboratedModule, shorts: &[(String, String)]) -> HashMap<S
         if ra == rb {
             continue;
         }
-        let (keep, merge) = if rank(&ra) <= rank(&rb) { (ra, rb) } else { (rb, ra) };
+        let (keep, merge) = if rank(&ra) <= rank(&rb) {
+            (ra, rb)
+        } else {
+            (rb, ra)
+        };
         if rank(&merge).0 < 2 {
             continue; // two ports, or a port and ground: a source, not a short
         }
         parent.insert(merge, keep);
     }
     let nodes: Vec<String> = parent.keys().cloned().collect();
-    nodes.into_iter().map(|n| (n.clone(), find(&parent, &n))).collect()
+    nodes
+        .into_iter()
+        .map(|n| (n.clone(), find(&parent, &n)))
+        .collect()
 }
 
 /// One lowering over what `branches` knows of the branches.
@@ -216,7 +229,7 @@ fn walk<'a, 'b>(
         noise: Vec::new(),
         events: Vec::new(),
         limits: Vec::new(),
-        cur_branch: None,
+        noise_scale: None,
         probe_of: HashMap::default(),
         probe_order: Vec::new(),
         flow_sum: HashMap::default(),
@@ -329,9 +342,11 @@ struct Lower<'a, 'b> {
     /// "pnjlim"/"fetlim", ...)` site lowered (a limit only shapes the Newton
     /// path, so one in an arm a binding does not take is harmless).
     limits: Vec<FragmentLimit>,
-    /// The (hi, lo) node voltage symbols of the contribution currently being
-    /// lowered, so a `white_noise`/`flicker_noise` in its RHS attaches to it.
-    cur_branch: Option<(Option<SymbolId>, Option<SymbolId>)>,
+    /// Inside a contribution's right-hand side, the factor its value is
+    /// scaled by (the multiplicity of a flow, `1` for a potential): a noise
+    /// generator in it is scaled with it, its density divided so the
+    /// parallel devices' noise adds as uncorrelated noise does.
+    noise_scale: Option<f64>,
     /// Branches whose current is probed `I(a,b)` somewhere: promoted to an
     /// explicit current unknown. Canonical (lo<=hi) key -> current expr.
     probe_of: HashMap<(String, String), ExprId>,
@@ -569,6 +584,30 @@ impl<'a, 'b> Lower<'a, 'b> {
             charges.drain(..n_cur).collect()
         };
         let mut noise = std::mem::take(&mut self.noise);
+        // The rows at rest, and where each noise generator enters them: the
+        // rows carry the generators where the contributions put them; the
+        // device hands over its rows without, and each generator's
+        // coefficient per row (see `BehavioralFragment::noise_rows`).
+        let (terminal_currents, currents, noise_rows) = if noise.is_empty() {
+            (terminal_currents, currents, Vec::new())
+        } else {
+            let rows: Vec<ExprId> = terminal_currents.iter().chain(&currents).copied().collect();
+            let inputs: Vec<SymbolId> = noise.iter().map(|n| n.input).collect();
+            let mut noise_rows = vec![Vec::new(); inputs.len()];
+            for (r, row) in rsdag::sparse_jacobian(self.ctx(), &rows, &inputs)
+                .into_iter()
+                .enumerate()
+            {
+                for (q, coeff) in row {
+                    noise_rows[q].push((r, coeff));
+                }
+            }
+            let zero = self.ctx().zero();
+            let quiet: HashMap<SymbolId, ExprId> = inputs.iter().map(|&s| (s, zero)).collect();
+            let mut rows = rsdag::substitute(self.ctx(), &rows, &quiet);
+            let currents = rows.split_off(n_cur);
+            (rows, currents, noise_rows)
+        };
         let mut events = std::mem::take(&mut self.events);
         let observed: Vec<ExprId> = op_vars
             .iter()
@@ -583,7 +622,7 @@ impl<'a, 'b> Lower<'a, 'b> {
             v.value = observed.next().expect("one per op-var");
         }
         for n in &mut noise {
-            *n = n.with_exprs(n.hi, n.lo, &mut observed);
+            *n = n.with_exprs(n.input, &mut observed);
         }
         for e in &mut events {
             e.g = observed.next().expect("one per event");
@@ -600,6 +639,7 @@ impl<'a, 'b> Lower<'a, 'b> {
             terminal_charges,
             charges,
             noise,
+            noise_rows,
             events,
             param_syms,
             op_vars,
@@ -710,6 +750,43 @@ impl<'a, 'b> Lower<'a, 'b> {
     }
 
     /// Scale a flow expression by the parallel multiplicity `m` (no-op for m = 1).
+    /// A noise generator of density `psd` (a table's densities `table`) in
+    /// the contribution being lowered: its symbol `{inst}#noise{k}`, the
+    /// density divided by the contribution's scale (see `noise_scale`).
+    fn noise_generator(
+        &mut self,
+        name: &str,
+        psd: ExprId,
+        flicker_exp: ExprId,
+        table: Vec<(ExprId, ExprId)>,
+    ) -> Result<ExprId, String> {
+        let Some(scale) = self.noise_scale else {
+            return Err(format!("{name} outside a contribution statement"));
+        };
+        let name = noise_symbol_name(&self.inst, self.noise.len());
+        let g = self.ctx().sym(&name);
+        let input = sym_of(self.lo.ctx(), g).expect("sym() yields a Symbol node");
+        let per = |ctx: &mut Graph, e: ExprId| {
+            if scale == 1.0 {
+                e
+            } else {
+                let s = ctx.konst_f64(scale);
+                ctx.div(e, s)
+            }
+        };
+        let psd = per(self.ctx(), psd);
+        let table = (table.into_iter())
+            .map(|(f, p)| (f, per(self.ctx(), p)))
+            .collect();
+        self.noise.push(NoiseSource {
+            input,
+            psd,
+            flicker_exp,
+            table,
+        });
+        Ok(g)
+    }
+
     fn scale_m(&mut self, e: ExprId) -> ExprId {
         let mf = self.mfactor;
         if (mf - 1.0).abs() < f64::EPSILON {
@@ -766,7 +843,10 @@ impl<'a, 'b> Lower<'a, 'b> {
             // parameters, it rejects the bindings that take the path.
             "error" | "fatal" => {
                 let reached = self.reached();
-                let text = format!("${name} (module {}, line {}): {}", self.em.name, span.line, msg);
+                let text = format!(
+                    "${name} (module {}, line {}): {}",
+                    self.em.name, span.line, msg
+                );
                 match self.ctx().const_f64(reached) {
                     Some(r) if r != 0.0 => Err(text),
                     Some(_) => Ok(()),
@@ -1283,21 +1363,17 @@ impl<'a, 'b> Lower<'a, 'b> {
             }
             return Ok(());
         }
-        // Attach any noise sources in the RHS to this branch's node voltages.
-        let hsym = self
-            .node_v
-            .get(&hn)
-            .copied()
-            .and_then(|e| sym_of(self.lo.ctx(), e));
-        let lsym = self
-            .node_v
-            .get(&ln)
-            .copied()
-            .and_then(|e| sym_of(self.lo.ctx(), e));
-        let saved_branch = self.cur_branch.take();
-        self.cur_branch = Some((hsym, lsym));
-        let val = self.expr(rhs)?;
-        self.cur_branch = saved_branch;
+        // A noise generator in the RHS enters the residuals where the value
+        // does, scaled with it (see `noise_scale`).
+        let scale = if is_potential(access) {
+            1.0
+        } else {
+            self.mfactor
+        };
+        let saved_scale = self.noise_scale.replace(scale);
+        let val = self.expr(rhs);
+        self.noise_scale = saved_scale;
+        let val = val?;
 
         // Switch branch: its current unknown `i` is minted/stamped
         // unconditionally (in `setup`). Each arm only records its constraint as a
@@ -1732,7 +1808,8 @@ impl<'a, 'b> Lower<'a, 'b> {
                             when,
                         };
                         if !self.limits.iter().any(|l| {
-                            (l.hi, l.lo, l.kind, l.when) == (limit.hi, limit.lo, limit.kind, limit.when)
+                            (l.hi, l.lo, l.kind, l.when)
+                                == (limit.hi, limit.lo, limit.kind, limit.when)
                         }) {
                             self.limits.push(limit);
                         }
@@ -1760,8 +1837,8 @@ impl<'a, 'b> Lower<'a, 'b> {
             return Ok(self.ddt(q));
         }
         if name == "white_noise" || name == "flicker_noise" {
-            // Record a noise source on the enclosing contribution's branch; the
-            // large-signal value is zero.
+            // A noise generator: a symbol, zero in every evaluation, that
+            // enters the residuals where the contribution puts it.
             if args.is_empty() {
                 return Err(format!("{name} expects a power-spectral-density argument"));
             }
@@ -1774,19 +1851,10 @@ impl<'a, 'b> Lower<'a, 'b> {
             } else {
                 self.ctx().zero()
             };
-            if let Some((hi, lo)) = self.cur_branch {
-                // A source on a conditional path is there where the path is.
-                let reached = self.reached();
-                let psd = self.ctx().mul(psd, reached);
-                self.noise.push(NoiseSource {
-                    hi,
-                    lo,
-                    psd,
-                    flicker_exp,
-                    table: Vec::new(),
-                });
-            }
-            return Ok(self.ctx().zero());
+            // A source on a conditional path is there where the path is.
+            let reached = self.reached();
+            let psd = self.ctx().mul(psd, reached);
+            return self.noise_generator(name, psd, flicker_exp, Vec::new());
         }
         if name == "noise_table" || name == "noise_table_log" {
             // Tabular noise: a flat {f0, p0, f1, p1, ...} coefficient array,
@@ -1801,23 +1869,13 @@ impl<'a, 'b> Lower<'a, 'b> {
                 .iter()
                 .map(|c| (c[0], c[1]))
                 .collect();
-            if let Some((hi, lo)) = self.cur_branch {
-                let reached = self.reached();
-                let table = table
-                    .into_iter()
-                    .map(|(f, p)| (f, self.ctx().mul(p, reached)))
-                    .collect();
-                let psd = self.ctx().zero();
-                let flicker_exp = self.ctx().zero();
-                self.noise.push(NoiseSource {
-                    hi,
-                    lo,
-                    psd,
-                    flicker_exp,
-                    table,
-                });
-            }
-            return Ok(self.ctx().zero());
+            let reached = self.reached();
+            let table = table
+                .into_iter()
+                .map(|(f, p)| (f, self.ctx().mul(p, reached)))
+                .collect();
+            let (psd, flicker_exp) = (self.ctx().zero(), self.ctx().zero());
+            return self.noise_generator(name, psd, flicker_exp, table);
         }
         if name == "laplace_nd" {
             // Continuous Laplace filter H(s) = N(s)/D(s) with numerator/
@@ -2046,7 +2104,6 @@ impl<'a, 'b> Lower<'a, 'b> {
             _ => Err("expected a coefficient vector {..}".into()),
         }
     }
-
 
     /// Lower H(s)=N(s)/D(s) (coefficient vectors, ascending powers of s) to a
     /// controllable-canonical state space: states s_i = w^(i) where D(s)w = u,
@@ -2372,4 +2429,9 @@ pub(crate) fn sym_of(ctx: &Graph, e: ExprId) -> Option<SymbolId> {
         Node::Symbol(s) => Some(*s),
         _ => None,
     }
+}
+
+/// The symbol of noise generator `k` of the device instance `inst`.
+pub(crate) fn noise_symbol_name(inst: &str, k: usize) -> String {
+    format!("{inst}#noise{k}")
 }

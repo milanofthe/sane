@@ -13,7 +13,7 @@ use crate::node::{BinOp, CmpOp, ExprId, Node, ReduceOp, SymbolId, UnaryOp};
 /// Derivative of `expr` with respect to the symbol `wrt`.
 pub fn differentiate<K: Field>(ctx: &mut Graph<K>, expr: ExprId, wrt: SymbolId) -> ExprId {
     let mut memo = ctx.take_memo();
-    let d = forward(ctx, &[expr], wrt, &mut memo)[0];
+    let d = forward(ctx, &[expr], wrt, &mut memo, &|_| true)[0];
     ctx.put_memo(memo);
     d
 }
@@ -339,13 +339,17 @@ fn cone<K: Field>(ctx: &Graph<K>, root: ExprId, seen: &mut Memo) -> Vec<ExprId> 
 /// roots (or by the roots of a later sweep over the same `wrt` and memo)
 /// is differentiated once. Operands first, in order, on an explicit stack
 /// (the order a recursive walk takes), so a deep chain does not overflow
-/// the call stack.
-fn forward<K: Field>(
+/// the call stack. Only operands `moves` admits are walked, the others'
+/// derivative is zero: given the support, a sweep visits only what depends
+/// on `wrt`, not the roots' whole cones.
+pub(crate) fn forward<K: Field>(
     ctx: &mut Graph<K>,
     roots: &[ExprId],
     wrt: SymbolId,
     memo: &mut Memo,
+    moves: &dyn Fn(ExprId) -> bool,
 ) -> Vec<ExprId> {
+    let zero = ctx.zero();
     let mut stack: Vec<(ExprId, bool)> = Vec::with_capacity(64);
     stack.extend(roots.iter().rev().map(|&r| (r, false)));
     let mut ops = Vec::new();
@@ -360,8 +364,15 @@ fn forward<K: Field>(
         } else {
             stack.push((e, true));
             carrying(ctx, e, &mut ops);
-            let pending = ops.iter().rev().filter(|&&c| memo.get(c).is_none());
-            stack.extend(pending.map(|&c| (c, false)));
+            for &c in ops.iter().rev() {
+                if memo.get(c).is_none() {
+                    if moves(c) {
+                        stack.push((c, false));
+                    } else {
+                        memo.set(c, zero);
+                    }
+                }
+            }
         }
     }
     roots
@@ -552,7 +563,6 @@ pub fn sparse_jacobian<K: Field>(
                 .collect()
         })
         .collect();
-    drop(flow);
     let mut rows: SparseRows = vec![Vec::new(); residuals.len()];
     // Forward rows by the columns they touch, rows in order within one.
     let mut by_col: Vec<Vec<usize>> = vec![Vec::new(); wrt.len()];
@@ -574,7 +584,10 @@ pub fn sparse_jacobian<K: Field>(
         }
         memo.begin(ctx.len());
         let roots: Vec<ExprId> = members.iter().map(|&i| residuals[i]).collect();
-        let col = forward(ctx, &roots, wrt[j], &mut memo);
+        // through the nodes whose support holds the column only
+        let col = forward(ctx, &roots, wrt[j], &mut memo, &|c| {
+            flow.get(c).contains(j as u32)
+        });
         for (&i, d) in members.iter().zip(col) {
             rows[i].push((j, d));
         }

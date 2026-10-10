@@ -1,89 +1,83 @@
-#########################################################################################
-##
-##                                      SANE
-##                                  (__init__.py)
-##
-##          Circuit analysis with exact component sensitivity (DC /
-##       transient / AC / pole-zero / noise / harmonic balance), on a
-##              hash-consed expression graph in Rust.
-##
-#########################################################################################
 """SANE: circuit analysis with exact sensitivities.
 
 SANE extracts the differential-algebraic system ``I(x, t) + d/dt Q(x) = 0``
-from a circuit as an expression graph and analyzes it exactly: DC operating point, transient response,
-small-signal AC transfer, poles / zeros, noise PSD and harmonic balance, and --
-its distinguishing capability -- exact component sensitivity (which component
-matters how much, to first and second order, hierarchically) for every one of
-those analyses, all via automatic differentiation of the symbolic DAG.
+from a circuit as an expression graph and analyzes it exactly: DC operating
+point and sweeps, transient response, small-signal AC transfer and
+S-parameters, poles / zeros, noise, state space, reduced models and harmonic
+balance -- and, for every one of them, exact parameter sensitivities (first
+and second order, hierarchically) by automatic differentiation of the graph.
 
-Every analysis returns a result object with the same derivative workflow:
-``result.sensitivity(...)`` is the exact gradient over **all** parameters (one
-adjoint solve -- the parameter Jacobian is sparse, so the full gradient is
-cheap); rank it to find the influential knobs, then ``result.hessian(...,
-wrt=knobs)`` is the exact sparse second-order-adjoint Hessian over that subset.
-No finite differences anywhere -- the gradients and Hessians are autodiff of the
-one symbolic DAG.
-
-Circuits come from SPICE netlists or are built programmatically; Verilog-A
-models drop into a deck (a ``.veriloga ... .endveriloga`` block placed with an
-``N`` element) and are compiled natively onto the same symbolic DAG, so they
-run through every analysis like a built-in device.
-
-The ergonomic surface is two classes:
-
-- :class:`~sane.circuit.Circuit` -- build from a netlist or programmatically
-- :class:`~sane.model.Model` -- the circuit as an analyzable symbolic graph
-
-Example
--------
+Everything runs in Rust; this package is a thin layer over it. A model is
+taken to a binding of its parameters, the point every analysis runs at;
+results carry their data as numpy arrays (over the engine's own memory, no
+copies) and their derivatives as methods:
 
 .. code-block:: python
 
     import numpy as np
     import sane
 
-    model = sane.Circuit.parse('''
+    model = sane.Model.from_netlist('''
         V1 in 0 5
         R1 in out 1k
         C1 out 0 1u
-    ''').extract()                       # or sane.Model.from_netlist(...)
+    ''')
+    pt = model.at(R1=2e3)                       # the point of a binding
+    op = pt.operating_point()
+    print(op["out"], op.sensitivity("out").grad)
 
-    op = model.operating_point()         # DC bias, labeled by node
-    print(op["out"])
+    ac = pt.ac("V1", ["out"], np.geomspace(1, 1e6, 61))
+    print(ac.mag_db("out"), ac.sensitivity().grad.shape)
 
-    ss = model.small_signal("V1", "out") # linearize at the bias
-    print(ss.poles())                    # the RC pole
+    tr = pt.transient(np.linspace(0, 5e-3, 200))
+    print(tr.signal("out")[-1])
 
-    traj = model.transient(np.linspace(0, 5e-3, 200))
-    print(traj["out"][-1])
-
-The raw, positional compiled API remains available as :mod:`sane._core`.
+Circuits come from SPICE netlists (``sane.parse``) or are built element by
+element (:class:`Circuit`), Verilog-A modules included; ``sane.Model(circuit)``
+sets up the model of either.
 """
 
-# IMPORTS ===============================================================================
 
 from . import _core
-from .circuit import Circuit, GROUND_ALIASES
-# The one analyzable object: a circuit as a symbolic graph you run analyses on and
-# transform. The orchestration, parameter store and solved state live in Rust
-# (``sane_analysis::Model``, exposed as ``_core.Model``); this Python ``Model`` is a
-# thin, name-ergonomic wrapper. The identical API is available natively in Rust for
-# embedding without Python.
-from .model import Model
-from .analysis import (
+from ._core import (
+    Circuit,
+    Waveform,
+    Model,
+    Point,
+    ParamGroup,
     OperatingPoint,
-    Trajectory,
+    Regularization,
     Sensitivity,
+    Hessian,
+    Gradient,
+    DcSweep,
+    Trajectory,
+    TrajectorySensitivity,
     AcResponse,
-    SmallSignal,
+    AcSensitivity,
+    AcHessian,
+    SParameters,
+    SpSensitivity,
     NoiseSpectrum,
+    NoiseSensitivity,
+    Poles,
+    Zeros,
+    RootSensitivity,
     StateSpace,
-    TempSweep,
     ReducedModel,
     HarmonicBalance,
+    HbSensitivity,
+    HbHessian,
 )
-from .differentiable import ParamFunction, TransientFunction, DcFunction, AcFunction, HbFunction, PzFunction, SpFunction
+from .differentiable import (
+    ParamFunction,
+    TransientFunction,
+    DcFunction,
+    AcFunction,
+    SpFunction,
+    HbFunction,
+    PzFunction,
+)
 from .rf import SParams, read_touchstone, write_touchstone, s_to_y, y_to_s, fit_verilog_a
 from . import interop
 from .warnings import (
@@ -96,19 +90,7 @@ from .warnings import (
 # CONVENIENCE ===========================================================================
 
 def parse(netlist):
-    """Parse a SPICE-like netlist into a :class:`~sane.circuit.Circuit`.
-
-    Shorthand for :meth:`sane.circuit.Circuit.parse`.
-
-    Parameters
-    ----------
-    netlist : str
-        the netlist text; a trailing ``.end`` is optional
-
-    Returns
-    -------
-    sane.circuit.Circuit
-    """
+    """The :class:`Circuit` of a SPICE-like netlist (:meth:`Circuit.parse`)."""
     return Circuit.parse(netlist)
 
 
@@ -162,7 +144,7 @@ def profile_begin():
     :func:`profile_take`::
 
         sane.profile_begin()
-        op = model.operating_point()
+        op = model.at().operating_point()
         breakdown = sane.profile_take()   # [(stage, ms), ...]
     """
     _core.profile_begin()
@@ -190,26 +172,49 @@ except Exception:  # pragma: no cover
 
 __all__ = [
     "Circuit",
+    "Waveform",
     "Model",
+    "Point",
+    "ParamGroup",
     "OperatingPoint",
-    "Trajectory",
+    "Regularization",
     "Sensitivity",
+    "Hessian",
+    "Gradient",
+    "DcSweep",
+    "Trajectory",
+    "TrajectorySensitivity",
     "AcResponse",
-    "SmallSignal",
+    "AcSensitivity",
+    "AcHessian",
+    "SParameters",
+    "SpSensitivity",
     "NoiseSpectrum",
+    "NoiseSensitivity",
+    "Poles",
+    "Zeros",
+    "RootSensitivity",
     "StateSpace",
-    "TempSweep",
     "ReducedModel",
     "HarmonicBalance",
-    "GROUND_ALIASES",
+    "HbSensitivity",
+    "HbHessian",
     # differentiable functions + optimizer interop
     "ParamFunction",
     "TransientFunction",
     "DcFunction",
     "AcFunction",
+    "SpFunction",
     "HbFunction",
     "PzFunction",
     "interop",
+    # RF data
+    "SParams",
+    "read_touchstone",
+    "write_touchstone",
+    "s_to_y",
+    "y_to_s",
+    "fit_verilog_a",
     "parse",
     "set_parallelism",
     "set_log_level",

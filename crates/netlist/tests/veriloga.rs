@@ -49,7 +49,7 @@ fn inline_veriloga_diode_parses_and_binds() {
 fn inline_veriloga_diode_assembles_dae() {
     let p = parse(DECK).expect("deck parses");
     let mut ctx = Graph::new();
-    let dae = p.assemble(&mut ctx).unwrap();
+    let dae = sane_dae::assemble(&mut ctx, &p).unwrap();
     // nodes v1, v2 + branch i_V1.
     assert!(dae.dim() >= 3, "dim {}", dae.dim());
     assert!(dae.unknowns.iter().any(|u| u == "v2"));
@@ -100,7 +100,7 @@ fn switch_branch_lowers_per_instance() {
     let p = parse(SWITCH).expect("parse");
     assert_eq!(p.devices.len(), 2);
     let mut ctx = Graph::new();
-    let dae = p.assemble(&mut ctx).unwrap();
+    let dae = sane_dae::assemble(&mut ctx, &p).unwrap();
     // The shorted instance mints a branch-current unknown (voltage source);
     // the resistor instance mints none -> at least one extra branch unknown.
     assert!(dae.dim() >= 3, "dim {}", dae.dim());
@@ -123,7 +123,7 @@ fn multiple_modules_per_block() {
     let p = parse(MULTI).expect("parse");
     assert_eq!(p.devices.len(), 2);
     let mut ctx = Graph::new();
-    let dae = p.assemble(&mut ctx).unwrap();
+    let dae = sane_dae::assemble(&mut ctx, &p).unwrap();
     assert!(dae.unknowns.iter().any(|u| u == "v2"));
 }
 
@@ -141,7 +141,7 @@ N1 1 0 bad
 .end
 ";
     let p = parse(deck).expect("the deck parses");
-    let Err(e) = p.assemble(&mut Graph::new()) else {
+    let Err(e) = sane_dae::assemble(&mut Graph::new(), &p) else {
         panic!("an unsupported construct assembled");
     };
     assert!(
@@ -169,7 +169,7 @@ R2 out 0 1k
     let p = parse(deck).expect("current-controlled model parses + lowers");
     assert_eq!(p.devices.len(), 1);
     let mut ctx = Graph::new();
-    let dae = p.assemble(&mut ctx).unwrap();
+    let dae = sane_dae::assemble(&mut ctx, &p).unwrap();
     assert!(
         dae.unknowns.iter().any(|u| u.contains("flow_")),
         "promoted current unknown: {:?}",
@@ -209,7 +209,7 @@ N1 d d 0 0 ekv26_va W=10u L=1u
         "model default VTO"
     );
     let mut ctx = Graph::new();
-    let dae = p.assemble(&mut ctx).unwrap();
+    let dae = sane_dae::assemble(&mut ctx, &p).unwrap();
     // node d (index 1 -> "v1") + branch i_V1.
     assert!(dae.dim() >= 2, "dim {}", dae.dim());
     assert!(
@@ -275,7 +275,7 @@ fn compact_level_card_routes_to_va_via_model_alias() {
     );
     // It actually assembles into a DAE (the device lowered).
     let mut ctx = Graph::new();
-    let dae = p.assemble(&mut ctx).unwrap();
+    let dae = sane_dae::assemble(&mut ctx, &p).unwrap();
     assert!(
         dae.unknowns.iter().any(|u| u == "v1"),
         "node d present: {:?}",
@@ -326,7 +326,7 @@ fn compact_m_routing_matches_n_element() {
     let pm = parse(&m).expect("M");
     let pn = parse(&n).expect("N");
     for key in ["type", "L", "W", "gain"] {
-        let bound = |p: &sane_netlist::ParsedCircuit, inst: &str| {
+        let bound = |p: &sane_circuit::Circuit, inst: &str| {
             p.param_value(&p.param_symbol(inst, key).unwrap())
         };
         assert_eq!(bound(&pm, "M1"), bound(&pn, "N1"), "param {key} parity");
@@ -458,7 +458,7 @@ V1 1 0 1
 N1 1 0 vres res=2k
 .end
 ";
-    let p = parse(deck).expect("deck parses");
+    let (p, report) = sane_netlist::parse_report(deck, None).expect("deck parses");
     assert_eq!(
         p.param_value(&p.param_symbol("N1", "R").unwrap()),
         Some(2000.0),
@@ -469,9 +469,9 @@ N1 1 0 vres res=2k
         "alias itself is not a parameter"
     );
     assert!(
-        !p.report.unknown_params.iter().any(|u| u.contains("res")),
+        !report.unknown_params.iter().any(|u| u.contains("res")),
         "alias key must not be reported as unknown: {:?}",
-        p.report.unknown_params
+        report.unknown_params
     );
 }
 
@@ -494,18 +494,13 @@ V1 1 0 1
     let doubled = format!("{module}N1 1 0 vres mult2=2\n.end\n");
     let mut ctx = Graph::new();
     let p1 = parse(&base).expect("base parses");
-    let d1 = p1.assemble(&mut ctx).unwrap();
+    let d1 = sane_dae::assemble(&mut ctx, &p1).unwrap();
     let p2 = parse(&doubled).expect("doubled parses");
-    let d2 = p2.assemble(&mut ctx).unwrap();
+    let d2 = sane_dae::assemble(&mut ctx, &p2).unwrap();
     // Evaluate the node-1 KCL residual at the same point: the m=2 device
     // contributes exactly twice the branch current.
     let mut env = std::collections::HashMap::new();
-    for (name, v) in [
-        ("v1", 1.0),
-        ("i_V1", 0.0),
-        ("t", 0.0),
-        ("N1.R", 1000.0),
-    ] {
+    for (name, v) in [("v1", 1.0), ("i_V1", 0.0), ("t", 0.0), ("N1.R", 1000.0)] {
         let e = ctx.sym(name);
         if let rsdag::Node::Symbol(s) = ctx.node(e) {
             env.insert(*s, v);

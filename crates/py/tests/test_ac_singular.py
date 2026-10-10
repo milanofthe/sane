@@ -2,7 +2,6 @@
 catchable warning, never as a silent flat/zero response (~-600 dB) that
 masquerades as a size limit or a real spectral null.
 
-Run after ``maturin develop -m crates/py/Cargo.toml``:
     python -m pytest crates/py/tests/test_ac_singular.py
 """
 
@@ -28,17 +27,17 @@ HEALTHY = "V1 in 0 1\nR1 in out 1k\nC1 out 0 1u\n.end"
 
 
 def test_singular_ac_frequency_warns_and_is_nan():
-    dae = sane.Circuit.parse(TANK).extract()
+    model = sane.Model.from_netlist(TANK)
     freqs = np.array([F0 * 0.5, F0, F0 * 2.0])
     with pytest.warns(SaneNumericalWarning, match="singular"):
-        res = dae.ac("I1", "1", freqs)
-    assert np.isnan(res.value[1]), "the resonance (singular) frequency must be NaN, not 0.0"
-    assert np.isfinite(res.value[0]) and np.isfinite(res.value[2]), "off-resonance stays finite"
+        h = model.at().ac("I1", "1", freqs).of("1")
+    assert np.isnan(h[1]), "the resonance (singular) frequency must be NaN, not 0.0"
+    assert np.isfinite(h[0]) and np.isfinite(h[2]), "off-resonance stays finite"
 
 
 def test_healthy_ac_does_not_warn():
-    dae = sane.Circuit.parse(HEALTHY).extract()
+    model = sane.Model.from_netlist(HEALTHY)
     with warnings.catch_warnings():
         warnings.simplefilter("error", SaneNumericalWarning)
-        res = dae.ac("V1", "out", np.logspace(1, 6, 40))
-    assert np.isfinite(res.value).all()
+        ac = model.at().ac("V1", "out", np.logspace(1, 6, 40))
+    assert np.isfinite(ac.h).all()

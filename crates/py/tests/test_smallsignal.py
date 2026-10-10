@@ -5,7 +5,6 @@
 parameters. The contract: bound to the operating point, the linearised model's
 `G` and `C` equal the original's there, whatever its own state.
 
-Run after `maturin develop -m crates/py/Cargo.toml`:
     python -m pytest crates/py/tests/test_smallsignal.py
 """
 
@@ -20,24 +19,19 @@ MOSFET = (
 )
 
 
-def _pvec(model, values):
-    return [float(values.get(n, 0.0)) for n in model.params]
-
-
 def _gc(model, x, p):
-    d = model.core
-    return np.array(d.jacobian_i_x(list(x), p, 0.0)), np.array(d.jacobian_q_x(list(x), p, 0.0))
+    return model.jacobian_i_x(x, p), model.jacobian_q_x(x, p)
 
 
 def _roundtrip(deck):
-    model = sane.Circuit.parse(deck).extract()
-    x = np.asarray(model.operating_point().vector)
-    g0, c0 = _gc(model, x, _pvec(model, model.values))
+    model = sane.Model.from_netlist(deck)
+    x = model.at().operating_point().x
+    g0, c0 = _gc(model, x, model.param_vector())
     lin = model.linearize()
     assert lin.dim == model.dim and lin.unknowns == model.unknowns
-    values = dict(model.values)
+    values = {k: v for k, v in model.values().items() if lin.is_param(k)}
     values.update({f"{u}#op": x[k] for k, u in enumerate(model.unknowns)})
-    p = _pvec(lin, values)
+    p = lin.param_vector(values)
     # linear: the same matrices at the operating point and anywhere else
     for state in (np.zeros_like(x), x + 0.37):
         g1, c1 = _gc(lin, state, p)

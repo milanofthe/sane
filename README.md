@@ -35,30 +35,24 @@ pulls in the whole engine.
 import numpy as np
 import sane
 
-model = sane.Circuit.parse("""
+model = sane.Model.from_netlist("""
     V1 in 0 5
     R1 in out 1k
     C1 out 0 1u
-""").extract()                        # or sane.Model.from_netlist(...)
+""")
 
-op  = model.operating_point()         # DC bias, labeled by node
-v   = op["out"]                       # 5.0
+pt = model.at(R1=2e3)                    # the model at one binding of its parameters
+op = pt.operating_point()                # DC bias, solved once for every analysis at pt
+op["out"]                                # ~5.0
+op.sensitivity("out").ranked("out")      # exact d v(out)/dp, most important first
 
-ss  = model.small_signal("V1", "out") # linearize at the bias
-ss.poles()                            # [-1000.+0.j]  (the RC pole)
-mag_db, phase_deg = ss.bode(np.logspace(1, 5, 50))
+ac = pt.ac("V1", ["out"], np.geomspace(10, 1e5, 50))
+ac.mag_db("out")                         # numpy, no copies
+pt.poles().poles                         # [-500.+0.j]  (the RC pole)
 
-traj = model.transient(np.linspace(0, 5e-3, 200))
-traj["out"]                           # time series at node "out"
-
-sens = op.sensitivity("out")          # exact dy/dp for every parameter (one adjoint solve)
-sens.ranked()                         # [(param, rel. sensitivity), ...] most important first
+tr = pt.transient(np.linspace(0, 5e-3, 200))
+tr["out"]                                # time series at node "out"
 ```
-
-Results are labeled by node and parameter name — no positional vectors. A result
-object keeps its solved state, so derived analyses (`op.sensitivity(...)`) need
-no re-solve. Parameters are read/written hierarchically: `model.X1.R2 = 1e3`,
-`model.set("X1.R2", 1e3)`, `model.get("X1.R2")`.
 
 ## Netlist format
 
@@ -113,179 +107,71 @@ thermal, semiconductor shot/flicker, MOSFET channel-thermal, Verilog-A
 
 ---
 
-# Python API
+# API
 
-`import sane`. The package exposes two classes — `Circuit` (build) and `Model`
-(analyze) — plus labeled result objects. The Python layer
-is a thin wrapper; orchestration, parameter store and analyses are in Rust
-(`sane_analysis::Model`, raw handles at `sane._core`).
+Everything runs in Rust; the Python package is a thin layer over the same API
+(`sane_analysis` in Rust, `import sane` in Python). One pattern throughout:
 
-## Top-level functions
+**model -> point -> analysis -> result**, the derivatives methods of the result.
 
-| Function | Returns | Purpose |
+- A `Model` is a circuit as an analyzable graph: its unknowns, its parameters
+  (hierarchical, `X1.R2`) and the values bound to them. Set it up from a
+  netlist (`Model.from_netlist`) or from a `Circuit` (`Model::new(circuit)`
+  in Rust, `sane.Model(circuit)` in Python).
+- `model.at(...)` is the model at one binding of its parameters (a dict and
+  keywords in Python, `&[(name, value)]` in Rust): the `Point` every analysis
+  runs at. A point solves its operating point once and every analysis at it
+  shares it; a binding that crosses a device topology is set up in the model of
+  its structure.
+- An analysis is a method of the point with its required inputs; tunables are
+  keyword arguments (Python) or an options struct (Rust). Several outputs per
+  analysis.
+- A result holds its data as arrays (numpy in Python, over the engine's own
+  memory, no copies; `ndarray` in Rust) and its derivatives as methods. The
+  parameter axis of every derivative is the last one.
+
+| Analysis at a point | Result | Derivatives |
 |---|---|---|
-| `parse(netlist)` | `Circuit` | shorthand for `Circuit.parse` |
-| `set_parallelism(threads)` | `None` | threads for the parallel work: the sweeps (AC/noise over frequency, HB device sampling) and, in every solve, the device instances of each evaluation: `n`=n, `0`=the default (4). Set it before the first analysis |
-| `set_log_level(level="info")` | `None` | native logging: `"debug"`/`"info"`/`"warning"`/`"error"`/`"off"` |
-| `profile_begin()` / `profile_take()` | `None` / `list[(stage, ms)]` | collect per-stage timings |
-| `reduced_netlist(netlist, transforms)` | `str` | apply graph transforms, emit a smaller netlist |
+| `operating_point()` | `OperatingPoint` (`x`, `op["out"]`, `regularization`) | `sensitivity(outputs, wrt)`, `hessian(outputs, wrt)` |
+| `dc_sweep(param, values)` | `DcSweep` (`x[k, i]`, `converged`) | |
+| `transient(t, rtol, atol, dt_max, x0)` | `Trajectory` (`x[k, i]`, `events`) | `sensitivity(outputs, wrt)`, `vjp(outputs, cotangent, wrt)` (forward) |
+| `ac(input, outputs, freqs)` | `AcResponse` (`h[i, k]`, complex) | `sensitivity(wrt)`, `vjp(cotangent)`, `hessian(wrt)` |
+| `s_parameters(freqs)` | `SParameters` (`s[k, i, j]`, the deck's `P` ports) | `sensitivity(wrt)`, `vjp(cotangent)` |
+| `noise(outputs, freqs)` | `NoiseSpectrum` (`psd[i, k]`, `density`, `rms`) | `sensitivity(wrt)` |
+| `poles()`, `zeros(input, outputs)` | `Poles`, `Zeros` | `sensitivity(wrt)` |
+| `state_space(inputs, outputs)` | `StateSpace` (`E, A, B, C, D`) | |
+| `reduce(input, output, order, freqs)` | `ReducedModel` | |
+| `harmonic_balance(f0, harmonics, ...)` | `HarmonicBalance` (`spectra[i, k]`, `amplitude`, `thd`) | `sensitivity(outputs, wrt)`, `hessian(output, harmonic, wrt)` |
+| `prune(rel_tol, freqs)` | a reduced `Model`, what was opened or shorted | |
 
-Exported types: `Circuit`, `Model`, the result objects and `GROUND_ALIASES`
-(`{"0","gnd","GND","Gnd","ground"}`).
+`wrt` names parameters or groups (`"X1"` for everything under it); none means
+all. Every derivative is exact (adjoints, forward sensitivities, second-order
+adjoints, eigenvalue perturbation), no finite differences. Temperature is the
+parameter `$temp` (K): a temperature sweep is `dc_sweep("$temp", kelvins)`.
 
-## `Circuit`
+The model also carries its parameter store (`model.R1`, `model["X1.R2"] = 1e3`,
+`set`, `update`, `reset`), transforms that return a new model on the same graph
+(`fold`, `keep`, `linearize`, `eliminate`) and the evaluations at a given state
+(`currents`, `charges`, `residual`, the Jacobians, dense or sparse).
 
-Build from a netlist string or programmatically. Builder methods return `self`
-for chaining. A node reference is a string name (or `0`/ground alias).
+Diagnostics that change what a result means (a gmin-regularized operating
+point, a singular small-signal frequency, a device parameter out of its range)
+are raised as `SaneConvergenceWarning` / `SaneNumericalWarning` whatever the
+log level.
 
-**Construction**
-- `Circuit()` — empty circuit
-- `Circuit.parse(netlist: str) -> Circuit` *(classmethod)* — parse a SPICE netlist
-- `extract(fold=None, keep=None) -> Model` — lower to an analyzable `Model`;
-  `fold` names parameters (or groups) to fold to their values, `keep` the only
-  ones to keep symbolic
+**Differentiable functions.** `DcFunction`, `AcFunction`, `SpFunction`,
+`TransientFunction`, `HbFunction` and `PzFunction` wrap an analysis as
+`f(p) -> y` with an exact `f.vjp(dL_dy)`; `sane.interop.as_torch` and
+`as_jax` make them autograd functions.
 
-**Linear / controlled elements** — each returns `Circuit`
-- `resistor(name, n1, n2, value=None)`
-- `capacitor(name, n1, n2, value=None)`
-- `inductor(name, n1, n2, value=None)`
-- `voltage_source(name, n1, n2, dc=None)`
-- `current_source(name, n1, n2, dc=None)`
-- `vcvs(name, out_p, out_n, ctrl_p, ctrl_n, gain=None)` — voltage-controlled voltage source
-- `vccs(name, out_p, out_n, ctrl_p, ctrl_n, gain=None)` — voltage-controlled current source
-- `cccs(name, out_p, out_n, ctrl, gain=None)` — current-controlled current source
-- `ccvs(name, out_p, out_n, ctrl, gain=None)` — current-controlled voltage source
-- `mutual(name, l1, l2, k=None)` — couple two named inductors
-
-**Nonlinear devices** — each returns `Circuit`; `**params` override model defaults
-- `diode(name, anode, cathode, **params)`
-- `mosfet(name, d, g, s, b=None, **params)` — bulk defaults to source
-- `bjt(name, c, b, e, **params)`
-- `vswitch(name, n1, n2, ctrl_p, ctrl_n, **params)`
-- `cswitch(name, n1, n2, ctrl, **params)`
-
-**Source waveforms** — attach to the most recently added source, return `Circuit`
-- `sine(offset=0.0, amplitude=1.0, freq=None, omega=None)`
-- `pulse(v1, v2, delay=0.0, rise=0.0, fall=0.0, width=0.0, period=0.0)`
-- `exp(v1, v2, td1=0.0, tau1=0.0, td2=0.0, tau2=0.0)`
-- `pwl(points)` — `points: list[(t, v)]`
-
-**Introspection**
-- `node_names: list[str]` — by internal node id (0 = ground)
-- `values: dict[str, float]` — bound values by symbol name (`"R1"`, `"D1.Is"`)
-- `elements: list[dict]` — `{"name","kind","nodes","control"}`
-- `couplings: list[dict]` — `{"name","inductors"}`
-- `device_count: int`
-
-## `Model` — analyses
-
-`Model.from_netlist(netlist) -> Model` is shorthand for
-`Circuit.parse(netlist).extract()`.
-
-Most analyses accept `values=None` (a `dict[str, float]` of per-call parameter
-overrides) and `x0=None` (a starting state vector). Node/output references
-resolve in order: unknown name → node name → source branch current.
-
-| Method | Returns | Notes |
-|---|---|---|
-| `operating_point(values=None, x0=None, tol=1e-10, max_iter=100, nodeset=None, reltol=None, abstol=None, vntol=None)` | `OperatingPoint` | DC solve; `nodeset: dict[ref, V]` stiff-pins for symmetry breaking; per-component `reltol`/`abstol`/`vntol` |
-| `transient(t, values=None, x0=None, rtol=1e-4, atol=1e-7, dt_max=None)` | `Trajectory` | ESDIRK32; `x0` defaults to the DC point; `dt_max` caps the adaptive step |
-| `transient_events()` | `list[(name, t, dir)]` | the switching events of the last transient: surface `instance#k`, crossing time, `+1` rising / `-1` falling |
-| `small_signal(input, output, values=None, x0=None)` | `SmallSignal` | linearize at the bias; poles/zeros/AC/sensitivity |
-| `ac(input, output, freqs_hz, values=None, x0=None)` | `AcResponse` | AC response with the full derivative API |
-| `harmonic_balance(f0=0.0, harmonics=8, values=None, x0=None, continuation=None, tol=1e-10, max_iter=60, oversample=16, samples=None)` | `HarmonicBalance` | periodic steady state; `f0<=0` infers from a `SIN` source |
-| `noise(output, fstart, fstop, points=50, values=None, x0=None)` | `NoiseSpectrum` | output-referred PSD [V/√Hz] |
-| `temp_sweep(output, tstart, tstop, points=50, values=None)` | `TempSweep` | output vs temperature [°C], warm-started |
-| `state_space(input, output, values=None, x0=None)` | `StateSpace` | descriptor `(E, A, B, C, D)` at the OP |
-| `model_reduce(input, output, order, fstart, fstop, points=50, values=None, x0=None)` | `ReducedModel` | dominant-pole MOR keeping `order` poles |
-| `optimize(targets, tunables, iters=50, values=None)` | `Optimization` | Levenberg-Marquardt over exact sensitivities; `targets: dict[output, value]`, `tunables: list[str]` |
-
-**Sensitivity** (exact, via autodiff — no finite differences)
-
-| Method | Returns | Notes |
-|---|---|---|
-| `sensitivity(output, values=None, x0=None, t=0.0)` | `Sensitivity` | DC `dy/dp` over all parameters (one adjoint solve) |
-| `hessian(output, wrt, values=None, x0=None, t=0.0)` | `ndarray` | exact second order over the `wrt` subset (dense symmetric) |
-| `transient_sensitivity(params, t, rtol=1e-4, atol=1e-7, values=None)` | `dict[str, Trajectory]` | forward `dx(t)/dp` per parameter |
-| `ac_sensitivity(input, param, output, freqs_hz, values=None, x0=None)` | `ndarray` | `dH/dp(f)` including the OP shift (complex per frequency) |
-| `pole_sensitivity(input, param, values=None, x0=None)` | `list[(pole, dpole/dp)]` | exact `dλ/dp` |
-| `zero_sensitivity(input, output, param, values=None, x0=None)` | `list[(zero, dzero/dp)]` | exact `dz/dp` |
-
-## `Model` — parameters & introspection
-
-**Parameters** (hierarchical, by name or path)
-- `model.X1.R2` / `model["X1.R2"]` — read leaf value or a group proxy
-- `model.X1.R2 = 1e3` / `model["X1.R2"] = 1e3` — write
-- `get(name) -> float`, `set(name, value) -> None`
-- `update(mapping=None, **kw) -> None` — bulk atomic set
-- `reset() -> None` — restore construction defaults
-- `name in model` / `len(model)` / `iter(model)` — membership / count / names
-
-**Introspection** (properties)
-- `unknowns: list[str]`, `dim: int`, `nnz: int`, `partition_sizes() -> (int, int) | None`
-- `params: list[str]`, `values: dict[str, float]`
-- `node_names: list[str]`
-- `unknown_index(ref) -> int`, `unknown_name(ref) -> str`
-- `transforms`, `eliminated`
-- `core` *(raw `_core.Model`)*
-
-## `Model` — transforms
-
-**Transforms** (return a new `Model` on the same context)
-- `linearize()` — small-signal linear DAE `G·dx + d/dt (C·dx) = 0`
-- `reduce(rel_tol=1e-3, freqs=None, values=None, x0=None)` — OP-guided branch pruning; sets `.transforms`
-- `eliminate(keep=None)` — exact resistive-node elimination; sets `.eliminated`
-- `fold(*paths)` — bind parameters/groups to their current value (constant-fold, drop from the sensitivity set)
-- `keep(*paths)` — fold every parameter except the named ones/groups (a few tuning knobs among many fixed device parameters)
-
-## Result objects
-
-All are labeled; `__getitem__(ref)` resolves a node/unknown/source name.
-
-**`OperatingPoint`** — `vector: ndarray`, `unknowns`, `node_names`;
-`op[ref] -> float`, `get(ref, default=None)`, `to_dict()`;
-`sensitivity(output) -> Sensitivity`, `hessian(output, wrt) -> ndarray`.
-
-**`Trajectory`** — `t: ndarray`, `matrix: ndarray (T,n)`, `unknowns`, `node_names`;
-`traj[ref] -> ndarray`, `to_dict()`, `plot(*refs, ax=None, show=False)`;
-`sensitivity(output, t=None, wrt=None, rtol=1e-4, atol=1e-7) -> Sensitivity`.
-
-**`Sensitivity`** — `params`, `gradient: ndarray`, `output`;
-`s[name] -> float`, `to_dict()`, `relative() -> ndarray`;
-`ranked(relative=True, threshold=0.0) -> list[(param, value)]`;
-`rollup(relative=True) -> list[(component, value)]` (L2-aggregated to device level).
-
-**`SmallSignal`** — `G, C, B`, `unknowns`, `input_name`, `output`;
-`poles() -> ndarray` [rad/s], `zeros() -> ndarray`,
-`response(freqs_hz) -> ndarray` (complex `H`), `bode(freqs_hz) -> (mag_db, phase_deg)`,
-`pole_sensitivity()`, `zero_sensitivity()` → `list[(value, Sensitivity)]`.
-
-**`AcResponse`** — `freqs`, `value: ndarray` (complex `H`);
-`sensitivity(f, metric="mag") -> Sensitivity` (metrics `"mag"`/`"phase"`/`"real"`/`"imag"`),
-`hessian(f, wrt, metric="mag") -> ndarray`.
-
-**`NoiseSpectrum`** — `freqs`, `noise: ndarray` [V/√Hz], `output`;
-`sensitivity(f) -> Sensitivity` (gradient of the PSD), `integrated_rms() -> float` [V].
-
-**`StateSpace`** — `states`, `E, A: (n,n)`, `B, C: (n,)`, `D: float`, `input`, `output`.
-Model: `E·x' = A·x + B·u`, `y = C·x + D·u`.
-
-**`TempSweep`** — `temps_c: ndarray`, `values: ndarray`, `output`.
-
-**`Optimization`** — `tuned: dict`, `results: list[(output, target, achieved)]`,
-`trace: ndarray` (RMS per iteration), `converged: bool`.
-
-**`ReducedModel`** — `freqs`, `full_db`, `reduced_db`, `poles`, `zeros`,
-`max_err_db: float`.
-
-**`HarmonicBalance`** — `spectra: (n, K+1)`, `f0`, `harmonics`, `freqs`,
-`converged`, `iters`, `residual_norm`, `setup_ms`, `solve_ms`;
-`hb[ref] -> ndarray` (complex spectrum), `harmonic(ref, k) -> complex`,
-`dc(ref) -> float`, `magnitude(ref)`, `phase(ref, deg=True)`, `thd(ref) -> float`,
-`plot(*refs, db=False)`; `sensitivity(ref, k, metric="coeff") -> Sensitivity`,
-`hessian(ref, k, wrt, metric="coeff") -> ndarray`.
-
----
+**Building circuits.** A `Circuit` is parsed from a netlist (`sane.parse`) or
+built element by element, by name: `resistor`, `capacitor`, `inductor`, the
+sources (a DC value or a `Waveform`: `sin`, `pulse`, `exp`, `pwl`), the
+controlled sources, `port`, and `device` for any Verilog-A module, built in or
+registered with `module` (`diode`, `mosfet`, `bjt` and the switches are
+shorthands). A subcircuit is a circuit with pins (`Circuit.subckt`), placed
+with `instance`; each instance renames what it owns (`X1.R1`, `X1.mid`). A
+model keeps its circuit (`model.circuit`) to build on.
 
 ## Verilog-A and PDK compact models
 
@@ -350,7 +236,7 @@ ckt = sane.Circuit.parse("""
     R1 1 2 1k
     N1 2 0 diode Is=2e-14
 """)
-op = ckt.extract().operating_point()   # solved by the native engine
+op = sane.Model(ckt).at().operating_point()   # solved by the native engine
 ```
 
 **PDK level idiom.** Foundry PDKs ship devices as Verilog-A bound by a SPICE
@@ -376,18 +262,16 @@ The analysis stack is pure Rust with the same labeled API the Python binding
 wraps.
 
 ```rust
-use sane_analysis::Model;
+use sane_analysis::{log_grid, Model};
 
 let model = Model::from_netlist("V1 in 0 5\nR1 in out 1k\nR2 out 0 1k\n.end")?;
-let op = model.operating_point(&[])?;            // DC bias
-let s  = op.sensitivity("out")?;                 // exact dy/dp over all parameters
-model.set("R2", 3e3)?;
-let traj = model.transient(&[], &t_eval, 1e-4, 1e-7)?;
-
-let x = op.vector().to_vec();
-let p = model.pvec(&[]);
-let poles  = model.poles(x.clone(), p.clone())?;
-let dpoles = model.pole_gradient(x, p)?;         // exact dpole/dp, all params
+let pt = model.at(&[("R2", 3e3)])?;
+let op = pt.operating_point()?;                  // DC bias, kept by the point
+let s = op.sensitivity(&["out"], &[])?;          // exact dy/dp over all parameters
+let ac = pt.ac("V1", &["out"], &log_grid(1.0, 1e6, 61))?;
+let dh = ac.sensitivity(&["R1", "R2"])?;         // dh[[i, k, j]], complex
+let poles = pt.poles()?;
+let dpoles = poles.sensitivity(&[])?;            // exact dpole/dp, all parameters
 ```
 
 See `crates/analysis/tests/embed.rs` for a worked acceptance suite.
@@ -424,12 +308,12 @@ benchmarking and debugging; the log level (`SANE_LOG`) and the test-corpus locat
 |---|---|
 | `sane-core` | SANE's constants, configuration, logging, profiling and the lowering of named math calls; the graph itself is rsdag |
 | `vendor/rsdag` | the expression graph, differentiation, tape, native backend and the sparse solve programs (vendored, see `vendor/rsdag/VENDOR.md`) |
-| `sane-mna` | the circuit IR: elements, sources, couplings, index-2 topology checks |
+| `sane-circuit` | the circuit IR: elements, sources, couplings, index-2 topology checks |
 | `sane-netlist` | SPICE parser (preprocessor, expressions, subckt hierarchy) |
 | `sane-veriloga` | native Verilog-A frontend (parse → elaborate → lower to DAG); ships the built-in device models as Verilog-A source (`builtin/*.va`) |
 | `sane-device` | the device contract (`lower_behavioral` → DAE fragment) and lowering support types |
 | `sane-dae` | DAE assembly (currents and charges) and graph transforms |
-| `sane-solve` | native sparse Newton DC + homotopy + ESDIRK32 transient |
+| `sane-solve` | native sparse Newton DC + homotopy + Rosenbrock (Rodas4) transient |
 | `sane-analysis` | high-level analyses (OP/transient/AC/sweeps/PZ/noise/MOR/opt) |
 | `sane-py` | PyO3 binding |
 
@@ -551,8 +435,12 @@ change on circuits of this size.
 
 The transient cases of the [VACASK](https://codeberg.org/arpadbuermen/VACASK)
 benchmark suite, the ring on the PSP103 Verilog-A model, with the step bound
-of the upstream decks. SANE's time is the transient solve; ngspice's the whole
-process on the upstream deck, as in VACASK's own methodology.
+of the upstream decks. SANE's time is the transient solve; ngspice's and
+VACASK's the whole process on the upstream deck, as in VACASK's own
+methodology. The first table runs SANE at its default tolerance; the second
+compares at equal accuracy: each simulator's error against a reference
+trajectory, relative to the signal's swing, and the time SANE takes at that
+error.
 
 <!-- bench:vacask -->
 | Case | Unknowns | Steps | SANE, s | ngspice, s |

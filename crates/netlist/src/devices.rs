@@ -11,7 +11,7 @@ use sane_veriloga::ElaboratedModule;
 use crate::expr::resolve_value;
 use crate::model_cards::ModelCard;
 use crate::source::alias_param;
-use crate::{err_at, CompatReport, ParseError};
+use crate::{CompatReport, ParseError};
 
 /// Fill any parameter the deck left unspecified with the device model's default
 /// (e.g. junction thermal voltage, default beta, MOSFET W/L). Explicit values
@@ -65,7 +65,7 @@ pub(crate) fn place_device(
     params: &HashMap<String, f64>,
     mfactor: f64,
 ) {
-    devices.push(DeviceInstance::new(model, terminals).with_mfactor(mfactor));
+    devices.push(DeviceInstance::new(model.into(), terminals).with_mfactor(mfactor));
     let m = devices.last().unwrap().model.as_ref();
     let _ = bind_device_params(name, None, extras, card, params, values, m, report);
     let m = devices.last().unwrap().model.as_ref();
@@ -220,7 +220,7 @@ pub(crate) fn place_va_device(
     dev.mfactor = mfactor;
     // What of the module does not lower is an error of the assembly, which
     // lowers it once per structure anyway.
-    devices.push(DeviceInstance::new(Box::new(dev), terminals));
+    devices.push(DeviceInstance::new(std::sync::Arc::new(dev), terminals));
     Ok(())
 }
 
@@ -339,7 +339,8 @@ pub(crate) fn place_osdi_device(
     let temperature = temp_c + 273.15;
     let dev = sane_osdi::OsdiDevice::new(name, lib, module, params, temperature);
     // Set up eagerly so parameter/collapse errors surface at parse time.
-    dev.setup().map_err(|e| err_at(line_no, line_col, &e))?;
-    devices.push(DeviceInstance::new(Box::new(dev), terminals));
+    dev.setup()
+        .map_err(|e| crate::err_at(line_no, line_col, &e))?;
+    devices.push(DeviceInstance::new(std::sync::Arc::new(dev), terminals));
     Ok(())
 }

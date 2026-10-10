@@ -56,18 +56,18 @@ N1 1 0 initmod
 
 def test_cross_event_rejected_with_diagnostic():
     with pytest.raises(ValueError, match="cross"):
-        sane.Circuit.parse(VA_CROSS).extract()
+        sane.Model.from_netlist(VA_CROSS)
 
 
 def test_unsupported_event_names_the_control():
     # `@(cross ...)` is a switching surface now; a body on it (a discrete state
     # SANE does not carry) is what stays rejected, naming the control.
     with pytest.raises(ValueError, match=r"@\(cross .*with a body"):
-        sane.Circuit.parse(VA_CROSS).extract()
+        sane.Model.from_netlist(VA_CROSS)
 
 
 def test_initial_step_precompute_loads_and_solves():
     # The precompute makes initmod a 1/R = 1 mS conductance; op must solve and
     # draw I = V*g = 1 * 1e-3 through the source.
-    op = sane.Circuit.parse(VA_INITIAL_STEP).extract().operating_point()
+    op = sane.Model.from_netlist(VA_INITIAL_STEP).at().operating_point()
     assert op is not None

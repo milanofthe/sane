@@ -300,7 +300,8 @@ mod tests {
         let tv: Vec<rsdag::ExprId> = (1..=np).map(|k| ctx.sym(&format!("v{k}"))).collect();
         let mut lo = sane_device::Lowerer::new(ctx);
         let given = std::collections::HashSet::default();
-        super::lower::lower_analog(&em, "X1", &given, &Default::default(), 1.0, &mut lo, &tv).expect("lower")
+        super::lower::lower_analog(&em, "X1", &given, &Default::default(), 1.0, &mut lo, &tv)
+            .expect("lower")
     }
 
     #[test]
@@ -456,14 +457,14 @@ mod tests {
 
         // Collapsed variant: identical DAE to a plain resistor element.
         let mut ctx = Graph::new();
-        let mut cn = Circuit::new();
+        let mut cn = Elements::new();
         cn.voltage_source("V1", 1, 0).resistor("R1", 1, 0);
-        let native = assemble_dae(&mut ctx, &cn, &[]).unwrap();
+        let native = sane_dae::assemble(&mut ctx, &sane_circuit::Circuit::flat(&cn, &[])).unwrap();
         let dev = VerilogADevice::new("R1", em.clone());
-        let mut cv = Circuit::new();
+        let mut cv = Elements::new();
         cv.voltage_source("V1", 1, 0);
-        let devs = vec![DeviceInstance::new(Box::new(dev), vec![1, 0])];
-        let va = assemble_dae(&mut ctx, &cv, &devs).unwrap();
+        let devs = vec![DeviceInstance::new(std::sync::Arc::new(dev), vec![1, 0])];
+        let va = sane_dae::assemble(&mut ctx, &sane_circuit::Circuit::flat(&cv, &devs)).unwrap();
         assert_eq!(
             va.unknowns, native.unknowns,
             "collapse removes the internal node and the source branch"
@@ -479,16 +480,16 @@ mod tests {
                 ("t", 0.0),
             ],
         );
-        assert_dae_match(&ctx, &native, &va, &env);
+        assert_dae_match(&mut ctx, &native, &va, &env);
 
         // Rs given: the short depends on its value, the structure.
         let mut dev2 = VerilogADevice::new("R2", em);
         dev2.params.insert("Rs".into(), 500.0);
         dev2.given.insert("Rs".into());
-        let mut cv2 = Circuit::new();
+        let mut cv2 = Elements::new();
         cv2.voltage_source("V1", 1, 0);
-        let devs2 = vec![DeviceInstance::new(Box::new(dev2), vec![1, 0])];
-        let va2 = assemble_dae(&mut ctx, &cv2, &devs2).unwrap();
+        let devs2 = vec![DeviceInstance::new(std::sync::Arc::new(dev2), vec![1, 0])];
+        let va2 = sane_dae::assemble(&mut ctx, &sane_circuit::Circuit::flat(&cv2, &devs2)).unwrap();
         assert!(
             va2.unknowns.iter().any(|u| u.contains("mid"))
                 && !va2.unknowns.iter().any(|u| u.contains("sw_")),
@@ -517,12 +518,14 @@ mod tests {
         "#;
         let mut ctx = Graph::new();
         let dev = VerilogADevice::new("X", elab(chain));
-        let mut cv = Circuit::new();
+        let mut cv = Elements::new();
         cv.voltage_source("V1", 1, 0);
-        let va = assemble_dae(
+        let va = sane_dae::assemble(
             &mut ctx,
-            &cv,
-            &[DeviceInstance::new(Box::new(dev), vec![1, 0])],
+            &sane_circuit::Circuit::flat(
+                &cv,
+                &[DeviceInstance::new(std::sync::Arc::new(dev), vec![1, 0])],
+            ),
         )
         .unwrap();
         assert_eq!(
@@ -547,12 +550,14 @@ mod tests {
         "#;
         let mut ctx2 = Graph::new();
         let dev2 = VerilogADevice::new("X", elab(probed));
-        let mut cv2 = Circuit::new();
+        let mut cv2 = Elements::new();
         cv2.voltage_source("V1", 1, 0);
-        let va2 = assemble_dae(
+        let va2 = sane_dae::assemble(
             &mut ctx2,
-            &cv2,
-            &[DeviceInstance::new(Box::new(dev2), vec![1, 0])],
+            &sane_circuit::Circuit::flat(
+                &cv2,
+                &[DeviceInstance::new(std::sync::Arc::new(dev2), vec![1, 0])],
+            ),
         )
         .unwrap();
         assert!(
@@ -624,7 +629,10 @@ mod tests {
         let e = VerilogADevice::new("X", elab(flag_nest))
             .validate()
             .unwrap_err();
-        assert!(e.contains("depends on the solution"), "clear diagnostic: {e}");
+        assert!(
+            e.contains("depends on the solution"),
+            "clear diagnostic: {e}"
+        );
 
         // Pattern 2: a descent loop on the solution, bounded only by an
         // enclosing guard (the HiSIM2 exp-reduction idiom).
@@ -650,7 +658,10 @@ mod tests {
         let e = VerilogADevice::new("X", elab(descent))
             .validate()
             .unwrap_err();
-        assert!(e.contains("depends on the solution"), "clear diagnostic: {e}");
+        assert!(
+            e.contains("depends on the solution"),
+            "clear diagnostic: {e}"
+        );
 
         // A genuinely unbounded loop likewise.
         let unbounded = r#"
@@ -666,7 +677,10 @@ mod tests {
         let e = VerilogADevice::new("X", elab(unbounded))
             .validate()
             .unwrap_err();
-        assert!(e.contains("depends on the solution"), "clear diagnostic: {e}");
+        assert!(
+            e.contains("depends on the solution"),
+            "clear diagnostic: {e}"
+        );
     }
 
     #[test]
@@ -703,9 +717,9 @@ mod tests {
     use super::device::VerilogADevice;
     use super::elaborate::elaborate;
     use rsdag::{eval, Crossing, Node, SymbolId};
+    use sane_circuit::Elements;
     use sane_core::Graph;
-    use sane_dae::{assemble_dae, Dae, DeviceInstance};
-    use sane_mna::Circuit;
+    use sane_dae::{Dae, DeviceInstance};
     use std::sync::Arc;
 
     fn elab(src: &str) -> Arc<super::elaborate::ElaboratedModule> {
@@ -743,12 +757,20 @@ mod tests {
     /// Assert two DAEs have the same unknown layout and identical currents and
     /// charges at the given environment point.
     fn assert_dae_match(
-        ctx: &Graph,
+        ctx: &mut Graph,
         a: &Dae,
         b: &Dae,
         env: &std::collections::HashMap<SymbolId, f64>,
     ) {
         assert_eq!(a.unknowns, b.unknowns, "unknown layout differs");
+        // noise generators are zero in every evaluation
+        let mut env = env.clone();
+        for d in [a, b] {
+            for g in d.observers.generators(ctx) {
+                env.insert(g, 0.0);
+            }
+        }
+        let (ctx, env) = (&*ctx, &env);
         let rows = |d: &Dae| {
             d.currents
                 .iter()
@@ -765,17 +787,17 @@ mod tests {
     #[test]
     fn va_resistor_matches_native_element() {
         let mut ctx = Graph::new();
-        let mut cn = Circuit::new();
+        let mut cn = Elements::new();
         cn.voltage_source("V1", 1, 0).resistor("R1", 1, 0);
-        let native = assemble_dae(&mut ctx, &cn, &[]).unwrap();
+        let native = sane_dae::assemble(&mut ctx, &sane_circuit::Circuit::flat(&cn, &[])).unwrap();
 
         let src = "module res(p,n); inout p,n; electrical p,n; \
                    parameter real R = 1000.0; analog I(p,n) <+ V(p,n)/R; endmodule";
         let dev = VerilogADevice::new("R1", elab(src));
-        let mut cv = Circuit::new();
+        let mut cv = Elements::new();
         cv.voltage_source("V1", 1, 0);
-        let devs = vec![DeviceInstance::new(Box::new(dev), vec![1, 0])];
-        let va = assemble_dae(&mut ctx, &cv, &devs).unwrap();
+        let devs = vec![DeviceInstance::new(std::sync::Arc::new(dev), vec![1, 0])];
+        let va = sane_dae::assemble(&mut ctx, &sane_circuit::Circuit::flat(&cv, &devs)).unwrap();
 
         let env = env_of(
             &mut ctx,
@@ -788,20 +810,20 @@ mod tests {
                 ("t", 0.0),
             ],
         );
-        assert_dae_match(&ctx, &native, &va, &env);
+        assert_dae_match(&mut ctx, &native, &va, &env);
     }
 
     #[test]
     fn va_diode_matches_native_diode() {
         let mut ctx = Graph::new();
         // native diode D1 across V1, with a series resistor for a real node.
-        let mut cn = Circuit::new();
+        let mut cn = Elements::new();
         cn.voltage_source("V1", 1, 0).resistor("R1", 1, 2);
         let nd = vec![DeviceInstance::new(
-            Box::new(crate::builtin_device("sane_diode", "D1", &[])),
+            std::sync::Arc::new(crate::builtin_device("sane_diode", "D1", &[])),
             vec![2, 0],
         )];
-        let native = assemble_dae(&mut ctx, &cn, &nd).unwrap();
+        let native = sane_dae::assemble(&mut ctx, &sane_circuit::Circuit::flat(&cn, &nd)).unwrap();
 
         // The VA diode uses the built-in thermal voltage `$vt = k*T/q`, exactly
         // as the native diode now does, so the two agree (rather than hard-coding
@@ -810,10 +832,10 @@ mod tests {
                    parameter real Is = 1e-14; parameter real N = 1.0; \
                    analog I(a,c) <+ Is * (limexp(V(a,c)/(N*$vt)) - 1.0); endmodule";
         let dev = VerilogADevice::new("D1", elab(src));
-        let mut cv = Circuit::new();
+        let mut cv = Elements::new();
         cv.voltage_source("V1", 1, 0).resistor("R1", 1, 2);
-        let vd = vec![DeviceInstance::new(Box::new(dev), vec![2, 0])];
-        let va = assemble_dae(&mut ctx, &cv, &vd).unwrap();
+        let vd = vec![DeviceInstance::new(std::sync::Arc::new(dev), vec![2, 0])];
+        let va = sane_dae::assemble(&mut ctx, &sane_circuit::Circuit::flat(&cv, &vd)).unwrap();
 
         let env = env_of(
             &mut ctx,
@@ -828,7 +850,7 @@ mod tests {
                 ("t", 0.0),
             ],
         );
-        assert_dae_match(&ctx, &native, &va, &env);
+        assert_dae_match(&mut ctx, &native, &va, &env);
     }
 
     fn resistor_env(ctx: &mut Graph) -> std::collections::HashMap<SymbolId, f64> {
@@ -848,40 +870,40 @@ mod tests {
     #[test]
     fn va_function_and_if_resistor_matches_native() {
         let mut ctx = Graph::new();
-        let mut cn = Circuit::new();
+        let mut cn = Elements::new();
         cn.voltage_source("V1", 1, 0).resistor("R1", 1, 0);
-        let native = assemble_dae(&mut ctx, &cn, &[]).unwrap();
+        let native = sane_dae::assemble(&mut ctx, &sane_circuit::Circuit::flat(&cn, &[])).unwrap();
         let src = "module res(p,n); inout p,n; electrical p,n; parameter real R = 1000.0; \
                    analog function real recip; input x; real x; recip = 1.0/x; endfunction \
                    analog begin real g; g = recip(R); \
                    if (V(p,n) >= 0.0) I(p,n) <+ g*V(p,n); else I(p,n) <+ g*V(p,n); end \
                    endmodule";
         let dev = VerilogADevice::new("R1", elab(src));
-        let mut cv = Circuit::new();
+        let mut cv = Elements::new();
         cv.voltage_source("V1", 1, 0);
-        let devs = vec![DeviceInstance::new(Box::new(dev), vec![1, 0])];
-        let va = assemble_dae(&mut ctx, &cv, &devs).unwrap();
+        let devs = vec![DeviceInstance::new(std::sync::Arc::new(dev), vec![1, 0])];
+        let va = sane_dae::assemble(&mut ctx, &sane_circuit::Circuit::flat(&cv, &devs)).unwrap();
         let env = resistor_env(&mut ctx);
-        assert_dae_match(&ctx, &native, &va, &env);
+        assert_dae_match(&mut ctx, &native, &va, &env);
     }
 
     #[test]
     fn va_for_loop_resistor_matches_native() {
         let mut ctx = Graph::new();
-        let mut cn = Circuit::new();
+        let mut cn = Elements::new();
         cn.voltage_source("V1", 1, 0).resistor("R1", 1, 0);
-        let native = assemble_dae(&mut ctx, &cn, &[]).unwrap();
+        let native = sane_dae::assemble(&mut ctx, &sane_circuit::Circuit::flat(&cn, &[])).unwrap();
         let src = "module res(p,n); inout p,n; electrical p,n; parameter real R = 1000.0; \
                    analog begin real g; integer k; g = 0.0; \
                    for (k = 0; k < 4; k = k + 1) g = g + 1.0/(4.0*R); \
                    I(p,n) <+ g*V(p,n); end endmodule";
         let dev = VerilogADevice::new("R1", elab(src));
-        let mut cv = Circuit::new();
+        let mut cv = Elements::new();
         cv.voltage_source("V1", 1, 0);
-        let devs = vec![DeviceInstance::new(Box::new(dev), vec![1, 0])];
-        let va = assemble_dae(&mut ctx, &cv, &devs).unwrap();
+        let devs = vec![DeviceInstance::new(std::sync::Arc::new(dev), vec![1, 0])];
+        let va = sane_dae::assemble(&mut ctx, &sane_circuit::Circuit::flat(&cv, &devs)).unwrap();
         let env = resistor_env(&mut ctx);
-        assert_dae_match(&ctx, &native, &va, &env);
+        assert_dae_match(&mut ctx, &native, &va, &env);
     }
 
     #[test]
@@ -1077,7 +1099,7 @@ mod tests {
     }
 
     // Corpus lowering probe: parse+elaborate+lower real ECL-2.0 models directly
-    // (bypassing assemble_dae), reporting which construct, if any, is unhandled.
+    // (bypassing the assembly), reporting which construct, if any, is unhandled.
     // Ignored (TEMP path); run with `--ignored`.
     #[test]
     #[ignore]
@@ -1146,7 +1168,15 @@ mod tests {
             let term_v: Vec<ExprId> = (1..=np).map(|k| ctx.sym(&format!("v{k}"))).collect();
             let mut lo = Lowerer::new(&mut ctx);
             let given = std::collections::HashSet::default();
-            match lower_analog(&em, "X1", &given, &Default::default(), 1.0, &mut lo, &term_v) {
+            match lower_analog(
+                &em,
+                "X1",
+                &given,
+                &Default::default(),
+                1.0,
+                &mut lo,
+                &term_v,
+            ) {
                 Ok(frag) => println!(
                     "{label}: LOWERED ok ({} terminals, {} rows, {} extras)",
                     frag.terminal_currents.len(),
@@ -1292,7 +1322,8 @@ mod tests {
         let tv: Vec<ExprId> = (1..=np).map(|k| ctx.sym(&format!("v{k}"))).collect();
         let mut lo = Lowerer::new(&mut ctx);
         let given = std::collections::HashSet::default();
-        let frag = lower_analog(&em, "X1", &given, &Default::default(), 1.0, &mut lo, &tv).expect("lower");
+        let frag =
+            lower_analog(&em, "X1", &given, &Default::default(), 1.0, &mut lo, &tv).expect("lower");
         let resids = frag.currents.clone();
         drop(lo);
 

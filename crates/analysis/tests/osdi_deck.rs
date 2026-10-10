@@ -28,7 +28,7 @@ fn osdi_deck_psp103_dc() {
         out.display()
     );
     let m = Model::from_netlist(&deck).expect("model");
-    let op = m.operating_point(&[]).expect("dc");
+    let op = m.at(&[]).and_then(|pt| pt.operating_point()).expect("dc");
     let id = op.get("Vd").expect("drain current");
     let reference = -7.163534299181468e-5; // symbolic frontend, same bias
     assert!(
@@ -67,7 +67,9 @@ fn osdi_noise_matches_symbolic_frontend() {
 
     let run = |deck: &str| -> Vec<f64> {
         let m = Model::from_netlist(deck).expect("model");
-        m.noise(&[], "a", 1e3, 1e6, 7).expect("noise").psd
+        let freqs = sane_analysis::log_grid(1e3, 1e6, 7);
+        let ns = m.at(&[]).unwrap().noise(&["a"], &freqs).expect("noise");
+        ns.psd.row(0).to_vec()
     };
     let sym = run(&deck_va);
     let os = run(&deck_osdi);
@@ -119,7 +121,8 @@ fn osdi_deck_model_card_idiom() {
     );
     let id_of = |deck: &str| {
         let m = Model::from_netlist(deck).expect("model");
-        m.operating_point(&[])
+        m.at(&[])
+            .and_then(|pt| pt.operating_point())
             .expect("dc")
             .get("Vd")
             .expect("drain current")

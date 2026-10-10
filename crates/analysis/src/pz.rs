@@ -273,7 +273,6 @@ fn inverse_apply(m: &[Vec<f64>], n_mat: &[Vec<f64>]) -> Option<faer::Mat<f64>> {
 #[cfg(test)]
 mod pz_tests {
     use super::*;
-    use num_complex::Complex64;
 
     /// A user initial condition: a node voltage `V(net)` or a branch current
     /// `I(element)` (e.g. an inductor) to start the transient from.
@@ -308,11 +307,11 @@ mod pz_tests {
     }
 
     fn resolve_out_idx(
-        parsed: &sane_netlist::ParsedCircuit,
+        parsed: &sane_circuit::Circuit,
         dae: &sane_dae::Dae,
         output: &str,
     ) -> Option<usize> {
-        let k = parsed.node(output)?;
+        let k = parsed.find_node(output)?;
         if k == 0 {
             return None;
         }
@@ -332,18 +331,11 @@ mod pz_tests {
     /// `dH/dp` (the same quantity the deleted `ac_sensitivity` façade ranked).
     fn ac_rel_sens(net: &str, input: &str, output: &str, freq: f64, param: &str) -> f64 {
         let m = Model::from_netlist(net).expect("model");
-        let op = m.operating_point(&[]).expect("operating point");
-        let x = op.vector().to_vec();
-        let p = m.pvec(&[]);
-        let out_idx = m.resolve(output).expect("output");
-        let h = m
-            .ac_response(input, out_idx, x.clone(), p.clone(), vec![freq])
-            .expect("ac")[0];
-        let h0 = Complex64::new(h.0, h.1);
-        let dh = m
-            .ac_sensitivity(input, param, out_idx, x, p, vec![freq])
-            .expect("ac_sens")[0];
-        let dhc = Complex64::new(dh.0, dh.1);
+        let ac = (m.at(&[]).unwrap())
+            .ac(input, &[output], &[freq])
+            .expect("ac");
+        let s = ac.sensitivity(&[param]).expect("ac sensitivity");
+        let (h0, dhc) = (ac.h[[0, 0]], s.grad[[0, 0, 0]]);
         let dmag_dp = (h0.conj() * dhc).re / (h0.norm() * h0.norm());
         m.get(param).expect("param value") * dmag_dp
     }
@@ -404,16 +396,9 @@ mod pz_tests {
         let dt_max = tstop / npts as f64;
         let base = m
             .cdc()
-            .solve_transient(
-                sane_solve::TransientMethod::Esdirk32,
-                &p0,
-                &x0,
-                &t_eval,
-                1e-4,
-                1e-7,
-                None,
-            )
+            .solve_transient(&p0, &x0, &t_eval, 1e-4, 1e-7, None)
             .expect("baseline transient")
+            .rows
             .last()
             .and_then(|r| r.get(out_idx).copied())
             .unwrap_or(0.0);
@@ -428,16 +413,9 @@ mod pz_tests {
         let mut x0_aug = x0.clone();
         x0_aug.extend_from_slice(&s0);
         let traj = aug_cdc
-            .solve_transient(
-                sane_solve::TransientMethod::Esdirk32,
-                &p_aug,
-                &x0_aug,
-                &t_eval,
-                1e-4,
-                1e-7,
-                Some(dt_max),
-            )
-            .expect("augmented transient");
+            .solve_transient(&p_aug, &x0_aug, &t_eval, 1e-4, 1e-7, Some(dt_max))
+            .expect("augmented transient")
+            .rows;
         let dydp = traj
             .last()
             .and_then(|r| r.get(n + out_idx).copied())
@@ -450,12 +428,12 @@ mod pz_tests {
         // R=1k, C=1u -> single real pole at s = -1/(RC) = -1000 rad/s.
         let net = "V1 in 0 1\nR1 in out 1k\nC1 out 0 1u\n";
         let m = Model::from_netlist(net).expect("model");
-        let pz = m.poles_zeros(&[], "V1", "out").expect("pole_zero");
-        let d = nearest_real(&pz.poles, -1000.0);
+        let poles = m.at(&[]).unwrap().poles().expect("poles").poles;
+        let roots: Vec<[f64; 2]> = poles.iter().map(|s| [s.re, s.im]).collect();
+        let d = nearest_real(&roots, -1000.0);
         assert!(
             d < 1.0,
-            "expected a pole near -1000, got {:?} (err {d})",
-            pz.poles
+            "expected a pole near -1000, got {poles:?} (err {d})"
         );
     }
 
@@ -491,43 +469,47 @@ mod pz_tests {
         };
         eprintln!("\n=== uA741 analysis breakdown (24 BJT, transistor level, dim 109) ===");
         t("Operating point", &|| {
-            let op = m.operating_point(&[]);
+            let op = m.at(&[]).and_then(|pt| pt.operating_point());
             format!("ok={} dim={}", op.is_ok(), m.dim())
         });
         t("Transient (1us/10ns)", &|| {
             let npts = ((1e-6 / 1e-8_f64).round() as usize).clamp(1, 100_000);
             let te: Vec<f64> = (0..=npts).map(|k| k as f64 * 1e-6 / npts as f64).collect();
-            let tr = m.transient(sane_solve::TransientMethod::default(), &[], &te, 1e-4, 1e-7);
+            let opts = crate::TransientOptions::default();
+            let tr = m.at(&[]).and_then(|pt| pt.transient(&te, &opts));
             format!("ok={} traces={}", tr.is_ok(), m.unknowns().len())
         });
         t("AC (50 pts, 1Hz-1MHz)", &|| {
-            let ac = m.ac(&[], "Vd", "22", 1.0, 1e6, 50);
+            let ac = (m.at(&[]))
+                .and_then(|pt| pt.ac("Vd", &["22"], &crate::log_grid(1.0, 1e6, 50)))
+                .map(|ac| ac.mag_db("22").unwrap());
             format!(
                 "ok={} |H0|={:.1}dB",
                 ac.is_ok(),
                 ac.as_ref()
                     .ok()
-                    .and_then(|a| a.mag_db.first().copied())
+                    .and_then(|a| a.first().copied())
                     .unwrap_or(0.0)
             )
         });
-        t(
-            "Pole-Zero (std-reduce, dim 109)",
-            &|| match m.poles_zeros(&[], "Vd", "22") {
-                Ok(pz) => format!("ok=true poles={} zeros={}", pz.poles.len(), pz.zeros.len()),
+        t("Pole-Zero (std-reduce, dim 109)", &|| {
+            let pt = m.at(&[]).unwrap();
+            match pt.poles().and_then(|p| Ok((p, pt.zeros("Vd", &["22"])?))) {
+                Ok((p, z)) => format!("ok=true poles={} zeros={}", p.poles.len(), z.zeros[0].len()),
                 Err(e) => format!("ok=false {e}"),
-            },
-        );
+            }
+        });
         t("DC sensitivity (adjoint)", &|| {
-            let s = m.operating_point(&[]).and_then(|op| op.sensitivity("22"));
+            let s = (m.at(&[]).and_then(|pt| pt.operating_point()))
+                .and_then(|op| op.sensitivity(&["22"], &[]));
             format!(
                 "ok={} params={}",
                 s.is_ok(),
-                s.as_ref().map(|s| s.names.len()).unwrap_or(0)
+                s.as_ref().map(|s| s.params.len()).unwrap_or(0)
             )
         });
         t("Noise (50 pts)", &|| {
-            let ns = m.noise(&[], "22", 1.0, 1e6, 50);
+            let ns = (m.at(&[])).and_then(|pt| pt.noise(&["22"], &crate::log_grid(1.0, 1e6, 50)));
             format!("ok={}", ns.is_ok())
         });
         eprintln!("====================================================================\n");
@@ -539,7 +521,8 @@ mod pz_tests {
         // transfer curve -- Vout high (~5V) at Vin=0, low (~0V) at Vin=5.
         let net = "VDD vdd 0 DC 5\nVIN vin 0 DC 2.5\nM1 vout vin 0 0 NMOS1\nM2 vout vin vdd vdd PMOS1\n.model NMOS1 NMOS(Kp=120u W=2 L=1 Vto=0.7)\n.model PMOS1 PMOS(Kp=40u W=4 L=1 Vto=-0.7)\n";
         let m = Model::from_netlist(net).expect("model");
-        let ds = m.dc_sweep("VIN", 0.0, 5.0, 0.25).expect("dc_sweep");
+        let vin: Vec<f64> = (0..=20).map(|k| 0.25 * k as f64).collect();
+        let ds = m.at(&[]).unwrap().dc_sweep("VIN", &vin).expect("dc_sweep");
         let vout = ds.signal("vout").expect("vout trace");
         assert!(vout[0] > 4.0, "Vout at Vin=0 = {}", vout[0]);
         assert!(
@@ -555,13 +538,16 @@ mod pz_tests {
         // the output must roll off (2nd-order low-pass).
         let net = "VS in 0 AC 1\nR1 in x 11.2k\nR2 x y 11.2k\nC1 x vo 2000pF\nC2 y 0 1000pF\nE_OP vo 0 y vo 1Meg\n";
         let m = Model::from_netlist(net).expect("model");
-        let ac = m.ac(&[], "VS", "vo", 10.0, 1e6, 50).expect("AC");
-        assert!(ac.mag_db.len() == 50);
+        let ac = (m.at(&[]).unwrap())
+            .ac("VS", &["vo"], &crate::log_grid(10.0, 1e6, 50))
+            .expect("AC");
+        let mag_db = ac.mag_db("vo").unwrap();
+        assert!(mag_db.len() == 50);
         assert!(
-            ac.mag_db[49] < ac.mag_db[0] - 20.0,
+            mag_db[49] < mag_db[0] - 20.0,
             "no rolloff: {} -> {}",
-            ac.mag_db[0],
-            ac.mag_db[49]
+            mag_db[0],
+            mag_db[49]
         );
     }
 
@@ -582,13 +568,13 @@ mod pz_tests {
         // full magnitude response to within rounding.
         let net = "V1 in 0 1\nR1 in a 10\nL1 a out 1m\nC1 out 0 1u\n";
         let m = Model::from_netlist(net).expect("model");
-        let r = m
-            .model_reduce(&[], "V1", "out", 4, 1.0, 1e6, 40)
-            .expect("model_reduce");
+        let r = (m.at(&[]).unwrap())
+            .reduce("V1", "out", 4, &crate::log_grid(1.0, 1e6, 40))
+            .expect("reduce");
         assert!(
-            r.max_err_db < 0.1,
+            r.max_error_db() < 0.1,
             "expected exact reconstruction, max_err {} dB",
-            r.max_err_db
+            r.max_error_db()
         );
     }
 
@@ -598,9 +584,11 @@ mod pz_tests {
         // flat in frequency.
         let net = "R1 out 0 1k\n";
         let m = Model::from_netlist(net).expect("model");
-        let r = m.noise(&[], "out", 1.0, 1e6, 3).expect("noise");
+        let r = (m.at(&[]).unwrap())
+            .noise(&["out"], &[1.0, 1e3, 1e6])
+            .expect("noise");
         let expected = (4.0 * 1.380649e-23 * 300.15 * 1000.0_f64).sqrt();
-        for nv in &r.psd {
+        for nv in &r.density("out").unwrap() {
             assert!(
                 (nv - expected).abs() / expected < 0.02,
                 "noise {nv} vs expected {expected}"
@@ -617,11 +605,13 @@ mod pz_tests {
         let i_bias = 1e-3_f64;
         let net = format!("I1 0 a {i_bias}\nD1 a 0\n");
         let m = Model::from_netlist(&net).expect("model");
-        let r = m.noise(&[], "a", 1.0, 1e6, 3).expect("noise");
+        let r = (m.at(&[]).unwrap())
+            .noise(&["a"], &[1.0, 1e3, 1e6])
+            .expect("noise");
         let q = 1.602176634e-19_f64;
         let vt = (1.380649e-23 / 1.602176634e-19) * 300.15;
         let expected = (2.0 * q * vt * vt / i_bias).sqrt(); // sqrt(2q Vt^2 / I)
-        for nv in &r.psd {
+        for nv in &r.density("a").unwrap() {
             assert!(
                 (nv - expected).abs() / expected < 0.05,
                 "diode shot noise {nv} vs expected {expected}"
@@ -635,9 +625,15 @@ mod pz_tests {
         // -2 mV/degC (the classic silicon junction tempco).
         let net = "V1 in 0 5\nR1 in a 4.3k\nD1 a 0\n";
         let m = Model::from_netlist(net).expect("model");
-        let r = m.temp_sweep(&[], "a", 27.0, 77.0, 2).expect("temp_sweep"); // tstart, tstop (deg C)
-        assert_eq!(r.values.len(), 2);
-        let slope_mv = (r.values[1] - r.values[0]) / (r.temps[1] - r.temps[0]) * 1000.0;
+        let kelvin = [300.15, 350.15]; // 27 and 77 degC
+        let r = m
+            .at(&[])
+            .unwrap()
+            .dc_sweep("$temp", &kelvin)
+            .expect("temperature sweep");
+        let v = r.signal("a").unwrap();
+        assert_eq!(v.len(), 2);
+        let slope_mv = (v[1] - v[0]) / (kelvin[1] - kelvin[0]) * 1000.0;
         assert!(
             slope_mv > -3.0 && slope_mv < -1.0,
             "expected ~ -2 mV/degC, got {slope_mv}"
@@ -661,14 +657,19 @@ R1 in a 4.3k
 N1 a 0 vadio
 ";
         let m = Model::from_netlist(net).expect("model");
-        let r = m.temp_sweep(&[], "a", -40.0, 125.0, 4).expect("temp_sweep");
-        assert_eq!(r.values.len(), 4);
-        let span = r.values.iter().cloned().fold(f64::MIN, f64::max)
-            - r.values.iter().cloned().fold(f64::MAX, f64::min);
+        let kelvin = [233.15, 288.15, 343.15, 398.15]; // -40 .. 125 degC
+        let r = m
+            .at(&[])
+            .unwrap()
+            .dc_sweep("$temp", &kelvin)
+            .expect("temperature sweep");
+        let v = r.signal("a").unwrap();
+        assert_eq!(v.len(), 4);
+        let span =
+            v.iter().cloned().fold(f64::MIN, f64::max) - v.iter().cloned().fold(f64::MAX, f64::min);
         assert!(
             span > 1e-3,
-            "temperature did not reach the VA model (flat: {:?})",
-            r.values
+            "temperature did not reach the VA model (flat: {v:?})"
         );
     }
 
@@ -676,7 +677,7 @@ N1 a 0 vadio
     fn dt_max_is_robust() {
         use super::*;
         use sane_solve::CompiledDc;
-        // dt_max must never crash and must be honored. ESDIRK32 caps each step at
+        // dt_max must never crash and must be honored. the transient caps each step at
         // the requested 50 ns natively (no backend fallback). Both the uncapped and
         // capped runs are independent, error-controlled integrations of the same
         // 1 MHz-driven RC; with the solution-space error estimate the uncapped run
@@ -684,33 +685,19 @@ N1 a 0 vadio
         // as they take different step sequences).
         let parsed = parse("Vin a 0 SIN(0 1 1e6)\nR1 a b 1k\nC1 b 0 1n\n").unwrap();
         let mut ctx = Graph::new();
-        let dae = parsed.assemble(&mut ctx).unwrap();
+        let dae = sane_dae::assemble(&mut ctx, &parsed).unwrap();
         let cdc = CompiledDc::new(&mut ctx, &dae);
         let pnames = cdc.param_names(&ctx);
         let p: Vec<f64> = parsed.pvec(&pnames);
         let t: Vec<f64> = (0..=4).map(|k| k as f64 * 0.25e-6).collect();
         let without = cdc
-            .solve_transient(
-                sane_solve::TransientMethod::Esdirk32,
-                &p,
-                &[],
-                &t,
-                1e-4,
-                1e-7,
-                None,
-            )
-            .unwrap();
+            .solve_transient(&p, &[], &t, 1e-4, 1e-7, None)
+            .unwrap()
+            .rows;
         let withcap = cdc
-            .solve_transient(
-                sane_solve::TransientMethod::Esdirk32,
-                &p,
-                &[],
-                &t,
-                1e-4,
-                1e-7,
-                Some(50e-9),
-            )
-            .unwrap();
+            .solve_transient(&p, &[], &t, 1e-4, 1e-7, Some(50e-9))
+            .unwrap()
+            .rows;
         assert_eq!(withcap.len(), t.len());
         // Both are accurate integrations of the same circuit, so they agree to a
         // tight (but not bit-exact) tolerance.
@@ -730,17 +717,19 @@ N1 a 0 vadio
         // RC: E=C (one reactive state), A=-G, D=0, output = e_out^T.
         let net = "V1 in 0 1\nR1 in out 1k\nC1 out 0 1u\n";
         let m = Model::from_netlist(net).expect("model");
-        let ss = m.state_space(&[], "V1", "out").expect("state_space");
+        let ss = m
+            .at(&[])
+            .unwrap()
+            .state_space(&["V1"], &["out"])
+            .expect("state_space");
         let n = m.unknowns().len();
-        assert!(n >= 1 && ss.a.len() == n && ss.e.len() == n && ss.b.len() == n && ss.c.len() == n);
-        assert_eq!(ss.d, 0.0);
+        assert!(n >= 1 && ss.a.dim() == (n, n) && ss.e.dim() == (n, n));
+        assert!(ss.b.dim() == (n, 1) && ss.c.dim() == (1, n));
+        assert_eq!(ss.d, ndarray::array![[0.0]]);
         // E must have at least one nonzero entry (the capacitor's dynamics).
-        assert!(
-            ss.e.iter().any(|row| row.iter().any(|&v| v.abs() > 0.0)),
-            "E is all zero"
-        );
+        assert!(ss.e.iter().any(|&v| v.abs() > 0.0), "E is all zero");
         // exactly one output pick.
-        assert!((ss.c.iter().sum::<f64>() - 1.0).abs() < 1e-9);
+        assert!((ss.c.row(0).sum() - 1.0).abs() < 1e-9);
     }
 
     #[test]
@@ -748,15 +737,9 @@ N1 a 0 vadio
         // R=10, L=1m, C=1u: s = -R/2L +/- j*sqrt(1/LC - (R/2L)^2) = -5000 +/- j31225.
         let net = "V1 in 0 1\nR1 in a 10\nL1 a out 1m\nC1 out 0 1u\n";
         let m = Model::from_netlist(net).expect("model");
-        let pz = m.poles_zeros(&[], "V1", "out").expect("pole_zero");
-        let hit = pz
-            .poles
-            .iter()
-            .any(|p| (p[0] + 5000.0).abs() < 200.0 && (p[1].abs() - 31225.0).abs() < 500.0);
-        assert!(
-            hit,
-            "expected poles near -5000 +/- j31225, got {:?}",
-            pz.poles
-        );
+        let poles = m.at(&[]).unwrap().poles().expect("poles").poles;
+        let hit = (poles.iter())
+            .any(|p| (p.re + 5000.0).abs() < 200.0 && (p.im.abs() - 31225.0).abs() < 500.0);
+        assert!(hit, "expected poles near -5000 +/- j31225, got {poles:?}");
     }
 }

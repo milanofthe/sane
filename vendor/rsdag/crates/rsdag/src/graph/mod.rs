@@ -156,6 +156,7 @@ mod calls;
 mod compose;
 mod flow;
 
+pub(crate) use calls::Deps;
 pub(crate) use flow::{Join, Set, Through};
 
 impl<K: Field> Default for Graph<K> {

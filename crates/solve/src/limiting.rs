@@ -7,10 +7,20 @@
 //! only the iteration path -- once the step is small the limiting is inactive, so
 //! the converged fixed point is identical with or without it. The numeric
 //! thresholds live in [`sane_core::constants`] (see the rationale there); the device
-//! declares only which voltages to limit and their kind (see [`sane_dae::Limit`]).
+//! declares only which voltages to limit and their kind (see [`sane_dae::Limit`]);
+//! the solver limits them by unknown index ([`Limit`]).
 
 use sane_core::constants::{LIMIT_VCRIT, LIMIT_VT, LIMIT_VTO};
-use sane_dae::{Limit, LimitKind};
+use sane_dae::LimitKind;
+
+/// A controlling-voltage limit over the unknowns: `x[hi] - x[lo]` (`None`
+/// ground), curve-limited as its kind says.
+#[derive(Clone, Copy, Debug)]
+pub struct Limit {
+    pub hi: Option<usize>,
+    pub lo: Option<usize>,
+    pub kind: LimitKind,
+}
 
 /// SPICE `pnjlim`: limit a forward PN-junction voltage update so the junction
 /// exponential grows at most one decade per step. Returns the limited `vnew`.
@@ -79,33 +89,6 @@ pub fn fetlim(vnew: f64, vold: f64) -> f64 {
 #[inline]
 fn volt(x: &[f64], idx: Option<usize>) -> f64 {
     idx.map_or(0.0, |i| x[i])
-}
-
-/// Apply per-device voltage limiting to the proposed iterate `x_new`, given the
-/// current iterate `x_old`. For each controlling voltage the limited difference
-/// is computed and the correction distributed back onto its (non-ground)
-/// endpoints, so the limited difference is realized while preserving the common
-/// mode. Returns the limited iterate (a no-op when `limits` is empty).
-pub fn apply(limits: &[Limit], x_old: &[f64], x_new: &[f64]) -> Vec<f64> {
-    let mut x = x_new.to_vec();
-    apply_in_place(limits, x_old, &mut x);
-    x
-}
-
-/// [`apply`] over `x_new` in place.
-pub fn apply_in_place(limits: &[Limit], x_old: &[f64], x_new: &mut [f64]) {
-    let alpha = fraction(limits, x_old, x_new);
-    if alpha < 1.0 {
-        for (n, o) in x_new.iter_mut().zip(x_old) {
-            *n = o + alpha * (*n - o);
-        }
-    }
-}
-
-/// The fraction of the move `x_old -> x_new` every limited junction allows
-/// (`1.0` when nothing limits).
-pub fn fraction(limits: &[Limit], x_old: &[f64], x_new: &[f64]) -> f64 {
-    fraction_by(limits, x_old, |i| x_new[i])
 }
 
 /// [`fraction`] with the proposed iterate given entry by entry (`x_new(i)`),

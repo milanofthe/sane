@@ -5,13 +5,10 @@
 use sane_analysis::Model;
 
 fn ac(model: &Model, input: &str, out: &str, freqs: &[f64]) -> Vec<(f64, f64)> {
-    let op = model.operating_point(&[]).expect("dc");
-    let x = op.vector().to_vec();
-    let p = model.pvec(&[]);
-    let idx = model.resolve(out).expect("out");
-    model
-        .ac_response(input, idx, x, p, freqs.to_vec())
-        .expect("ac")
+    let r = (model.at(&[]).unwrap())
+        .ac(input, &[out], freqs)
+        .expect("ac");
+    r.h.row(0).iter().map(|h| (h.re, h.im)).collect()
 }
 
 /// Matched source and load: |H| is flat at 1/2 (the source divider) and the

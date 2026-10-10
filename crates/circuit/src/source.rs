@@ -22,6 +22,49 @@
 use rsdag::{CmpOp, ExprId};
 use sane_core::Graph;
 
+/// What an independent source drives: a DC value or a time-domain
+/// waveform. A number is its DC value.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Waveform {
+    Dc(f64),
+    /// `offset + amplitude * sin(2 pi freq t)`.
+    Sin {
+        offset: f64,
+        amplitude: f64,
+        freq: f64,
+    },
+    /// `v1` until `delay`, then a trapezoid to `v2` (`rise`, `width`,
+    /// `fall`) repeating every `period`; a zero `fall`, `width` or `period`
+    /// takes SPICE's default.
+    Pulse {
+        v1: f64,
+        v2: f64,
+        delay: f64,
+        rise: f64,
+        fall: f64,
+        width: f64,
+        period: f64,
+    },
+    /// A double exponential from `v1` toward `v2` at `td1` (time constant
+    /// `tau1`), back at `td2` (`tau2`).
+    Exp {
+        v1: f64,
+        v2: f64,
+        td1: f64,
+        tau1: f64,
+        td2: f64,
+        tau2: f64,
+    },
+    /// Piecewise linear through the points `(t, value)`.
+    Pwl(Vec<(f64, f64)>),
+}
+
+impl From<f64> for Waveform {
+    fn from(v: f64) -> Waveform {
+        Waveform::Dc(v)
+    }
+}
+
 /// Time-domain stimulus shape of an independent source. `None` on an element (the
 /// default) means a constant whose value is the element's own symbol.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -37,6 +80,19 @@ pub enum SourceFn {
 }
 
 impl SourceFn {
+    /// Whether the parameter `suffix` (`sin_off`, `pulse_v2`, ...) is one of
+    /// those that shift a waveform's level as a whole: moved together, they
+    /// add their move to the waveform at every instant, the way a
+    /// small-signal input drives the source.
+    pub fn is_level(suffix: &str) -> bool {
+        matches!(
+            suffix,
+            "sin_off" | "pulse_v1" | "pulse_v2" | "exp_v1" | "exp_v2"
+        ) || suffix
+            .strip_prefix("pwl_v")
+            .is_some_and(|k| !k.is_empty() && k.bytes().all(|b| b.is_ascii_digit()))
+    }
+
     /// Identify a source shape from its netlist function name and argument count
     /// (`pwl` carries its point count). Returns `None` for an unknown function.
     pub fn from_func(func: &str, nargs: usize) -> Option<Self> {

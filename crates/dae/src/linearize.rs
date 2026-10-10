@@ -19,7 +19,7 @@ use rustc_hash::FxHashMap;
 use rsdag::{ExprId, SymbolId};
 use sane_core::Graph;
 
-use crate::{Dae, Observers};
+use crate::Dae;
 
 /// The operating-point freeze map: every unknown symbol `x_j` is mapped to a
 /// fresh constant symbol named `"{name}#op"`. Applied to a Jacobian entry, it
@@ -35,51 +35,110 @@ pub fn freeze_op_point(ctx: &mut Graph, dae: &Dae) -> FxHashMap<SymbolId, ExprId
 }
 
 /// Linearise the DAE about its operating point into the linear DAE
-/// `G dx + d/dt (C dx) = 0` (see the module docs). The returned [`Dae`] keeps
-/// the same unknowns and time symbol; row `i` carries the current
-/// `sum_j G_ij x_j` and the charge `sum_j C_ij x_j`, the Jacobians frozen at
-/// the operating point.
+/// `G dx + d/dt (C dx) + H dh + B_n n + B_u du = 0` (see the module docs).
+/// The returned [`Dae`] keeps the same unknowns and time symbol; row `i`
+/// carries the current `sum_j G_ij x_j`, the charge `sum_j C_ij x_j`, and
+/// what drives the small signal: every transport delay's history `h_k`
+/// (each delay keeps its time, its signal linearized), every noise generator
+/// `n_q` (each source keeps its level, frozen at the operating point), and
+/// every independent source's drive `u` as its deviation `u - u#op`. The
+/// coefficients are frozen at the operating point. A small-signal model has
+/// no switching surfaces, Newton aids or waveforms: those it drops.
 pub fn linearize(ctx: &mut Graph, dae: &Dae) -> Dae {
     let freeze = freeze_op_point(ctx, dae);
+    let zero = ctx.zero();
+    let generators = dae.observers.generators(ctx);
+    // a coefficient reads every generator at zero, as in every evaluation
+    let mut frozen = freeze.clone();
+    frozen.extend(generators.iter().map(|&g| (g, zero)));
     let (g, c) = dae.jacobian_iq_coo(ctx);
-    let [currents, charges] = [g, c].map(|(rows, cols, coefs)| {
-        let frozen = rsdag::substitute(ctx, &coefs, &freeze);
-        let mut terms: Vec<Vec<ExprId>> = vec![Vec::new(); dae.dim()];
-        for ((&row, &col), coef) in rows.iter().zip(&cols).zip(frozen) {
+    let mut terms: [Vec<Vec<ExprId>>; 2] =
+        [vec![Vec::new(); dae.dim()], vec![Vec::new(); dae.dim()]];
+    for (k, (rows, cols, coefs)) in [g, c].into_iter().enumerate() {
+        let coefs = rsdag::substitute(ctx, &coefs, &frozen);
+        for ((&row, &col), coef) in rows.iter().zip(&cols).zip(coefs) {
             let xj = ctx.symbol_expr(dae.x[col]);
-            terms[row].push(ctx.mul(coef, xj));
+            terms[k][row].push(ctx.mul(coef, xj));
         }
-        (terms.into_iter())
+    }
+    // the small signal's drives: the histories, the generators, the sources
+    // (each as its deviation from the operating point)
+    let mut drives: Vec<(SymbolId, ExprId)> = Vec::new();
+    for s in dae
+        .delays
+        .iter()
+        .map(|d| d.hist)
+        .chain(generators.iter().copied())
+    {
+        drives.push((s, ctx.symbol_expr(s)));
+    }
+    let params = dae.params(ctx);
+    for name in &dae.source_names {
+        let value = sane_circuit::value_symbol_name(name);
+        let prefix = format!("{name}.");
+        for &p in &params {
+            let pn = ctx.symbol_name(p).to_string();
+            let drive = pn == value
+                || pn
+                    .strip_prefix(&prefix)
+                    .is_some_and(sane_circuit::SourceFn::is_level);
+            if drive {
+                let u = ctx.symbol_expr(p);
+                let op = ctx.sym(&format!("{pn}#op"));
+                drives.push((p, ctx.sub(u, op)));
+            }
+        }
+    }
+    let wrt: Vec<SymbolId> = drives.iter().map(|&(s, _)| s).collect();
+    for (row, entries) in rsdag::sparse_jacobian(ctx, &dae.currents, &wrt)
+        .into_iter()
+        .enumerate()
+    {
+        for (k, coef) in entries {
+            let coef = rsdag::substitute(ctx, &[coef], &frozen)[0];
+            terms[0][row].push(ctx.mul(coef, drives[k].1));
+        }
+    }
+    let [currents, charges] = terms.map(|rows| {
+        (rows.into_iter())
             .map(|t| ctx.reduce(rsdag::ReduceOp::Sum, t))
             .collect::<Vec<_>>()
     });
+    // each delay's signal, linearized
+    let srcs: Vec<ExprId> = dae.delays.iter().map(|d| d.src).collect();
+    let src_lin: Vec<ExprId> = (rsdag::sparse_jacobian(ctx, &srcs, &dae.x).into_iter())
+        .map(|entries| {
+            let t: Vec<ExprId> = (entries.into_iter())
+                .map(|(j, coef)| {
+                    let coef = rsdag::substitute(ctx, &[coef], &frozen)[0];
+                    let xj = ctx.symbol_expr(dae.x[j]);
+                    ctx.mul(coef, xj)
+                })
+                .collect();
+            ctx.reduce(rsdag::ReduceOp::Sum, t)
+        })
+        .collect();
 
-    Dae {
-        n_nodes: dae.n_nodes,
-        param_defaults: dae.param_defaults.clone(),
-        currents,
-        charges,
-        assertions: dae.assertions.clone(),
-        structure: dae.structure.clone(),
-        aliases: dae.aliases.clone(),
-        events: Vec::new(),
-        delays: dae.delays.clone(),
-        unknowns: dae.unknowns.clone(),
-        kinds: dae.kinds.clone(),
-        x: dae.x.clone(),
-        t: dae.t,
-        // A linear DAE carries no homotopy companion network, device limits or
-        // (re-derived) noise sources; those stay with the nonlinear DAE the
-        // operating point was solved on. Source shapes (transient breakpoints / HB
-        // fundamental) likewise belong to the time-domain DAE, not this AC form.
-        companion: Vec::new(),
-        observers: Observers::default(),
-        dc_seeds: Vec::new(),
-        limits: Vec::new(),
-        sources: Vec::new(),
-        source_names: Vec::new(),
-        labels: dae.labels.clone(),
+    // the observers frozen at the operating point, the rest as rewritten
+    let mut lin = dae.rewrite(
+        ctx,
+        crate::rewrite::Rewrite {
+            rows: Some((currents, charges)),
+            keep: (0..dae.dim()).collect(),
+            n_nodes: dae.n_nodes,
+            subst: freeze,
+        },
+    );
+    for (d, src) in lin.delays.iter_mut().zip(src_lin) {
+        d.src = src;
     }
+    lin.events.clear();
+    lin.limits.clear();
+    lin.companion.clear();
+    lin.dc_seeds.clear();
+    lin.sources.clear();
+    lin.source_names.clear();
+    lin
 }
 
 /// Shared verification helpers for the small-signal transforms (used by both the
@@ -89,35 +148,35 @@ pub fn linearize(ctx: &mut Graph, dae: &Dae) -> Dae {
 #[cfg(test)]
 pub(crate) mod tests_support {
     use super::*;
-    use crate::{assemble_dae, DeviceInstance};
+    use crate::DeviceInstance;
     use rsdag::eval;
-    use sane_mna::Circuit;
+    use sane_circuit::Elements;
     use std::collections::HashMap;
 
     /// A parallel RLC tank driven by a current source: a genuine second-order
     /// linear DAE (node KCL with the capacitor's charge `C*v`, plus the
     /// inductor's branch constraint `v - d/dt (L*i_L)`).
     pub(crate) fn rlc(ctx: &mut Graph) -> Dae {
-        let mut c = Circuit::new();
+        let mut c = Elements::new();
         c.current_source("I1", 0, 1)
             .resistor("R1", 1, 0)
             .inductor("L1", 1, 0)
             .capacitor("C1", 1, 0);
-        assemble_dae(ctx, &c, &[]).unwrap()
+        crate::assemble(ctx, &sane_circuit::Circuit::flat(&c, &[])).unwrap()
     }
 
     /// A diode-loaded RC node: a nonlinear DAE whose small-signal entries are the
     /// junction conductance and capacitance.
     pub(crate) fn diode_rc(ctx: &mut Graph) -> Dae {
-        let mut c = Circuit::new();
+        let mut c = Elements::new();
         c.voltage_source("V1", 2, 0)
             .resistor("R1", 1, 2)
             .capacitor("C1", 1, 0);
         let devs = vec![DeviceInstance::new(
-            Box::new(sane_veriloga::builtin_device("sane_diode", "D1", &[])),
+            std::sync::Arc::new(sane_veriloga::builtin_device("sane_diode", "D1", &[])),
             vec![1, 0],
         )];
-        assemble_dae(ctx, &c, &devs).unwrap()
+        crate::assemble(ctx, &sane_circuit::Circuit::flat(&c, &devs)).unwrap()
     }
 
     /// Deterministic pseudo-random value for a symbol name (FNV-1a of the

@@ -24,7 +24,10 @@ fn gdiv(ctx: &mut Graph, a: ExprId, b: ExprId) -> ExprId {
 /// and smooth everywhere. Any other exponent goes through the domain-guarded
 /// `exp(b ln a)`, whose base must be positive.
 pub fn pow(ctx: &mut Graph, a: ExprId, b: ExprId) -> ExprId {
-    if let Some(n) = ctx.const_f64(b).filter(|n| n.fract() == 0.0 && n.abs() <= i32::MAX as f64) {
+    if let Some(n) = ctx
+        .const_f64(b)
+        .filter(|n| n.fract() == 0.0 && n.abs() <= i32::MAX as f64)
+    {
         return ctx.pow_i(a, n as i64);
     }
     let l = ctx.ln(a);

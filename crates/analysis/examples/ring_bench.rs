@@ -1,15 +1,14 @@
 //! VACASK ring benchmark (9-stage PSP103 CMOS ring, 1 us at dt_max = 50 ps),
 //! runnable over both device paths for a same-methodology comparison:
 //!
-//!   cargo run --release -p sane-analysis --example ring_bench -- osdi <psp103.osdi> <models.inc> [t_end] [rtol] [atol] [method]
-//!   cargo run --release -p sane-analysis --example ring_bench -- va   <psp103.va>   <models.inc> [t_end] [rtol] [atol] [method]
+//!   cargo run --release -p sane-analysis --example ring_bench -- osdi <psp103.osdi> <models.inc> [t_end] [rtol] [atol]
+//!   cargo run --release -p sane-analysis --example ring_bench -- va   <psp103.va>   <models.inc> [t_end] [rtol] [atol]
 //!
 //! Methodology mirrors `benchmarks/suites/vacask.py` (`ring` case):
 //! rtol 1e-4, atol 1e-7, forced dt_max 5e-11, DC start, swing check on n1.
 //! `t_end` (seconds, default 1e-6) scales the span for quick probes.
 
-use sane_analysis::Model;
-use sane_solve::TransientMethod;
+use sane_analysis::{Model, TransientOptions};
 
 const STAGES: usize = 9;
 const VDD: f64 = 1.2;
@@ -57,8 +56,6 @@ fn main() {
     let t_end: f64 = args.get(4).map(|s| s.parse().unwrap()).unwrap_or(1e-6);
     let rtol: f64 = args.get(5).map(|s| s.parse().unwrap()).unwrap_or(1e-4);
     let atol: f64 = args.get(6).map(|s| s.parse().unwrap()).unwrap_or(1e-7);
-    let method = TransientMethod::from_name(args.get(7).map(String::as_str).unwrap_or(""))
-        .expect("method: esdirk32|trap");
     let cards = std::fs::read_to_string(cards_path).expect("model cards");
 
     let t0 = std::time::Instant::now();
@@ -70,13 +67,20 @@ fn main() {
     let t_eval: Vec<f64> = (0..npts)
         .map(|i| t_end * i as f64 / (npts - 1) as f64)
         .collect();
-    let p = model.pvec(&[]);
+    let opts = TransientOptions {
+        rtol,
+        atol,
+        dt_max: Some(DT_MAX),
+        ..Default::default()
+    };
 
     let t0 = std::time::Instant::now();
-    let rows = model
-        .solve_transient(method, p, t_eval.clone(), None, rtol, atol, Some(DT_MAX))
+    let traj = model
+        .at(&[])
+        .and_then(|pt| pt.transient(&t_eval, &opts))
         .expect("transient");
     let solve = t0.elapsed().as_secs_f64();
+    let rows = traj.x.outer_iter().map(|r| r.to_vec()).collect::<Vec<_>>();
 
     let i = model.resolve("n1").expect("n1");
     let tail: Vec<f64> = rows[rows.len() / 2..].iter().map(|r| r[i]).collect();

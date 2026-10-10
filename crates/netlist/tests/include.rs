@@ -23,7 +23,7 @@ fn truncated_lib_section_does_not_panic() {
     let deck = "* corner\nV1 a 0 1\n.lib \"corners.lib\" tt\n.end";
     // Must not panic; parses (the section is simply empty).
     let parsed = parse_with_base(deck, Some(&dir)).expect("parse with truncated .lib");
-    assert!(parsed.values.contains_key("V1") || parsed.node_index.contains_key("a"));
+    assert!(parsed.values.contains_key("V1") || parsed.find_node("a").is_some());
     fs::remove_dir_all(&dir).ok();
 }
 

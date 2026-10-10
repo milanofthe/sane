@@ -8,25 +8,24 @@
 //! the previous iteration and solves in work it keeps, so a warm Newton
 //! step allocates next to nothing.
 //!
-//! Three rslab backends serve three structural regimes, chosen
-//! automatically from the pattern's BTF analysis and a per-factorization
-//! value-symmetry test:
+//! KLU (BTF + per-block AMD + Gilbert-Peierls) factors every pattern whose
+//! factorization is sparse work: its numeric-only `refactor` (frozen pattern
+//! and pivot sequence, no DFS, no pivot search) makes every Newton iteration
+//! after the first factorization cheap, and it provides the transpose solve
+//! the adjoint paths use. A pattern whose factorization is dense work -- the
+//! flops per factor entry KLU's analysis predicts reach
+//! [`SUPERNODAL_FLOPS_PER_ENTRY`], large fronts as in a power grid -- goes to
+//! the supernodal backends, whose blocked kernels turn that work into BLAS-3:
 //!
-//! * **KLU** (BTF + per-block AMD + Gilbert-Peierls) for circuit-shaped
-//!   patterns -- many BTF blocks / modest irreducible blocks. Its numeric-only
-//!   `refactor` (frozen pattern + pivot sequence, no DFS, no pivot search)
-//!   makes Newton iterations after the first factorization very cheap, and it
-//!   provides the transpose solve the adjoint paths use.
 //! * **Supernodal LDLT** (`rslab::LdltSolver`, Bunch-Kaufman) when the
-//!   system is large ([`LDLT_BLOCK_MIN`]) and the assembled values are
-//!   *symmetric* -- MNA of R/L/C networks with independent sources, i.e. the
-//!   power-grid regime. Half the fill/flops of any LU and rslab's most
-//!   optimized kernel; checked per factorization (O(nnz) bitwise), so a
-//!   nonlinear iterate that breaks symmetry transparently falls back to LU.
-//! * **Supernodal LU** (`rslab::LuSolver`, blocked SIMD kernels, scoped
-//!   worker pool) for large *unsymmetric* single-block patterns crossing
-//!   [`MF_BLOCK_MIN`], where scalar Gilbert-Peierls loses to blocked fronts
-//!   (measured crossover ~1e4 unknowns on RC grids).
+//!   pattern is structurally symmetric and the assembled values are
+//!   *symmetric* -- MNA of R/L/C networks with independent sources. Half the
+//!   fill/flops of any LU; checked per factorization (O(nnz) bitwise), so a
+//!   nonlinear iterate that breaks symmetry falls back to LU.
+//! * **Supernodal LU** (`rslab::LuSolver`) otherwise.
+//!
+//! The supernodal backends run on SANE's configured thread count
+//! ([`crate::parallel::threads`]), one thread inside a parallel sweep.
 //!
 //! Values are supplied in the caller's *entry order* (the tape's Jacobian
 //! nonzeros followed by augmentation entries such as the gmin diagonal), with
@@ -41,7 +40,7 @@ use std::sync::OnceLock;
 
 use rslab::{
     CscMatrix, GeneralCsc, KluSettings, KluSolver, KluSymbolic, LdltSolver, LdltSymbolic, LuSolver,
-    LuSymbolic, SolveWork, SolverSettings,
+    LuSymbolic, SolveWork, SolverSettings, Threads,
 };
 
 /// rslab's log records routed into SANE's logger. rslab's `Info` lines (one
@@ -85,20 +84,26 @@ pub(crate) fn install_log_bridge() {
     });
 }
 
-/// Largest-BTF-block threshold above which the blocked supernodal LU
-/// replaces KLU for this pattern. Calibrated on RC grids on Apple M3: at ~8e3
-/// the two are on par, at ~1.7e4 the supernodal LU is ~1.4x faster, at 4e4
-/// ~2.2x (KLU's numeric-only refactor narrows but does not close the gap).
-const MF_BLOCK_MIN: usize = 10_000;
+/// Flops per factor entry, as KLU's analysis predicts them a priori, from
+/// which a pattern is factored by the supernodal backends instead of KLU.
+/// Size alone does not tell: a 25k-unknown gate-level circuit (4.8 flops
+/// per entry) refactors 3.7x faster in KLU and solves 3.5x faster, a
+/// 45k-unknown power grid (14) 2.2x and 2.1x, a 3.6e3-unknown RC grid (19)
+/// 1.3x; RC grids of 1e4 and 2e4 unknowns (30, 38) factor 2x faster
+/// supernodal and refactor 1.5x, a 1.3e5-unknown power grid (94) factors
+/// 3.9x faster (one thread each, real values).
+const SUPERNODAL_FLOPS_PER_ENTRY: f64 = 25.0;
 
-/// Dimension threshold above which a *symmetric* value set is factored by the
-/// supernodal Bunch-Kaufman LDLT instead (half the flops/fill of any LU, and
-/// rslab's most optimized kernel). MNA systems of R/L/C networks with
-/// independent sources are symmetric -- exactly the power-grid regime.
-/// Calibrated on RC-grid Laplacians (Apple M3): at 1.6e3 KLU still wins
-/// (1.5 vs 2.4 ms), at ~4e3 they tie, at 8.1e3 LDLT-MF wins 12.7 vs 16.6 ms,
-/// at 4e4 it wins 71 vs 97 ms (unsymmetric LU) / 195 ms (KLU).
-const LDLT_BLOCK_MIN: usize = 8_000;
+/// The supernodal backends' settings: SANE's thread count, one thread inside
+/// a parallel sweep (whose tasks solve sequentially).
+fn supernodal_settings() -> SolverSettings {
+    let threads = if rayon::current_thread_index().is_some() {
+        1
+    } else {
+        crate::parallel::threads()
+    };
+    SolverSettings::default().with_threads(Threads::Fixed(threads))
+}
 
 /// Symmetry side-structure over a CSC pattern: the transposed-slot pairing for
 /// the O(nnz) per-factorization value-symmetry test, and the lower-triangle
@@ -141,7 +146,7 @@ impl LdltCand {
             row_idx: lrow_idx.clone(),
             values: vec![1.0; lrow_idx.len()],
         };
-        let lsym = LdltSymbolic::analyze(&skeleton, &SolverSettings::default()).ok()?;
+        let lsym = LdltSymbolic::analyze(&skeleton, &supernodal_settings()).ok()?;
         Some(LdltCand {
             tpair,
             lower_from,
@@ -183,7 +188,7 @@ impl LdltCand {
         for (v, &k) in lower.values.iter_mut().zip(&self.lower_from) {
             *v = vals[k];
         }
-        let opts = SolverSettings::default();
+        let opts = supernodal_settings();
         in_place(
             ldlt,
             |s| self.lsym.refactor(lower, &opts, s),
@@ -213,12 +218,17 @@ fn transpose_pairs(n: usize, col_ptr: &[usize], row_idx: &[usize]) -> Option<Vec
     Some(tpair)
 }
 
-/// The symbolic analysis of a fixed pattern, in the backend the structure
-/// selected.
-/// Boxed: both analyses are large and of very different sizes.
+/// The symbolic analysis of a fixed pattern, in the backend its work
+/// selected (see [`SUPERNODAL_FLOPS_PER_ENTRY`]): KLU's, or the supernodal
+/// paths' -- the LDLT candidacy of a structurally symmetric pattern, and the
+/// LU analysis, made when a value set first needs it.
+/// Boxed: the analyses are large and of very different sizes.
 enum Sym {
     Klu(Box<KluSymbolic>),
-    Mf(Box<LuSymbolic>),
+    Supernodal {
+        ldlt: Option<Box<LdltCand>>,
+        lu: OnceLock<Box<LuSymbolic>>,
+    },
 }
 
 /// Factor into `slot` in place when it holds a factor of the same analysis,
@@ -338,16 +348,12 @@ pub struct SparsePattern {
     /// Input entry `k` (the caller's entry order) -> CSC value slot.
     /// Duplicate positions map onto the same slot (contributions sum).
     slot: Vec<usize>,
-    /// The unsymmetric analysis (KLU's block triangular form with the MC64
-    /// transversal, or the LU path's row matching), computed from the values
-    /// of the first numeric factorization and shared by every factorizer of
-    /// the pattern: the DC drivers each hold their own `Refactorable`, and
-    /// the analysis is the expensive part.
+    /// The analysis (KLU's block triangular form with the MC64 transversal,
+    /// or the supernodal paths'), computed from the values of the first
+    /// numeric factorization and shared by every factorizer of the pattern:
+    /// the DC drivers each hold their own `Refactorable`, and the analysis is
+    /// the expensive part.
     sym: OnceLock<Sym>,
-    /// LDLT candidacy: present when the pattern is large and structurally
-    /// symmetric; each factorization then tests the values and takes the
-    /// symmetric fast path when they match.
-    ldlt: Option<LdltCand>,
 }
 
 impl SparsePattern {
@@ -386,34 +392,31 @@ impl SparsePattern {
         if !has_full_transversal(n, &col_ptr, &row_idx) {
             return None;
         }
-        // LDLT candidacy: large + structurally symmetric. Built once; the
-        // per-factorization value test decides whether it is used.
-        let ldlt = if n >= LDLT_BLOCK_MIN {
-            LdltCand::build(n, &col_ptr, &row_idx)
-        } else {
-            None
-        };
         Some(SparsePattern {
             n,
             col_ptr,
             row_idx,
             slot,
             sym: OnceLock::new(),
-            ldlt,
         })
     }
 
-    /// Backend routing: KLU's BTF analysis is cheap and also yields the block
-    /// structure; a pattern whose largest irreducible block crosses
-    /// [`MF_BLOCK_MIN`] re-analyzes for the supernodal backend instead.
-    fn route(csc: &GeneralCsc<f64>) -> Option<Sym> {
+    /// Backend routing: KLU's analysis is cheap and predicts the work of its
+    /// factorization; a pattern whose flops per factor entry reach
+    /// [`SUPERNODAL_FLOPS_PER_ENTRY`] is analyzed for the supernodal backends
+    /// instead, with the LDLT candidacy when it is structurally symmetric
+    /// (each factorization's value test decides its use).
+    fn route(&self, csc: &GeneralCsc<f64>) -> Option<Sym> {
         let klu = KluSymbolic::analyze(csc, &KluSettings::default()).ok()?;
-        if klu.max_block_size() >= MF_BLOCK_MIN {
-            if let Ok(mf) = LuSymbolic::analyze(csc, &SolverSettings::default()) {
-                return Some(Sym::Mf(Box::new(mf)));
+        let per_entry = klu.estimated_flops() as f64 / klu.estimated_factor_nnz().max(1) as f64;
+        Some(if per_entry >= SUPERNODAL_FLOPS_PER_ENTRY {
+            Sym::Supernodal {
+                ldlt: LdltCand::build(self.n, &self.col_ptr, &self.row_idx).map(Box::new),
+                lu: OnceLock::new(),
             }
-        }
-        Some(Sym::Klu(Box::new(klu)))
+        } else {
+            Sym::Klu(Box::new(klu))
+        })
     }
 
     /// A per-solve-loop factorizer over this pattern. Every factorization
@@ -433,7 +436,7 @@ impl SparsePattern {
             },
             lower: None,
             klu: None,
-            mf: None,
+            lu: None,
             ldlt: None,
             active: Backend::None,
             prev_vals: Vec::new(),
@@ -448,7 +451,7 @@ enum Backend {
     None,
     Ldlt,
     Klu,
-    Mf,
+    Lu,
 }
 
 /// Reusable numeric factorization state over a [`SparsePattern`] for one solve
@@ -464,7 +467,7 @@ pub struct Refactorable<'p> {
     /// Each backend's factor, kept while another serves a value set so its
     /// next factorization is again in place.
     klu: Option<KluSolver<f64>>,
-    mf: Option<LuSolver<f64>>,
+    lu: Option<LuSolver<f64>>,
     ldlt: Option<LdltSolver<f64>>,
     active: Backend,
     /// CSC values of the last *successful* factorization, for the identity
@@ -485,6 +488,30 @@ impl Refactorable<'_> {
         for (k, &v) in values.iter().enumerate() {
             self.csc.values[self.pat.slot[k]] += v;
         }
+        self.factor_loaded(row_scaling)
+    }
+
+    /// [`factor`](Self::factor) of values given as consecutive parts of the
+    /// entry order, each times its scale, the remaining entries (an
+    /// augmentation such as the gmin diagonal) all at `rest`: the same sums
+    /// in the same order, without the concatenated copy.
+    pub fn factor_scaled(&mut self, parts: &[(&[f64], f64)], rest: f64, row_scaling: bool) -> bool {
+        self.csc.values.fill(0.0);
+        let mut k = 0;
+        for &(vals, scale) in parts {
+            for &v in vals {
+                self.csc.values[self.pat.slot[k]] += v * scale;
+                k += 1;
+            }
+        }
+        for &slot in &self.pat.slot[k..] {
+            self.csc.values[slot] += rest;
+        }
+        self.factor_loaded(row_scaling)
+    }
+
+    /// The factorization of the values `csc` holds.
+    fn factor_loaded(&mut self, row_scaling: bool) -> bool {
         // Identity fast path: a bitwise-unchanged matrix (linear system, or a
         // clamped step that left the Jacobian untouched) keeps the existing
         // factors -- no refactor at all. NaN never compares equal, so a
@@ -503,20 +530,9 @@ impl Refactorable<'_> {
     /// The numeric factorization of `csc`'s values; the backend that took it.
     fn factor_values(&mut self, row_scaling: bool) -> Backend {
         let pat = self.pat;
-        // Symmetric fast path: LDLT over the shared analysis; on symmetry
-        // break or rank deficiency the unsymmetric backends below take over
-        // for this value set.
-        if let Some(cand) = &pat.ldlt {
-            if cand.values_symmetric(&self.csc.values) {
-                let lower = self.lower.get_or_insert_with(|| cand.lower(pat.n));
-                if cand.factor(&self.csc.values, lower, &mut self.ldlt) {
-                    return Backend::Ldlt;
-                }
-            }
-        }
         let sym = match pat.sym.get() {
             Some(sym) => sym,
-            None => match SparsePattern::route(&self.csc) {
+            None => match pat.route(&self.csc) {
                 // A numerically singular first matrix leaves the slot empty,
                 // so a later factorization with regular values analyzes anew.
                 Some(s) => pat.sym.get_or_init(|| s),
@@ -524,28 +540,50 @@ impl Refactorable<'_> {
             },
         };
         let csc = &self.csc;
-        let ok = match sym {
+        match sym {
             // A replay that hits a vanished pivot factors afresh, pivoting.
             Sym::Klu(sym) => {
-                self.klu.as_mut().is_some_and(|s| s.refactor(csc).is_ok()) || {
+                let ok = self.klu.as_mut().is_some_and(|s| s.refactor(csc).is_ok()) || {
                     let settings = KluSettings::default().with_row_scaling(row_scaling);
                     self.klu = sym.factor(csc, &settings).ok();
                     self.klu.is_some()
+                };
+                if ok {
+                    Backend::Klu
+                } else {
+                    Backend::None
                 }
             }
-            Sym::Mf(sym) => {
-                let opts = SolverSettings::default();
-                in_place(
-                    &mut self.mf,
+            Sym::Supernodal { ldlt, lu } => {
+                // Symmetric values: LDLT; on symmetry break or rank
+                // deficiency the LU takes this value set.
+                if let Some(cand) = ldlt {
+                    if cand.values_symmetric(&csc.values) {
+                        let lower = self.lower.get_or_insert_with(|| cand.lower(pat.n));
+                        if cand.factor(&csc.values, lower, &mut self.ldlt) {
+                            return Backend::Ldlt;
+                        }
+                    }
+                }
+                let opts = supernodal_settings();
+                let sym = match lu.get() {
+                    Some(sym) => sym,
+                    None => match LuSymbolic::analyze(csc, &opts) {
+                        Ok(s) => lu.get_or_init(|| Box::new(s)),
+                        Err(_) => return Backend::None,
+                    },
+                };
+                let ok = in_place(
+                    &mut self.lu,
                     |s| sym.refactor(csc, &opts, s),
                     || sym.factor(csc, &opts),
-                )
+                );
+                if ok {
+                    Backend::Lu
+                } else {
+                    Backend::None
+                }
             }
-        };
-        match (ok, sym) {
-            (false, _) => Backend::None,
-            (true, Sym::Klu(_)) => Backend::Klu,
-            (true, Sym::Mf(_)) => Backend::Mf,
         }
     }
 
@@ -558,7 +596,7 @@ impl Refactorable<'_> {
         match self.active {
             Backend::Ldlt => self.ldlt.as_ref().map(|s| s.solve_into(rhs, x, w)),
             Backend::Klu => self.klu.as_ref().map(|s| s.solve_into(rhs, x, w)),
-            Backend::Mf => self.mf.as_ref().map(|s| s.solve_into(rhs, x, w)),
+            Backend::Lu => self.lu.as_ref().map(|s| s.solve_into(rhs, x, w)),
             Backend::None => None,
         }
         .is_some_and(|r| r.is_ok())
@@ -716,28 +754,55 @@ mod tests {
         assert!(fac.factor(&[1.0, 2.0, 2.0, 5.0], false));
     }
 
+    /// The `(rows, cols)` of an `m x m` grid Laplacian's pattern.
+    fn grid(m: usize) -> (Vec<usize>, Vec<usize>) {
+        let (mut rows, mut cols) = (Vec::new(), Vec::new());
+        for i in 0..m * m {
+            rows.push(i);
+            cols.push(i);
+            for j in [i + 1, i + m] {
+                if j < m * m && (j != i + 1 || j % m != 0) {
+                    rows.extend([i, j]);
+                    cols.extend([j, i]);
+                }
+            }
+        }
+        (rows, cols)
+    }
+
     #[test]
-    fn symmetric_large_pattern_takes_ldlt_and_matches() {
-        // Symmetric tridiagonal above the LDLT threshold: the pattern must
-        // carry the LDLT candidacy, factor through it, and solve correctly;
-        // breaking symmetry in one value must fall back and still solve.
-        let n = LDLT_BLOCK_MIN + 100;
+    fn sparse_work_takes_klu_at_any_size() {
+        // A long chain: 20k unknowns, but its factorization is no dense work.
+        let n = 20_000;
         let (mut rows, mut cols) = (Vec::new(), Vec::new());
         for i in 0..n {
             rows.push(i);
             cols.push(i);
             if i + 1 < n {
-                rows.push(i);
-                cols.push(i + 1);
-                rows.push(i + 1);
-                cols.push(i);
+                rows.extend([i, i + 1]);
+                cols.extend([i + 1, i]);
             }
         }
         let pat = SparsePattern::new(n, &rows, &cols).expect("pattern");
-        assert!(
-            pat.ldlt.is_some(),
-            "structurally symmetric + large => LDLT candidate"
-        );
+        let vals: Vec<f64> = rows
+            .iter()
+            .zip(&cols)
+            .map(|(&r, &c)| if r == c { 4.0 } else { -1.0 })
+            .collect();
+        let mut fac = pat.factorizer();
+        assert!(fac.factor(&vals, true));
+        assert_eq!(fac.active, Backend::Klu);
+    }
+
+    #[test]
+    fn dense_work_symmetric_takes_ldlt_and_matches() {
+        // A 130 x 130 grid: dense work (~70 flops per factor entry), routed
+        // to the supernodal paths; symmetric values factor through LDLT and
+        // solve correctly, breaking symmetry in one value falls back to the
+        // supernodal LU and still solves.
+        let (rows, cols) = grid(130);
+        let n = 130 * 130;
+        let pat = SparsePattern::new(n, &rows, &cols).expect("pattern");
         let sym_vals: Vec<f64> = rows
             .iter()
             .zip(&cols)
@@ -763,10 +828,10 @@ mod tests {
             b2[rows[k]] += v;
         }
         assert!(fac.factor(&asym, true));
-        assert_ne!(
+        assert_eq!(
             fac.active,
-            Backend::Ldlt,
-            "asymmetric values must not use LDLT"
+            Backend::Lu,
+            "asymmetric values take the supernodal LU"
         );
         let x2 = solved(&mut fac, &b2).expect("solve asym");
         let err2 = x2.iter().map(|v| (v - 1.0).abs()).fold(0.0f64, f64::max);

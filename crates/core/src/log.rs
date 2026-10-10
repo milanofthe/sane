@@ -212,23 +212,42 @@ pub fn error(msg: &str) {
 /// threshold, so a diagnostic the user must not miss (a gmin-regularized point,
 /// an out-of-range device parameter) reaches them even with logging disabled --
 /// the default. See [`warn_captured`] / [`drain_captured`] (issue #54).
-static CAPTURED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static CAPTURED: Mutex<Vec<(Concern, String)>> = Mutex::new(Vec::new());
+
+/// What a captured warning is about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Concern {
+    /// A usable but suspect result: a gmin-regularized point, a device
+    /// parameter clamped to its range.
+    Convergence,
+    /// A numerical breakdown left part of a result undefined (`NaN`).
+    Numerical,
+}
 
 /// Emit a WARNING (gated by the log level, as usual) **and** unconditionally
 /// capture it for the host to re-raise as a catchable warning. Use for
 /// correctness-affecting diagnostics that must reach the caller regardless of
 /// [`set_level`] (issue #54).
 pub fn warn_captured(msg: &str) {
+    capture(Concern::Convergence, msg);
+}
+
+/// [`warn_captured`] for a numerical breakdown (see [`Concern::Numerical`]).
+pub fn warn_numerical(msg: &str) {
+    capture(Concern::Numerical, msg);
+}
+
+fn capture(concern: Concern, msg: &str) {
     warning(msg);
     if let Ok(mut c) = CAPTURED.lock() {
-        c.push(msg.to_string());
+        c.push((concern, msg.to_string()));
     }
 }
 
-/// Drain and return every message captured by [`warn_captured`] since the last
-/// drain (clearing the buffer). The Python layer calls this at analysis
-/// boundaries and re-emits each as a `SaneConvergenceWarning`.
-pub fn drain_captured() -> Vec<String> {
+/// Drain and return every warning captured since the last drain (clearing
+/// the buffer). A host calls this at analysis boundaries and re-emits each
+/// in its own warning machinery.
+pub fn drain_captured() -> Vec<(Concern, String)> {
     CAPTURED
         .lock()
         .map(|mut c| std::mem::take(&mut *c))

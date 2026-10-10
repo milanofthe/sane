@@ -28,26 +28,28 @@ mod veriloga_engine_tests {
     //! device, proving the lowered VA model is an ordinary device to the engine.
     use super::*;
 
-    fn poles_of(net: &str, input: &str, output: &str) -> Vec<[f64; 2]> {
-        Model::from_netlist(net)
-            .expect("model")
-            .poles_zeros(&[], input, output)
-            .expect("pole_zero")
+    fn poles_of(net: &str) -> Vec<[f64; 2]> {
+        (Model::from_netlist(net).expect("model").at(&[]).unwrap())
+            .poles()
+            .expect("poles")
             .poles
+            .iter()
+            .map(|s| [s.re, s.im])
+            .collect()
     }
     fn ac_mag_db(net: &str, input: &str, output: &str, f0: f64, f1: f64, n: usize) -> Vec<f64> {
-        Model::from_netlist(net)
-            .expect("model")
-            .ac(&[], input, output, f0, f1, n)
+        (Model::from_netlist(net).expect("model").at(&[]).unwrap())
+            .ac(input, &[output], &crate::log_grid(f0, f1, n))
             .expect("ac")
-            .mag_db
+            .mag_db(output)
+            .unwrap()
     }
-    fn noise_psd(net: &str, output: &str, f0: f64, f1: f64, n: usize) -> Vec<f64> {
-        Model::from_netlist(net)
-            .expect("model")
-            .noise(&[], output, f0, f1, n)
+    fn noise_density(net: &str, output: &str, f0: f64, f1: f64, n: usize) -> Vec<f64> {
+        (Model::from_netlist(net).expect("model").at(&[]).unwrap())
+            .noise(&[output], &crate::log_grid(f0, f1, n))
             .expect("noise")
-            .psd
+            .density(output)
+            .unwrap()
     }
 
     const VA: &str = r#"
@@ -82,8 +84,8 @@ C1 n1 0 1u
 
     #[test]
     fn va_diode_matches_native_pole_zero() {
-        let va = poles_of(VA, "V1", "n1");
-        let nat = poles_of(NATIVE, "V1", "n1");
+        let va = poles_of(VA);
+        let nat = poles_of(NATIVE);
         let (pv, pn) = (sorted_poles(&va), sorted_poles(&nat));
         assert_eq!(pv.len(), pn.len(), "pole count: {pv:?} vs {pn:?}");
         // The native and Verilog-A diodes are independent lowerings of the same
@@ -119,7 +121,8 @@ C1 n1 0 1u
         let npts = ((5e-3 / 5e-5_f64).round() as usize).clamp(1, 100_000);
         let t: Vec<f64> = (0..=npts).map(|k| k as f64 * 5e-3 / npts as f64).collect();
         let tr = m
-            .transient(sane_solve::TransientMethod::default(), &[], &t, 1e-4, 1e-7)
+            .at(&[])
+            .and_then(|pt| pt.transient(&t, &crate::TransientOptions::default()))
             .expect("transient");
         assert!(!tr.t.is_empty(), "no transient samples");
     }
@@ -165,7 +168,7 @@ N1 in out lpf
 Rl out 0 1meg
 .end
 ";
-        let poles = poles_of(deck, "V1", "out");
+        let poles = poles_of(deck);
         let hit = poles
             .iter()
             .any(|p| (p[0] + 1000.0).abs() < 5.0 && p[1].abs() < 1.0);
@@ -191,8 +194,8 @@ R2 out 0 1k
 .end
 ";
         let nat = "V1 in 0 0\nR1 in out 1k\nR2 out 0 1k\n.end\n";
-        let rv = noise_psd(va, "out", 1.0, 1e5, 8);
-        let rn = noise_psd(nat, "out", 1.0, 1e5, 8);
+        let rv = noise_density(va, "out", 1.0, 1e5, 8);
+        let rn = noise_density(nat, "out", 1.0, 1e5, 8);
         for (a, b) in rv.iter().zip(&rn) {
             assert!(
                 (a - b).abs() < 1e-12 * b.max(1e-12) + 1e-15,
@@ -203,8 +206,8 @@ R2 out 0 1k
 
     #[test]
     fn va_white_noise_matches_native_resistor() {
-        let va = noise_psd(VA_NOISE, "out", 1.0, 1e5, 8);
-        let nat = noise_psd(NATIVE_NOISE, "out", 1.0, 1e5, 8);
+        let va = noise_density(VA_NOISE, "out", 1.0, 1e5, 8);
+        let nat = noise_density(NATIVE_NOISE, "out", 1.0, 1e5, 8);
         assert_eq!(va.len(), nat.len());
         for (a, b) in va.iter().zip(&nat) {
             assert!(
@@ -259,7 +262,7 @@ mod bsim4_validation {
         mag_db: Vec<f64>,
     }
 
-    fn label_traces(m: &Model, rows: &[Vec<f64>]) -> Vec<Trace> {
+    fn label_traces(m: &Model, rows: &ndarray::Array2<f64>) -> Vec<Trace> {
         m.unknowns()
             .iter()
             .enumerate()
@@ -268,10 +271,7 @@ mod bsim4_validation {
                 Trace {
                     name,
                     kind: kind.into(),
-                    values: rows
-                        .iter()
-                        .map(|r| r.get(i).copied().unwrap_or(0.0))
-                        .collect(),
+                    values: rows.column(i).to_vec(),
                 }
             })
             .collect()
@@ -289,12 +289,14 @@ mod bsim4_validation {
                 }
             }
         };
-        match m.dc_sweep(&source, a, b, step) {
+        let n = ((b - a) / step).abs().round() as usize;
+        let values: Vec<f64> = (0..=n).map(|k| a + step * k as f64).collect();
+        match m.at(&[]).and_then(|pt| pt.dc_sweep(&source, &values)) {
             Ok(ds) => SweepResult {
                 ok: true,
                 message: "ok".into(),
-                sweep: ds.sweep.clone(),
-                traces: label_traces(&m, ds.rows()),
+                sweep: ds.values.clone(),
+                traces: label_traces(&m, &ds.x),
             },
             Err(e) => SweepResult {
                 ok: false,
@@ -318,7 +320,7 @@ mod bsim4_validation {
             }
         };
         let dim = m.dim();
-        match m.operating_point(&[]) {
+        match m.at(&[]).and_then(|pt| pt.operating_point()) {
             Ok(op) => {
                 let signals = m
                     .unknowns()
@@ -368,11 +370,12 @@ mod bsim4_validation {
         };
         let n = ((tstop / tstep).round() as usize).clamp(1, 100_000);
         let t: Vec<f64> = (0..=n).map(|k| k as f64 * tstop / n as f64).collect();
-        match m.transient(sane_solve::TransientMethod::default(), &[], &t, 1e-4, 1e-7) {
+        let opts = crate::TransientOptions::default();
+        match m.at(&[]).and_then(|pt| pt.transient(&t, &opts)) {
             Ok(tr) => TranResult {
                 ok: true,
                 message: "ok".into(),
-                traces: label_traces(&m, tr.rows()),
+                traces: label_traces(&m, &tr.x),
             },
             Err(e) => TranResult {
                 ok: false,
@@ -401,12 +404,13 @@ mod bsim4_validation {
                 }
             }
         };
-        match m.ac(&[], &input, &output, f0, f1, n) {
+        let freqs = crate::log_grid(f0, f1, n);
+        match m.at(&[]).and_then(|pt| pt.ac(&input, &[&output], &freqs)) {
             Ok(ac) => AcResult {
                 ok: true,
                 message: "ok".into(),
+                mag_db: ac.mag_db(&output).unwrap(),
                 f: ac.freqs,
-                mag_db: ac.mag_db,
             },
             Err(e) => AcResult {
                 ok: false,
@@ -1045,7 +1049,7 @@ mod nonlinearity_reality {
     fn classify(net: &str) -> rsdag::Nonlinearity {
         let parsed = parse(net).expect("parse");
         let mut ctx = Graph::new();
-        let dae = parsed.assemble(&mut ctx).unwrap();
+        let dae = sane_dae::assemble(&mut ctx, &parsed).unwrap();
         dae.nonlinearity(&ctx)
     }
 
@@ -1105,8 +1109,8 @@ mod hb_verify {
     use num_complex::Complex64;
     use sane_solve::hb::{hb_samples, CompiledHb};
 
-    fn unknown_idx(dae: &sane_dae::Dae, parsed: &sane_netlist::ParsedCircuit, node: &str) -> usize {
-        let k = parsed.node(node).unwrap();
+    fn unknown_idx(dae: &sane_dae::Dae, parsed: &sane_circuit::Circuit, node: &str) -> usize {
+        let k = parsed.find_node(node).unwrap();
         dae.unknowns
             .iter()
             .position(|u| *u == format!("v{k}"))
@@ -1122,7 +1126,7 @@ mod hb_verify {
         let net = "V1 in 0 SIN(0 1 1000)\nR1 in out 1k\nC1 out 0 1u\n.end";
         let parsed = parse(net).unwrap();
         let mut ctx = Graph::new();
-        let dae = parsed.assemble(&mut ctx).unwrap();
+        let dae = sane_dae::assemble(&mut ctx, &parsed).unwrap();
         let cdc = CompiledDc::new(&mut ctx, &dae);
         let pnames = cdc.param_names(&ctx);
         let p: Vec<f64> = parsed.pvec(&pnames);
@@ -1181,7 +1185,7 @@ mod hb_verify {
                    C1 mid 0 100n\n.model DMOD D(Is=1e-14 N=1 Vt=0.02585)\n.end";
         let parsed = parse(net).unwrap();
         let mut ctx = Graph::new();
-        let dae = parsed.assemble(&mut ctx).unwrap();
+        let dae = sane_dae::assemble(&mut ctx, &parsed).unwrap();
         let cdc = CompiledDc::new(&mut ctx, &dae);
         let pnames = cdc.param_names(&ctx);
         let p: Vec<f64> = parsed.pvec(&pnames);
@@ -1210,16 +1214,9 @@ mod hb_verify {
             .map(|j| j as f64 * period / mfft as f64)
             .collect();
         let traj = cdc
-            .solve_transient(
-                sane_solve::TransientMethod::Esdirk32,
-                &p,
-                &[],
-                &t_eval,
-                1e-6,
-                1e-9,
-                None,
-            )
-            .expect("transient");
+            .solve_transient(&p, &[], &t_eval, 1e-6, 1e-9, None)
+            .expect("transient")
+            .rows;
         let last: Vec<f64> = (0..mfft)
             .map(|j| traj[(n_per - 1) * mfft + j][mid])
             .collect();
@@ -1248,7 +1245,7 @@ mod hb_verify {
                    C1 mid 0 100n\n.model DMOD D(Is=1e-14 N=1 Vt=0.02585)\n.end";
         let parsed = parse(net).unwrap();
         let mut ctx = Graph::new();
-        let dae = parsed.assemble(&mut ctx).unwrap();
+        let dae = sane_dae::assemble(&mut ctx, &parsed).unwrap();
         let cdc = CompiledDc::new(&mut ctx, &dae);
         cdc.ensure_param_jac(&mut ctx, &dae);
         let pnames = cdc.param_names(&ctx);
@@ -1291,7 +1288,7 @@ mod hb_verify {
                    C1 mid 0 100n\n.model DMOD D(Is=1e-14 N=1 Vt=0.02585)\n.end";
         let parsed = parse(net).unwrap();
         let mut ctx = Graph::new();
-        let dae = parsed.assemble(&mut ctx).unwrap();
+        let dae = sane_dae::assemble(&mut ctx, &parsed).unwrap();
         let cdc = CompiledDc::new(&mut ctx, &dae);
         cdc.ensure_param_jac(&mut ctx, &dae);
         cdc.ensure_hessian(&mut ctx, &dae);
@@ -1343,7 +1340,7 @@ mod hb_verify {
     ) {
         let parsed = parse(net).unwrap();
         let mut ctx = Graph::new();
-        let dae = parsed.assemble(&mut ctx).unwrap();
+        let dae = sane_dae::assemble(&mut ctx, &parsed).unwrap();
         let cdc = CompiledDc::new(&mut ctx, &dae);
         let pnames = cdc.param_names(&ctx);
         let p: Vec<f64> = parsed.pvec(&pnames);
@@ -1366,10 +1363,14 @@ mod hb_verify {
         let net = "V1 in 0 SIN(0.6 0.15 1000)\nR1 in mid 1k\nD1 mid 0 DMOD\n\
                    C1 mid 0 100n\n.model DMOD D(Is=1e-14 N=1 Vt=0.02585)\n.end";
         let m = Model::from_netlist(net).expect("model");
-        let auto = m.harmonic_balance(&[], 0.0, 8, None).expect("auto HB");
-        let explicit = m
-            .harmonic_balance(&[], 1000.0, 8, None)
-            .expect("explicit HB");
+        let pt = m.at(&[]).unwrap();
+        let auto = pt.harmonic_balance(&HbOptions::default()).expect("auto HB");
+        let explicit = (pt.harmonic_balance(&HbOptions {
+            f0: Some(1000.0),
+            ..HbOptions::default()
+        }))
+        .expect("explicit HB");
+        assert!((auto.f0 - 1000.0).abs() < 1e-9, "inferred f0 = {}", auto.f0);
         // The inferred fundamental (f0 <= 0 path) must be the source's 1 kHz.
         let f0 = m
             .cdc()
@@ -1462,20 +1463,13 @@ mod sensitivity_ad_tests {
         let net = "V1 in 0 AC 1\nR1 in out 1k\nC1 out 0 1u\n";
         let fc = 1.0 / (2.0 * std::f64::consts::PI * 1e3 * 1e-6); // wRC = 1
         let m = Model::from_netlist(net).expect("model");
-        let op = m.operating_point(&[]).expect("operating point");
-        let x = op.vector().to_vec();
-        let p = m.pvec(&[]);
-        let out_idx = m.resolve("out").expect("output");
-        let h = m
-            .ac_response("V1", out_idx, x.clone(), p.clone(), vec![fc])
-            .expect("ac")[0];
-        let h0 = Complex64::new(h.0, h.1);
-        // d ln|H|/d ln p = p * Re(conj(H) dH/dp) / |H|^2 (the deleted façade's rel).
+        let ac = (m.at(&[]).unwrap()).ac("V1", &["out"], &[fc]).expect("ac");
+        let s = ac.sensitivity(&["R1", "C1"]).expect("ac sensitivity");
+        let h0 = ac.h[[0, 0]];
+        // d ln|H|/d ln p = p * Re(conj(H) dH/dp) / |H|^2
         let rel = |param: &str| -> f64 {
-            let dh = m
-                .ac_sensitivity("V1", param, out_idx, x.clone(), p.clone(), vec![fc])
-                .expect("ac_sens")[0];
-            let dhc = Complex64::new(dh.0, dh.1);
+            let j = s.params.iter().position(|q| q == param).unwrap();
+            let dhc: Complex64 = s.grad[[0, 0, j]];
             m.get(param).unwrap() * (h0.conj() * dhc).re / (h0.norm() * h0.norm())
         };
         let r1 = rel("R1");
@@ -1498,30 +1492,27 @@ mod sensitivity_ad_tests {
     fn transient_sensitivity_settles_to_dc() {
         let net = "V1 in 0 5\nR1 in out 1k\nR2 out 0 1k\nC1 out 0 1u\n";
         let m = Model::from_netlist(net).expect("model");
-        let n = m.dim();
-        let out_idx = m.resolve("out").expect("output");
         // RC = (R1||R2)*C = 500 us; integrate well past it.
         let (tstop, tstep) = (1e-2_f64, 5e-5_f64);
         let npts = ((tstop / tstep).round() as usize).clamp(1, 100_000);
         let t_eval: Vec<f64> = (0..=npts).map(|k| k as f64 * tstop / npts as f64).collect();
         // Forward transient sensitivity: d ln(out(tstop))/d ln R1, normalised by the
         // baseline output at tstop (row [0..n) of the augmented trajectory).
-        let (nn, traj) = m
-            .transient_sensitivity(vec!["R1".to_string()], t_eval, 1e-4, 1e-7, None)
-            .expect("transient_sensitivity");
-        assert_eq!(nn, n);
-        let last = traj.last().expect("trajectory");
-        let (y, dydp) = (last[out_idx], last[n + out_idx]);
+        let s = (m.at(&[]).unwrap())
+            .transient(&t_eval, &TransientOptions::default())
+            .and_then(|tr| tr.sensitivity(&["out"], &["R1"]))
+            .expect("transient sensitivity");
+        let k = t_eval.len() - 1;
+        let (y, dydp) = (s.values[[0, k]], s.grad[[0, k, 0]]);
         let tr_r1 = dydp * m.get("R1").unwrap() / y;
         // Adjoint DC sensitivity at the operating point: rel = grad * p / value.
-        let op = m.operating_point(&[]).expect("operating point");
-        let sens = op.sensitivity("out").expect("sensitivity");
-        let i = sens
-            .names
-            .iter()
-            .position(|nm| nm == "R1")
-            .expect("R1 column");
-        let dc_r1 = sens.grad[i] * m.get("R1").unwrap() / sens.value;
+        let op = m
+            .at(&[])
+            .unwrap()
+            .operating_point()
+            .expect("operating point");
+        let sens = op.sensitivity(&["out"], &["R1"]).expect("sensitivity");
+        let dc_r1 = sens.grad[[0, 0]] * m.get("R1").unwrap() / sens.values[0];
         // Analytic d ln(out)/d ln R1 = -R1/(R1+R2) = -0.5.
         assert!((tr_r1 + 0.5).abs() < 1e-2, "transient R1 sens {tr_r1}");
         assert!(
@@ -1532,7 +1523,7 @@ mod sensitivity_ad_tests {
 }
 
 mod nodeset_tests {
-    //! `.nodeset` flows from the directive through `parse_nodeset` and `prepare`
+    //! `.nodeset` flows from the directive through the circuit and `prepare`
     //! into every cold DC solve: the same bistable latch settles on whichever
     //! branch the node-set selects.
     use super::*;
@@ -1555,16 +1546,20 @@ B2 0 b I=0.5 - 0.3183098862*atan(10*(V(a)-0.5))
     fn op_of(net: String) -> OperatingPoint {
         Model::from_netlist(&net)
             .expect("build model")
-            .operating_point(&[])
+            .at(&[])
+            .and_then(|pt| pt.operating_point())
             .expect("operating point")
     }
 
     #[test]
-    fn parse_nodeset_reads_voltage_targets() {
-        let ns = parse_nodeset(".nodeset V(a)=1 V(b)=0\n");
+    fn nodeset_reads_voltage_targets() {
+        let ns = parse("R1 a 0 1\n.nodeset V(a)=1 V(b)=0\n").unwrap().nodeset;
         assert_eq!(ns, vec![("a".to_string(), 1.0), ("b".to_string(), 0.0)]);
         // `.ic`-style branch currents are not node-sets.
-        assert!(parse_nodeset(".nodeset I(L1)=1m\n").is_empty());
+        assert!(parse("R1 a 0 1\n.nodeset I(L1)=1m\n")
+            .unwrap()
+            .nodeset
+            .is_empty());
     }
 
     #[test]

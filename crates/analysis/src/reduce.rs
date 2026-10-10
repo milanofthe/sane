@@ -7,12 +7,22 @@ use sane_core::Graph;
 use sane_solve::CompiledDc;
 use std::f64::consts::PI;
 
+/// A dominant-pole reduction (see [`model_reduce_on_dae`]): the kept roots
+/// `[re, im]` (rad/s), the gain and the full against the reduced transfer.
+pub struct Reduction {
+    pub poles: Vec<[f64; 2]>,
+    pub zeros: Vec<[f64; 2]>,
+    pub gain: Complex64,
+    pub full: Vec<Complex64>,
+    pub reduced: Vec<Complex64>,
+}
+
 /// Dominant-pole model-order reduction of the `input -> out_idx` transfer, from
 /// the already-assembled DAE at the operating point `x`. Keeps the `order` most
 /// dominant poles (and matching zeros) of the small-signal pencil, fits the gain
-/// `K` to the full DC gain, and reports the full vs. reduced magnitude over a log
-/// band. Returns `(freqs_hz, full_db, reduced_db, kept_poles, kept_zeros, max_err_db)`.
-#[allow(clippy::type_complexity)]
+/// `K` to the full DC gain, and evaluates the full and the reduced transfer at
+/// `freqs` (Hz).
+#[allow(clippy::too_many_arguments)]
 pub fn model_reduce_on_dae(
     ctx: &mut Graph,
     dae: &sane_dae::Dae,
@@ -22,22 +32,10 @@ pub fn model_reduce_on_dae(
     x: &[f64],
     p: &[f64],
     order: usize,
-    fstart: f64,
-    fstop: f64,
-    points: usize,
-) -> Result<
-    (
-        Vec<f64>,
-        Vec<f64>,
-        Vec<f64>,
-        Vec<[f64; 2]>,
-        Vec<[f64; 2]>,
-        f64,
-    ),
-    String,
-> {
-    if !(fstart > 0.0) || !(fstop > fstart) || points < 2 || order == 0 {
-        return Err("model_reduce needs order >= 1, 0 < fstart < fstop, points >= 2".into());
+    freqs: &[f64],
+) -> Result<Reduction, String> {
+    if order == 0 || freqs.iter().any(|&f| !(f >= 0.0)) {
+        return Err("model_reduce needs order >= 1 and frequencies >= 0".into());
     }
     let n = dae.dim();
     let g = cdc.system_matrix_dc(x, p, 0.0);
@@ -95,25 +93,23 @@ pub fn model_reduce_on_dae(
         h0 * pp
     };
 
-    let (l0, l1) = (fstart.log10(), fstop.log10());
-    let (mut f, mut full_db, mut red_db) = (
-        Vec::with_capacity(points),
-        Vec::with_capacity(points),
-        Vec::with_capacity(points),
+    let (mut full, mut reduced) = (
+        Vec::with_capacity(freqs.len()),
+        Vec::with_capacity(freqs.len()),
     );
-    let mut max_err_db = 0.0_f64;
-    for i in 0..points {
-        let fi = 10f64.powf(l0 + (l1 - l0) * i as f64 / (points - 1) as f64);
+    for &fi in freqs {
         let w = 2.0 * PI * fi;
-        let s = Complex64::new(0.0, w);
-        let hf = solve_full(w);
-        let hr = k * prod(&kept_zeros, s) / prod(&kept_poles, s);
-        let fdb = 20.0 * hf.norm().max(1e-30).log10();
-        let rdb = 20.0 * hr.norm().max(1e-30).log10();
-        max_err_db = max_err_db.max((fdb - rdb).abs());
-        f.push(fi);
-        full_db.push(fdb);
-        red_db.push(rdb);
+        full.push(solve_full(w));
+        reduced.push(
+            k * prod(&kept_zeros, Complex64::new(0.0, w))
+                / prod(&kept_poles, Complex64::new(0.0, w)),
+        );
     }
-    Ok((f, full_db, red_db, kept_poles, kept_zeros, max_err_db))
+    Ok(Reduction {
+        poles: kept_poles,
+        zeros: kept_zeros,
+        gain: k,
+        full,
+        reduced,
+    })
 }

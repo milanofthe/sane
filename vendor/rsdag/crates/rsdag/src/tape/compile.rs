@@ -19,6 +19,11 @@
 //! 5. [`Program::emit`]: lifetimes, slots (a kernel's outputs a block of
 //!    consecutive slots), and the instruction stream.
 //!
+//! Passes 1 and 2 serve every tape over one set of roots: a [`Lowered`]
+//! program is lowered once, and a tape of some of its roots is a view of
+//! it, the instructions those roots reach, its calls computing the outputs
+//! read ([`Program::narrow_calls`]), then passes 3 to 5 alone.
+//!
 //! A compiled tape can be lifted back into its program ([`Tape::lift`]),
 //! which is how a transform of a tape (a specialization) is compiled.
 
@@ -93,21 +98,115 @@ impl Tape {
         input_syms: &[SymbolId],
         pure_inputs: Option<&[bool]>,
     ) -> Tape {
-        use crate::hooks::timed;
-        let forest = timed("tape analyze", || {
-            Forest::analyze(ctx, roots, input_syms, pure_inputs)
-        });
-        let mut templates = Templates::default();
-        let mut program = timed("tape lower", || forest.lower(ctx, roots, &mut templates));
-        if templates.expanded {
-            timed("tape merge", || program.merge_calls());
+        let program = lower(ctx, roots, input_syms, pure_inputs);
+        finish(program, pure_inputs, input_syms.len())
+    }
+}
+
+/// Passes 1 and 2: `roots` lowered over the inputs `input_syms`.
+fn lower<K: Field>(
+    ctx: &Graph<K>,
+    roots: &[ExprId],
+    input_syms: &[SymbolId],
+    pure_inputs: Option<&[bool]>,
+) -> Program {
+    use crate::hooks::timed;
+    let forest = timed("tape analyze", || {
+        Forest::analyze(ctx, roots, input_syms, pure_inputs)
+    });
+    let mut templates = Templates::default();
+    let mut program = timed("tape lower", || forest.lower(ctx, roots, &mut templates));
+    if templates.expanded {
+        timed("tape merge", || program.merge_calls());
+    }
+    program
+}
+
+/// Passes 3 to 5: `program` fused, scheduled and given slots.
+fn finish(mut program: Program, pure_inputs: Option<&[bool]>, n_inputs: usize) -> Tape {
+    use crate::hooks::timed;
+    timed("tape fuse", || program.fuse_accumulators(pure_inputs));
+    let order = timed("tape schedule", || program.schedule());
+    let split = pure_inputs.is_some();
+    let mut tape = timed("tape emit", || program.emit(&order, split));
+    tape.n_inputs = n_inputs;
+    tape
+}
+
+/// The program of a set of roots over one signature, lowered once (the
+/// reachable forest analyzed, its kernels grouped, its templates expanded
+/// and their calls merged): the tapes of a system that compute some of the
+/// same roots (its residuals; with its Jacobian; with its charges) are views
+/// of one program rather than compilations of their own. A view takes the
+/// instructions its roots reach, its calls computing only the outputs it
+/// reads, and is scheduled and given slots alone; it computes what
+/// [`Tape::compile`] of its roots computes, value for value.
+pub struct Lowered {
+    program: Program,
+    /// The roots, and the place of each among them (its first).
+    roots: Vec<ExprId>,
+    at: HashMap<ExprId, u32>,
+    inputs: Vec<SymbolId>,
+    pure_inputs: Option<Vec<bool>>,
+}
+
+impl Lowered {
+    /// `roots` lowered over the inputs `input_syms`; with `pure_inputs`,
+    /// every view split into a prolog as by [`Tape::compile_split`].
+    pub fn new<K: Field>(
+        ctx: &Graph<K>,
+        roots: &[ExprId],
+        input_syms: &[SymbolId],
+        pure_inputs: Option<&[bool]>,
+    ) -> Lowered {
+        let program = lower(ctx, roots, input_syms, pure_inputs);
+        let mut at: HashMap<ExprId, u32> = HashMap::default();
+        for (k, &r) in roots.iter().enumerate() {
+            at.entry(r).or_insert(k as u32);
         }
-        timed("tape fuse", || program.fuse_accumulators(pure_inputs));
-        let order = timed("tape schedule", || program.schedule());
-        let split = pure_inputs.is_some();
-        let mut tape = timed("tape emit", || program.emit(&order, split));
-        tape.n_inputs = input_syms.len();
-        tape
+        Lowered {
+            program,
+            roots: roots.to_vec(),
+            at,
+            inputs: input_syms.to_vec(),
+            pure_inputs: pure_inputs.map(<[bool]>::to_vec),
+        }
+    }
+
+    /// The roots it was lowered for.
+    pub fn roots(&self) -> &[ExprId] {
+        &self.roots
+    }
+
+    /// Whether it was lowered over the inputs `input_syms`, split by
+    /// `pure_inputs`.
+    pub fn signature(&self, input_syms: &[SymbolId], pure_inputs: Option<&[bool]>) -> bool {
+        self.inputs == input_syms && self.pure_inputs.as_deref() == pure_inputs
+    }
+
+    /// Whether a tape of `roots` over that signature is a view of it.
+    pub fn serves(
+        &self,
+        roots: &[ExprId],
+        input_syms: &[SymbolId],
+        pure_inputs: Option<&[bool]>,
+    ) -> bool {
+        self.signature(input_syms, pure_inputs) && roots.iter().all(|r| self.at.contains_key(r))
+    }
+
+    /// The tape computing `roots`, each one of the lowered roots.
+    pub fn tape<K: Field>(&self, ctx: &Graph<K>, roots: &[ExprId]) -> Tape {
+        use crate::hooks::timed;
+        let mut p = self.program.clone();
+        p.roots = (roots.iter())
+            .map(|r| self.program.roots[*self.at.get(r).expect("a lowered root") as usize])
+            .collect();
+        let pure = self.pure_inputs.as_deref();
+        timed("tape view", || {
+            p.retain_reachable();
+            p.narrow_calls(ctx, pure);
+        });
+        finish(p, pure, self.inputs.len())
     }
 }
 
@@ -213,6 +312,7 @@ struct Forest {
 /// references, or tagged inputs, see [`INPUT`]); `n_out` is the number of
 /// values it produces, one for anything but a kernel. Value `(inst, k)` is
 /// the `k`th output of instruction `inst`.
+#[derive(Clone)]
 pub(super) struct Inst {
     pub(super) kind: Kind,
     /// The operands: `pool[start .. start + len]` of the program's pool,
@@ -254,8 +354,11 @@ pub(super) enum Kind {
     /// the last operand is the instances' state block (the value of a
     /// [`Kind::CallProlog`]). With `reads`, a list holds only the arguments
     /// at those positions (see [`Op::Call`]).
+    /// `func` is the function the bundle is a body of ([`NO_FUNC`] for one
+    /// lifted from a tape).
     Call {
         bundle: u32,
+        func: u32,
         n_groups: u32,
         n_args: u32,
         reads: Option<Arc<[u32]>>,
@@ -291,8 +394,12 @@ pub(super) enum Kind {
     },
 }
 
+/// The function of a call lifted from a tape: unknown.
+pub(super) const NO_FUNC: u32 = u32::MAX;
+
 /// The lowered program: instructions in a dependency order, the bundle
 /// table, and which value each root is.
+#[derive(Clone)]
 pub(super) struct Program {
     pub(super) insts: Vec<Inst>,
     /// The operand pool of every instruction (see [`Inst::ins`]).
@@ -519,7 +626,7 @@ impl Program {
 
     /// Drop the instructions `dead` marks, every operand and root first
     /// redirected by `resolve` (to a value that stays), the rest renumbered
-    /// in order.
+    /// in order; the operand pool holds the ones that stay only.
     pub(super) fn compact(&mut self, dead: &[bool], resolve: impl Fn(Ref) -> Ref) {
         let mut renumber = vec![u32::MAX; self.insts.len()];
         let mut next = 0u32;
@@ -535,20 +642,27 @@ impl Program {
                 r => r,
             }
         };
-        for r in self.pool.iter_mut().chain(self.roots.iter_mut()) {
+        let old_pool = std::mem::take(&mut self.pool);
+        let old = std::mem::take(&mut self.insts);
+        self.pool.reserve(old_pool.len());
+        for (mut inst, _) in old.into_iter().zip(dead).filter(|(_, &d)| !d) {
+            let (s, l) = inst.ins;
+            let start = self.pool.len() as u32;
+            self.pool.extend(
+                old_pool[s as usize..(s + l) as usize]
+                    .iter()
+                    .map(|&r| map(r)),
+            );
+            inst.ins = (start, l);
+            self.insts.push(inst);
+        }
+        for r in self.roots.iter_mut() {
             *r = map(*r);
         }
         self.placeholder = self
             .placeholder
             .filter(|&i| !dead[i as usize])
             .map(|i| renumber[i as usize]);
-        let old = std::mem::take(&mut self.insts);
-        self.insts = old
-            .into_iter()
-            .zip(dead)
-            .filter(|(_, &d)| !d)
-            .map(|(inst, _)| inst)
-            .collect();
     }
 
     /// The calls of one bundle the expanded templates left apart, one per
@@ -614,6 +728,7 @@ impl Program {
             let first = &self.insts[members[0] as usize];
             let Kind::Call {
                 bundle,
+                func,
                 n_args,
                 ref reads,
                 stateful,
@@ -693,6 +808,7 @@ impl Program {
             }
             let kind = Kind::Call {
                 bundle,
+                func,
                 n_groups,
                 n_args,
                 reads,
@@ -755,6 +871,222 @@ impl Program {
         }
         self.compact(&dead, |r| r);
     }
+
+    /// Every call whose outputs not all are read, over a body of the ones
+    /// read: a view of a program lowered for more roots (the residuals out
+    /// of the residuals with their Jacobian) runs the bodies it needs, as
+    /// its own compilation would. A call's instances, its arguments and,
+    /// under a split (`pure_inputs`), its prolog are rebuilt for the body.
+    pub(super) fn narrow_calls<K: Field>(&mut self, ctx: &Graph<K>, pure_inputs: Option<&[bool]>) {
+        // per call of a known function, the outputs of a group it reads
+        let mut read: HashMap<u32, Vec<bool>> = HashMap::default();
+        for (i, inst) in self.insts.iter().enumerate() {
+            if let Kind::Call { func, n_groups, .. } = inst.kind {
+                if func != NO_FUNC {
+                    read.insert(i as u32, vec![false; (inst.n_out / n_groups) as usize]);
+                }
+            }
+        }
+        if read.is_empty() {
+            return;
+        }
+        let m = self.insts.len();
+        for i in 0..m {
+            for r in self.ins(i) {
+                if let Ref::Value(j, o) = *r {
+                    if let Some(u) = read.get_mut(&j) {
+                        let w = u.len();
+                        u[o as usize % w] = true;
+                    }
+                }
+            }
+        }
+        for r in &self.roots {
+            if let Ref::Value(j, o) = *r {
+                if let Some(u) = read.get_mut(&j) {
+                    let w = u.len();
+                    u[o as usize % w] = true;
+                }
+            }
+        }
+        let is_pure = |p: &Program, r: Ref| match r {
+            Ref::Value(j, _) => p.insts[j as usize].pure,
+            Ref::Input(k) => pure_inputs.is_some_and(|m| m.get(k as usize) == Some(&true)),
+        };
+        let mut calls: Vec<(u32, Vec<bool>)> = read.into_iter().collect();
+        calls.sort_unstable_by_key(|c| c.0);
+        let mut dead = vec![false; m];
+        // per call rebuilt: the new call, the old width, and per old slot
+        // the new one
+        let mut moved: HashMap<u32, (u32, u32, Vec<u32>)> = HashMap::default();
+        for (i, used) in calls {
+            if used.iter().all(|&u| u) {
+                continue;
+            }
+            let Kind::Call {
+                bundle,
+                func,
+                n_groups,
+                n_args,
+                ref reads,
+                stateful,
+            } = self.insts[i as usize].kind
+            else {
+                unreachable!()
+            };
+            let reads = reads.clone();
+            let function = ctx.func(FuncId(func));
+            let old = self.bundles[bundle as usize].clone();
+            let Some(outs) = function.slot_outputs(&old) else {
+                continue;
+            };
+            let needed: Vec<u32> = (used.iter().zip(&outs))
+                .filter(|(&u, _)| u)
+                .map(|(_, &k)| k)
+                .collect();
+            let body = function.body_exact(ctx, &needed);
+            if Arc::ptr_eq(&body.bundle, &old) {
+                continue;
+            }
+            // the instances' arguments, whole: from the call's list, and
+            // what it does not read after its prolog from the prolog's
+            let own = self.ins(i as usize).to_vec();
+            let own = &own[..own.len() - usize::from(stateful)];
+            let mask = old.pure_args().to_vec();
+            let prolog = stateful.then(|| match own_last(self, i) {
+                Ref::Value(p, 0) => p,
+                _ => unreachable!("a stateful call's last operand is its state"),
+            });
+            let n_in = own.len() / n_groups as usize;
+            let n_pure = mask.iter().filter(|&&p| p).count();
+            // per argument: where the call's list holds it, else its place
+            // among the prolog's
+            let mut from: Vec<Result<usize, usize>> = Vec::with_capacity(n_args as usize);
+            let mut rank = 0;
+            let mut at_read: Vec<Option<usize>> = vec![None; n_args as usize];
+            if let Some(r) = &reads {
+                for (k, &q) in r.iter().enumerate() {
+                    at_read[q as usize] = Some(k);
+                }
+            }
+            for p in 0..n_args as usize {
+                from.push(match (&reads, at_read[p]) {
+                    (None, _) => Ok(p),
+                    (Some(_), Some(k)) => Ok(k),
+                    (Some(_), None) => Err(rank),
+                });
+                rank += usize::from(mask.get(p) == Some(&true));
+            }
+            let pro_ins: Option<Vec<Ref>> = prolog.map(|p| self.ins(p as usize).to_vec());
+            let mut args: Vec<Ref> = Vec::with_capacity(n_groups as usize * n_args as usize);
+            for g in 0..n_groups as usize {
+                let list = &own[g * n_in..(g + 1) * n_in];
+                for f in &from {
+                    args.push(match *f {
+                        Ok(k) => list[k],
+                        Err(k) => {
+                            let pro = pro_ins.as_ref().expect("an argument not read is pure");
+                            pro[g * n_pure + k]
+                        }
+                    });
+                }
+            }
+            if let Some(p) = prolog {
+                dead[p as usize] = true;
+            }
+            dead[i as usize] = true;
+            let pure = self.insts[i as usize].pure;
+            let b = body.bundle.clone();
+            let at_bundle = match self.bundles.iter().position(|x| Arc::ptr_eq(x, &b)) {
+                Some(k) => k as u32,
+                None => {
+                    self.bundles.push(b.clone());
+                    self.bundles.len() as u32 - 1
+                }
+            };
+            let lists: Vec<&[Ref]> = args.chunks(n_args as usize).collect();
+            let mask = b.pure_args();
+            let stateful = !pure
+                && pure_inputs.is_some()
+                && b.state_len() > 0
+                && mask.iter().any(|&p| p)
+                && lists.iter().all(|a| {
+                    a.len() == mask.len()
+                        && a.iter().zip(mask).all(|(&r, &p)| !p || is_pure(self, r))
+                });
+            let reads: Option<Arc<[u32]>> = stateful
+                .then(|| b.main_reads())
+                .flatten()
+                .filter(|r| r.len() < n_args as usize)
+                .map(Into::into);
+            let mut ins: Vec<Ref> = match &reads {
+                None => args.clone(),
+                Some(r) => (lists.iter())
+                    .flat_map(|a| r.iter().map(move |&p| a[p as usize]))
+                    .collect(),
+            };
+            if stateful {
+                let pure_args: Vec<Ref> = (lists.iter())
+                    .flat_map(|a| a.iter().zip(mask).filter(|&(_, &p)| p).map(|(&r, _)| r))
+                    .collect();
+                let kind = Kind::CallProlog {
+                    bundle: at_bundle,
+                    n_groups,
+                    n_pure: mask.iter().filter(|&&p| p).count() as u32,
+                };
+                let p = self.push(kind, pure_args, n_groups * b.state_len() as u32, true);
+                ins.push(Ref::Value(p, 0));
+            }
+            let width = b.n_outputs() as u32;
+            let kind = Kind::Call {
+                bundle: at_bundle,
+                func,
+                n_groups,
+                n_args,
+                reads,
+                stateful,
+            };
+            let at = self.push(kind, ins, n_groups * width, pure);
+            let slots: Vec<u32> = (outs.iter())
+                .map(|&k| {
+                    body.slot_of
+                        .get(k as usize)
+                        .copied()
+                        .flatten()
+                        .unwrap_or(u32::MAX)
+                })
+                .collect();
+            moved.insert(i, (at, outs.len() as u32, slots));
+        }
+        if moved.is_empty() {
+            return;
+        }
+        dead.resize(self.insts.len(), false);
+        let width = |at: u32| -> u32 {
+            match self.insts[at as usize].kind {
+                Kind::Call { n_groups, .. } => self.insts[at as usize].n_out / n_groups,
+                _ => unreachable!(),
+            }
+        };
+        let widths: HashMap<u32, u32> = moved.values().map(|&(at, _, _)| (at, width(at))).collect();
+        self.compact(&dead, |r| match r {
+            Ref::Value(i, o) => match moved.get(&i) {
+                Some((at, w_old, slots)) => {
+                    let (g, s) = (o / w_old, o % w_old);
+                    let slot = slots[s as usize];
+                    debug_assert!(slot != u32::MAX, "a read output the body carries");
+                    Ref::Value(*at, g * widths[at] + slot)
+                }
+                None => r,
+            },
+            r => r,
+        });
+    }
+}
+
+/// The last operand of instruction `i` of `p`.
+fn own_last(p: &Program, i: u32) -> Ref {
+    *p.ins(i as usize).last().expect("an operand")
 }
 
 impl Tape {
@@ -812,6 +1144,7 @@ impl Tape {
                     ..
                 } => Kind::Call {
                     bundle,
+                    func: NO_FUNC,
                     n_groups,
                     n_args,
                     reads: (reads != super::ALL_ARGS).then(|| self.pool(reads, n_in).into()),
@@ -1774,6 +2107,7 @@ impl Forest {
         }
         let kind = Kind::Call {
             bundle,
+            func: f,
             n_groups,
             n_args,
             reads,
@@ -2437,6 +2771,7 @@ impl Program {
                     n_args,
                     ref reads,
                     stateful,
+                    ..
                 } => {
                     // A stateful call's last operand is its state block.
                     let (args, state) = split_state(o, stateful);
@@ -2467,6 +2802,7 @@ impl Program {
                     bundle,
                     n_groups,
                     n_pure,
+                    ..
                 } => {
                     let start = gather(&mut arg_pool, &mut max_args, o);
                     Op::CallProlog {

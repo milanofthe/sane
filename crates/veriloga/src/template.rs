@@ -33,7 +33,7 @@ use sane_device::{
 };
 
 use crate::device::VerilogADevice;
-use crate::lower::{lower_analog, sym_of};
+use crate::lower::{lower_analog, noise_symbol_name, sym_of};
 
 /// An extra unknown the function's body reads, minted afresh per instance.
 #[derive(Clone)]
@@ -58,10 +58,17 @@ struct DelayMeta {
 
 #[derive(Clone)]
 struct NoiseMeta {
-    hi: Option<SymbolId>,
-    lo: Option<SymbolId>,
-    /// The source as lowered, for its shape (its expressions are outputs).
+    /// The source as lowered: its formal generator (minted per instance,
+    /// see `noise_symbol_name`), and its shape (its expressions are
+    /// outputs).
     source: NoiseSource,
+}
+
+/// A noise generator's coefficient in a row of a model function.
+#[derive(Clone, Copy)]
+enum Coefficient {
+    Const(ExprId),
+    Output(u32),
 }
 
 /// A module lowered once for one structure: the function, its formal leaves
@@ -69,7 +76,10 @@ struct NoiseMeta {
 /// delays, events) over those leaves.
 #[derive(Clone)]
 struct ModelFn {
+    /// The rows (currents, charges), and what is read off them (the
+    /// outputs from `out_noise` on), over the same leaves.
     func: FuncId,
+    obs: Option<FuncId>,
     /// Per terminal, the formal voltage symbol (`None`: a ground terminal, a
     /// constant in the body).
     terminal_syms: Vec<Option<SymbolId>>,
@@ -97,6 +107,10 @@ struct ModelFn {
     out_opvar: u32,
     out_tau: u32,
     out_event: u32,
+    /// Where each noise generator enters the rows (see
+    /// `BehavioralFragment::noise_rows`): a constant coefficient as it is,
+    /// another as the output it is computed in.
+    noise_rows: Vec<Vec<(usize, Coefficient)>>,
     /// Its assertions, over the formal parameters.
     assertions: Vec<sane_device::Assertion>,
     /// What its structure rests on (see the module docs), over the formal
@@ -252,6 +266,20 @@ fn build_function(
     outs.extend(minted_delays.iter().map(|d| d.tau));
     let out_event = outs.len() as u32;
     outs.extend(frag.events.iter().map(|e| e.g));
+    // the noise generators' coefficients that are no constant, after
+    let noise_rows: Vec<Vec<(usize, Coefficient)>> = (frag.noise_rows.iter())
+        .map(|rows| {
+            (rows.iter())
+                .map(|&(r, e)| match lo.ctx().const_f64(e) {
+                    Some(_) => (r, Coefficient::Const(e)),
+                    None => {
+                        outs.push(e);
+                        (r, Coefficient::Output(outs.len() as u32 - 1))
+                    }
+                })
+                .collect()
+        })
+        .collect();
 
     // The parameters in a fixed order: terminals, the extras, the model
     // parameters by name, then what else the body reads (the temperature,
@@ -278,20 +306,50 @@ fn build_function(
     for &s in &free {
         push(s, &mut leaves);
     }
-    // named after its module; `ns` keeps the formal leaves apart
+    // The rows and what is read off them (noise, op-vars, delays, events,
+    // the noise coefficients) are two functions over the same leaves, so a
+    // call of the rows reads only what they read and their derivatives
+    // derive only them. Named after the module; `ns` keeps the formal
+    // leaves apart.
+    let observed = outs.split_off(out_noise as usize);
     let func = ctx.define_func(&dev.module.name, leaves.clone(), outs);
+    let obs = (!observed.is_empty()).then(|| {
+        ctx.define_func(
+            &format!("{}, observers", dev.module.name),
+            leaves.clone(),
+            observed,
+        )
+    });
     // The parameters (the model's, and the temperature) are the body's pure
     // arguments: a compiled body splits over them, so their work runs once
     // per parameter binding rather than in every evaluation.
     let pure: std::collections::HashSet<SymbolId> = param_syms.iter().map(|&(_, s)| s).collect();
-    for (k, &s) in leaves.iter().enumerate() {
-        if pure.contains(&s) || ctx.symbol_name(s) == sane_core::constants::TEMP_SYMBOL {
-            ctx.set_param_role(func, k as u32, ParamRole::Param);
+    for f in std::iter::once(func).chain(obs) {
+        for (k, &s) in leaves.iter().enumerate() {
+            if pure.contains(&s) || ctx.symbol_name(s) == sane_core::constants::TEMP_SYMBOL {
+                ctx.set_param_role(f, k as u32, ParamRole::Param);
+            }
+        }
+    }
+    // what the observers are: the noise sources' levels, the op-vars
+    if let Some(obs) = obs {
+        let mut out = 0u32;
+        for (id, n) in frag.noise.iter().enumerate() {
+            for elem in 0..n.exprs().len() as u32 {
+                let id = id as u32;
+                ctx.set_output_role(obs, out, rsdag::OutputRole::NoiseLevel { id, elem });
+                out += 1;
+            }
+        }
+        for id in 0..frag.op_vars.len() as u32 {
+            ctx.set_output_role(obs, out, rsdag::OutputRole::Observer { id });
+            out += 1;
         }
     }
 
     let mf = ModelFn {
         func,
+        obs,
         terminal_syms,
         extras,
         delays,
@@ -299,11 +357,7 @@ fn build_function(
         noise: frag
             .noise
             .iter()
-            .map(|n| NoiseMeta {
-                hi: n.hi,
-                lo: n.lo,
-                source: n.clone(),
-            })
+            .map(|n| NoiseMeta { source: n.clone() })
             .collect(),
         limits: frag.limits.clone(),
         op_vars: frag
@@ -321,6 +375,7 @@ fn build_function(
         out_opvar,
         out_tau,
         out_event,
+        noise_rows,
         assertions: frag.assertions.clone(),
         structure: frag.structural.clone(),
         collapsed: frag.collapsed.clone(),
@@ -364,6 +419,14 @@ fn instantiate(
             param_syms.push((name.clone(), s));
         }
     }
+    // each noise generator the instance's own, passed as an argument
+    let generators: Vec<SymbolId> = (mf.noise.iter().enumerate())
+        .map(|(k, n)| {
+            let g = ctx.sym(&noise_symbol_name(&dev.name, k));
+            map.insert(n.source.input, g);
+            sym_of(ctx, g).expect("sym() yields a Symbol")
+        })
+        .collect();
     let hist_syms: Vec<(SymbolId, String)> = mf
         .delays
         .iter()
@@ -387,8 +450,16 @@ fn instantiate(
         }
     }
     let func = ctx.bind(mf.func, &bound);
+    let obs = mf.obs.map(|f| ctx.bind(f, &bound));
+    let out_noise = mf.out_noise;
     let mut call = |range: std::ops::Range<u32>| -> Vec<ExprId> {
-        ctx.calls_bound(func, &range.collect::<Vec<u32>>(), &args)
+        match obs {
+            Some(obs) if range.start >= out_noise => {
+                let outs: Vec<u32> = range.map(|o| o - out_noise).collect();
+                ctx.calls_bound(obs, &outs, &args)
+            }
+            _ => ctx.calls_bound(func, &range.collect::<Vec<u32>>(), &args),
+        }
     };
     let terminal_currents = call(0..mf.n_cur);
     let currents = call(mf.out_rows..mf.out_charge);
@@ -411,6 +482,16 @@ fn instantiate(
     let opvar_vals = call(mf.out_opvar..mf.out_tau);
     let taus = call(mf.out_tau..mf.out_event);
     let event_vals = call(mf.out_event..mf.out_event + mf.events.len() as u32);
+    let noise_rows: Vec<Vec<(usize, ExprId)>> = (mf.noise_rows.iter())
+        .map(|rows| {
+            (rows.iter())
+                .map(|&(r, c)| match c {
+                    Coefficient::Const(e) => (r, e),
+                    Coefficient::Output(o) => (r, call(o..o + 1)[0]),
+                })
+                .collect()
+        })
+        .collect();
 
     let events = event_vals
         .into_iter()
@@ -434,10 +515,8 @@ fn instantiate(
     let noise = mf
         .noise
         .iter()
-        .map(|n| {
-            let (hi, lo) = (remap_sym(n.hi, &map, ctx), remap_sym(n.lo, &map, ctx));
-            n.source.with_exprs(hi, lo, &mut noise_vals)
-        })
+        .zip(generators)
+        .map(|(n, g)| n.source.with_exprs(g, &mut noise_vals))
         .collect();
     let op_vars = mf
         .op_vars
@@ -491,6 +570,7 @@ fn instantiate(
         terminal_charges,
         charges,
         noise,
+        noise_rows,
         events,
         param_syms,
         op_vars,

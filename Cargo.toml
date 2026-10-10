@@ -2,7 +2,7 @@
 resolver = "2"
 members = [
     "crates/core",
-    "crates/mna",
+    "crates/circuit",
     "crates/netlist",
     "crates/device",
     "crates/veriloga",
@@ -18,7 +18,7 @@ members = [
 exclude = ["vendor/rslab", "vendor/vectfit", "vendor/rsdag"]
 
 [workspace.package]
-version = "3.0.0"
+version = "4.0.0"
 edition = "2021"
 license = "LicenseRef-PolyForm-Noncommercial-1.0.0"
 authors = ["Milan Rother"]
@@ -41,6 +41,8 @@ while_let_loop = "allow"
 
 [workspace.dependencies]
 num-complex = "0.4"
+# N-d results (the version numpy's bindings take without a copy).
+ndarray = { version = "0.16", default-features = false, features = ["std"] }
 rustc-hash = "2"
 # Vendored expression graph, tape and native backend; see vendor/rsdag/VENDOR.md.
 # Exact rational constants, so folding a deck's numbers never rounds.
@@ -52,7 +54,7 @@ rslab = { path = "vendor/rslab" }
 vectfit = { path = "vendor/vectfit" }
 rayon = "1"
 sane-core = { path = "crates/core" }
-sane-mna = { path = "crates/mna" }
+sane-circuit = { path = "crates/circuit" }
 
 # Release profile: cross-crate inlining (tape interpreter in `core`, solver glue in
 # `solve`, faer) and a single codegen unit so the hot Newton/HB kernels optimize as

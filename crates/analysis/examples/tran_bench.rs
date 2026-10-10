@@ -9,8 +9,7 @@
 
 use std::time::Instant;
 
-use sane_analysis::Model;
-use sane_solve::TransientMethod;
+use sane_analysis::{Model, TransientOptions};
 
 fn ladder(n: usize) -> String {
     let mut s = String::from("Vin 1 0 SIN(0 1 1000)\n");
@@ -35,7 +34,11 @@ fn main() {
     let t: Vec<f64> = (0..=steps).map(|k| k as f64 * tstep).collect();
 
     let t0 = Instant::now();
-    let _r = model.transient(TransientMethod::Esdirk32, &[], &t, tstep, 1e-7);
+    let opts = TransientOptions {
+        rtol: tstep,
+        ..Default::default()
+    };
+    let _r = model.at(&[]).and_then(|pt| pt.transient(&t, &opts));
     let dt = t0.elapsed();
     // Result detail goes to the UI struct; here the stage log (SANE_LOG=debug)
     // and the wall time are what we want.

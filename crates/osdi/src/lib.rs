@@ -24,7 +24,6 @@ use std::ffi::{c_char, c_void, CStr, CString};
 use std::sync::{Arc, Mutex};
 
 use rsdag::ExprId;
-use sane_core::Graph;
 use sane_device::{BehavioralFragment, DeviceModel, Lowerer};
 
 mod ffi;
@@ -977,17 +976,28 @@ impl DeviceModel for OsdiDevice {
             charges.push(ctx.zero());
         }
         // Noise sources: power / exponent as bundle outputs over the same
-        // argument group (computed in the same eval as the currents), node
-        // pair by voltage symbol. Table sources and collapsed self-pairs are
-        // skipped; the PSD's derivative markers (w.r.t. node voltages) bind to
-        // zero -- the operating-point dependence of the PSD is not
-        // differentiated through OSDI, matching other OSDI hosts.
+        // argument group (computed in the same eval as the currents), each a
+        // generator entering as a current from its first node to its second
+        // (see `BehavioralFragment::noise_rows`).
+        // Table sources and collapsed self-pairs are skipped; the PSD's
+        // derivative markers (w.r.t. node voltages) bind to zero -- the
+        // operating-point dependence of the PSD is not differentiated through
+        // OSDI, matching other OSDI hosts.
         let ctx = lo.ctx();
-        let mut noise = Vec::new();
-        let sym_of = |ctx: &Graph, e: ExprId| match ctx.node(e) {
-            rsdag::Node::Symbol(s) => Some(*s),
-            _ => None,
-        };
+        let (mut noise, mut noise_rows) = (Vec::new(), Vec::new());
+        // the row of each active node: a terminal's, or (after them) an
+        // internal one's
+        let mut internal = 0;
+        let row_of: Vec<usize> = (active_nodes.iter())
+            .map(|&node| {
+                if node < nt {
+                    node
+                } else {
+                    internal += 1;
+                    nt + internal - 1
+                }
+            })
+            .collect();
         for (k, &(hi, lo_n, ty)) in noise_meta.iter().enumerate() {
             if ty == ffi::NOISE_TYPE_TABLE || (hi == lo_n) {
                 continue; // table: unsupported; self-pair: no net injection
@@ -998,10 +1008,18 @@ impl DeviceModel for OsdiDevice {
             } else {
                 ctx.zero()
             };
-            let node_sym = |idx: Option<usize>| idx.and_then(|i| sym_of(ctx, args[i]));
+            let g = ctx.sym(&format!("{}#noise{k}", self.name));
+            let rows: Vec<(usize, ExprId)> = [(hi, 1.0), (lo_n, -1.0)]
+                .into_iter()
+                .filter_map(|(node, sign)| Some((row_of[node?], ctx.konst_f64(sign))))
+                .collect();
+            noise_rows.push(rows);
+            let input = match *ctx.node(g) {
+                rsdag::Node::Symbol(s) => s,
+                _ => unreachable!("sym() yields a Symbol"),
+            };
             noise.push(sane_device::NoiseSource {
-                hi: node_sym(hi),
-                lo: node_sym(lo_n),
+                input,
                 psd,
                 flicker_exp,
                 table: Vec::new(),
@@ -1018,6 +1036,7 @@ impl DeviceModel for OsdiDevice {
             terminal_charges,
             charges,
             noise,
+            noise_rows,
             op_vars: Vec::new(),
             limits: Vec::new(),
         })

@@ -222,6 +222,7 @@ mod specialize;
 mod topo;
 
 use calls::Shared;
+pub use compile::Lowered;
 pub use specialize::{ParamSelects, SpecializedTape};
 
 /// Consecutive calls of a tape that read nothing another of them writes:

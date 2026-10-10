@@ -46,15 +46,19 @@ pub enum LimitKind {
     Fet,
 }
 
-/// A small-signal noise source contributed by a behavioral device: a current
-/// noise generator across nodes `hi`/`lo` (by voltage symbol; `None` = ground)
-/// with power spectral density `psd` and flicker exponent `flicker_exp` (both
-/// expressions evaluated at the operating point; a constant-zero exponent is
-/// white noise, `S(f) = psd / f^exp` otherwise). Consumed by noise analysis.
+/// A small-signal noise source: a generator `input` the residuals carry where
+/// the noise enters, with power spectral density `psd` and flicker exponent
+/// `flicker_exp` (both expressions evaluated at the operating point; a
+/// constant-zero exponent is white noise, `S(f) = psd / f^exp` otherwise).
+/// Consumed by noise analysis.
 #[derive(Clone)]
 pub struct NoiseSource {
-    pub hi: Option<SymbolId>,
-    pub lo: Option<SymbolId>,
+    /// The noise generator: a symbol the residuals carry where the noise
+    /// enters (a current between two nodes, a voltage in a branch), zero in
+    /// every evaluation; the circuit's small-signal response to it, weighted
+    /// by the level, is the source's noise.
+    pub input: SymbolId,
+    /// The power spectral density of the generator (at 1 Hz for flicker).
     pub psd: ExprId,
     pub flicker_exp: ExprId,
     /// Tabular noise: `(frequency, psd)` points, linearly interpolated, each an
@@ -68,21 +72,22 @@ impl NoiseSource {
     /// its table point by point.
     pub fn exprs(&self) -> Vec<ExprId> {
         let table = self.table.iter().flat_map(|&(f, p)| [f, p]);
-        [self.psd, self.flicker_exp].into_iter().chain(table).collect()
+        [self.psd, self.flicker_exp]
+            .into_iter()
+            .chain(table)
+            .collect()
     }
 
-    /// This source across `hi`/`lo`, its expressions the next of `exprs` in
-    /// the order [`exprs`](Self::exprs) gives them.
+    /// This source with the generator `input`, its expressions the next of
+    /// `exprs` in the order [`exprs`](Self::exprs) gives them.
     pub fn with_exprs(
         &self,
-        hi: Option<SymbolId>,
-        lo: Option<SymbolId>,
+        input: SymbolId,
         exprs: &mut impl Iterator<Item = ExprId>,
     ) -> NoiseSource {
         let mut next = || exprs.next().expect("one per expression of the source");
         NoiseSource {
-            hi,
-            lo,
+            input,
             psd: next(),
             flicker_exp: next(),
             table: self.table.iter().map(|_| (next(), next())).collect(),
@@ -123,7 +128,7 @@ pub struct FragmentLimit {
     pub when: Option<ExprId>,
 }
 
-/// What an unknown physically is. `assemble_dae` mints them in blocks -- node
+/// What an unknown physically is. the assembly mints them in blocks -- node
 /// voltages `v{k}`, then one branch current `i_{elem}` per voltage source /
 /// inductor / controlled source, then device-internal states -- and every
 /// transform preserves that order.
@@ -166,6 +171,12 @@ pub struct BehavioralFragment {
     pub terminal_charges: Vec<ExprId>,
     pub charges: Vec<ExprId>,
     pub noise: Vec<NoiseSource>,
+    /// Where each noise generator enters the rows, aligned with `noise`: the
+    /// row (a terminal's, then an extra's) and the generator's coefficient
+    /// there. The rows above are at rest (every generator zero, as in every
+    /// evaluation); the assembler adds `coefficient * generator` to the
+    /// circuit's rows, so no call of the device carries a generator.
+    pub noise_rows: Vec<Vec<(usize, ExprId)>>,
     /// Switching surfaces (see [`FragmentEvent`]).
     pub events: Vec<FragmentEvent>,
     /// The instance's parameter symbols by parameter name (the ones its
@@ -350,8 +361,11 @@ impl<'a> ParamDefaults<'a> {
     }
 }
 
+/// A device placed in a circuit: its model (shared by the circuit's copies)
+/// and the nodes its terminals connect to.
+#[derive(Clone)]
 pub struct DeviceInstance {
-    pub model: Box<dyn DeviceModel>,
+    pub model: std::sync::Arc<dyn DeviceModel>,
     pub terminals: Vec<usize>,
     /// Parallel multiplicity (SPICE `M=` times MOSFET `nf`). The device's
     /// terminal currents are scaled by this at DAE assembly, modelling
@@ -361,7 +375,7 @@ pub struct DeviceInstance {
 }
 
 impl DeviceInstance {
-    pub fn new(model: Box<dyn DeviceModel>, terminals: Vec<usize>) -> Self {
+    pub fn new(model: std::sync::Arc<dyn DeviceModel>, terminals: Vec<usize>) -> Self {
         Self {
             model,
             terminals,

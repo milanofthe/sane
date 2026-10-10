@@ -2,19 +2,39 @@
 //! history Jacobian tapes, first-order adjoint sensitivities, and the
 //! second-order-adjoint Hessian over the compiled Lagrangian blocks.
 
-use rsdag::{SymbolId, Tape};
+use std::collections::HashMap;
+
+use rsdag::{ExprId, SymbolId, Tape};
 use sane_core::constants::GMIN_DC;
 use sane_core::log_stage;
 use sane_core::Graph;
-use sane_dae::{lagrangian_hessian, Dae};
+use sane_dae::{frozen, lagrangian_hessian, param_column, Dae};
 
-use crate::{sparse, CompiledDc, StepEval};
+use crate::{sparse, CompiledDc, PrologToken, StepEval};
 
 /// Compiled `∂I/∂hist` triplets (see [`CompiledDc::ensure_hist_jac`]).
 pub(crate) struct HistJac {
     tape: StepEval,
     rows: Vec<usize>,
     cols: Vec<usize>,
+}
+
+/// The noise sources compiled: one tape over the system's inputs computing
+/// every source's level expressions (see `NoiseSource::exprs`) and then the
+/// entries of where its generator enters the rows.
+pub(crate) struct NoiseProgram {
+    tape: StepEval,
+    /// Per source, its number of level expressions.
+    levels: Vec<usize>,
+    /// Per source, the rows its generator enters.
+    rows: Vec<Vec<usize>>,
+}
+
+/// A noise source at a point: its level and where it enters the rows, with
+/// what gain.
+pub struct NoiseAt {
+    pub level: sane_dae::NoiseLevel,
+    pub injection: Vec<(usize, f64)>,
 }
 
 /// A sparse Jacobian's coordinates.
@@ -26,6 +46,82 @@ pub(crate) struct ParamJac {
     tape: StepEval,
     i_rc: Pattern,
     q_rc: Pattern,
+}
+
+/// The frozen Jacobians of a step start for the transient sensitivities
+/// (see [`sane_dae::Frozen`]), laid out for contracting their gradients with
+/// a stage's direction `w = (v, τ)` into `dE/dx`.
+pub(crate) struct FrozenState {
+    /// The entries' rows (the charges' offset by `n`) and the direction's
+    /// component each takes (`n` for the time rate `τ`).
+    pub rows: Vec<usize>,
+    pub cols: Vec<usize>,
+    entries: Vec<ExprId>,
+    /// The gradients' expressions, and per gradient entry its direction
+    /// component and its place in `dE/dx`.
+    hx_e: Vec<ExprId>,
+    pub hx_w: Vec<usize>,
+    pub hx_slot: Vec<usize>,
+    /// `dE/dx`'s coordinates, the rows as the entries'.
+    pub x_rc: Pattern,
+}
+
+/// One parameter's columns, symbolic: of the currents and charges
+/// (`dI/dp ++ dQ/dp`, the charges' rows offset by `n`) and of the frozen
+/// entries (`d(entry)/dp`, by the entry's place).
+pub(crate) struct ParamExprs {
+    iq_rows: Vec<usize>,
+    iq_e: Vec<ExprId>,
+    e_at: Vec<usize>,
+    e_e: Vec<ExprId>,
+}
+
+/// The programs of the transient sensitivities by one set of parameters,
+/// compiled together so the parameters share what they have in common (a
+/// device's own evaluation): at a stage point the columns of the currents
+/// and charges, `dI/dp ++ dQ/dp`; at a step start the frozen entries'
+/// gradients by the states, then their columns. Each column entry carries
+/// its row (the frozen entry's place) and the parameter's place in the set.
+pub(crate) struct SensProgram {
+    pub iq: StepEval,
+    pub iq_rows: Vec<usize>,
+    pub iq_of: Vec<usize>,
+    pub e: StepEval,
+    pub e_at: Vec<usize>,
+    pub e_of: Vec<usize>,
+}
+
+/// A program of the system's inputs bound to one parameter vector: its
+/// parameter prolog run once, each evaluation patching the state and the
+/// time into the inputs and running the main phase.
+pub(crate) struct Bound {
+    tok: PrologToken,
+    inputs: Vec<f64>,
+    work: Vec<f64>,
+}
+
+impl Bound {
+    /// `tape` at the parameters `p`.
+    pub fn new(cdc: &CompiledDc, tape: &StepEval, p: &[f64]) -> Self {
+        let mut inputs = Vec::new();
+        cdc.fill_inputs(&[], p, 0.0, &mut inputs);
+        let mut work = Vec::new();
+        let tok = tape.eval_prolog(&inputs, &mut work);
+        Bound { tok, inputs, work }
+    }
+
+    /// `tape` at `(x, t)` into `out`.
+    pub fn eval(
+        &mut self,
+        cdc: &CompiledDc,
+        tape: &StepEval,
+        x: &[f64],
+        t: f64,
+        out: &mut Vec<f64>,
+    ) {
+        cdc.patch_inputs(x, t, &mut self.inputs);
+        tape.eval_main(&mut self.tok, &self.inputs, &mut self.work, out);
+    }
 }
 
 /// The Lagrangian-Hessian blocks `L_xx`, `L_xp`, `L_pp` of
@@ -59,6 +155,59 @@ impl CompiledDc {
         });
     }
 
+    /// Every noise source of `dae` at `(x, p)`: its level and its injection
+    /// (see [`NoiseAt`]), in the order of its observers. The program is
+    /// compiled on the first query and kept.
+    pub fn noise_at(&self, ctx: &mut Graph, dae: &Dae, x: &[f64], p: &[f64]) -> Vec<NoiseAt> {
+        let prog = self.noise.get_or_init(|| {
+            let noise = dae.observers.noise(ctx);
+            let injection = dae.noise_injection(ctx);
+            let mut roots: Vec<ExprId> = Vec::new();
+            let mut levels = Vec::with_capacity(noise.len());
+            for n in noise.iter() {
+                let e = n.exprs();
+                levels.push(e.len());
+                roots.extend(e);
+            }
+            let rows = (injection.iter())
+                .map(|q| q.iter().map(|&(i, _)| i).collect())
+                .collect();
+            roots.extend(injection.iter().flat_map(|q| q.iter().map(|&(_, e)| e)));
+            NoiseProgram {
+                tape: crate::eval::step_eval(Tape::compile(ctx, &roots, &self.base_inputs)),
+                levels,
+                rows,
+            }
+        });
+        let (mut inputs, mut work, mut out) = (Vec::new(), Vec::new(), Vec::new());
+        self.fill_inputs(x, p, 0.0, &mut inputs);
+        prog.tape.eval(&inputs, &mut work, &mut out);
+        let mut vals = out.into_iter();
+        let level: Vec<sane_dae::NoiseLevel> = (prog.levels.iter())
+            .map(|&k| {
+                let mut v: Vec<f64> = vals.by_ref().take(k).collect();
+                match k {
+                    2 => sane_dae::NoiseLevel::Spectral {
+                        psd: v[0],
+                        fexp: v[1],
+                    },
+                    _ => sane_dae::NoiseLevel::Table(
+                        v.split_off(2).chunks(2).map(|c| (c[0], c[1])).collect(),
+                    ),
+                }
+            })
+            .collect();
+        (level.into_iter().zip(&prog.rows))
+            .map(|(level, rows)| NoiseAt {
+                level,
+                injection: rows
+                    .iter()
+                    .map(|&i| (i, vals.next().expect("one per entry")))
+                    .collect(),
+            })
+            .collect()
+    }
+
     /// `∂I/∂hist` at `(x, p)` as `(rows, delay indices, values)`; empty when
     /// the circuit has no delays or [`ensure_hist_jac`](Self::ensure_hist_jac)
     /// was not called.
@@ -90,9 +239,7 @@ impl CompiledDc {
             cache
                 .entry(input)
                 .or_insert_with(|| {
-                    let roots: Vec<_> = dae
-                        .currents
-                        .iter()
+                    let roots: Vec<_> = (dae.at_rest(ctx).0.iter())
                         .map(|&r| rsdag::differentiate(ctx, r, input))
                         .collect();
                     std::sync::Arc::new(crate::eval::step_eval(Tape::compile(
@@ -130,6 +277,96 @@ impl CompiledDc {
             i_rc: (ir, ic),
             q_rc: (qr, qc),
         });
+    }
+
+    /// Build what the transient sensitivities by the parameter columns
+    /// `cols` read, on demand: the frozen entries' gradients once, each
+    /// parameter's columns the first time it is asked for, and the
+    /// programs of the set (see [`SensProgram`]). Call before
+    /// [`solve_transient_sensitivity`](Self::solve_transient_sensitivity).
+    pub fn ensure_transient_sensitivity(&self, ctx: &mut Graph, dae: &Dae, cols: &[usize]) {
+        if self.sens_programs.lock().unwrap().contains_key(cols) {
+            return;
+        }
+        let fz = self.frozen.get_or_init(|| {
+            let f = log_stage!("sens/frozen", frozen(ctx, dae));
+            // dE/dx: an entry's gradient moves its row
+            let mut at: HashMap<(usize, usize), usize> = HashMap::new();
+            let (mut x_rc, mut hx_slot): (Pattern, Vec<usize>) = Default::default();
+            for (&k, &c) in f.x.0.iter().zip(&f.x.1) {
+                let slot = *at.entry((f.rows[k], c)).or_insert_with(|| {
+                    x_rc.0.push(f.rows[k]);
+                    x_rc.1.push(c);
+                    x_rc.0.len() - 1
+                });
+                hx_slot.push(slot);
+            }
+            FrozenState {
+                hx_w: f.x.0.iter().map(|&k| f.cols[k]).collect(),
+                rows: f.rows,
+                cols: f.cols,
+                entries: f.entries,
+                hx_e: f.x.2,
+                hx_slot,
+                x_rc,
+            }
+        });
+        let mut exprs = self.param_exprs.lock().unwrap();
+        for &c in cols {
+            if exprs.contains_key(&c) {
+                continue;
+            }
+            let sym = self.param_syms[c];
+            let rest = dae.at_rest(ctx);
+            let iq: Vec<ExprId> = rest.0.iter().chain(&rest.1).copied().collect();
+            let (iq_rows, iq_e) = param_column(ctx, &iq, sym);
+            let (e_at, e_e) = param_column(ctx, &fz.entries, sym);
+            let col = ParamExprs {
+                iq_rows,
+                iq_e,
+                e_at,
+                e_e,
+            };
+            exprs.insert(c, std::sync::Arc::new(col));
+        }
+        let (mut iq_rows, mut iq_of, mut iq_e) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut e_at, mut e_of, mut e_e) = (Vec::new(), Vec::new(), fz.hx_e.clone());
+        for (j, c) in cols.iter().enumerate() {
+            let col = &exprs[c];
+            iq_rows.extend_from_slice(&col.iq_rows);
+            iq_of.extend(std::iter::repeat_n(j, col.iq_rows.len()));
+            iq_e.extend_from_slice(&col.iq_e);
+            e_at.extend_from_slice(&col.e_at);
+            e_of.extend(std::iter::repeat_n(j, col.e_at.len()));
+            e_e.extend_from_slice(&col.e_e);
+        }
+        drop(exprs);
+        let split = |roots: &[ExprId]| {
+            let tape = Tape::compile_split(ctx, roots, &self.base_inputs, &self.base_pure);
+            crate::eval::step_eval(tape)
+        };
+        let prog = SensProgram {
+            iq: log_stage!("sens/iq_tape", split(&iq_e)),
+            iq_rows,
+            iq_of,
+            e: log_stage!("sens/e_tape", split(&e_e)),
+            e_at,
+            e_of,
+        };
+        let mut programs = self.sens_programs.lock().unwrap();
+        programs.insert(cols.to_vec(), std::sync::Arc::new(prog));
+    }
+
+    /// The frozen entries' layout (see
+    /// [`ensure_transient_sensitivity`](Self::ensure_transient_sensitivity)).
+    pub(crate) fn frozen(&self) -> Option<&FrozenState> {
+        self.frozen.get()
+    }
+
+    /// The programs of the transient sensitivities by `cols` (see
+    /// [`ensure_transient_sensitivity`](Self::ensure_transient_sensitivity)).
+    pub(crate) fn sens_program(&self, cols: &[usize]) -> Option<std::sync::Arc<SensProgram>> {
+        self.sens_programs.lock().unwrap().get(cols).cloned()
     }
 
     /// Build the Lagrangian-Hessian tape on demand (idempotent). Call before
@@ -227,7 +464,7 @@ impl CompiledDc {
     /// Factor `G + GMIN_DC*I` at the point, for the adjoint / forward
     /// sensitivity solves. Forward solves use [`KluSolver::solve`], adjoints
     /// [`KluSolver::solve_transpose`] on the same factorization.
-    fn factor_fx(&self, x: &[f64], p: &[f64], t: f64) -> Option<sparse::TripletLu> {
+    pub(crate) fn factor_fx(&self, x: &[f64], p: &[f64], t: f64) -> Option<sparse::TripletLu> {
         let n = self.n;
         let (mut jr, mut jc, mut jv) = self.jacobian_i_x_sparse(x, p, t);
         for i in 0..n {

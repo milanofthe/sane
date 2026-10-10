@@ -6,9 +6,9 @@
 use rustc_hash::FxHashMap as HashMap;
 use std::path::PathBuf;
 
+use sane_circuit::Elements;
 use sane_core::Graph;
-use sane_dae::{assemble_dae, DeviceInstance};
-use sane_mna::Circuit;
+use sane_dae::DeviceInstance;
 use sane_osdi::{OsdiDevice, OsdiLib};
 use sane_solve::CompiledDc;
 
@@ -33,7 +33,7 @@ fn compile(src: &std::path::Path) -> PathBuf {
     out
 }
 
-fn params_vec(ctx: &Graph, dae: &sane_dae::Dae, vals: &[(&str, f64)]) -> Vec<f64> {
+fn params_vec(ctx: &mut Graph, dae: &sane_dae::Dae, vals: &[(&str, f64)]) -> Vec<f64> {
     let map: HashMap<&str, f64> = vals.iter().copied().collect();
     dae.params(ctx)
         .iter()
@@ -68,7 +68,7 @@ fn osdi_resistor_divider_matches_analytic() {
     // V1 (2 V) -- OSDI resistor (2k) -- native resistor (1k) to ground:
     // divider with v2 = 2 * 1k/3k.
     let mut ctx = Graph::new();
-    let mut c = Circuit::new();
+    let mut c = Elements::new();
     c.voltage_source("V1", 1, 0).resistor("R2", 2, 0);
     let mut params = HashMap::default();
     params.insert("R".to_string(), 2000.0);
@@ -80,14 +80,16 @@ fn osdi_resistor_divider_matches_analytic() {
         sane_core::constants::TEMP_NOMINAL_K,
     );
     dev.setup().expect("setup");
-    let dae = assemble_dae(
+    let dae = sane_dae::assemble(
         &mut ctx,
-        &c,
-        &[DeviceInstance::new(Box::new(dev), vec![1, 2])],
+        &sane_circuit::Circuit::flat(
+            &c,
+            &[DeviceInstance::new(std::sync::Arc::new(dev), vec![1, 2])],
+        ),
     )
     .unwrap();
     let cdc = CompiledDc::new(&mut ctx, &dae);
-    let p = params_vec(&ctx, &dae, &[("V1", 2.0), ("R2", 1000.0)]);
+    let p = params_vec(&mut ctx, &dae, &[("V1", 2.0), ("R2", 1000.0)]);
     let (x, conv, _) = cdc.solve_dc(&p, &[], 1e-12, 100);
     assert!(conv, "OSDI resistor DC did not converge: {x:?}");
     let v2 = dae.unknowns.iter().position(|u| u == "v2").unwrap();
@@ -124,7 +126,7 @@ fn osdi_diode_matches_analytic() {
     // diode current against the load line (I = (0.7 - va)/1k must equal the
     // current entering the diode -- consistency, not closed form).
     let mut ctx = Graph::new();
-    let mut c = Circuit::new();
+    let mut c = Elements::new();
     c.voltage_source("V1", 1, 0).resistor("R1", 1, 2);
     let mut params = HashMap::default();
     params.insert("is".to_string(), 1e-14);
@@ -144,9 +146,13 @@ fn osdi_diode_matches_analytic() {
     } else {
         vec![2, 0]
     };
-    let dae = assemble_dae(&mut ctx, &c, &[DeviceInstance::new(Box::new(dev), terms)]).unwrap();
+    let dae = sane_dae::assemble(
+        &mut ctx,
+        &sane_circuit::Circuit::flat(&c, &[DeviceInstance::new(std::sync::Arc::new(dev), terms)]),
+    )
+    .unwrap();
     let cdc = CompiledDc::new(&mut ctx, &dae);
-    let p = params_vec(&ctx, &dae, &[("V1", 0.7), ("R1", 1000.0)]);
+    let p = params_vec(&mut ctx, &dae, &[("V1", 0.7), ("R1", 1000.0)]);
     let (x, conv, _) = cdc.solve_dc(&p, &[], 1e-12, 200);
     assert!(conv, "OSDI diode DC did not converge: {x:?}");
     let v2 = x[dae.unknowns.iter().position(|u| u == "v2").unwrap()];
@@ -175,7 +181,7 @@ fn osdi_psp103_matches_symbolic_frontend() {
     );
 
     let mut ctx = Graph::new();
-    let mut c = Circuit::new();
+    let mut c = Elements::new();
     c.voltage_source("Vd", 1, 0).voltage_source("Vg", 2, 0);
     let dev = OsdiDevice::new(
         "N1",
@@ -185,14 +191,19 @@ fn osdi_psp103_matches_symbolic_frontend() {
         sane_core::constants::TEMP_NOMINAL_K,
     );
     dev.setup().expect("setup");
-    let dae = assemble_dae(
+    let dae = sane_dae::assemble(
         &mut ctx,
-        &c,
-        &[DeviceInstance::new(Box::new(dev), vec![1, 2, 0, 0])],
+        &sane_circuit::Circuit::flat(
+            &c,
+            &[DeviceInstance::new(
+                std::sync::Arc::new(dev),
+                vec![1, 2, 0, 0],
+            )],
+        ),
     )
     .unwrap();
     let cdc = CompiledDc::new(&mut ctx, &dae);
-    let p = params_vec(&ctx, &dae, &[("Vd", 1.0), ("Vg", 0.8)]);
+    let p = params_vec(&mut ctx, &dae, &[("Vd", 1.0), ("Vg", 0.8)]);
     let (x, conv, _) = cdc.solve_dc(&p, &[], 1e-12, 200);
     assert!(conv, "OSDI psp103 DC did not converge");
     let id = x[dae.unknowns.iter().position(|u| u == "i_Vd").unwrap()];
@@ -227,7 +238,7 @@ fn osdi_capacitor_transient_matches_analytic() {
     let module = lib.modules()[0].clone();
 
     let mut ctx = Graph::new();
-    let mut c = Circuit::new();
+    let mut c = Elements::new();
     c.voltage_source("V1", 1, 0).resistor("R1", 1, 2);
     let mut params = HashMap::default();
     params.insert("c".to_string(), 1e-6);
@@ -239,32 +250,27 @@ fn osdi_capacitor_transient_matches_analytic() {
         sane_core::constants::TEMP_NOMINAL_K,
     );
     dev.setup().expect("setup");
-    let dae = assemble_dae(
+    let dae = sane_dae::assemble(
         &mut ctx,
-        &c,
-        &[DeviceInstance::new(Box::new(dev), vec![2, 0])],
+        &sane_circuit::Circuit::flat(
+            &c,
+            &[DeviceInstance::new(std::sync::Arc::new(dev), vec![2, 0])],
+        ),
     )
     .unwrap();
     let cdc = CompiledDc::new(&mut ctx, &dae);
     let (r, cap) = (1000.0, 1e-6);
     let tau = r * cap;
-    let p = params_vec(&ctx, &dae, &[("V1", 1.0), ("R1", r)]);
+    let p = params_vec(&mut ctx, &dae, &[("V1", 1.0), ("R1", r)]);
     let v1 = dae.unknowns.iter().position(|u| u == "v1").unwrap();
     let v2 = dae.unknowns.iter().position(|u| u == "v2").unwrap();
     let mut x0 = vec![0.0; cdc.dim()];
     x0[v1] = 1.0;
     let times: Vec<f64> = (0..=5).map(|k| k as f64 * tau).collect();
     let traj = cdc
-        .solve_transient(
-            sane_solve::TransientMethod::Esdirk32,
-            &p,
-            &x0,
-            &times,
-            1e-6,
-            1e-9,
-            None,
-        )
-        .expect("transient");
+        .solve_transient(&p, &x0, &times, 1e-6, 1e-9, None)
+        .expect("transient")
+        .rows;
     for (k, t) in times.iter().enumerate() {
         let want = 1.0 - (-t / tau).exp();
         let got = traj[k][v2];

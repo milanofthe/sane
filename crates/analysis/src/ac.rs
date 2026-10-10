@@ -1,11 +1,7 @@
-//! AC-domain analyses: complex response, log-frequency sweep, response
-//! sensitivity, and the descriptor state-space at the operating point.
+//! AC-domain kernels: the response sensitivity of the small-signal system.
 
-use crate::input_vector;
 use crate::linalg::{lu_factor_complex, lu_solve_complex};
 use num_complex::Complex64;
-use sane_core::Graph;
-use sane_solve::CompiledDc;
 use std::f64::consts::PI;
 
 #[cfg(test)]
@@ -70,41 +66,13 @@ pub fn ac_response_sensitivity(
     out
 }
 
-/// Descriptor state-space `(E, A, B, C, D)` at the operating point, from the
-/// already-assembled DAE: `E = dQ/dx`, `A = -dI/dx`, `B = -dI/d(input)`,
-/// `C = e_out^T`, `D = 0`. (`E x' = A x + B u`, `y = C x + D u`.)
-#[allow(clippy::type_complexity)]
-pub fn state_space_on_dae(
-    ctx: &mut Graph,
-    dae: &sane_dae::Dae,
-    cdc: &CompiledDc,
-    input: &str,
-    out_idx: usize,
-    x: &[f64],
-    p: &[f64],
-) -> (Vec<Vec<f64>>, Vec<Vec<f64>>, Vec<f64>, Vec<f64>, f64) {
-    let n = dae.dim();
-    let g = cdc.jacobian_i_x(x, p, 0.0);
-    let e = cdc.jacobian_q_x(x, p, 0.0);
-    let a: Vec<Vec<f64>> = g
-        .iter()
-        .map(|row| row.iter().map(|v| -v).collect())
-        .collect();
-    let pnames = cdc.param_names(ctx);
-    let b = match input_vector(ctx, dae, &pnames, p, x, input) {
-        Some(db) => db.iter().map(|v| -v).collect(),
-        None => vec![0.0; n],
-    };
-    let c: Vec<f64> = (0..n)
-        .map(|i| if i == out_idx { 1.0 } else { 0.0 })
-        .collect();
-    (e, a, b, c, 0.0)
-}
-
 #[cfg(test)]
 mod sparse_ac_equiv {
     use super::*;
+    use crate::input_vector;
     use num_complex::Complex64;
+    use sane_core::Graph;
+    use sane_solve::CompiledDc;
 
     // The sparse complex AC system (assembled from the sparse Jacobians + gmin)
     // must reproduce the dense `system_matrix_dc + jwC` solve bit-for-bit.
@@ -113,14 +81,14 @@ mod sparse_ac_equiv {
         let net = "V1 in 0 1\nR1 in a 100\nL1 a out 1m\nC1 out 0 1u\nR2 out 0 1k\n";
         let parsed = parse(net).unwrap();
         let mut ctx = Graph::new();
-        let dae = parsed.assemble(&mut ctx).unwrap();
+        let dae = sane_dae::assemble(&mut ctx, &parsed).unwrap();
         let cdc = CompiledDc::new(&mut ctx, &dae);
         let pnames = cdc.param_names(&ctx);
         let p: Vec<f64> = parsed.pvec(&pnames);
         let n = dae.dim();
         let (x, conv, _) = cdc.solve_dc(&p, &[], DC_OP_TOL, DC_OP_MAXIT);
         assert!(conv, "DC did not converge");
-        let node = parsed.node("out").unwrap();
+        let node = parsed.find_node("out").unwrap();
         let out_idx = dae
             .unknowns
             .iter()

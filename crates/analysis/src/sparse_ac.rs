@@ -125,7 +125,7 @@ struct AcValues {
     slot_c: Vec<usize>,
     slot_d: Vec<usize>,
     c_v: Vec<f64>,
-    /// transport-delay coupling: value and delay per entry (see new_with_delays)
+    /// transport-delay coupling: value and delay per entry (see `new`)
     d_v: Vec<f64>,
     d_tau: Vec<f64>,
 }
@@ -150,22 +150,12 @@ impl SymbolicAc {
     /// on the values at angular frequency `w_ref` (the sweep's first, say).
     /// Duplicate `(i, j)` contributions are summed, matching
     /// [`AcSystem::assemble`]. `None` if the pattern is degenerate
-    /// (structurally singular).
+    /// (structurally singular). The transport-delay coupling `d` (empty
+    /// without delays): entry `k` adds `d.2[k] * e^{-jω d.3[k]}` at
+    /// `(d.0[k], d.1[k])` -- the frequency-domain image of
+    /// `hist_k(t) = src_k(t - τ_k)` (rows from `∂F/∂hist`, columns the
+    /// unknowns of the delayed signal).
     pub fn new(
-        n: usize,
-        g: (&[usize], &[usize], &[f64]),
-        c: (&[usize], &[usize], &[f64]),
-        transpose: bool,
-        w_ref: f64,
-    ) -> Option<Self> {
-        Self::new_with_delays(n, g, c, (&[], &[], &[], &[]), transpose, w_ref)
-    }
-
-    /// As [`new`](Self::new), plus transport-delay coupling: entry `k` adds
-    /// `d.2[k] * e^{-jω d.3[k]}` at `(d.0[k], d.1[k])` -- the frequency-domain
-    /// image of `hist_k(t) = x_{src}(t - τ_k)` (rows from `∂F/∂hist`, columns
-    /// the delayed source unknowns).
-    pub fn new_with_delays(
         n: usize,
         g: (&[usize], &[usize], &[f64]),
         c: (&[usize], &[usize], &[f64]),
@@ -260,6 +250,7 @@ impl SymbolicAc {
                 values: Vec::with_capacity(self.row_idx.len()),
             },
             solver: None,
+            w: None,
             x: vec![Complex64::new(0.0, 0.0); self.n],
             work: SolveWork::default(),
         }
@@ -272,6 +263,8 @@ pub struct AcSweepSolver<'a> {
     /// The CSC of `A`: pattern fixed, values refilled per frequency.
     csc: GeneralCsc<Complex64>,
     solver: Option<KluSolver<Complex64>>,
+    /// The frequency `solver` is factored at.
+    w: Option<f64>,
     /// The solution and the solve's workspace, kept across frequencies.
     x: Vec<Complex64>,
     work: SolveWork<Complex64>,
@@ -280,18 +273,22 @@ pub struct AcSweepSolver<'a> {
 impl AcSweepSolver<'_> {
     /// Solve at angular frequency `w` (refactor fast path; `None` on a
     /// singular system at this frequency). The solution lives in the worker
-    /// until the next solve.
+    /// until the next solve; another right-hand side at the same `w` reuses
+    /// the factorization.
     pub fn solve(&mut self, w: f64, b: &[Complex64]) -> Option<&[Complex64]> {
         let sys = self.sys;
-        sys.vals.fill(w, &mut self.csc.values);
-        sane_solve::dump_system(&self.csc, b);
-        let refactored = match self.solver.as_mut() {
-            Some(s) => s.refactor(&self.csc).is_ok(),
-            None => false,
-        };
-        if !refactored {
-            self.solver = sys.sym.factor(&self.csc, &KluSettings::default()).ok();
+        if self.w != Some(w) || self.solver.is_none() {
+            sys.vals.fill(w, &mut self.csc.values);
+            let refactored = match self.solver.as_mut() {
+                Some(s) => s.refactor(&self.csc).is_ok(),
+                None => false,
+            };
+            if !refactored {
+                self.solver = sys.sym.factor(&self.csc, &KluSettings::default()).ok();
+            }
+            self.w = Some(w);
         }
+        sane_solve::dump_system(&self.csc, b);
         let s = self.solver.as_ref()?;
         s.solve_into(b, &mut self.x, &mut self.work).ok()?;
         Some(&self.x)
@@ -358,8 +355,24 @@ mod tests {
             Complex64::new(0.0, 20.0),
             Complex64::new(8.0, 3.0),
         ];
-        let sym = SymbolicAc::new(3, (&g.0, &g.1, &g.2), (&c.0, &c.1, &c.2), false, 2.0).expect("sym");
-        let symt = SymbolicAc::new(3, (&g.0, &g.1, &g.2), (&c.0, &c.1, &c.2), true, 2.0).expect("symT");
+        let sym = SymbolicAc::new(
+            3,
+            (&g.0, &g.1, &g.2),
+            (&c.0, &c.1, &c.2),
+            (&[], &[], &[], &[]),
+            false,
+            2.0,
+        )
+        .expect("sym");
+        let symt = SymbolicAc::new(
+            3,
+            (&g.0, &g.1, &g.2),
+            (&c.0, &c.1, &c.2),
+            (&[], &[], &[], &[]),
+            true,
+            2.0,
+        )
+        .expect("symT");
         let mut sweep = sym.solver();
         let mut sweep_t = symt.solver();
         for &w in &[0.0, 1.0, 7.5, 1e3] {

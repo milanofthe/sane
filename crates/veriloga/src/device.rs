@@ -84,7 +84,12 @@ impl VerilogADevice {
     /// module's defaults): what decides its structure (see `template`).
     pub fn values(&self) -> rustc_hash::FxHashMap<String, f64> {
         (self.module.params.iter())
-            .map(|p| (p.name.clone(), self.params.get(&p.name).copied().unwrap_or(p.default)))
+            .map(|p| {
+                (
+                    p.name.clone(),
+                    self.params.get(&p.name).copied().unwrap_or(p.default),
+                )
+            })
             .collect()
     }
 

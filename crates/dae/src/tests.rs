@@ -1,7 +1,7 @@
 use super::*;
 use rsdag::eval;
+use sane_circuit::{Elements, SourceFn};
 use sane_device::Lowerer;
-use sane_mna::{Circuit, SourceFn};
 use std::collections::{HashMap, HashSet};
 
 fn env_of(ctx: &mut Graph, vals: &[(&str, f64)]) -> HashMap<SymbolId, f64> {
@@ -71,6 +71,7 @@ impl sane_device::DeviceModel for BehavioralCap {
         let q = ctx.mul(c, dv);
         let nq = ctx.neg(q);
         Ok(sane_device::BehavioralFragment {
+            noise_rows: Vec::new(),
             param_syms: Vec::new(),
             structural: Vec::new(),
             collapsed: Vec::new(),
@@ -92,19 +93,19 @@ fn behavioral_capacitor_matches_native() {
     // Same V1+R network, capacitor once as a native element, once as a
     // behavioral lowering. Same unknowns; residuals identical at any point.
     let mut ctx = Graph::new();
-    let mut cn = Circuit::new();
+    let mut cn = Elements::new();
     cn.voltage_source("V1", 1, 0)
         .resistor("R", 1, 2)
         .capacitor("C", 2, 0);
-    let native = assemble_dae(&mut ctx, &cn, &[]).unwrap();
+    let native = crate::assemble(&mut ctx, &sane_circuit::Circuit::flat(&cn, &[])).unwrap();
 
-    let mut cb = Circuit::new();
+    let mut cb = Elements::new();
     cb.voltage_source("V1", 1, 0).resistor("R", 1, 2);
     let devs = vec![DeviceInstance::new(
-        Box::new(BehavioralCap { name: "C".into() }),
+        std::sync::Arc::new(BehavioralCap { name: "C".into() }),
         vec![2, 0],
     )];
-    let behav = assemble_dae(&mut ctx, &cb, &devs).unwrap();
+    let behav = crate::assemble(&mut ctx, &sane_circuit::Circuit::flat(&cb, &devs)).unwrap();
 
     assert_eq!(native.unknowns, behav.unknowns, "same unknown layout");
     assert_eq!(behav.dim(), 3, "behavioral cap mints no extra unknown");
@@ -115,6 +116,7 @@ fn behavioral_capacitor_matches_native() {
         &[
             ("V1", 1.0),
             ("R", 1000.0),
+            ("R#noise", 0.0),
             ("C", 1e-6),
             ("v1", 1.3),
             ("v2", 0.4),
@@ -142,14 +144,14 @@ fn mfactor_scales_terminal_current() {
     // while every other row is untouched (m parallel devices).
     let mut ctx = Graph::new();
     let build = |ctx: &mut Graph, m: f64| {
-        let mut cb = Circuit::new();
+        let mut cb = Elements::new();
         cb.voltage_source("V1", 1, 0).resistor("R", 1, 2);
-        let devs =
-            vec![
-                DeviceInstance::new(Box::new(BehavioralCap { name: "C".into() }), vec![2, 0])
-                    .with_mfactor(m),
-            ];
-        assemble_dae(ctx, &cb, &devs).unwrap()
+        let devs = vec![DeviceInstance::new(
+            std::sync::Arc::new(BehavioralCap { name: "C".into() }),
+            vec![2, 0],
+        )
+        .with_mfactor(m)];
+        crate::assemble(ctx, &sane_circuit::Circuit::flat(&cb, &devs)).unwrap()
     };
     let d1 = build(&mut ctx, 1.0);
     let d2 = build(&mut ctx, 2.0);
@@ -162,6 +164,7 @@ fn mfactor_scales_terminal_current() {
         &[
             ("V1", 1.0),
             ("R", 1000.0),
+            ("R#noise", 0.0),
             ("C", cap),
             ("v1", 1.3),
             ("v2", 0.4),
@@ -189,11 +192,11 @@ fn mfactor_scales_terminal_current() {
 #[test]
 fn rc_dae_consistent_point() {
     let mut ctx = Graph::new();
-    let mut c = Circuit::new();
+    let mut c = Elements::new();
     c.voltage_source("V1", 1, 0)
         .resistor("R", 1, 2)
         .capacitor("C", 2, 0);
-    let dae = assemble_dae(&mut ctx, &c, &[]).unwrap();
+    let dae = crate::assemble(&mut ctx, &sane_circuit::Circuit::flat(&c, &[])).unwrap();
     assert_eq!(dae.dim(), 3);
     assert_eq!(dae.unknowns, vec!["v1", "v2", "i_V1"]);
 
@@ -222,12 +225,12 @@ fn eliminate_resistive_node_preserves_point() {
     // Node 2 is internal and purely resistive: eliminating it must fold R1,R2
     // into a direct branch and preserve the divider's consistent point.
     let mut ctx = Graph::new();
-    let mut c = Circuit::new();
+    let mut c = Elements::new();
     c.voltage_source("V1", 1, 0)
         .resistor("R1", 1, 2)
         .resistor("R2", 2, 3)
         .resistor("Rload", 3, 0);
-    let dae = assemble_dae(&mut ctx, &c, &[]).unwrap();
+    let dae = crate::assemble(&mut ctx, &sane_circuit::Circuit::flat(&c, &[])).unwrap();
     assert_eq!(dae.unknowns, vec!["v1", "v2", "v3", "i_V1"]);
 
     let mut keep = HashSet::new();
@@ -256,13 +259,13 @@ fn eliminate_resistive_node_preserves_point() {
 #[test]
 fn diode_rectifier_consistent_point() {
     let mut ctx = Graph::new();
-    let mut c = Circuit::new();
+    let mut c = Elements::new();
     c.voltage_source("V1", 1, 0).resistor("R", 1, 2);
     let devs = vec![DeviceInstance::new(
-        Box::new(sane_veriloga::builtin_device("sane_diode", "D1", &[])),
+        std::sync::Arc::new(sane_veriloga::builtin_device("sane_diode", "D1", &[])),
         vec![2, 0], // anode = node 2, cathode = ground
     )];
-    let dae = assemble_dae(&mut ctx, &c, &devs).unwrap();
+    let dae = crate::assemble(&mut ctx, &sane_circuit::Circuit::flat(&c, &devs)).unwrap();
     assert_eq!(dae.dim(), 3);
 
     // Pick a diode voltage, derive the rest so F = 0. The diode's thermal
@@ -295,12 +298,12 @@ fn diode_rectifier_consistent_point() {
 fn ccvs_consistent_point() {
     // V1 1 0; R1 1 0; H1: V(2,0) = H1*I(V1); RL 2 0.
     let mut ctx = Graph::new();
-    let mut c = Circuit::new();
+    let mut c = Elements::new();
     c.voltage_source("V1", 1, 0)
         .resistor("R1", 1, 0)
         .ccvs("H1", 2, 0, "V1")
         .resistor("RL", 2, 0);
-    let dae = assemble_dae(&mut ctx, &c, &[]).unwrap();
+    let dae = crate::assemble(&mut ctx, &sane_circuit::Circuit::flat(&c, &[])).unwrap();
     assert_eq!(dae.dim(), 4); // v1, v2, i_V1, i_H1
 
     let (vin, r1, gain, rl) = (1.0, 1000.0, 5.0, 2000.0);
@@ -327,10 +330,10 @@ fn ccvs_consistent_point() {
 #[test]
 fn sin_source_residual_is_time_dependent() {
     let mut ctx = Graph::new();
-    let mut c = Circuit::new();
+    let mut c = Elements::new();
     c.voltage_source("V1", 1, 0).set_source(SourceFn::Sin);
     c.resistor("R1", 1, 0);
-    let dae = assemble_dae(&mut ctx, &c, &[]).unwrap();
+    let dae = crate::assemble(&mut ctx, &sane_circuit::Circuit::flat(&c, &[])).unwrap();
     let i_v1 = dae.unknowns.iter().position(|u| u == "i_V1").unwrap();
     let s = rsdag::to_string(&ctx, dae.currents[i_v1]);
     assert!(
@@ -342,13 +345,13 @@ fn sin_source_residual_is_time_dependent() {
 #[test]
 fn current_switch_uses_control_current() {
     let mut ctx = Graph::new();
-    let mut c = Circuit::new();
+    let mut c = Elements::new();
     c.voltage_source("Vc", 1, 0).resistor("R1", 1, 0);
     let devs = vec![DeviceInstance::new(
-        Box::new(sane_device::CSwitch::new("W1", "Vc")),
+        std::sync::Arc::new(sane_device::CSwitch::new("W1", "Vc")),
         vec![2, 0],
     )];
-    let dae = assemble_dae(&mut ctx, &c, &devs).unwrap();
+    let dae = crate::assemble(&mut ctx, &sane_circuit::Circuit::flat(&c, &devs)).unwrap();
     // node 2 KCL carries the switch conductance (a Select on I(Vc)).
     let v2 = dae.unknowns.iter().position(|u| u == "v2").unwrap();
     let s = rsdag::to_string(&ctx, dae.currents[v2]);
@@ -362,13 +365,13 @@ fn current_switch_uses_control_current() {
 #[test]
 fn mutual_inductance_couples_constraints() {
     let mut ctx = Graph::new();
-    let mut c = Circuit::new();
+    let mut c = Elements::new();
     c.voltage_source("V1", 1, 0)
         .inductor("L1", 1, 0)
         .inductor("L2", 2, 0)
         .resistor("RL", 2, 0)
         .mutual("K1", "L1", "L2");
-    let dae = assemble_dae(&mut ctx, &c, &[]).unwrap();
+    let dae = crate::assemble(&mut ctx, &sane_circuit::Circuit::flat(&c, &[])).unwrap();
     let i_l1 = dae.unknowns.iter().position(|u| u == "i_L1").unwrap();
     // the coupling is in the L1 row's flux
     let s = rsdag::to_string(&ctx, dae.charges[i_l1]);

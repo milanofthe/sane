@@ -9,7 +9,7 @@ description = "Time-domain nonlinear DAE assembly and extraction for SANE"
 [dependencies]
 rsdag.workspace = true
 sane-core.workspace = true
-sane-mna.workspace = true
+sane-circuit.workspace = true
 sane-device = { path = "../device" }
 rustc-hash.workspace = true
 

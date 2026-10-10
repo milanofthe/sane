@@ -13,17 +13,18 @@
 //! currents `i_{name}`, and time `t`.
 
 use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 
 use rsdag::{sparse_jacobian, Crossing, ExprId, Node, SymbolId};
+use sane_circuit::SourceFn;
 use sane_core::Graph;
-use sane_mna::SourceFn;
 
 // Assembly of the symbolic DAE from a parsed circuit.
 mod assemble;
 // Subcircuit instances: placed bodies, their renaming and topology.
-mod hierarchy;
 pub mod linearize;
 mod observers;
+mod rewrite;
 // Sensitivity machinery: directional derivatives, augmentation, Hessian blocks.
 mod sens;
 // Graph transformations (shorts / opens / exact node elimination).
@@ -31,30 +32,18 @@ mod sens;
 mod tests;
 mod transform;
 
-pub use assemble::{assemble, assemble_at, assemble_dae};
-pub use hierarchy::{topology, Body, Instance};
-pub use observers::{Flat, Observers};
+pub use assemble::{assemble, assemble_at};
+pub use observers::Observers;
 pub use sens::{
-    ac_param_derivatives, augment_with_scaled_sensitivities, augment_with_sensitivities,
-    lagrangian_hessian, HessianSym,
+    ac_param_derivatives, augment_with_scaled_sensitivities, augment_with_sensitivities, frozen,
+    lagrangian_hessian, param_column, Frozen, HessianSym,
 };
 pub use transform::{eliminate_nodes, reduce_graph};
 
-pub use sane_device::{Assertion, DeviceInstance, DeviceModel, LimitKind, NoiseSource, UnknownKind};
-
-/// A device controlling-voltage limit (SPICE `pnjlim` / `fetlim`) mapped to the
-/// global unknown vector: `v(hi) - v(lo)`, where `None` denotes ground. The DC
-/// solver curve-limits this difference between Newton iterates (see
-/// [`sane_device::DeviceModel::limits`]).
-#[derive(Clone, Copy, Debug)]
-pub struct Limit {
-    pub hi: Option<usize>,
-    pub lo: Option<usize>,
-    pub kind: LimitKind,
-    /// The condition over the parameters it holds under (see
-    /// [`sane_device::FragmentLimit::when`]); `None` for always.
-    pub when: Option<ExprId>,
-}
+pub use sane_device::{
+    Assertion, DeviceInstance, DeviceModel, FragmentLimit as Limit, LimitKind, NoiseSource,
+    UnknownKind,
+};
 
 impl Dae {
     /// Keep the limits that hold at the parameter values `value_of` gives
@@ -89,11 +78,10 @@ impl Dae {
 /// (constant per run).
 #[derive(Clone, Debug)]
 pub struct DelaySpec {
-    /// Unknown index of the delayed source signal.
-    pub src: usize,
-    /// Unknown index of the delay output.
-    pub out: usize,
-    /// The history input symbol appearing in `out`'s residual.
+    /// The signal the line delays, over the unknowns (an unknown as
+    /// assembled; what a transform makes of it after).
+    pub src: ExprId,
+    /// The history input: `src` a delay `tau` earlier.
     pub hist: SymbolId,
     /// Delay time as an expression over parameters.
     pub tau: ExprId,
@@ -144,8 +132,9 @@ pub struct Dae {
     pub delays: Vec<DelaySpec>,
     /// Companion conductance network (node-KCL row, node-voltage col, value) for
     /// homotopy continuation: each device's linear `lambda = 0` form (see
-    /// [`sane_device::DeviceModel::companion`]). Empty for transformed DAEs.
-    pub companion: Vec<(usize, usize, f64)>,
+    /// [`sane_device::DeviceModel::companion`]), by the node voltage of the
+    /// row and of the column.
+    pub companion: Vec<(SymbolId, SymbolId, f64)>,
     /// The small-signal noise sources (current noise generators with a PSD
     /// expression) and the operating-point variables (`(* desc *)`
     /// annotations, named expressions for OP reporting) the devices export:
@@ -157,9 +146,9 @@ pub struct Dae {
     /// registry survives unknown reordering; entries whose unknown no longer
     /// exists are ignored at lookup.
     pub dc_seeds: Vec<(String, f64)>,
-    /// Per-device controlling-voltage limits (SPICE `pnjlim`/`fetlim`) mapped to
-    /// global unknown indices, for the DC solver's `device_limiting` trick. Empty
-    /// for transformed DAEs (which carry no device limits).
+    /// Per-device controlling-voltage limits (SPICE `pnjlim`/`fetlim`) over
+    /// the unknowns' symbols (`None`: ground), for the Newton loops'
+    /// `device_limiting`.
     pub limits: Vec<Limit>,
     /// Independent-source stimulus shapes in the circuit, by element name. Carries
     /// the structural facts the lowered graph cannot recover -- transient
@@ -194,6 +183,12 @@ pub struct Dae {
     /// body the body's own name, `__inv__.M1`), a subcircuit body's formal
     /// net by the net's name in the body.
     pub labels: rustc_hash::FxHashMap<ExprId, String>,
+    /// Where each noise generator enters, once asked for (see
+    /// [`noise_injection`](Self::noise_injection)).
+    pub injection: OnceLock<Arc<Vec<Vec<(usize, ExprId)>>>>,
+    /// The currents and charges at rest, once asked for (see
+    /// [`at_rest`](Self::at_rest)).
+    pub rest: OnceLock<Arc<(Vec<ExprId>, Vec<ExprId>)>>,
 }
 
 /// A noise source's level at an operating point (see [`Dae::noise_levels`]).
@@ -206,18 +201,59 @@ pub enum NoiseLevel {
 }
 
 impl Dae {
+    /// The currents and charges with every noise generator at zero, where
+    /// they are in every evaluation, the calls that pass one specialized to
+    /// it: what the solver's programs and the Jacobians are built from, so
+    /// the generators cost no evaluation.
+    pub fn at_rest(&self, ctx: &mut Graph) -> Arc<(Vec<ExprId>, Vec<ExprId>)> {
+        if let Some(r) = self.rest.get() {
+            return r.clone();
+        }
+        let generators = self.observers.generators(ctx);
+        let rest = if generators.is_empty() {
+            (self.currents.clone(), self.charges.clone())
+        } else {
+            let zero = ctx.zero();
+            let quiet: rustc_hash::FxHashMap<SymbolId, ExprId> =
+                generators.iter().map(|&g| (g, zero)).collect();
+            let roots: Vec<ExprId> = self.currents.iter().chain(&self.charges).copied().collect();
+            let roots = rsdag::substitute(ctx, &roots, &quiet);
+            let mut roots = ctx.specialize_calls(&roots);
+            let charges = roots.split_off(self.currents.len());
+            (roots, charges)
+        };
+        self.rest.get_or_init(|| Arc::new(rest)).clone()
+    }
+
+    /// Where each noise generator (in [`Observers::noise`] order) enters
+    /// the rows: `(row, d current / d generator)` per source. A generator a
+    /// device puts between two nodes enters as `+1` and `-1`; through a
+    /// transform (a node eliminated, merged) wherever the rows now carry it.
+    pub fn noise_injection(&self, ctx: &mut Graph) -> Arc<Vec<Vec<(usize, ExprId)>>> {
+        if let Some(inj) = self.injection.get() {
+            return inj.clone();
+        }
+        let inputs = self.observers.generators(ctx);
+        let mut by_source = vec![Vec::new(); inputs.len()];
+        for (i, row) in sparse_jacobian(ctx, &self.currents, &inputs)
+            .into_iter()
+            .enumerate()
+        {
+            for (q, e) in row {
+                by_source[q].push((i, e));
+            }
+        }
+        self.injection.get_or_init(|| Arc::new(by_source)).clone()
+    }
+
     /// Every noise source's level over `env`, in one arena sweep: the sources
     /// share the device subexpressions and calls they read.
-    pub fn noise_levels(
-        &self,
-        ctx: &mut Graph,
-        env: &HashMap<SymbolId, f64>,
-    ) -> Vec<NoiseLevel> {
-        let flat = self.observers.flatten(ctx);
-        let roots: Vec<ExprId> = flat.noise.iter().flat_map(|ns| ns.exprs()).collect();
+    pub fn noise_levels(&self, ctx: &mut Graph, env: &HashMap<SymbolId, f64>) -> Vec<NoiseLevel> {
+        let noise = self.observers.noise(ctx);
+        let roots: Vec<ExprId> = noise.iter().flat_map(|ns| ns.exprs()).collect();
         let mut vals = rsdag::eval(ctx, &roots, env).into_iter();
         let mut next = || vals.next().expect("one per expression");
-        flat.noise
+        noise
             .iter()
             .map(|ns| {
                 let (psd, fexp) = (next(), next());
@@ -232,8 +268,11 @@ impl Dae {
     /// Register the system as an rsdag function carrying its roles: the
     /// unknowns as `State`, time as `Time`, every parameter as `Param`, the
     /// currents as `Residual` outputs, the charges a row stores as `Charge`
-    /// outputs of the same row, and every switching surface as a `Guard`
-    /// output with its crossing direction.
+    /// outputs of the same row, every switching surface as a `Guard`
+    /// output with its crossing direction, the delays' signals and times,
+    /// and the noise sources' levels. An op-var is the `Observer` output of
+    /// the function it is computed in (a device's, a subcircuit body's),
+    /// stated there once rather than per system.
     ///
     /// This is how the system layer states what it is: a consumer (SANE's own
     /// solver, an exporter, another backend) reads the structure off the graph
@@ -258,6 +297,11 @@ impl Dae {
             params.push(dl.hist);
             roles.push(rsdag::ParamRole::History { id: k as u32 });
         }
+        let noise = self.observers.noise(ctx);
+        for (k, n) in noise.iter().enumerate() {
+            params.push(n.input);
+            roles.push(rsdag::ParamRole::Noise { id: k as u32 });
+        }
 
         let mut outputs: Vec<ExprId> = self.currents.clone();
         let mut out_roles: Vec<rsdag::OutputRole> = (0..self.currents.len())
@@ -275,6 +319,20 @@ impl Dae {
                 id: i as u32,
                 dir: ev.dir,
             });
+        }
+        for (k, dl) in self.delays.iter().enumerate() {
+            outputs.extend([dl.src, dl.tau]);
+            out_roles.push(rsdag::OutputRole::DelaySource { id: k as u32 });
+            out_roles.push(rsdag::OutputRole::DelayTime { id: k as u32 });
+        }
+        for (k, n) in noise.iter().enumerate() {
+            for (elem, e) in n.exprs().into_iter().enumerate() {
+                outputs.push(e);
+                out_roles.push(rsdag::OutputRole::NoiseLevel {
+                    id: k as u32,
+                    elem: elem as u32,
+                });
+            }
         }
 
         // Idempotent per system, not per name: a DAE compiled twice (an AC
@@ -339,6 +397,21 @@ impl Dae {
         self.split_coo(ctx, &self.x_cols())
     }
 
+    /// `dI/dt` and `dQ/dt` as sparse `(rows, 0, exprs)`: the explicit time
+    /// dependence of the sources, which a Rosenbrock stage reads.
+    pub fn jacobian_t_iq_coo(&self, ctx: &mut Graph) -> (Coo, Coo) {
+        self.split_coo(ctx, &[(0, self.t)])
+    }
+
+    /// `dI/dhist` and `dQ/dhist` as sparse `(rows, cols, exprs)`, columns
+    /// indexed like `delays`: how the rows move with the delayed signals.
+    pub fn jacobian_hist_iq_coo(&self, ctx: &mut Graph) -> (Coo, Coo) {
+        let cols: Vec<(usize, SymbolId)> = (self.delays.iter().enumerate())
+            .map(|(c, d)| (c, d.hist))
+            .collect();
+        self.split_coo(ctx, &cols)
+    }
+
     /// `dI/dp` and `dQ/dp` as sparse `(rows, cols, exprs)`, columns indexed
     /// like `params`.
     pub fn jacobian_p_iq_coo(&self, ctx: &mut Graph, params: &[SymbolId]) -> (Coo, Coo) {
@@ -349,7 +422,8 @@ impl Dae {
     /// split into the currents' rows and the charges'.
     fn split_coo(&self, ctx: &mut Graph, cols: &[(usize, SymbolId)]) -> (Coo, Coo) {
         let n = self.currents.len();
-        let roots: Vec<ExprId> = self.currents.iter().chain(&self.charges).copied().collect();
+        let rest = self.at_rest(ctx);
+        let roots: Vec<ExprId> = rest.0.iter().chain(&rest.1).copied().collect();
         let wrt: Vec<SymbolId> = cols.iter().map(|&(_, s)| s).collect();
         let (mut i, mut q) = (Coo::default(), Coo::default());
         for (r, row) in sparse_jacobian(ctx, &roots, &wrt).into_iter().enumerate() {
@@ -379,21 +453,26 @@ impl Dae {
             .enumerate()
             .map(|(c, d)| (c, d.hist))
             .collect();
-        coo(ctx, &self.currents, &cols)
+        let rest = self.at_rest(ctx);
+        coo(ctx, &rest.0, &cols)
     }
 
-    /// Parameter symbols: free symbols in the currents, charges and
-    /// assertions that are neither unknowns nor time, sorted by id.
-    pub fn params(&self, ctx: &Graph) -> Vec<SymbolId> {
+    /// Parameter symbols: free symbols in the currents, charges, assertions
+    /// and observers (noise sources, op-vars) that are neither unknowns nor
+    /// time, sorted by id.
+    pub fn params(&self, ctx: &mut Graph) -> Vec<SymbolId> {
         // The currents and charges, the delay times (parameters even though they appear
-        // only in the delay registry) and the switching surfaces (which may
-        // reference a parameter nothing else does), in one walk.
+        // only in the delay registry), the switching surfaces (which may
+        // reference a parameter nothing else does) and what the observers read
+        // (a noise-only coefficient, the temperature of thermal noise), in one
+        // walk.
+        let observed = self.observers.reads(ctx);
         let roots: Vec<ExprId> = self
             .currents
             .iter()
             .chain(&self.charges)
             .copied()
-            .chain(self.delays.iter().map(|dl| dl.tau))
+            .chain(self.delays.iter().flat_map(|dl| [dl.src, dl.tau]))
             .chain(self.events.iter().map(|ev| ev.g))
             .chain(
                 self.assertions
@@ -401,15 +480,20 @@ impl Dae {
                     .chain(&self.structure)
                     .map(|a| a.holds),
             )
+            .chain(observed)
             .collect();
         let mut all = ctx.free_symbols_in(&roots);
         for s in &self.x {
             all.remove(s);
         }
         all.remove(&self.t);
-        // history inputs are integrator-provided, not parameters
+        // history inputs are integrator-provided, noise generators zero in
+        // every evaluation: neither is a parameter
         for dl in &self.delays {
             all.remove(&dl.hist);
+        }
+        for g in self.observers.generators(ctx) {
+            all.remove(&g);
         }
         all.into_iter().collect()
     }
@@ -423,77 +507,16 @@ impl Dae {
     /// topology and sparsity. This is the graph-transform core of parameter fold,
     /// in the same family as `linearize` / `eliminate_nodes`.
     pub fn fold_params(&self, ctx: &mut Graph, fold: &[(SymbolId, f64)]) -> Dae {
-        // Build the symbol -> constant substitution. An empty `fold` is a no-op
-        // (every node re-interns to itself), so the same path also serves the
-        // "derive an independent copy" case.
-        let map: rustc_hash::FxHashMap<SymbolId, ExprId> =
-            fold.iter().map(|&(s, v)| (s, ctx.konst_f64(v))).collect();
-        let fold = &map;
-        let currents = rsdag::substitute(ctx, &self.currents, fold);
-        let charges = rsdag::substitute(ctx, &self.charges, fold);
-        let flat = self.observers.flatten(ctx);
-        let noise = flat
-            .noise
-            .iter()
-            .map(|n| {
-                let mut e = rsdag::substitute(ctx, &n.exprs(), fold).into_iter();
-                n.with_exprs(n.hi, n.lo, &mut e)
-            })
-            .collect();
-        let op_vars = flat
-            .op_vars
-            .iter()
-            .map(|v| sane_device::OpVar {
-                value: rsdag::substitute(ctx, &[v.value], fold)[0],
-                ..v.clone()
-            })
-            .collect();
-        let mut fold_all = |list: &[sane_device::Assertion]| -> Vec<sane_device::Assertion> {
-            list.iter()
-                .map(|a| sane_device::Assertion {
-                    holds: rsdag::substitute(ctx, &[a.holds], fold)[0],
-                    message: a.message.clone(),
-                })
-                .collect()
-        };
-        let assertions = fold_all(&self.assertions);
-        let structure = fold_all(&self.structure);
-        Dae {
-            currents,
-            charges,
-            assertions,
-            structure,
-            aliases: self.aliases.clone(),
-            n_nodes: self.n_nodes,
-            param_defaults: self.param_defaults.clone(),
-            events: self
-                .events
-                .iter()
-                .map(|ev| EventSpec {
-                    g: rsdag::substitute(ctx, &[ev.g], fold)[0],
-                    ..ev.clone()
-                })
-                .collect(),
-            delays: self
-                .delays
-                .iter()
-                .map(|dl| DelaySpec {
-                    tau: rsdag::substitute(ctx, &[dl.tau], fold)[0],
-                    ..dl.clone()
-                })
-                .collect(),
-            unknowns: self.unknowns.clone(),
-            kinds: self.kinds.clone(),
-            x: self.x.clone(),
-            t: self.t,
-            companion: self.companion.clone(),
-            observers: Observers::flat(noise, op_vars),
-            dc_seeds: self.dc_seeds.clone(),
-            limits: self.limits.clone(),
-            sources: self.sources.clone(),
-            source_names: self.source_names.clone(),
-            labels: self.labels.clone(),
-        }
+        let subst = fold.iter().map(|&(s, v)| (s, ctx.konst_f64(v))).collect();
+        self.rewrite(
+            ctx,
+            rewrite::Rewrite {
+                rows: None,
+                keep: (0..self.dim()).collect(),
+                n_nodes: self.n_nodes,
+                subst,
+            },
+        )
     }
 }
 

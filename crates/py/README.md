@@ -6,7 +6,7 @@ Symbolic circuit analysis with exact component sensitivities.
 front-end), extracts a symbolic differential-algebraic model of the circuit, and
 runs DC, AC, transient, pole/zero, harmonic-balance, noise and model-reduction
 analyses. Every analysis exposes exact first- and second-order parameter
-sensitivities (adjoint autodiff, no finite differences), so component tolerancing,
+sensitivities (adjoint and forward autodiff, no finite differences), so component tolerancing,
 optimisation and cross-simulator validation all read off the same model.
 
 ```python
@@ -18,13 +18,13 @@ R1 in out 1k
 R2 out 0 1k
 .end
 """)
-op = m.operating_point()
+op = m.at().operating_point()
 print(op.get("out"))          # 2.5 V
 s = op.sensitivity("out")     # exact d v(out) / d p for every parameter
 ```
 
-The compiled core is written in Rust (PyO3); the ergonomic, documented surface is
-the pure-Python package overlaid on top. An optional native backend (rsdag's emitter) can be
+Everything runs in Rust (PyO3); the package is a thin layer over it, results
+come as numpy arrays. An optional native backend (rsdag's emitter) can be
 enabled at build time (`maturin develop --features jit`, the default) and
 disabled at runtime with `SANE_JIT=0`.
 

@@ -33,9 +33,15 @@ fn currents(
     });
     let term_v: Vec<ExprId> = terms.iter().map(|n| ctx.sym(n)).collect();
     let mut lo = Lowerer::new(ctx);
-    dev.lower_behavioral(&mut lo, &term_v, &[])
-        .unwrap()
-        .terminal_currents
+    let frag = dev.lower_behavioral(&mut lo, &term_v, &[]).unwrap();
+    // the noise generators the currents carry are zero in every evaluation
+    PARAMS.with(|p| {
+        let mut p = p.borrow_mut();
+        for n in &frag.noise {
+            p.push((ctx.symbol_name(n.input).to_string(), 0.0));
+        }
+    });
+    frag.terminal_currents
 }
 
 thread_local! {

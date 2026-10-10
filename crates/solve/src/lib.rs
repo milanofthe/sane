@@ -25,10 +25,10 @@
 
 use std::collections::HashMap;
 
+use crate::limiting::Limit;
 use rsdag::{Crossing, SymbolId, Tape};
+use sane_circuit::SourceFn;
 use sane_core::Graph;
-use sane_dae::Limit;
-use sane_mna::SourceFn;
 
 pub mod hb;
 pub use delay::DelayHistory;
@@ -40,11 +40,13 @@ mod compile;
 // The DC operating-point solve and its continuation cascade.
 mod dc;
 mod delay;
-mod esdirk32;
 mod events;
+mod index2;
 mod newton;
+mod program;
+mod rosenbrock;
 mod stage;
-mod trap;
+mod stage_matrix;
 // The hot-tape backend ladder (interpreter / specialized / native).
 mod eval;
 pub mod parallel;
@@ -57,11 +59,12 @@ pub use sparse::{dump_system, DumpValue};
 #[cfg(test)]
 mod tests;
 mod transient;
-mod transient_adjoint;
+mod transient_sens;
 
 pub use eval::Evaluator;
 pub(crate) use eval::{PrologToken, StepEval};
 use schur::{LinCache, Partition};
+pub use sens::NoiseAt;
 use sens::{CompiledHessian, HistJac, ParamJac};
 
 use sane_core::constants::*;
@@ -75,13 +78,11 @@ use sane_core::constants::*;
 /// single trick, or enabling device limiting for hard FET-dense circuits).
 #[derive(Clone, Copy, Debug)]
 pub struct SolverTricks {
-    /// Curve-aware per-device junction / channel limiting (`pnjlim` / `fetlim`)
-    /// in the continuation correctors (the robust path). The fast-path Newton
-    /// always limits when the devices declare limits: the Newton step is
+    /// Curve-aware per-device junction / channel limiting (`pnjlim` /
+    /// `fetlim`) in every Newton where the devices declare limits: the step is
     /// shortened as a whole to the largest fraction that keeps every limited
     /// junction within its bound (see `limiting::apply`), which is what takes
     /// a BJT mirror from 719 iterations through the cascade to 7 plain ones.
-    /// Measured neutral in the correctors on the fixture corpus.
     pub device_limiting: bool,
     /// Backtracking line search on the residual norm.
     pub line_search: bool,
@@ -139,7 +140,7 @@ impl Default for SolverTricks {
             // model (`$limit`), applied at the device's own scale on every
             // evaluation; SANE's `$limit` support is the place to take this
             // further, not the trick toggle.
-            device_limiting: false,
+            device_limiting: true,
             line_search: true,
             composite_step: true,
             gmin_continuation: true,
@@ -236,45 +237,9 @@ struct Symbolic {
     pattern: sparse::SparsePattern,
 }
 
-/// Transient integration method. The adaptive outer loop and the method's single
-/// step (`esdirk32_step`) are split so further integrators can be added behind the
-/// same interface.
-#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
-pub enum TransientMethod {
-    /// ESDIRK32: 3rd-order, 4-stage, singly-diagonally-implicit (stages solved in
-    /// sequence). Its modified-Newton stage solve -- per-stage device limiting and
-    /// warm-starting -- is robust on hard, strongly-nonlinear circuits, where a
-    /// fully-implicit coupled solve (RADAU IIA, evaluated and removed) is not.
-    #[default]
-    Esdirk32,
-    /// Trapezoidal rule (SPICE `trap`): 2nd-order, A-stable, one implicit solve
-    /// per step with a polynomial predictor as Newton start and a filtered
-    /// predictor-corrector error estimate. The iteration-economy choice for
-    /// switching / digital-style transients.
-    Trap,
-}
-
-impl TransientMethod {
-    /// Parse a method name (case-insensitive); `None` if unknown. The empty string
-    /// selects the default ([`Self::Esdirk32`]).
-    pub fn from_name(s: &str) -> Option<Self> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "" | "esdirk32" | "esdirk" => Some(Self::Esdirk32),
-            "trap" | "trapezoidal" => Some(Self::Trap),
-            _ => None,
-        }
-    }
-    pub(crate) fn label(&self) -> &'static str {
-        match self {
-            Self::Esdirk32 => "ESDIRK32",
-            Self::Trap => "TRAP",
-        }
-    }
-}
-
-/// Integration counters (logged at debug level), shared by the transient
-/// integrators: steps taken / rejected, total inner Newton iterations, and
-/// Jacobian (re)factorizations (= full `G` tape evals).
+/// Integration counters (logged at debug level): steps taken / rejected,
+/// the system's evaluations (a Rosenbrock stage's, a restart's Newton
+/// iteration's), and the stage matrix's factorizations.
 #[derive(Default)]
 pub(crate) struct Stats {
     pub steps: usize,
@@ -297,10 +262,21 @@ pub struct TransientEvent {
     pub direction: i8,
 }
 
+/// A transient run: the state at every requested time, and the switching
+/// events it crossed, in time order.
+#[derive(Clone, Debug, Default)]
+pub struct TransientRun {
+    pub rows: Vec<Vec<f64>>,
+    pub events: Vec<TransientEvent>,
+}
+
 /// A DAE compiled for repeated numeric evaluation/solve.
 pub struct CompiledDc {
     n: usize,
     nnz_x: usize,
+    /// Per unknown, whether it is index-2 (see [`index2`]): a rate of the
+    /// others, outside the transient's error control.
+    index2: Vec<bool>,
     jx_rows: Vec<usize>,
     jx_cols: Vec<usize>,
     /// Position of each unknown's diagonal within the jacobian-x value array
@@ -322,6 +298,13 @@ pub struct CompiledDc {
     tape_tran_step: StepEval,
     /// `C` alone (the state rates `x' = C⁻¹ f`).
     tape_c: StepEval,
+    /// The rows' explicit time rates `dI/dt ++ dQ/dt` at the rows `dt_rows`
+    /// (a charge's row offset by `n`), followed by `dI/dhist ++ dQ/dhist` at
+    /// the `(row, delay)` of `dt_hist`; `None` without a time-dependent
+    /// source or a delay.
+    tape_dt: Option<StepEval>,
+    dt_rows: Vec<usize>,
+    dt_hist: Vec<(usize, usize)>,
     /// Compiled `dI/dp` and `dQ/dp` (parameter Jacobians) for exact adjoint
     /// sensitivity, built lazily on first sensitivity / Hessian call (they are
     /// ~O(n^2)-ish to build at scale and only needed for sensitivity), via
@@ -336,12 +319,13 @@ pub struct CompiledDc {
     /// Lazily compiled `∂F/∂hist` (frequency-domain delay coupling), built by
     /// [`ensure_hist_jac`](Self::ensure_hist_jac).
     hjac: std::sync::OnceLock<HistJac>,
-    /// Transport delays: the delayed-source unknown per delay (whose history
-    /// the transient loop records and queries; the delay OUTPUT needs no
-    /// position -- its residual `d - hist = 0` pins it through the tape's
-    /// history input), plus the taus compiled over the parameter inputs
+    /// The noise sources compiled (see [`noise_at`](Self::noise_at)).
+    noise: std::sync::OnceLock<sens::NoiseProgram>,
+    /// Transport delays: what each delays (whose history the transient loop
+    /// records and queries; the delay's output reads it through the tapes'
+    /// history inputs), plus the taus compiled over the parameter inputs
     /// (evaluated once per solve).
-    delay_src: Vec<usize>,
+    delay_src: crate::delay::DelaySources,
     tape_tau: Option<Tape>,
     /// The switching surfaces as one tape over the step inputs (`None` when
     /// the DAE declares no events), their directions and names, and the
@@ -350,7 +334,6 @@ pub struct CompiledDc {
     tape_event: Option<Tape>,
     event_dirs: Vec<Crossing>,
     event_names: Vec<String>,
-    last_events: std::sync::Mutex<Vec<TransientEvent>>,
     /// Per-param flag: is this the DC value of an independent source (a `V`/`I`
     /// element value, no `.` in the name)? Used by source stepping to ramp only
     /// the excitation, leaving component values fixed.
@@ -374,6 +357,12 @@ pub struct CompiledDc {
     /// lazily on first `hessian()` call (it is the heaviest, ~O(n^2) extract stage
     /// and is only needed for second-order sensitivity), via [`ensure_hessian`].
     chess: std::sync::OnceLock<CompiledHessian>,
+    /// The transient sensitivities' programs: the directional derivative's
+    /// state Jacobian, and per parameter column asked for its columns; built
+    /// by [`ensure_transient_sensitivity`](Self::ensure_transient_sensitivity).
+    frozen: std::sync::OnceLock<sens::FrozenState>,
+    param_exprs: std::sync::Mutex<HashMap<usize, std::sync::Arc<sens::ParamExprs>>>,
+    sens_programs: std::sync::Mutex<HashMap<Vec<usize>, std::sync::Arc<sens::SensProgram>>>,
     /// Compiled `dI/d(input)` per input symbol (an independent source's value,
     /// the AC and pole-zero excitation), built on the first query for that
     /// input by [`input_jacobian`](Self::input_jacobian).
@@ -381,6 +370,9 @@ pub struct CompiledDc {
     /// Base input symbols (x, params, t, delay histories), kept so the lazy
     /// parameter-Jacobian and Hessian tapes can be compiled on demand.
     base_inputs: Vec<SymbolId>,
+    /// Which of them are parameter-pure (solve-constant): the prolog split
+    /// of the lazily built programs.
+    base_pure: Vec<bool>,
     /// Companion conductance network `(row, col, value)` from the device models
     /// (their linear `lambda = 0` form) -- the per-device homotopy continuation.
     companion: Vec<(usize, usize, f64)>,
@@ -641,42 +633,70 @@ impl CompiledDc {
         Self::build_symbolic(self.n, &rows, &cols)
     }
 
-    /// Factorize the stage matrix `G + α·C + gmin·I` into the transient's
-    /// stage factorization cache `fac` (a [`sparse::Refactorable`] over the
-    /// combined [`stage_symbolic`](Self::stage_symbolic) pattern). The
-    /// modified-Newton integrator refreshes once per step and on convergence
-    /// stalls; through the cache every refresh after the very first is a KLU
-    /// numeric-only refactor (frozen pivot sequence, no DFS / pivot search)
-    /// rather than a full pivoting factorization. Row equilibration (the
-    /// `row_equilibration` trick) is the backend's built-in scaling, folded
-    /// into factorization and solves. `false` on a singular stage matrix.
-    pub(crate) fn factorize_stage(
-        &self,
-        fac: &mut sparse::Refactorable<'_>,
-        dfdx_vals: &[f64],
-        c_vals: &[f64],
-        alpha: f64,
-        gmin: f64,
-        valbuf: &mut Vec<f64>,
-    ) -> bool {
-        let n = self.n;
-        valbuf.clear();
-        valbuf.extend_from_slice(dfdx_vals);
-        valbuf.extend(c_vals.iter().map(|&c| c * alpha));
-        valbuf.extend(std::iter::repeat_n(gmin, n));
-        fac.factor(valbuf, self.tricks.row_equilibration)
-    }
-
     /// Are transport delays present? Analyses without delay support guard on
     /// this and report a clear error instead of silently mis-solving.
     pub fn has_delays(&self) -> bool {
-        !self.delay_src.is_empty()
+        self.delay_src.len() > 0
     }
 
-    /// Unknown indices of the delayed source signals, aligned with
+    /// The number of transport delays.
+    pub fn delay_count(&self) -> usize {
+        self.delay_src.len()
+    }
+
+    /// The delayed signals at `(x, t)`, into `out`, aligned with
     /// [`delay_taus`](Self::delay_taus).
-    pub fn delay_sources(&self) -> &[usize] {
-        &self.delay_src
+    pub fn delay_values(&self, x: &[f64], p: &[f64], t: f64, out: &mut Vec<f64>) {
+        out.clear();
+        match &self.delay_src {
+            crate::delay::DelaySources::Unknowns(ix) => {
+                out.extend(ix.iter().map(|&i| x.get(i).copied().unwrap_or(0.0)))
+            }
+            crate::delay::DelaySources::Exprs { n, tape, .. } => {
+                let (mut inputs, mut work) = (Vec::new(), Vec::new());
+                self.fill_inputs(x, p, t, &mut inputs);
+                tape.eval(&inputs, &mut work, out);
+                out.truncate(*n);
+            }
+        }
+    }
+
+    /// The rates of the delayed signals as the state moves at `xdot`, into
+    /// `out`.
+    pub fn delay_rates(&self, x: &[f64], xdot: &[f64], p: &[f64], t: f64, out: &mut Vec<f64>) {
+        out.clear();
+        match &self.delay_src {
+            crate::delay::DelaySources::Unknowns(ix) => {
+                out.extend(ix.iter().map(|&i| xdot.get(i).copied().unwrap_or(0.0)))
+            }
+            crate::delay::DelaySources::Exprs { n, tape, jac } => {
+                let (mut inputs, mut work, mut vals) = (Vec::new(), Vec::new(), Vec::new());
+                self.fill_inputs(x, p, t, &mut inputs);
+                tape.eval(&inputs, &mut work, &mut vals);
+                out.extend_from_slice(&vals[*n..2 * *n]);
+                for (&(k, j), &g) in jac.iter().zip(&vals[2 * *n..]) {
+                    out[k] += g * xdot.get(j).copied().unwrap_or(0.0);
+                }
+            }
+        }
+    }
+
+    /// The gradient of the delayed signals w.r.t. the unknowns at `(x, t)`:
+    /// `(delay, unknown, value)` triplets.
+    pub fn delay_source_jac(&self, x: &[f64], p: &[f64], t: f64) -> Vec<(usize, usize, f64)> {
+        match &self.delay_src {
+            crate::delay::DelaySources::Unknowns(ix) => {
+                ix.iter().enumerate().map(|(k, &i)| (k, i, 1.0)).collect()
+            }
+            crate::delay::DelaySources::Exprs { n, tape, jac } => {
+                let (mut inputs, mut work, mut vals) = (Vec::new(), Vec::new(), Vec::new());
+                self.fill_inputs(x, p, t, &mut inputs);
+                tape.eval(&inputs, &mut work, &mut vals);
+                (jac.iter().zip(&vals[2 * *n..]))
+                    .map(|(&(k, j), &g)| (k, j, g))
+                    .collect()
+            }
+        }
     }
 
     /// The delay times, evaluated over the parameter vector.
@@ -726,11 +746,6 @@ impl CompiledDc {
         &self.event_names
     }
 
-    /// The switching events of the most recent transient solve, in time order.
-    pub fn last_transient_events(&self) -> Vec<TransientEvent> {
-        self.last_events.lock().unwrap().clone()
-    }
-
     pub fn transient_breakpoints(&self, p: &[f64], t0: f64, t1: f64) -> Vec<f64> {
         let mut bps = Vec::new();
         for (name, src) in &self.sources {
@@ -763,48 +778,58 @@ impl CompiledDc {
         })
     }
 
-    /// Transient solve of the DAE `I(x, t) + d/dt Q(x) = 0` over `t_eval` with the
-    /// selected implicit-RK method (adaptive ESDIRK32; see [`TransientMethod`]).
-    /// The methods integrate the charges `dQ/dt = -I(x, t)` (every row of the
-    /// DAE reads `I + d/dt Q`), so a nonlinear capacitance is exact at every
-    /// stage; every stage solve reuses the engine's device-limiting Newton
-    /// machinery.
+    /// Transient solve of the DAE `I(x, t) + d/dt Q(x) = 0` over `t_eval` by
+    /// adaptive Rodas4 (see [`transient`]). It integrates the charges
+    /// `dQ/dt = -I(x, t)` (every row of the DAE reads `I + d/dt Q`), so a
+    /// nonlinear capacitance is exact at every stage.
     ///
     /// `x0` is the initial state; if it does not match the system dimension a
     /// consistent DC operating point is computed and used instead. Returns the
-    /// state at each time in `t_eval` (one inner vector per time point), or an
-    /// error string if integration fails.
+    /// state at each time in `t_eval` (one inner vector per time point) and
+    /// the switching events crossed, or an error string if integration fails.
     pub fn solve_transient(
         &self,
-        method: TransientMethod,
         p: &[f64],
         x0: &[f64],
         t_eval: &[f64],
         rtol: f64,
         atol: f64,
         dt_max: Option<f64>,
-    ) -> Result<Vec<Vec<f64>>, String> {
+    ) -> Result<TransientRun, String> {
         crate::parallel::solve(|| {
-            self.solve_transient_here(method, p, x0, t_eval, rtol, atol, dt_max)
+            self.integrate(p, x0, t_eval, rtol, atol, dt_max, None)
+                .map(|(run, _)| run)
         })
     }
 
-    /// [`solve_transient`](Self::solve_transient) on this thread.
-    fn solve_transient_here(
+    /// [`solve_transient`](Self::solve_transient) with the forward
+    /// sensitivities of the unknowns `outputs` by the parameter columns
+    /// `cols` (see [`transient_sens`]): per time, `outputs × cols` values,
+    /// `d x[outputs[o]] / d p[cols[j]]` at `o * cols.len() + j`. From an
+    /// operating point (`x0` empty, or the point itself with `dc_start`) the
+    /// sensitivities start at the point's, from a given state at zero.
+    /// Requires [`ensure_transient_sensitivity`](Self::ensure_transient_sensitivity).
+    #[allow(clippy::too_many_arguments)]
+    pub fn solve_transient_sensitivity(
         &self,
-        method: TransientMethod,
         p: &[f64],
         x0: &[f64],
+        dc_start: bool,
         t_eval: &[f64],
         rtol: f64,
         atol: f64,
         dt_max: Option<f64>,
-    ) -> Result<Vec<Vec<f64>>, String> {
-        if t_eval.is_empty() {
-            return Ok(Vec::new());
-        }
-        // The implicit-RK stage solve owns the device limiting / gmin / damping
-        // the generic ODE backends lacked; see `TransientMethod`.
-        self.solve_transient_irk(method, p, x0, t_eval, rtol, atol, dt_max)
+        cols: &[usize],
+        outputs: &[usize],
+    ) -> Result<(TransientRun, Vec<Vec<f64>>), String> {
+        let req = transient::SensRequest {
+            cols,
+            outputs,
+            dc_start,
+        };
+        crate::parallel::solve(|| {
+            self.integrate(p, x0, t_eval, rtol, atol, dt_max, Some(&req))
+                .map(|(run, sens)| (run, sens.unwrap_or_default()))
+        })
     }
 }

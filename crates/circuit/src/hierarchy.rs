@@ -1,13 +1,12 @@
 //! Subcircuit instances: a body placed once in its own names, and where it
 //! sits in its parent.
 //!
-//! A subcircuit body is assembled like the top level, over its own nodes and
-//! names, and closed into one function of the graph (see `assemble`): its
-//! node voltages, the unknowns it mints and its parameters in, the current it
-//! draws from each of its nodes and the residuals of its unknowns out. Every
-//! instance is a call. A body is shared by the instances that place it and
-//! assembled once; bodies that lower to the same expressions are one
-//! function, whatever instance placed them.
+//! A subcircuit body is a [`Circuit`] over its own nodes and names, assembled
+//! like the top level and closed into one function of the graph (see the
+//! `dae` crate): its node voltages, the unknowns it mints and its parameters
+//! in, the current it draws from each of its nodes and the residuals of its
+//! unknowns out. Every instance is a call. A body is shared by the instances
+//! that place it and assembled once.
 //!
 //! The body's names carry its namespace (`__inv__.R1`, `i___inv__.V1`); an
 //! instance renames a body name into its parent's frame by replacing that
@@ -16,28 +15,17 @@
 
 use std::sync::Arc;
 
-use sane_device::DeviceInstance;
-use sane_mna::{Circuit, Element};
+use crate::{Circuit, Element};
 
 /// A subcircuit instance: its body and how it connects to its parent.
+#[derive(Clone)]
 pub struct Instance {
     /// The instance's name in its parent's frame (`X1`, `__inv__.Xa`).
     pub name: String,
     /// The parent's node of each body node: body node `k` is parent node
-    /// `nodes[k - 1]` (`0` is ground). Ports and internal nodes alike.
+    /// `nodes[k - 1]` (`0` is ground). Pins and internal nodes alike.
     pub nodes: Vec<usize>,
-    pub body: Arc<Body>,
-}
-
-/// A placed subcircuit body, in its own names.
-pub struct Body {
-    /// The prefix every instance-owned name in the body carries (`__inv__.`).
-    pub ns: String,
-    /// The body's name of each body node (`mid`, a port's name), for views.
-    pub node_names: Vec<String>,
-    pub circuit: Circuit,
-    pub devices: Vec<DeviceInstance>,
-    pub instances: Vec<Instance>,
+    pub body: Arc<Circuit>,
 }
 
 impl Instance {
@@ -59,10 +47,10 @@ impl Instance {
 
 /// A name of a body in namespace `ns` in the frame of its instance `inst`
 /// (see [`Instance::rename`]).
-pub(crate) fn rename(name: &str, inst: &str, ns: &str) -> String {
+pub fn rename(name: &str, inst: &str, ns: &str) -> String {
     match name.find(ns) {
-        Some(i) => format!("{}{inst}.{}", &name[..i], &name[i + ns.len()..]),
-        None => name.to_string(),
+        Some(i) if !ns.is_empty() => format!("{}{inst}.{}", &name[..i], &name[i + ns.len()..]),
+        _ => name.to_string(),
     }
 }
 
@@ -70,16 +58,13 @@ pub(crate) fn rename(name: &str, inst: &str, ns: &str) -> String {
 /// instance's elements renamed and rewired onto the top-level nodes. For the
 /// topological checks that look at the whole circuit at once (index-2 loops
 /// and cutsets); the DAE never flattens.
-pub fn topology(
-    circuit: &Circuit,
-    devices: &[DeviceInstance],
-    instances: &[Instance],
-) -> (Vec<Element>, Vec<Vec<usize>>) {
-    let mut elements = circuit.elements().to_vec();
-    let mut terminals: Vec<Vec<usize>> = devices.iter().map(|d| d.terminals.clone()).collect();
-    for inst in instances {
-        let b = &inst.body;
-        let (es, ts) = topology(&b.circuit, &b.devices, &b.instances);
+pub fn topology(circuit: &Circuit) -> (Vec<Element>, Vec<Vec<usize>>) {
+    let mut elements = circuit.elements.elements().to_vec();
+    let mut terminals: Vec<Vec<usize>> = (circuit.devices.iter())
+        .map(|d| d.terminals.clone())
+        .collect();
+    for inst in &circuit.instances {
+        let (es, ts) = topology(&inst.body);
         elements.extend(es.into_iter().map(|mut e| {
             e.name = inst.rename(&e.name);
             e.a = inst.node(e.a);

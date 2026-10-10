@@ -10,9 +10,8 @@ description = "SPICE-like netlist parser producing an SANE circuit"
 rsdag.workspace = true
 rustc-hash.workspace = true
 sane-core.workspace = true
-sane-mna.workspace = true
+sane-circuit.workspace = true
 sane-device = { path = "../device" }
-sane-dae = { path = "../dae" }
 sane-veriloga = { path = "../veriloga" }
 
 [dev-dependencies]

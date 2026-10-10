@@ -3,7 +3,7 @@ machine-readable and unconditionally catchable, independent of the native log
 level (which is disabled by default).
 
 - A gmin-regularized operating point returns converged=True but is physically
-  suspect: it must carry a ``regularized_at_gmin`` flag AND raise a
+  suspect: it must carry its ``regularization`` AND raise a
   ``SaneConvergenceWarning``. Two things earn the flag -- the solve never
   reached the gmin floor, or it reached the floor and the floor is what sets an
   unknown's value -- and the second one converges cleanly, so only an explicit
@@ -12,7 +12,6 @@ level (which is disabled by default).
   ``SaneConvergenceWarning`` at parse/extract instead of only logging on the
   default-disabled channel.
 
-Run after ``maturin develop -m crates/py/Cargo.toml``:
     python -m pytest crates/py/tests/test_convergence_warnings.py
 """
 
@@ -49,20 +48,20 @@ N1 1 0 vres R=-5
 
 
 def test_gmin_regularized_warns_and_flags():
-    dae = sane.Circuit.parse(REGULARIZED).extract()
+    model = sane.Model.from_netlist(REGULARIZED)
     with pytest.warns(SaneConvergenceWarning, match="gmin-regularized"):
-        op = dae.operating_point()
-    assert op.regularized_at_gmin is not None, "the flag must record the gmin in question"
-    assert op.regularized_at_gmin > 0
+        op = model.at().operating_point()
+    assert op.regularization is not None, "the flag must record the gmin in question"
+    assert op.regularization.gmin > 0
 
 
 def test_gmin_dominance_names_the_node_and_its_shift():
     """The warning has to be actionable: which node, and how wrong it is."""
-    dae = sane.Circuit.parse(REGULARIZED).extract()
-    with pytest.warns(SaneConvergenceWarning, match=r"shift node '1' by 99\.9%"):
-        dae.operating_point()
-    idx, shift = dae._d.gmin_dominance()
-    assert idx == 0
+    model = sane.Model.from_netlist(REGULARIZED)
+    with pytest.warns(SaneConvergenceWarning, match=r"shift '1' by 99\.9%"):
+        op = model.at().operating_point()
+    node, shift = op.regularization.dominant
+    assert node == "1"
     # g/(g + 1/R): the exact first-order error gmin imprints on this node
     assert shift == pytest.approx(0.999, abs=1e-3)
 
@@ -71,12 +70,11 @@ def test_gmin_dominance_names_the_node_and_its_shift():
 def test_currentless_nodes_are_not_flagged(deck):
     """The obvious false positive: a node the shunt "dominates" only because
     nothing flows there at all."""
-    dae = sane.Circuit.parse(deck).extract()
+    model = sane.Model.from_netlist(deck)
     with warnings.catch_warnings():
         warnings.simplefilter("error", SaneConvergenceWarning)
-        op = dae.operating_point()
-    assert op.regularized_at_gmin is None
-    assert dae._d.gmin_dominance() is None
+        op = model.at().operating_point()
+    assert op.regularization is None
 
 
 @pytest.mark.parametrize(
@@ -88,29 +86,29 @@ def test_the_threshold_tracks_the_error(r, flagged):
     """1 uA into R, shunted by gmin = 1e-12: the reported voltage is off by the
     ratio of the two conductances. 1e9 errs by 0.1%, 1e11 by 9%, 1e13 by 10x,
     1e15 by 1000x -- the flag has to turn on where the error does."""
-    dae = sane.Circuit.parse(f"I1 0 1 1u\nR1 1 0 {r:g}\n.end").extract()
+    model = sane.Model.from_netlist(f"I1 0 1 1u\nR1 1 0 {r:g}\n.end")
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", SaneConvergenceWarning)
-        op = dae.operating_point()
-    assert (op.regularized_at_gmin is not None) is flagged
+        op = model.at().operating_point()
+    assert (op.regularization is not None) is flagged
 
 
 def test_healthy_op_no_warning_and_flag_none():
-    dae = sane.Circuit.parse(HEALTHY).extract()
+    model = sane.Model.from_netlist(HEALTHY)
     with warnings.catch_warnings():
         warnings.simplefilter("error", SaneConvergenceWarning)
-        op = dae.operating_point()
-    assert op.regularized_at_gmin is None
+        op = model.at().operating_point()
+    assert op.regularization is None
 
 
 def test_gmin_warning_is_unconditional_of_log_level():
     # The warning must fire even with the native logger disabled (the default).
     sane.set_log_level("off")
-    dae = sane.Circuit.parse(REGULARIZED).extract()
+    model = sane.Model.from_netlist(REGULARIZED)
     with pytest.warns(SaneConvergenceWarning):
-        dae.operating_point()
+        model.at().operating_point()
 
 
 def test_va_out_of_range_param_warns():
     with pytest.warns(SaneConvergenceWarning, match="range"):
-        sane.Circuit.parse(VA_OUT_OF_RANGE).extract()
+        sane.Model.from_netlist(VA_OUT_OF_RANGE)

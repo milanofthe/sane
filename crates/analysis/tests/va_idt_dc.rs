@@ -39,7 +39,10 @@ fn idt_ic_registers_a_dc_seed() {
 fn idt_ic_selects_the_dc_branch() {
     for (ic, root) in [(0.9, 1.0), (-0.9, -1.0)] {
         let model = Model::from_netlist(&bistable_deck(ic)).expect("model");
-        let op = model.operating_point(&[]).expect("dc");
+        let op = model
+            .at(&[])
+            .and_then(|pt| pt.operating_point())
+            .expect("dc");
         let v = op.get("out").expect("out");
         assert!((v - root).abs() < 1e-9, "ic={ic}: expected {root}, got {v}");
     }
@@ -96,11 +99,14 @@ R1 x 0 1k
     let model = Model::from_netlist(deck).expect("model");
     let warns = sane_core::log::drain_captured();
     assert!(
-        warns.iter().any(|w| w.contains("not a constant")),
+        warns.iter().any(|(_, w)| w.contains("not a constant")),
         "expected a non-constant-ic warning, got {warns:?}"
     );
     assert!(model.dae().dc_seeds.is_empty());
-    let op = model.operating_point(&[]).expect("dc");
+    let op = model
+        .at(&[])
+        .and_then(|pt| pt.operating_point())
+        .expect("dc");
     assert!(
         (op.get("x").unwrap() - 1.0).abs() < 1e-9,
         "steady state u = 0"

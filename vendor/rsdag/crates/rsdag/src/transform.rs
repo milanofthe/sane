@@ -65,17 +65,29 @@ pub(crate) fn rewrite<K: Field>(
             };
             if !expanded {
                 stack.push((e, true));
-                if call_list.is_some_and(|l| lists.contains_key(&l)) {
-                    continue;
+                // a list rewritten before: only the binding, which another
+                // call over the list may not share
+                match (node, call_list) {
+                    (Node::Call(o, _), Some(l)) if lists.contains_key(&l) => {
+                        let c = g.context_of(o);
+                        if c != NO_CONTEXT && !contexts.contains_key(&c) {
+                            let bound = g.args(g.context_list(c));
+                            stack.extend(
+                                (bound.iter().rev())
+                                    .filter(|&&c| memo.get(c).is_none())
+                                    .map(|&c| (c, false)),
+                            );
+                        }
+                    }
+                    _ => {
+                        let pending = g.operands(e);
+                        stack.extend(
+                            (pending.iter().rev())
+                                .filter(|&&c| memo.get(c).is_none())
+                                .map(|&c| (c, false)),
+                        );
+                    }
                 }
-                let pending = g.operands(e);
-                stack.extend(
-                    pending
-                        .iter()
-                        .rev()
-                        .filter(|&&c| memo.get(c).is_none())
-                        .map(|&c| (c, false)),
-                );
                 continue;
             }
             let r = match call_list {

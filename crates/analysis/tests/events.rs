@@ -3,19 +3,26 @@
 //! crossing time is resolved far below the step size and the waveform is a
 //! clean step; the events are reported by surface name.
 
-use sane_analysis::Model;
-use sane_solve::TransientMethod;
+use sane_analysis::{Event, Model, TransientOptions};
 
-fn tran(model: &Model, tstop: f64, npts: usize) -> (Vec<f64>, Vec<Vec<f64>>) {
+fn tran(model: &Model, tstop: f64, npts: usize) -> (Vec<f64>, Vec<Vec<f64>>, Vec<Event>) {
     let t: Vec<f64> = (0..npts)
         .map(|k| tstop * k as f64 / (npts - 1) as f64)
         .collect();
-    let rows = model
-        .transient(TransientMethod::Esdirk32, &[], &t, 1e-6, 1e-9)
-        .expect("transient")
-        .rows()
-        .to_vec();
-    (t, rows)
+    let opts = TransientOptions {
+        rtol: 1e-6,
+        atol: 1e-9,
+        ..Default::default()
+    };
+    let traj = model
+        .at(&[])
+        .and_then(|pt| pt.transient(&t, &opts))
+        .expect("transient");
+    (
+        t,
+        traj.x.outer_iter().map(|r| r.to_vec()).collect::<Vec<_>>(),
+        traj.events,
+    )
 }
 
 /// A hard voltage-controlled switch (Vh = 0) driven by a ramp closes at the
@@ -35,10 +42,13 @@ R1 out 0 1k
 ";
     let model = Model::from_netlist(deck).expect("model");
     let out = model.resolve("out").expect("out");
-    let (t, rows) = tran(&model, 1e-3, 201);
-    let events = model.transient_events();
+    let (t, rows, events) = tran(&model, 1e-3, 201);
     assert_eq!(events.len(), 1, "one crossing: {events:?}");
-    let (name, te, dir) = &events[0];
+    let Event {
+        name,
+        t: te,
+        direction: dir,
+    } = &events[0];
     assert_eq!(name, "S1#0");
     assert_eq!(*dir, 1, "the surface V(ctrl) - Vt rises through zero");
     assert!(
@@ -78,15 +88,14 @@ Rl out 0 1k
 .end
 ";
     let model = Model::from_netlist(deck).expect("model");
-    let _ = tran(&model, 1e-3, 51);
-    let mut events = model.transient_events();
-    events.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+    let (_, _, mut events) = tran(&model, 1e-3, 51);
+    events.sort_by(|a, b| a.t.partial_cmp(&b.t).unwrap());
     assert_eq!(events.len(), 2, "both window edges: {events:?}");
     // I(Vsense) = V1/1k ramps 0 -> 4 mA; the edges It -/+ Ih = 1 mA, 3 mA
     // are crossed at 0.25 ms and 0.75 ms.
-    assert!((events[0].1 - 0.25e-3).abs() < 1e-8, "{events:?}");
-    assert!((events[1].1 - 0.75e-3).abs() < 1e-8, "{events:?}");
-    assert!(events.iter().all(|e| e.0.starts_with("W1#")));
+    assert!((events[0].t - 0.25e-3).abs() < 1e-8, "{events:?}");
+    assert!((events[1].t - 0.75e-3).abs() < 1e-8, "{events:?}");
+    assert!(events.iter().all(|e| e.name.starts_with("W1#")));
 }
 
 /// A hard switch toggled by a pulse train: one event per edge, each within
@@ -103,18 +112,18 @@ R1 sw 0 100
 .end
 ";
     let model = Model::from_netlist(deck).expect("model");
-    let _ = tran(&model, 50e-6, 101);
-    let events = model.transient_events();
+    let (_, _, events) = tran(&model, 50e-6, 101);
     // edges at 1u + k*10u (rising) and 1u + 4u + 10n + k*10u (falling), k < 5
     assert_eq!(events.len(), 10, "{events:?}");
-    for (k, (_, te, dir)) in events.iter().enumerate() {
+    for (k, e) in events.iter().enumerate() {
+        let (te, dir) = (e.t, e.direction);
         let period = (k / 2) as f64 * 10e-6;
         let (edge, want_dir) = if k % 2 == 0 {
             (1e-6 + 5e-9 + period, 1)
         } else {
             (1e-6 + 4e-6 + 10e-9 + 5e-9 + period, -1)
         };
-        assert_eq!(*dir, want_dir, "event {k}: {events:?}");
+        assert_eq!(dir, want_dir, "event {k}: {events:?}");
         assert!(
             (te - edge).abs() < 6e-9,
             "event {k} at {te:.4e}, edge midpoint {edge:.4e}"
@@ -141,10 +150,13 @@ R1 out 0 1k
 ";
     let model = Model::from_netlist(deck).expect("model");
     let out = model.resolve("out").expect("out");
-    let (t, rows) = tran(&model, 1e-3, 51);
-    let events = model.transient_events();
+    let (t, rows, events) = tran(&model, 1e-3, 51);
     assert_eq!(events.len(), 1, "the surface is left at t = 0: {events:?}");
-    let (name, te, dir) = &events[0];
+    let Event {
+        name,
+        t: te,
+        direction: dir,
+    } = &events[0];
     assert_eq!(name, "S1#0");
     assert_eq!(*dir, 1, "the control rises away from the threshold");
     // The crossing is at t = 0, where a landing would be a zero step, so the
@@ -179,17 +191,16 @@ R1 out 0 1k
 ";
     let model = Model::from_netlist(deck).expect("model");
     // The master runs first, so its system function is in the graph.
-    let _ = tran(&model, 1e-3, 21);
-    assert_eq!(model.transient_events().len(), 1);
+    let (_, _, events) = tran(&model, 1e-3, 21);
+    assert_eq!(events.len(), 1);
     let params: Vec<&str> = model.params().iter().map(String::as_str).collect();
     assert!(!params.is_empty());
     let folded = model.fold(&params).expect("fold");
-    let _ = tran(&folded, 1e-3, 21);
-    let events = folded.transient_events();
+    let (_, _, events) = tran(&folded, 1e-3, 21);
     assert_eq!(events.len(), 1, "one crossing: {events:?}");
     assert!(
-        (events[0].1 - 0.5e-3).abs() < 1e-9,
+        (events[0].t - 0.5e-3).abs() < 1e-9,
         "event at {:.9e}",
-        events[0].1
+        events[0].t
     );
 }

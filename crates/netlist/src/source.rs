@@ -4,7 +4,7 @@
 
 use rustc_hash::FxHashMap as HashMap;
 
-use sane_mna::SourceFn;
+use sane_circuit::SourceFn;
 
 use crate::expr::resolve_value;
 

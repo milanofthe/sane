@@ -7,7 +7,11 @@
 //! `State`, `Time`, `Memory` and `Param` parameters and `Output`,
 //! `StateDeriv` and `MemoryWrite` outputs, an event a `Guard` output (with
 //! the [`Crossing`] direction that counts) plus an effect function with
-//! `StateWrite` outputs. Consumers keep their own
+//! `StateWrite` outputs. A transport delay is a `History` parameter beside
+//! a `DelaySource` and a `DelayTime` output, a noise generator a `Noise`
+//! parameter (zero in every evaluation, the system's response to it its
+//! transfer) beside its `NoiseLevel` outputs, and a quantity read off the
+//! system without entering it an `Observer` output. Consumers keep their own
 //! integrators and schedulers; the backend guarantees that a function with
 //! roles can be evaluated, differentiated with respect to any role subset,
 //! specialized and lowered.
@@ -33,8 +37,14 @@ pub enum ParamRole {
     /// A discrete memory slot element.
     Memory { slot: u32, offset: u32 },
     /// A past value a consumer supplies, delay line `id`'s output (a
-    /// transport delay's interpolated history).
+    /// transport delay's interpolated history): its
+    /// [`DelaySource`](OutputRole::DelaySource) output
+    /// [`DelayTime`](OutputRole::DelayTime) earlier.
     History { id: u32 },
+    /// Noise generator `id`: an input that is zero in every evaluation; the
+    /// system's small-signal response to it, weighted by its
+    /// [`NoiseLevel`](OutputRole::NoiseLevel) outputs, is its noise.
+    Noise { id: u32 },
 }
 
 impl ParamRole {
@@ -49,14 +59,15 @@ impl ParamRole {
             ParamRole::Time => (4, 0, 0),
             ParamRole::Memory { slot, offset } => (5, slot, offset),
             ParamRole::History { id } => (6, id, 0),
-            ParamRole::Free => (7, 0, 0),
+            ParamRole::Noise { id } => (7, id, 0),
+            ParamRole::Free => (8, 0, 0),
         }
     }
 }
 
 /// A function's parameters in the order a program over it takes its inputs:
 /// grouped by role (states, their derivatives, inputs, parameters, time,
-/// memory, histories, the rest), each group by its index (a state's id, an
+/// memory, histories, noise generators, the rest), each group by its index (a state's id, an
 /// input's port and element) and otherwise in declaration order. One
 /// ordering, so the function's roles and the programs compiled over it
 /// state the same signature, and a consumer fills a group as one slice.
@@ -170,6 +181,20 @@ pub enum OutputRole {
     /// consumer's integrator lands a step on the crossing and runs the
     /// effect function (the [`StateWrite`](Self::StateWrite) outputs).
     Guard { id: u32, dir: Crossing },
+    /// The signal delay line `id` delays: its
+    /// [`History`](ParamRole::History) input reads this output
+    /// [`DelayTime`](Self::DelayTime) earlier.
+    DelaySource { id: u32 },
+    /// The delay of delay line `id`.
+    DelayTime { id: u32 },
+    /// The level of noise generator `id` (see [`ParamRole::Noise`]):
+    /// `elem` 0 the power spectral density at 1 Hz, 1 the exponent of its
+    /// frequency dependence (`level / f^exponent`), then, for a tabulated
+    /// one, `(frequency, density)` pairs from `elem` 2 on.
+    NoiseLevel { id: u32, elem: u32 },
+    /// A quantity read off the system without entering it (an operating
+    /// point variable).
+    Observer { id: u32 },
     /// A derivative output `d outputs[of] / d params[wrt]` (memoised by
     /// [`Graph::derivative_output`](crate::graph::Graph::derivative_output)).
     Derivative { of: u32, wrt: u32 },

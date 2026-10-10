@@ -42,7 +42,7 @@ def reduced_netlist(netlist, transforms):
     netlist : str
         the original deck
     transforms : list[tuple[str, str]]
-        the ``(element, operation)`` list from :attr:`sane.model.Model.transforms`
+        the ``(element, operation)`` list :meth:`sane.Point.prune` returns
 
     Returns
     -------

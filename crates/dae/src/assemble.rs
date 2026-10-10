@@ -9,19 +9,18 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use rsdag::{CmpOp, ExprId, FuncId, ParamRole, ReduceOp, SymbolId};
+use sane_circuit::{BExpr, BKind, Circuit, Element, Instance, Kind, SourceFn};
 use sane_core::Graph;
 use sane_device::Lowerer;
-use sane_mna::{BExpr, BKind, Circuit, Element, Kind, SourceFn};
 
-use crate::hierarchy::{Body, Instance};
 use crate::observers::Observers;
-use crate::{sym2, Dae, DelaySpec, DeviceInstance, EventSpec, Limit, NoiseSource, UnknownKind};
+use crate::{sym2, Dae, DelaySpec, EventSpec, NoiseSource, UnknownKind};
 
 /// Symbol for an element's value parameter, mapped out of the reserved unknown
-/// namespace (see [`sane_mna::value_symbol_name`]) so e.g. a voltage source
+/// namespace (see [`sane_circuit::value_symbol_name`]) so e.g. a voltage source
 /// named `v91` cannot be hash-consed onto node 91's voltage unknown.
 fn value_sym(ctx: &mut Graph, name: &str) -> ExprId {
-    ctx.sym(&sane_mna::value_symbol_name(name))
+    ctx.sym(&sane_circuit::value_symbol_name(name))
 }
 
 /// The (possibly time-dependent) value of an independent source.
@@ -30,7 +29,7 @@ fn value_sym(ctx: &mut Graph, name: &str) -> ExprId {
 /// expression stays symbolic. Region splits use `Select`; periodicity uses
 /// `floor`.
 fn source_value(ctx: &mut Graph, e: &Element, t: ExprId) -> ExprId {
-    // The constitutive waveform lives with the source type (see `sane_mna::SourceFn`);
+    // The constitutive waveform lives with the source type (see `sane_circuit::SourceFn`);
     // a constant element (no source shape) is just its own value symbol.
     match e.source {
         None => value_sym(ctx, &e.name),
@@ -124,15 +123,6 @@ fn translate_bexpr(
     }
 }
 
-/// Assemble a flat circuit (no subcircuit instances).
-pub fn assemble_dae(
-    ctx: &mut Graph,
-    circuit: &Circuit,
-    devices: &[DeviceInstance],
-) -> Result<Dae, String> {
-    assemble(ctx, circuit, devices, &[])
-}
-
 /// An unknown a body mints beyond its nodes (a branch current, a device
 /// extra), with its row `current + d/dt charge = 0`.
 struct Unknown {
@@ -142,6 +132,14 @@ struct Unknown {
     current: ExprId,
     /// Zero for an algebraic row.
     charge: ExprId,
+}
+
+/// A row of a part a noise generator enters: a node's KCL (`k - 1` for
+/// node `k`), or an extra's (a device's internal node or branch).
+#[derive(Clone, Copy)]
+enum RowRef {
+    Node(usize),
+    Extra(usize),
 }
 
 /// A body assembled over its own nodes: the current terms into each node and
@@ -155,8 +153,14 @@ struct Part {
     node_charges: Vec<Vec<ExprId>>,
     branches: Vec<Unknown>,
     extras: Vec<Unknown>,
-    /// `src` / `out` index `extras`.
-    delays: Vec<DelaySpec>,
+    /// The noise generators entering the rows: the row, the generator and
+    /// its coefficient there. The rows above are at rest; the top level adds
+    /// `coefficient * generator` to its own, a subcircuit body hands them to
+    /// its instances (see `Lowered::noise`), so no call carries a generator.
+    noise_terms: Vec<(RowRef, SymbolId, ExprId)>,
+    /// Transport delays: the extra (body-relative) whose value is delayed,
+    /// the history symbol, the delay.
+    delays: Vec<(usize, SymbolId, ExprId)>,
     events: Vec<EventSpec>,
     /// The noise sources and op-vars: its own, and its instances'.
     observers: Observers,
@@ -185,9 +189,29 @@ struct Part {
 struct Bodies {
     funcs: HashMap<(Vec<ExprId>, Vec<SymbolId>), FuncId>,
     /// The subcircuit bodies assembled so far, by the body.
-    lowered: HashMap<*const Body, Rc<Lowered>>,
+    lowered: HashMap<*const Circuit, Rc<Lowered>>,
+    /// Per body, at how many places of the hierarchy it is instantiated
+    /// (each body counted once, however often its parent is).
+    sites: HashMap<*const Circuit, usize>,
     /// Time spent in device `lower_behavioral`, for the stage log.
     lower_t: std::time::Duration,
+}
+
+/// Per body under `c`, at how many places it is instantiated: each body
+/// visited once, so an instance in a body counts once however often the
+/// body is instantiated itself.
+fn count_sites(
+    c: &Circuit,
+    seen: &mut HashSet<*const Circuit>,
+    sites: &mut HashMap<*const Circuit, usize>,
+) {
+    for inst in &c.instances {
+        let body = Arc::as_ptr(&inst.body);
+        *sites.entry(body).or_default() += 1;
+        if seen.insert(body) {
+            count_sites(&inst.body, seen, sites);
+        }
+    }
 }
 
 fn sym_of(ctx: &Graph, e: ExprId) -> Option<SymbolId> {
@@ -197,26 +221,12 @@ fn sym_of(ctx: &Graph, e: ExprId) -> Option<SymbolId> {
     }
 }
 
-/// The nodes a body spans: its elements', its devices' terminals and its
-/// instances' connections (a node only a device or an instance touches is
-/// not counted by the element graph).
-fn body_nodes(circuit: &Circuit, devices: &[DeviceInstance], instances: &[Instance]) -> usize {
-    let dev = devices.iter().flat_map(|d| d.terminals.iter().copied());
-    let inst = instances.iter().flat_map(|i| i.nodes.iter().copied());
-    dev.chain(inst).max().unwrap_or(0).max(circuit.node_count())
-}
-
 /// Assemble the DAE of a circuit with its subcircuit instances. Every node
 /// of the hierarchy is a top-level node (`v{k}`); every other unknown keeps
 /// its block (branch currents, then device extras) in the instance's names.
 /// An error names the device whose model does not lower.
-pub fn assemble(
-    ctx: &mut Graph,
-    circuit: &Circuit,
-    devices: &[DeviceInstance],
-    instances: &[Instance],
-) -> Result<Dae, String> {
-    assemble_at(ctx, circuit, devices, instances, &|_| None)
+pub fn assemble(ctx: &mut Graph, circuit: &Circuit) -> Result<Dae, String> {
+    assemble_at(ctx, circuit, &|_| None)
 }
 
 /// [`assemble`] with the devices' structure decided at `values` (by
@@ -224,11 +234,9 @@ pub fn assemble(
 pub fn assemble_at(
     ctx: &mut Graph,
     circuit: &Circuit,
-    devices: &[DeviceInstance],
-    instances: &[Instance],
     values: &dyn Fn(&str) -> Option<f64>,
 ) -> Result<Dae, String> {
-    let n = body_nodes(circuit, devices, instances);
+    let n = circuit.node_count();
     let zero = ctx.zero();
     let (t_e, t) = sym2(ctx, "t");
     // Node voltage symbols (index 0 = ground = 0).
@@ -242,8 +250,9 @@ pub fn assemble_at(
 
     let dev_t0 = sane_core::time::Instant::now();
     let mut bodies = Bodies::default();
+    count_sites(circuit, &mut HashSet::new(), &mut bodies.sites);
     let mut lo = Lowerer::at(ctx, values);
-    let part = lower_body(&mut lo, &mut bodies, circuit, devices, instances, &v, t_e)?;
+    let part = lower_body(&mut lo, &mut bodies, circuit, &v, t_e)?;
     drop(lo); // release the &mut Graph borrow before reusing `ctx` below
     sane_core::log::stage("dae/devices", dev_t0.elapsed());
     sane_core::log::stage("dae/devices_lower", bodies.lower_t);
@@ -261,13 +270,38 @@ pub fn assemble_at(
         bodies.funcs.len()
     ));
 
-    // Layout: node KCL, then branch constraints, then device extras.
-    let mut currents: Vec<ExprId> = part
-        .node_terms
-        .into_iter()
-        .map(|terms| ctx.reduce(ReduceOp::Sum, terms))
+    // Layout: node KCL, then branch constraints, then device extras. The
+    // rows at rest, and the rows with every noise generator where it enters
+    // (`coefficient * generator`): the DAE's own.
+    let rows_t0 = sane_core::time::Instant::now();
+    let nb = part.branches.len();
+    let mut noise: Vec<Vec<ExprId>> = vec![Vec::new(); n + nb + part.extras.len()];
+    for &(row, g, coeff) in &part.noise_terms {
+        let r = match row {
+            RowRef::Node(k) => k,
+            RowRef::Extra(j) => n + nb + j,
+        };
+        let g = ctx.symbol_expr(g);
+        noise[r].push(ctx.mul(coeff, g));
+    }
+    let mut rest: Vec<ExprId> = (part.node_terms.iter())
+        .map(|terms| ctx.reduce(ReduceOp::Sum, terms.clone()))
         .collect();
-    currents.extend(part.branches.iter().chain(&part.extras).map(|u| u.current));
+    rest.extend(part.branches.iter().chain(&part.extras).map(|u| u.current));
+    let currents: Vec<ExprId> = (rest.iter().zip(&noise).enumerate())
+        .map(|(r, (&row, ns))| match (ns.is_empty(), r < n) {
+            (true, _) => row,
+            // a node's terms and the generators in one sum
+            (false, true) => {
+                let terms = part.node_terms[r].iter().chain(ns).copied().collect();
+                ctx.reduce(ReduceOp::Sum, terms)
+            }
+            (false, false) => {
+                let terms = std::iter::once(row).chain(ns.iter().copied()).collect();
+                ctx.reduce(ReduceOp::Sum, terms)
+            }
+        })
+        .collect();
     let mut charges: Vec<ExprId> = part
         .node_charges
         .into_iter()
@@ -287,30 +321,34 @@ pub fn assemble_at(
         kinds.push(u.kind);
         x.push(u.x);
     }
+    sane_core::log::stage("dae/rows", rows_t0.elapsed());
     let mut events = part.events;
-    let (currents, charges) = specialized(ctx, currents, charges, &mut events);
+    let n_rows = currents.len();
+    let both: Vec<ExprId> = currents.into_iter().chain(rest).collect();
+    // a circuit without devices and instances has no call to specialize
+    let spec_t0 = sane_core::time::Instant::now();
+    let (mut currents, charges) = if circuit.devices.is_empty() && circuit.instances.is_empty() {
+        (both, charges)
+    } else {
+        specialized(ctx, both, charges, &mut events)
+    };
+    sane_core::log::stage("dae/specialize", spec_t0.elapsed());
+    let rest = Arc::new((currents.split_off(n_rows), charges.clone()));
 
-    // delay indices were extra-relative; shift onto the final layout
+    // a delay's source is the extra unknown it was minted as
     let extra_base = n + part.branches.len();
-    let mut delays = part.delays;
-    for dl in delays.iter_mut() {
-        dl.src += extra_base;
-        dl.out += extra_base;
-    }
-
-    // Controlling-voltage limits: node symbols -> global unknown indices, now
-    // that the layout is final (covers external terminals and, for behavioral
-    // devices, internal nodes alike; ground / non-unknown symbols -> None).
-    let unknown_of: HashMap<SymbolId, usize> = x.iter().enumerate().map(|(i, &s)| (s, i)).collect();
-    let limits: Vec<Limit> = part
-        .limits
-        .iter()
-        .map(|fl| Limit {
-            hi: fl.hi.and_then(|s| unknown_of.get(&s).copied()),
-            lo: fl.lo.and_then(|s| unknown_of.get(&s).copied()),
-            kind: fl.kind,
-            when: fl.when,
+    let delays: Vec<DelaySpec> = (part.delays.iter())
+        .map(|&(src, hist, tau)| DelaySpec {
+            src: ctx.symbol_expr(x[extra_base + src]),
+            hist,
+            tau,
         })
+        .collect();
+
+    let unknown_of: HashMap<SymbolId, usize> = x.iter().enumerate().map(|(i, &s)| (s, i)).collect();
+    // the companion network by node voltage (its indices are node rows)
+    let companion = (part.companion.iter())
+        .map(|&(r, c, g)| (x[r], x[c], g))
         .collect();
 
     // A collapsed node's voltage is a kept node's, or ground's.
@@ -323,6 +361,10 @@ pub fn assemble_at(
             _ => None,
         })
         .collect();
+    // The circuit temperature is nominal unless the circuit states it.
+    let mut param_defaults = part.param_defaults;
+    let (_, temp) = sym2(ctx, sane_core::constants::TEMP_SYMBOL);
+    param_defaults.insert(temp, sane_core::constants::TEMP_NOMINAL_K);
     Ok(Dae {
         currents,
         charges,
@@ -330,20 +372,22 @@ pub fn assemble_at(
         structure: part.structure,
         aliases,
         n_nodes: n,
-        param_defaults: part.param_defaults,
+        param_defaults,
         events,
         delays,
         unknowns,
         kinds,
         x,
         t,
-        companion: part.companion,
+        companion,
         observers: part.observers,
         dc_seeds: part.dc_seeds,
-        limits,
+        limits: part.limits,
         sources: part.sources,
         source_names: part.source_names,
         labels: part.labels.into_iter().collect(),
+        injection: Default::default(),
+        rest: std::sync::OnceLock::from(rest),
     })
 }
 
@@ -356,15 +400,15 @@ fn specialized(
     charges: Vec<ExprId>,
     events: &mut [EventSpec],
 ) -> (Vec<ExprId>, Vec<ExprId>) {
-    let n = currents.len();
+    let (nc, nq) = (currents.len(), charges.len());
     let roots: Vec<ExprId> = (currents.into_iter().chain(charges))
         .chain(events.iter().map(|e| e.g))
         .collect();
     let mut out = ctx.specialize_calls(&roots);
-    for (ev, g) in events.iter_mut().zip(out.split_off(2 * n)) {
+    for (ev, g) in events.iter_mut().zip(out.split_off(nc + nq)) {
         ev.g = g;
     }
-    let charges = out.split_off(n);
+    let charges = out.split_off(nc);
     (out, charges)
 }
 
@@ -374,12 +418,11 @@ fn specialized(
 fn lower_body(
     lo: &mut Lowerer,
     bodies: &mut Bodies,
-    circuit: &Circuit,
-    devices: &[DeviceInstance],
-    instances: &[Instance],
+    c: &Circuit,
     v: &[ExprId],
     t_e: ExprId,
 ) -> Result<Part, String> {
+    let (circuit, devices, instances) = (&c.elements, &c.devices[..], &c.instances[..]);
     let n = v.len() - 1;
     let mut part = Part {
         node_terms: vec![Vec::new(); n],
@@ -460,12 +503,13 @@ fn lower_body(
         }
     }
 
-    // Resistor thermal noise: each resistor R is a current-noise generator across
-    // its two nodes with white PSD 4*k_B*T/R. Emitted here (alongside behavioral
-    // device noise below) so every noise source, stamped or behavioral, lives in
-    // one registry that the noise analysis consumes uniformly. Temperature is the
-    // shared `$temp` symbol (not a fixed constant), so a temperature sweep moves
-    // resistor noise exactly as it moves diode/MOSFET noise.
+    // Resistor thermal noise: each resistor R is a current-noise generator
+    // `R#noise` across its two nodes with white PSD 4*k_B*T/R, a current the
+    // rows carry beside the resistor's. Every noise source, stamped or
+    // behavioral, lives in one registry that the noise analysis consumes
+    // uniformly. Temperature is the shared `$temp` symbol (not a fixed
+    // constant), so a temperature sweep moves resistor noise exactly as it
+    // moves diode/MOSFET noise.
     {
         let k4 = ctx.konst_f64(4.0 * sane_core::constants::BOLTZMANN);
         let temp = ctx.sym(sane_core::constants::TEMP_SYMBOL);
@@ -475,9 +519,15 @@ fn lower_body(
             let g = ctx.recip(r);
             let psd = ctx.mul(coeff, g);
             let flicker_exp = ctx.zero();
+            let (_, input) = sym2(ctx, &format!("{name}#noise"));
+            for (node, sign) in [(a, 1.0), (b, -1.0)] {
+                if node != 0 {
+                    let c = ctx.konst_f64(sign);
+                    part.noise_terms.push((RowRef::Node(node - 1), input, c));
+                }
+            }
             part.observers.noise.push(NoiseSource {
-                hi: sym_of(ctx, v[a]),
-                lo: sym_of(ctx, v[b]),
+                input,
                 psd,
                 flicker_exp,
                 table: Vec::new(),
@@ -556,12 +606,8 @@ fn lower_body(
         // Transport delays (`absdelay`) minted by this device: shift the
         // device-relative extras positions onto the body's extras.
         for dl in std::mem::take(&mut lo.delays) {
-            part.delays.push(DelaySpec {
-                src: dev_extra_base + dl.src_extra,
-                out: dev_extra_base + dl.out_extra,
-                hist: dl.hist,
-                tau: dl.tau,
-            });
+            part.delays
+                .push((dev_extra_base + dl.src_extra, dl.hist, dl.tau));
         }
         let zero = lo.ctx().zero();
         for (j, (ex, &current)) in extras.iter().zip(&frag.currents).enumerate() {
@@ -582,6 +628,37 @@ fn lower_body(
                 if let Some(&q) = frag.terminal_charges.get(k) {
                     part.node_charges[nd - 1].push(q);
                 }
+            }
+        }
+        // Its noise generators where they enter: a terminal's row onto the
+        // node it is on (scaled by the multiplicity like the terminal
+        // currents, the density divided, so parallel devices' noise adds
+        // uncorrelated), an extra's onto the extra.
+        let n_term = inst.terminals.len();
+        let m = (inst.mfactor != 1.0).then(|| lo.ctx().konst_f64(inst.mfactor));
+        for (src, rows) in frag.noise.iter_mut().zip(&frag.noise_rows) {
+            let ctx = lo.ctx();
+            for &(r, coeff) in rows {
+                if r < n_term {
+                    let nd = inst.terminals[r];
+                    if nd != 0 {
+                        let coeff = m.map_or(coeff, |m| ctx.mul(m, coeff));
+                        part.noise_terms
+                            .push((RowRef::Node(nd - 1), src.input, coeff));
+                    }
+                } else {
+                    part.noise_terms.push((
+                        RowRef::Extra(dev_extra_base + r - n_term),
+                        src.input,
+                        coeff,
+                    ));
+                }
+            }
+            if let Some(m) = m {
+                src.psd = ctx.div(src.psd, m);
+                src.table = (src.table.iter())
+                    .map(|&(f, p)| (f, ctx.div(p, m)))
+                    .collect();
             }
         }
         part.observers.noise.extend(frag.noise);
@@ -727,7 +804,8 @@ fn lower_body(
             part.sources.push((e.name.clone(), s));
         }
         if matches!(e.kind, Kind::VoltageSource | Kind::CurrentSource) {
-            part.source_names.push(sane_mna::value_symbol_name(&e.name));
+            part.source_names
+                .push(sane_circuit::value_symbol_name(&e.name));
         }
     }
 
@@ -738,11 +816,14 @@ fn lower_body(
 }
 
 /// A subcircuit body assembled once, for every instance of it: its part in
-/// its own names over formal nodes, and the functions its outputs are.
+/// its own names over formal nodes, and the functions its outputs are. A
+/// body instantiated at one place only is no function: its outputs are
+/// carried into that instance's frame (see `instantiate`); a function
+/// shares a body between instances and has nothing to share there.
 struct Lowered {
     part: Part,
-    /// The noise sources and op-vars, with the body's namespace.
-    observers: Arc<(String, Observers)>,
+    /// The noise sources and op-vars.
+    observers: Arc<crate::observers::Body>,
     /// The formal node voltages (`[0]` ground).
     fv: Vec<ExprId>,
     /// Where each kind of output starts among the outputs of the functions
@@ -752,8 +833,15 @@ struct Lowered {
     out_charge: usize,
     out_tau: usize,
     out_event: usize,
-    /// The functions, each with its parameters and its number of outputs.
+    /// The functions, each with its parameters and the number of outputs
+    /// an instance calls (the observers' after them it does not).
     funcs: Vec<(FuncId, Vec<SymbolId>, usize)>,
+    /// The body's noise terms (see `Part::noise_terms`), each coefficient a
+    /// constant (`Err`) or the output it is computed in (`Ok`).
+    noise: Vec<(RowRef, SymbolId, Result<usize, ExprId>)>,
+    /// A body carried into its one instance's frame: its outputs, in the
+    /// order the functions' would be.
+    inline: Option<Vec<ExprId>>,
 }
 
 /// `body` assembled over formal nodes and closed into its functions: once
@@ -762,33 +850,29 @@ struct Lowered {
 fn lowered(
     lo: &mut Lowerer,
     bodies: &mut Bodies,
-    body: &Arc<Body>,
+    body: &Arc<Circuit>,
     t_e: ExprId,
     labels: &mut Vec<(ExprId, String)>,
 ) -> Result<Rc<Lowered>, String> {
     if let Some(l) = bodies.lowered.get(&Arc::as_ptr(body)) {
         return Ok(l.clone());
     }
-    let n = body.node_names.len();
+    let n = body.node_count();
     let ctx = lo.ctx();
     let zero = ctx.zero();
     let mut fv = vec![zero; n + 1];
     for k in 1..=n {
         fv[k] = ctx.sym(&format!("{}v#{k}", body.ns));
     }
-    let mut part = lower_body(
-        lo,
-        bodies,
-        &body.circuit,
-        &body.devices,
-        &body.instances,
-        &fv,
-        t_e,
-    )?;
-    for (k, name) in body.node_names.iter().enumerate() {
-        part.labels.push((fv[k + 1], name.clone()));
+    let mut part = lower_body(lo, bodies, body, &fv, t_e)?;
+    let inline = bodies.sites.get(&Arc::as_ptr(body)) == Some(&1);
+    if !inline {
+        for (k, name) in body.node_names().iter().enumerate().skip(1) {
+            let name = name.strip_prefix(body.ns.as_str()).unwrap_or(name);
+            part.labels.push((fv[k], name.to_string()));
+        }
+        labels.append(&mut part.labels);
     }
-    labels.append(&mut part.labels);
     let ctx = lo.ctx();
 
     // Every per-instance quantity is one output.
@@ -805,13 +889,28 @@ fn lowered(
     }
     outs.extend(part.branches.iter().chain(&part.extras).map(|u| u.charge));
     let out_tau = outs.len();
-    outs.extend(part.delays.iter().map(|d| d.tau));
+    outs.extend(part.delays.iter().map(|d| d.2));
     let out_event = outs.len();
     outs.extend(part.events.iter().map(|e| e.g));
+    // the noise coefficients that are no constant, read per instance
+    let mut noise = Vec::with_capacity(part.noise_terms.len());
+    for &(row, g, coeff) in &part.noise_terms {
+        let at = match ctx.const_f64(coeff) {
+            Some(_) => Err(coeff),
+            None => {
+                outs.push(coeff);
+                Ok(outs.len() - 1)
+            }
+        };
+        noise.push((row, g, at));
+    }
 
-    // The rows and the observers (delays, events) are two functions, so a
-    // call of the rows reads only what they read. The noise and the op-vars
-    // stay the body's (see `Observers`).
+    // The rows and the observers are two functions, so a call of the rows
+    // reads only what they read. An instance calls the delays, the events
+    // and the noise coefficients; the noise sources' levels and the op-vars
+    // after them are called where asked for (see `Observers`).
+    let n_called = outs.len() - out_tau;
+    let observed = part.observers.exprs();
     let firsts: Vec<SymbolId> = fv[1..]
         .iter()
         .map(|&e| sym_of(ctx, e).expect("formal node"))
@@ -824,43 +923,63 @@ fn lowered(
         .iter()
         .copied()
         .chain(sym_of(ctx, t_e))
-        .chain(part.delays.iter().map(|d| d.hist))
+        .chain(part.delays.iter().map(|d| d.1))
         .collect();
     // named after the subcircuit (its namespace `__name__.`)
     let subckt = body.ns.trim_end_matches('.').trim_matches('_');
     let names = [subckt.to_string(), format!("{subckt}, observers")];
     let mut funcs = Vec::new();
-    for (group, name) in [&outs[..out_tau], &outs[out_tau..]].into_iter().zip(&names) {
-        if !group.is_empty() {
-            let (f, leaves) = close(
-                ctx,
-                bodies,
-                &body.ns,
-                name,
-                group.to_vec(),
-                &firsts,
-                &impure,
-            );
-            funcs.push((f, leaves, group.len()));
+    let own = if inline {
+        // the observers alone a function, called where asked for
+        (!observed.is_empty()).then(|| {
+            let (f, leaves) = close(ctx, bodies, &body.ns, &names[1], observed, &firsts, &impure);
+            (f, leaves, 0)
+        })
+    } else {
+        let mut outs = outs.clone();
+        outs.extend(observed.iter().copied());
+        for (group, name) in [&outs[..out_tau], &outs[out_tau..]].into_iter().zip(&names) {
+            if !group.is_empty() {
+                let (f, leaves) = close(
+                    ctx,
+                    bodies,
+                    &body.ns,
+                    name,
+                    group.to_vec(),
+                    &firsts,
+                    &impure,
+                );
+                funcs.push((f, leaves, group.len()));
+            }
         }
-    }
-    let observers = std::mem::take(&mut part.observers);
+        match funcs.last_mut() {
+            Some((f, leaves, n)) if !observed.is_empty() => {
+                *n = n_called;
+                Some((*f, leaves.clone(), n_called as u32))
+            }
+            _ => None,
+        }
+    };
+    let observers = std::mem::take(&mut part.observers).into_body(ctx, &body.ns, own);
     let l = Rc::new(Lowered {
         part,
-        observers: Arc::new((body.ns.clone(), observers)),
+        observers,
         fv,
         out_unknown,
         out_charge,
         out_tau,
         out_event,
         funcs,
+        noise,
+        inline: inline.then_some(outs),
     });
     bodies.lowered.insert(Arc::as_ptr(body), l.clone());
     Ok(l)
 }
 
 /// A subcircuit instance into its parent's `part`: its body's functions
-/// called with the instance's nodes and names.
+/// called with the instance's nodes and names, or the body's outputs
+/// carried into the parent's frame where it is instantiated here only.
 #[allow(clippy::too_many_arguments)]
 fn instantiate(
     lo: &mut Lowerer,
@@ -877,19 +996,44 @@ fn instantiate(
     // A formal node binds to the parent's node; every other leaf to its name
     // in the parent's frame.
     let binding: Vec<(SymbolId, ExprId)> = (1..=inst.nodes.len())
-        .map(|k| (sym_of(ctx, low.fv[k]).expect("formal node"), v[inst.node(k)]))
+        .map(|k| {
+            (
+                sym_of(ctx, low.fv[k]).expect("formal node"),
+                v[inst.node(k)],
+            )
+        })
         .collect();
-    let mut map: HashMap<SymbolId, ExprId> = binding.iter().copied().collect();
-    part.observers.place(&inst.name, binding, &low.observers);
+    let mut map: rustc_hash::FxHashMap<SymbolId, ExprId> = binding.iter().copied().collect();
     let mut actual = |ctx: &mut Graph, s: SymbolId| rebind(ctx, inst, &mut map, s);
     let mut calls: Vec<ExprId> = Vec::with_capacity(low.out_event + body.events.len());
-    for (func, leaves, n_out) in &low.funcs {
-        let args: Vec<ExprId> = leaves.iter().map(|&s| actual(ctx, s)).collect();
-        let outs: Vec<u32> = (0..*n_out as u32).collect();
-        calls.extend(ctx.calls(*func, &outs, &args));
+    match &low.inline {
+        Some(outs) => {
+            // the outputs, and the labels of the calls in them in the
+            // instance's names
+            let roots: Vec<ExprId> = (outs.iter().copied())
+                .chain(body.labels.iter().map(|&(e, _)| e))
+                .collect();
+            let free: Vec<SymbolId> = ctx.free_symbols_in(&roots).into_iter().collect();
+            let subst: rustc_hash::FxHashMap<SymbolId, ExprId> =
+                free.into_iter().map(|s| (s, actual(ctx, s))).collect();
+            calls = rsdag::substitute(ctx, &roots, &subst);
+            let keys = calls.split_off(outs.len());
+            part.labels.extend(
+                keys.into_iter()
+                    .zip(&body.labels)
+                    .map(|(e, (_, name))| (e, inst.rename(name))),
+            );
+        }
+        None => {
+            for (func, leaves, n_out) in low.funcs.iter().filter(|f| f.2 > 0) {
+                let args: Vec<ExprId> = leaves.iter().map(|&s| actual(ctx, s)).collect();
+                let outs: Vec<u32> = (0..*n_out as u32).collect();
+                calls.extend(ctx.calls(*func, &outs, &args));
+            }
+            part.labels
+                .extend(calls.iter().map(|&e| (e, inst.name.clone())));
+        }
     }
-    part.labels
-        .extend(calls.iter().map(|&e| (e, inst.name.clone())));
     let mut actual_sym = |ctx: &mut Graph, s: SymbolId| {
         let e = actual(ctx, s);
         sym_of(ctx, e)
@@ -926,13 +1070,22 @@ fn instantiate(
             part.extras.push(u);
         }
     }
-    for (j, d) in body.delays.iter().enumerate() {
-        part.delays.push(DelaySpec {
-            src: extra_base + d.src,
-            out: extra_base + d.out,
-            hist: actual_sym(ctx, d.hist).expect("a history is a symbol"),
-            tau: calls[low.out_tau + j],
-        });
+    for &(row, g, at) in &low.noise {
+        let row = match row {
+            RowRef::Node(k) => match inst.node(k + 1) {
+                0 => continue,
+                p => RowRef::Node(p - 1),
+            },
+            RowRef::Extra(j) => RowRef::Extra(extra_base + j),
+        };
+        let g = actual_sym(ctx, g).expect("a noise generator is a symbol");
+        part.noise_terms
+            .push((row, g, at.map_or_else(|c| c, |o| calls[o])));
+    }
+    for (j, &(src, hist, _)) in body.delays.iter().enumerate() {
+        let hist = actual_sym(ctx, hist).expect("a history is a symbol");
+        part.delays
+            .push((extra_base + src, hist, calls[low.out_tau + j]));
     }
     for (j, e) in body.events.iter().enumerate() {
         part.events.push(EventSpec {
@@ -1002,6 +1155,9 @@ fn instantiate(
         (body.aliases.iter())
             .map(|(name, _)| (inst.rename(name), exprs.next().expect("one per alias"))),
     );
+    // what each body symbol the instance reads is in the parent's frame,
+    // where its observers are found when asked for
+    part.observers.place(&inst.name, map, &low.observers);
     Ok(())
 }
 
@@ -1049,7 +1205,7 @@ fn close(
 fn rebind(
     ctx: &mut Graph,
     inst: &Instance,
-    map: &mut HashMap<SymbolId, ExprId>,
+    map: &mut rustc_hash::FxHashMap<SymbolId, ExprId>,
     s: SymbolId,
 ) -> ExprId {
     if let Some(&e) = map.get(&s) {

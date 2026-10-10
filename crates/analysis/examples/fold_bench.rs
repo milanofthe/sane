@@ -24,9 +24,12 @@ fn main() {
     println!("params total = {}", all.len());
 
     // Baseline: sensitivity over ALL parameters.
-    let op = model.operating_point(&[]).expect("op");
+    let op = model
+        .at(&[])
+        .and_then(|pt| pt.operating_point())
+        .expect("op");
     let t0 = Instant::now();
-    let s0 = op.sensitivity(&output);
+    let s0 = op.sensitivity(&[&output], &[]);
     let dt0 = t0.elapsed().as_secs_f64() * 1e3;
     println!(
         "baseline sensitivity (all {} params): {:.1} ms ({})",
@@ -47,9 +50,12 @@ fn main() {
         dt_fold
     );
 
-    let op2 = folded.operating_point(&[]).expect("op2");
+    let op2 = folded
+        .at(&[])
+        .and_then(|pt| pt.operating_point())
+        .expect("op2");
     let t2 = Instant::now();
-    let s1 = op2.sensitivity(&output);
+    let s1 = op2.sensitivity(&[&output], &[]);
     let dt1 = t2.elapsed().as_secs_f64() * 1e3;
     println!(
         "folded sensitivity ({} params): {:.1} ms ({})",

@@ -5,7 +5,7 @@
 
 use std::time::Instant;
 
-use sane_analysis::Model;
+use sane_analysis::{HbOptions, Model};
 
 fn deck(k: usize, caps: bool) -> String {
     let mut s = String::from("V1 1 0 SIN(1.2 0.4 1000)\n");
@@ -31,15 +31,20 @@ fn main() {
         .unwrap_or(16);
     let caps = std::env::args().nth(3).is_some_and(|s| s == "caps");
     let model = Model::from_netlist(&deck(k, caps)).expect("build");
+    let pt = model.at(&[]).expect("binding");
+    let opts = HbOptions {
+        f0: Some(1000.0),
+        harmonics: kh,
+        ..HbOptions::default()
+    };
     // warm
-    let hb = model.harmonic_balance(&[], 1000.0, kh, None).expect("hb");
-    assert!(hb.converged, "HB must converge");
+    let _ = pt.harmonic_balance(&opts).expect("hb");
 
     let reps = 50;
     sane_core::profile::collect_begin();
     let t = Instant::now();
     for _ in 0..reps {
-        let _ = model.harmonic_balance(&[], 1000.0, kh, None).expect("hb");
+        let _ = pt.harmonic_balance(&opts).expect("hb");
     }
     let ms = t.elapsed().as_secs_f64() * 1e3 / reps as f64;
     let prof = sane_core::profile::collect_take();

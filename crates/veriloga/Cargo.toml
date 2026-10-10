@@ -14,7 +14,7 @@ rustc-hash.workspace = true
 
 [dev-dependencies]
 sane-dae = { path = "../dae" }
-sane-mna = { path = "../mna" }
+sane-circuit = { path = "../circuit" }
 num-complex.workspace = true
 
 [lints]

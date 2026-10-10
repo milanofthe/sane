@@ -38,7 +38,7 @@
 use rsdag::{Crossing, Tape};
 use sane_core::constants::*;
 
-use crate::transient::{hermite_point, linear_point};
+use crate::transient::{hermite_into, linear_into};
 use crate::{CompiledDc, TransientEvent};
 
 /// What an accepted step landed on.
@@ -208,6 +208,8 @@ pub(crate) struct EventTracker<'a> {
     inputs: Vec<f64>,
     work: Vec<f64>,
     out: Vec<f64>,
+    /// A state on the step's interpolant, where a crossing is bracketed.
+    xc: Vec<f64>,
     /// `g` at the last accepted point (the start of the current step).
     g_prev: Vec<f64>,
     /// `g` at the candidate step end.
@@ -246,6 +248,7 @@ impl<'a> EventTracker<'a> {
             inputs: Vec::new(),
             work: Vec::new(),
             out: Vec::new(),
+            xc: Vec::new(),
             g_prev: Vec::new(),
             g_new: Vec::new(),
             scale: vec![0.0; m],
@@ -310,11 +313,14 @@ impl<'a> EventTracker<'a> {
                 if !(c > a && c < b) {
                     c = 0.5 * (a + b);
                 }
-                let xc = match &herm {
-                    Some((m0, m1)) => hermite_point(x_prev, x_new, m0, m1, t, h, c, n),
-                    None => linear_point(x_prev, x_new, t, t + h, c, n),
-                };
+                let mut xc = std::mem::take(&mut self.xc);
+                xc.resize(n, 0.0);
+                match &herm {
+                    Some((m0, m1)) => hermite_into(&mut xc, x_prev, x_new, m0, m1, t, h, c),
+                    None => linear_into(&mut xc, x_prev, x_new, t, t + h, c),
+                }
                 self.eval(&xc, c);
+                self.xc = xc;
                 let fc = self.out[k];
                 if fc == 0.0 || (fc < 0.0) != (fa < 0.0) {
                     b = c;

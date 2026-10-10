@@ -25,7 +25,7 @@
 //!
 //! UI-free throughout: the analysis stack is a plain Rust library.
 
-use rsdag::{differentiate, Node, SymbolId};
+use rsdag::{differentiate, ExprId, Node, ReduceOp, SymbolId};
 use sane_core::Graph;
 use sane_core::{log, log_stage};
 
@@ -48,13 +48,30 @@ use std::f64::consts::PI;
 
 mod model;
 pub use model::{
-    AcResponse as ModelAcResponse, DcSweep, HarmonicBalance as ModelHarmonicBalance, Model,
-    ModelError, NoiseSpectrum, OpVarValue, OperatingPoint, PoleZero, ReducedModel, Sensitivity,
-    StateSpace as ModelStateSpace, TempSweep, Trajectory,
+    AcHessian, AcResponse, AcSensitivity, DcOptions, DcSweep, Event, Gradient, HarmonicBalance,
+    HbHessian, HbOptions, HbSensitivity, Hessian, Model, ModelError, NoiseSensitivity,
+    NoiseSpectrum, OpVarValue, OperatingPoint, Point, Poles, ReducedModel, Regularization,
+    RootSensitivity, SParameters, Sensitivity, SpSensitivity, StateSpace, Trajectory,
+    TrajectorySensitivity, TransientOptions, Zeros,
 };
+/// The arrays results come in, re-exported so a caller takes the same
+/// version.
+pub use ndarray;
+/// The complex scalar of every small-signal result.
+pub use num_complex::Complex64;
 
 mod linalg;
 pub use linalg::{solve_complex, solve_real};
+
+/// `points` frequencies spaced logarithmically from `fstart` to `fstop`,
+/// both included: the usual AC grid.
+pub fn log_grid(fstart: f64, fstop: f64, points: usize) -> Vec<f64> {
+    let (l0, l1) = (fstart.log10(), fstop.log10());
+    let last = points.saturating_sub(1).max(1) as f64;
+    (0..points)
+        .map(|k| 10f64.powf(l0 + (l1 - l0) * k as f64 / last))
+        .collect()
+}
 
 mod sparse_ac;
 
@@ -62,13 +79,11 @@ mod ac;
 mod noise;
 mod pz;
 mod reduce;
-mod sweep;
 
-pub use ac::{ac_response_sensitivity, state_space_on_dae};
+pub use ac::ac_response_sensitivity;
 pub use noise::noise_on_dae;
 pub use pz::{dominant_subset, finite_pencil_roots, pencil_eigvectors, pencil_root_sensitivity};
-pub use reduce::model_reduce_on_dae;
-pub use sweep::temp_sweep_on_dae;
+pub use reduce::{model_reduce_on_dae, Reduction};
 
 // --- shared analysis front end ----------------------------------------------
 
@@ -83,22 +98,24 @@ struct Prepared {
 }
 
 /// Assemble a circuit's symbolic DAE and compile the DC solver: the one
-/// setup every model of a circuit goes through, parsed or built (see
-/// [`Model::from_parsed`](crate::Model::from_parsed)). The devices decide
-/// their structure at `values` (by parameter name) where those set a
-/// parameter, else at the circuit's own; `targets` holds the `.nodeset`
-/// targets (node name, volts). An error names what does not assemble.
+/// setup every model of a circuit goes through (see
+/// [`Model::new`](crate::Model::new)). The devices decide their structure at
+/// `values` (by parameter name) where those set a parameter, else at the
+/// circuit's own; the circuit's node-set seeds the operating point. An
+/// error names what does not assemble.
 fn prepare(
-    parsed: &sane_netlist::ParsedCircuit,
-    targets: &[(String, f64)],
+    circuit: &sane_circuit::Circuit,
     values: &dyn Fn(&str) -> Option<f64>,
 ) -> Result<Prepared, String> {
     let mut ctx = Graph::new();
-    let mut dae = log_stage!("dae/assemble", parsed.assemble_at(&mut ctx, values))?;
+    let mut dae = log_stage!(
+        "dae/assemble",
+        sane_dae::assemble_at(&mut ctx, circuit, values)
+    )?;
     // The devices' Newton limits under the parameters the circuit is at.
     dae.keep_limits_at(&ctx, |s| {
         let name = ctx.symbol_name(s);
-        values(name).or_else(|| parsed.param_value(name))
+        values(name).or_else(|| circuit.param_value(name))
     });
     let mut cdc = log_stage!("compile", CompiledDc::new(&mut ctx, &dae));
     // `.nodeset` symmetry breaking: device-emitted DC seeds first (`idt(u, ic)`
@@ -115,9 +132,9 @@ fn prepare(
                 .map(|i| (i, *val))
         })
         .collect();
-    for (node, val) in targets.iter().cloned() {
-        let Some(i) = parsed
-            .node(&node)
+    for &(ref node, val) in &circuit.nodeset {
+        let Some(i) = circuit
+            .find_node(node)
             .and_then(|k| dae.unknowns.iter().position(|u| *u == format!("v{k}")))
         else {
             continue;
@@ -162,32 +179,6 @@ pub fn eng(s: &str) -> Option<f64> {
     None
 }
 
-/// Parse `.nodeset V(net)=value ...` directives. Unlike `.ic` (a hard transient
-/// initial condition) a node-set is a *soft* DC convergence aid: it pins the
-/// nodes in a first solve phase to break the symmetry of a bistable circuit,
-/// then releases them. Node voltages only (SPICE allows no branch currents in a
-/// node-set). Returns `(node_name, value)` pairs.
-pub fn parse_nodeset(netlist: &str) -> Vec<(String, f64)> {
-    let mut out = Vec::new();
-    for raw in netlist.lines() {
-        let line = raw.trim();
-        if !line.to_ascii_lowercase().starts_with(".nodeset") {
-            continue;
-        }
-        for tok in line.split_whitespace().skip(1) {
-            let Some(eq) = tok.find('=') else { continue };
-            let lhs = tok[..eq].trim();
-            let Some(val) = eng(tok[eq + 1..].trim()) else {
-                continue;
-            };
-            if lhs.to_ascii_lowercase().starts_with("v(") && lhs.ends_with(')') {
-                out.push((lhs[2..lhs.len() - 1].to_string(), val));
-            }
-        }
-    }
-    out
-}
-
 /// Build the operating-point evaluation environment: bind each state unknown
 /// `dae.x[i]` to `x[i]`, each state-derivative symbol to `xdot[i]` (or 0 where
 /// `xdot` is shorter -- a DC point passes `&[]`), each parameter name to its
@@ -212,7 +203,54 @@ pub(crate) fn op_env(
         }
     }
     env.insert(dae.t, t);
+    // noise generators are zero in every evaluation
+    for g in dae.observers.generators(ctx) {
+        env.insert(g, 0.0);
+    }
     env
+}
+
+/// What drives the small-signal response from the source `input`: the
+/// parameters among `pnames` a unit input moves together. A source with a
+/// value is driven through it; one driven by a waveform through the
+/// parameters that shift its level as a whole (see
+/// [`sane_circuit::SourceFn::is_level`]), as an AC source on top of its
+/// transient waveform would. Empty when it has neither (a folded source).
+pub(crate) fn drive_params(pnames: &[String], input: &str) -> Vec<String> {
+    let own = sane_circuit::value_symbol_name(input);
+    if pnames.contains(&own) {
+        return vec![own];
+    }
+    let prefix = format!("{input}.");
+    (pnames.iter())
+        .filter(|p| (p.strip_prefix(&prefix)).is_some_and(sane_circuit::SourceFn::is_level))
+        .cloned()
+        .collect()
+}
+
+/// The symbols of [`drive_params`]; `None` for none.
+pub(crate) fn drive_syms(ctx: &mut Graph, pnames: &[String], input: &str) -> Option<Vec<SymbolId>> {
+    let syms: Vec<SymbolId> = (drive_params(pnames, input).iter())
+        .filter_map(|n| {
+            let e = ctx.sym(n);
+            match ctx.node(e) {
+                Node::Symbol(s) => Some(*s),
+                _ => None,
+            }
+        })
+        .collect();
+    (!syms.is_empty()).then_some(syms)
+}
+
+/// The derivative of `e` along the drive `syms` (see [`drive_params`]).
+pub(crate) fn d_drive(ctx: &mut Graph, e: ExprId, syms: &[SymbolId]) -> ExprId {
+    match syms {
+        [s] => differentiate(ctx, e, *s),
+        _ => {
+            let terms: Vec<ExprId> = syms.iter().map(|&s| differentiate(ctx, e, s)).collect();
+            ctx.reduce(ReduceOp::Sum, terms)
+        }
+    }
 }
 
 /// The input-coupling vector dI/d(input) at the operating point.
@@ -224,15 +262,9 @@ pub fn input_vector(
     x: &[f64],
     input: &str,
 ) -> Option<Vec<f64>> {
-    let ie = ctx.sym(input);
-    let input_sym = match ctx.node(ie) {
-        Node::Symbol(s) => *s,
-        _ => return None,
-    };
-    let db: Vec<_> = dae
-        .currents
-        .iter()
-        .map(|&r| differentiate(ctx, r, input_sym))
+    let syms = drive_syms(ctx, pnames, input)?;
+    let db: Vec<_> = (dae.at_rest(ctx).0.iter())
+        .map(|&r| d_drive(ctx, r, &syms))
         .collect();
     let env = op_env(ctx, dae, pnames, x, p, 0.0);
     Some(rsdag::eval(ctx, &db, &env))

@@ -4,8 +4,8 @@
 use std::sync::Arc;
 
 use rustc_hash::FxHashMap as HashMap;
-use sane_device::{CSwitch, DeviceInstance};
-use sane_mna::{BKind, Circuit};
+use sane_circuit::{BKind, Circuit};
+use sane_device::CSwitch;
 use sane_veriloga::builtin_module;
 
 use crate::behavioral::parse_bexpr;
@@ -18,7 +18,7 @@ use crate::options::NetlistOptions;
 use crate::source::{
     dc_value, is_bare_source_kw, is_source_fn, parse_source_fn, value_is_behavioral,
 };
-use crate::{err_at, CompatReport, NodeMap, ParseError, PortDef};
+use crate::{err_at, CompatReport, ParseError};
 
 /// One element line: the name, its type letter, the tokens and the source
 /// position for diagnostics.
@@ -48,16 +48,12 @@ impl Elem<'_> {
 }
 
 /// The parser's state while elements are placed: the circuit under
-/// construction, the placed devices, the bound values, and the read-only
-/// tables (parameters, model cards, options, Verilog-A modules) the placement
+/// construction, the compatibility report, and the read-only tables
+/// (parameters, model cards, options, Verilog-A modules) the placement
 /// consults.
 pub(crate) struct Placer<'a> {
-    pub nodes: NodeMap,
     pub circuit: Circuit,
-    pub devices: Vec<DeviceInstance>,
-    pub values: HashMap<String, f64>,
     pub report: CompatReport,
-    pub ports: Vec<PortDef>,
     pub params: &'a HashMap<String, f64>,
     pub models: &'a ModelLib,
     pub model_aliases: &'a HashMap<u32, String>,
@@ -74,8 +70,8 @@ impl Placer<'_> {
     pub(crate) fn place_passive(&mut self, el: &Elem<'_>) -> Result<(), ParseError> {
         let (name, tok, line_no, line_col) = (el.name, el.tok, el.line_no, el.line_col);
         el.need(3)?;
-        let a = self.nodes.resolve(tok[1]);
-        let b = self.nodes.resolve(tok[2]);
+        let a = self.circuit.node(tok[1]);
+        let b = self.circuit.node(tok[2]);
         // Behavioral resistor: a value that references a node voltage /
         // branch current (a foundry voltage-dependent resistor, e.g.
         // `R n1 n2 r={rbody*(1+vc1*abs(V(n1,n2)))}`) is the linear
@@ -86,18 +82,20 @@ impl Placer<'_> {
             let raw = tok[3..].join(" ");
             let expr = value_expr(&raw);
             let bstr = format!("(V({},{}))/({})", tok[1], tok[2], expr);
-            let mut resolve = |n: &str| self.nodes.resolve(n);
+            let mut resolve = |n: &str| self.circuit.node(n);
             let bexpr =
                 parse_bexpr(&bstr, &mut resolve).map_err(|m| err_at(line_no, line_col, &m))?;
-            self.circuit.behavioral_source(name, a, b, BKind::I, bexpr);
+            self.circuit
+                .elements
+                .behavioral_source(name, a, b, BKind::I, bexpr);
             return Ok(());
         }
         match el.kind {
-            'R' => self.circuit.resistor(name, a, b),
-            'C' => self.circuit.capacitor(name, a, b),
-            'L' => self.circuit.inductor(name, a, b),
-            'V' => self.circuit.voltage_source(name, a, b),
-            'I' => self.circuit.current_source(name, a, b),
+            'R' => self.circuit.elements.resistor(name, a, b),
+            'C' => self.circuit.elements.capacitor(name, a, b),
+            'L' => self.circuit.elements.inductor(name, a, b),
+            'V' => self.circuit.elements.voltage_source(name, a, b),
+            'I' => self.circuit.elements.current_source(name, a, b),
             _ => unreachable!(),
         };
         // Element value. For sources, the DC operating-point value is a
@@ -112,7 +110,9 @@ impl Placer<'_> {
             })
         };
         if let Some(v) = val {
-            self.values.insert(sane_mna::value_symbol_name(name), v);
+            self.circuit
+                .values
+                .insert(sane_circuit::value_symbol_name(name), v);
         }
         // Transient source functions on independent sources. Both the
         // parenthesised form (`SIN(0 1 1k)`, one token after grouping)
@@ -136,8 +136,10 @@ impl Placer<'_> {
                     })
                 });
             if let Some(spec) = spec {
-                if let Some(src) = parse_source_fn(name, &spec, self.params, &mut self.values) {
-                    self.circuit.set_source(src);
+                if let Some(src) =
+                    parse_source_fn(name, &spec, self.params, &mut self.circuit.values)
+                {
+                    self.circuit.elements.set_source(src);
                 }
             }
         }
@@ -146,17 +148,19 @@ impl Placer<'_> {
     pub(crate) fn place_controlled_voltage(&mut self, el: &Elem<'_>) -> Result<(), ParseError> {
         let (name, tok) = (el.name, el.tok);
         el.need(5)?;
-        let a = self.nodes.resolve(tok[1]);
-        let b = self.nodes.resolve(tok[2]);
-        let cp = self.nodes.resolve(tok[3]);
-        let cm = self.nodes.resolve(tok[4]);
+        let a = self.circuit.node(tok[1]);
+        let b = self.circuit.node(tok[2]);
+        let cp = self.circuit.node(tok[3]);
+        let cm = self.circuit.node(tok[4]);
         match el.kind {
-            'E' => self.circuit.vcvs(name, a, b, cp, cm),
-            'G' => self.circuit.vccs(name, a, b, cp, cm),
+            'E' => self.circuit.elements.vcvs(name, a, b, cp, cm),
+            'G' => self.circuit.elements.vccs(name, a, b, cp, cm),
             _ => unreachable!(),
         };
         if let Some(v) = tok[5..].iter().find_map(|s| resolve_value(s, self.params)) {
-            self.values.insert(sane_mna::value_symbol_name(name), v);
+            self.circuit
+                .values
+                .insert(sane_circuit::value_symbol_name(name), v);
         }
         Ok(())
     }
@@ -171,10 +175,10 @@ impl Placer<'_> {
         // requests the lumped RLGC-ladder approximation instead (next
         // arm), which flows through analyses without delay support.
         el.need(5)?;
-        let a = self.nodes.resolve(tok[1]);
-        let b = self.nodes.resolve(tok[2]);
-        let cp = self.nodes.resolve(tok[3]);
-        let cm = self.nodes.resolve(tok[4]);
+        let a = self.circuit.node(tok[1]);
+        let b = self.circuit.node(tok[2]);
+        let cp = self.circuit.node(tok[3]);
+        let cm = self.circuit.node(tok[4]);
         let td = tok[5..].iter().find_map(|s| {
             let (k, vs) = s.split_once('=')?;
             k.eq_ignore_ascii_case("td")
@@ -192,8 +196,8 @@ impl Placer<'_> {
         }
         let em = builtin_module("sane_tline").expect("builtin tline");
         place_va_device(
-            &mut self.devices,
-            &mut self.values,
+            &mut self.circuit.devices,
+            &mut self.circuit.values,
             &mut self.report,
             name,
             base,
@@ -214,17 +218,17 @@ impl Placer<'_> {
         // Voltage-controlled switch: S name n+ n- nc+ nc- [model].
         // Built-in Verilog-A model (smooth log-conductance transition).
         el.need(5)?;
-        let a = self.nodes.resolve(tok[1]);
-        let b = self.nodes.resolve(tok[2]);
-        let cp = self.nodes.resolve(tok[3]);
-        let cm = self.nodes.resolve(tok[4]);
+        let a = self.circuit.node(tok[1]);
+        let b = self.circuit.node(tok[2]);
+        let cp = self.circuit.node(tok[3]);
+        let cm = self.circuit.node(tok[4]);
         let model_tok = tok[5..].iter().find(|t| !t.contains('=')).copied();
         let card = model_tok.and_then(|m| self.models.select(m, None, None));
         let modelname = model_tok.unwrap_or(base);
         let em = builtin_module("sane_vswitch").expect("builtin vswitch");
         place_va_device(
-            &mut self.devices,
-            &mut self.values,
+            &mut self.circuit.devices,
+            &mut self.circuit.values,
             &mut self.report,
             name,
             modelname,
@@ -244,8 +248,8 @@ impl Placer<'_> {
         let (name, tok) = (el.name, el.tok);
         // Current-controlled switch: W name n+ n- Vctrl [model].
         el.need(4)?;
-        let a = self.nodes.resolve(tok[1]);
-        let b = self.nodes.resolve(tok[2]);
+        let a = self.circuit.node(tok[1]);
+        let b = self.circuit.node(tok[2]);
         let ctrl = tok[3];
         let card = tok[4..]
             .iter()
@@ -253,8 +257,8 @@ impl Placer<'_> {
             .and_then(|m| self.models.select(m, None, None));
         let mf = instance_mfactor(&tok, self.params, el.kind == 'M');
         place_device(
-            &mut self.devices,
-            &mut self.values,
+            &mut self.circuit.devices,
+            &mut self.circuit.values,
             &mut self.report,
             name,
             Box::new(CSwitch::new(name, ctrl)),
@@ -271,11 +275,9 @@ impl Placer<'_> {
         // Power port: P<name> n+ n- [Z0=<ohms>]. Lowers to the Thevenin
         // form the S-parameter extraction assumes: an ideal source
         // (named like the port, so it doubles as the AC/SP drive)
-        // behind a Z0 series resistor onto n+; n- is the reference.
-        // The port is registered in `ParsedCircuit::self.ports`.
+        // behind a Z0 series resistor onto n+; n- is the reference
+        // (see `Circuit::port`).
         el.need(3)?;
-        let a = self.nodes.resolve(tok[1]);
-        let b = self.nodes.resolve(tok[2]);
         let z0 = tok[3..]
             .iter()
             .find_map(|s| {
@@ -287,20 +289,7 @@ impl Placer<'_> {
                 }
             })
             .unwrap_or(50.0);
-        if !(z0 > 0.0) {
-            return Err(err_at(line_no, line_col, "port Z0 must be positive"));
-        }
-        let t = self.nodes.resolve(&format!("{name}.t"));
-        self.circuit.voltage_source(name, t, b);
-        self.values.insert(sane_mna::value_symbol_name(name), 0.0);
-        let rn = format!("{name}.z0");
-        self.circuit.resistor(&rn, t, a);
-        self.values.insert(sane_mna::value_symbol_name(&rn), z0);
-        self.ports.push(PortDef {
-            name: name.to_string(),
-            node: tok[1].to_string(),
-            z0,
-        });
+        (self.circuit.port(name, tok[1], tok[2], z0)).map_err(|m| err_at(line_no, line_col, &m))?;
         Ok(())
     }
     pub(crate) fn place_coupling(&mut self, el: &Elem<'_>) -> Result<(), ParseError> {
@@ -308,9 +297,11 @@ impl Placer<'_> {
         // Mutual inductance: K name Lx Ly coupling. Args are inductor
         // element names, not self.nodes.
         el.need(4)?;
-        self.circuit.mutual(name, tok[1], tok[2]);
+        self.circuit.elements.mutual(name, tok[1], tok[2]);
         if let Some(v) = tok[3..].iter().find_map(|s| resolve_value(s, self.params)) {
-            self.values.insert(sane_mna::value_symbol_name(name), v);
+            self.circuit
+                .values
+                .insert(sane_circuit::value_symbol_name(name), v);
         }
         Ok(())
     }
@@ -318,16 +309,18 @@ impl Placer<'_> {
         let (name, tok) = (el.name, el.tok);
         // Current-controlled sources: F/H n+ n- Vctrl gain.
         el.need(4)?;
-        let a = self.nodes.resolve(tok[1]);
-        let b = self.nodes.resolve(tok[2]);
+        let a = self.circuit.node(tok[1]);
+        let b = self.circuit.node(tok[2]);
         let ctrl = tok[3]; // controlling (voltage-defined) element name
         match el.kind {
-            'F' => self.circuit.cccs(name, a, b, ctrl),
-            'H' => self.circuit.ccvs(name, a, b, ctrl),
+            'F' => self.circuit.elements.cccs(name, a, b, ctrl),
+            'H' => self.circuit.elements.ccvs(name, a, b, ctrl),
             _ => unreachable!(),
         };
         if let Some(v) = tok[4..].iter().find_map(|s| resolve_value(s, self.params)) {
-            self.values.insert(sane_mna::value_symbol_name(name), v);
+            self.circuit
+                .values
+                .insert(sane_circuit::value_symbol_name(name), v);
         }
         Ok(())
     }
@@ -339,15 +332,15 @@ impl Placer<'_> {
         // series-resistance internal node fold structurally from the
         // bound parameters, so a bare card lowers to the bare junction.
         el.need(3)?;
-        let a = self.nodes.resolve(tok[1]);
-        let k = self.nodes.resolve(tok[2]);
+        let a = self.circuit.node(tok[1]);
+        let k = self.circuit.node(tok[2]);
         let model_tok = tok[3..].iter().find(|t| !t.contains('=')).copied();
         let card = model_tok.and_then(|m| self.models.select(m, None, None));
         let modelname = model_tok.unwrap_or(base);
         let em = builtin_module("sane_diode").expect("builtin diode");
         place_va_device(
-            &mut self.devices,
-            &mut self.values,
+            &mut self.circuit.devices,
+            &mut self.circuit.values,
             &mut self.report,
             name,
             modelname,
@@ -368,10 +361,10 @@ impl Placer<'_> {
             (el.name, el.base, el.tok, el.line_no, el.line_col);
         // SPICE MOSFET: M name drain gate source body [model] [self.params].
         el.need(5)?;
-        let d = self.nodes.resolve(tok[1]);
-        let g = self.nodes.resolve(tok[2]);
-        let s = self.nodes.resolve(tok[3]);
-        let body = self.nodes.resolve(tok[4]);
+        let d = self.circuit.node(tok[1]);
+        let g = self.circuit.node(tok[2]);
+        let s = self.circuit.node(tok[3]);
+        let body = self.circuit.node(tok[4]);
         let extras = &tok[5..];
         // The `M` element is the built-in square-law MOSFET (levels 1-3,
         // body ignored). Compact self.models (level > 3, BSIM/EKV/PSP/...) have
@@ -421,7 +414,7 @@ impl Placer<'_> {
                 let terminals = vec![d, g, s, body];
                 if terminals.len() != em.ports.len() {
                     return Err(err_at(line_no, line_col, &format!(
-                        "compact MOSFET '{name}' routed to Verilog-A module '{}' with {} self.ports, \
+                        "compact MOSFET '{name}' routed to Verilog-A module '{}' with {} self.circuit.ports, \
                          but `M` provides 4 terminals (d g s b)",
                         em.name, em.ports.len())));
                 }
@@ -431,8 +424,8 @@ impl Placer<'_> {
                     1.0
                 };
                 place_va_device(
-                    &mut self.devices,
-                    &mut self.values,
+                    &mut self.circuit.devices,
+                    &mut self.circuit.values,
                     &mut self.report,
                     name,
                     modelname,
@@ -467,8 +460,8 @@ impl Placer<'_> {
         let sign = if is_p { -1.0 } else { 1.0 };
         let em = builtin_module("sane_mos").expect("builtin mosfet");
         place_va_device(
-            &mut self.devices,
-            &mut self.values,
+            &mut self.circuit.devices,
+            &mut self.circuit.values,
             &mut self.report,
             name,
             model_name.unwrap_or(base),
@@ -488,9 +481,9 @@ impl Placer<'_> {
         let (name, base, tok) = (el.name, el.base, el.tok);
         // Q name collector base emitter [model] [area].
         el.need(4)?;
-        let c = self.nodes.resolve(tok[1]);
-        let b = self.nodes.resolve(tok[2]);
-        let e = self.nodes.resolve(tok[3]);
+        let c = self.circuit.node(tok[1]);
+        let b = self.circuit.node(tok[2]);
+        let e = self.circuit.node(tok[3]);
         let extras = &tok[4..];
         // Model name = first token that is neither `key=val` nor a bare
         // number (the area multiplier is a bare number after the model).
@@ -524,8 +517,8 @@ impl Placer<'_> {
             })
             .unwrap_or_default();
         place_va_device(
-            &mut self.devices,
-            &mut self.values,
+            &mut self.circuit.devices,
+            &mut self.circuit.values,
             &mut self.report,
             name,
             modelname,
@@ -546,9 +539,9 @@ impl Placer<'_> {
         // JFET: J name drain gate source [model]. Polarity from the model
         // type (PJF -> P, else N-channel).
         el.need(4)?;
-        let d = self.nodes.resolve(tok[1]);
-        let g = self.nodes.resolve(tok[2]);
-        let s = self.nodes.resolve(tok[3]);
+        let d = self.circuit.node(tok[1]);
+        let g = self.circuit.node(tok[2]);
+        let s = self.circuit.node(tok[3]);
         let extras = &tok[4..];
         let card = extras
             .iter()
@@ -563,8 +556,8 @@ impl Placer<'_> {
             .unwrap_or(base);
         let em = builtin_module("sane_jfet").expect("builtin jfet");
         place_va_device(
-            &mut self.devices,
-            &mut self.values,
+            &mut self.circuit.devices,
+            &mut self.circuit.values,
             &mut self.report,
             name,
             modelname,
@@ -585,8 +578,8 @@ impl Placer<'_> {
         // Behavioral source: B name n+ n- V=<expr> | I=<expr>. The
         // expression spans the rest of the line (may contain spaces).
         el.need(4)?;
-        let np = self.nodes.resolve(tok[1]);
-        let nm = self.nodes.resolve(tok[2]);
+        let np = self.circuit.node(tok[1]);
+        let nm = self.circuit.node(tok[2]);
         let rest: String = tok[3..].join(" ");
         let (bkind, expr_str) = match rest.chars().next() {
             Some('V' | 'v') if rest[1..].starts_with('=') => (BKind::V, &rest[2..]),
@@ -599,19 +592,21 @@ impl Placer<'_> {
                 ))
             }
         };
-        let mut resolve = |n: &str| self.nodes.resolve(n);
+        let mut resolve = |n: &str| self.circuit.node(n);
         let bexpr =
             parse_bexpr(expr_str, &mut resolve).map_err(|m| err_at(line_no, line_col, &m))?;
-        self.circuit.behavioral_source(name, np, nm, bkind, bexpr);
+        self.circuit
+            .elements
+            .behavioral_source(name, np, nm, bkind, bexpr);
         Ok(())
     }
     pub(crate) fn place_zener(&mut self, el: &Elem<'_>) -> Result<(), ParseError> {
         let (name, base, tok) = (el.name, el.base, el.tok);
         // MESFET: Z name drain gate source [model]. PMF -> P-channel.
         el.need(4)?;
-        let d = self.nodes.resolve(tok[1]);
-        let g = self.nodes.resolve(tok[2]);
-        let s = self.nodes.resolve(tok[3]);
+        let d = self.circuit.node(tok[1]);
+        let g = self.circuit.node(tok[2]);
+        let s = self.circuit.node(tok[3]);
         let extras = &tok[4..];
         let card = extras
             .iter()
@@ -626,8 +621,8 @@ impl Placer<'_> {
             .unwrap_or(base);
         let em = builtin_module("sane_mesfet").expect("builtin mesfet");
         place_va_device(
-            &mut self.devices,
-            &mut self.values,
+            &mut self.circuit.devices,
+            &mut self.circuit.values,
             &mut self.report,
             name,
             modelname,
@@ -685,9 +680,9 @@ impl Placer<'_> {
                     ),
                 ));
             }
-            let terminals: Vec<usize> = node_toks.iter().map(|t| self.nodes.resolve(t)).collect();
+            let terminals: Vec<usize> = node_toks.iter().map(|t| self.circuit.node(t)).collect();
             place_osdi_device(
-                &mut self.devices,
+                &mut self.circuit.devices,
                 &mut self.report,
                 name,
                 modelname,
@@ -730,16 +725,16 @@ impl Placer<'_> {
                 line_no,
                 line_col,
                 &format!(
-                    "veriloga model '{modelname}' has {} self.ports, {} connections given",
+                    "veriloga model '{modelname}' has {} self.circuit.ports, {} connections given",
                     em.ports.len(),
                     node_toks.len()
                 ),
             ));
         }
-        let terminals: Vec<usize> = node_toks.iter().map(|t| self.nodes.resolve(t)).collect();
+        let terminals: Vec<usize> = node_toks.iter().map(|t| self.circuit.node(t)).collect();
         place_va_device(
-            &mut self.devices,
-            &mut self.values,
+            &mut self.circuit.devices,
+            &mut self.circuit.values,
             &mut self.report,
             name,
             modelname,
@@ -770,10 +765,10 @@ impl Placer<'_> {
         // Port 1 is (n1,n2), port 2 is (n3,n4); n2/n4 are the common
         // series/shunt reference (tie them externally for a 2-wire line).
         el.need(5)?;
-        let n_in = self.nodes.resolve(tok[1]);
-        let n_out = self.nodes.resolve(tok[3]);
-        let n_ref = self.nodes.resolve(tok[2]); // shunt/series reference = n2
-        let _n4 = self.nodes.resolve(tok[4]);
+        let n_in = self.circuit.node(tok[1]);
+        let n_out = self.circuit.node(tok[3]);
+        let n_ref = self.circuit.node(tok[2]); // shunt/series reference = n2
+        let _n4 = self.circuit.node(tok[4]);
         let kv = |key: &str| {
             tok[5..].iter().find_map(|t| {
                 let (k, v) = t.split_once('=')?;
@@ -816,44 +811,57 @@ impl Placer<'_> {
             let node = if k + 1 == nseg {
                 n_out
             } else {
-                self.nodes.resolve(&format!("{name}.x{k}"))
+                self.circuit.node(&format!("{name}.x{k}"))
             };
             // Series branch prev -> node: R and/or L in series. A mid node
             // is only needed when BOTH are present; with neither, a tiny R
-            // keeps the ladder regular (a plain wire would short the self.ports).
+            // keeps the ladder regular (a plain wire would short the self.circuit.ports).
             let rn = format!("{name}.R{k}");
             let ln = format!("{name}.L{k}");
             match (rs != 0.0, ls != 0.0) {
                 (true, true) => {
-                    let mid = self.nodes.resolve(&format!("{name}.r{k}"));
-                    self.circuit.resistor(&rn, prev, mid);
-                    self.values.insert(sane_mna::value_symbol_name(&rn), rs);
-                    self.circuit.inductor(&ln, mid, node);
-                    self.values.insert(sane_mna::value_symbol_name(&ln), ls);
+                    let mid = self.circuit.node(&format!("{name}.r{k}"));
+                    self.circuit.elements.resistor(&rn, prev, mid);
+                    self.circuit
+                        .values
+                        .insert(sane_circuit::value_symbol_name(&rn), rs);
+                    self.circuit.elements.inductor(&ln, mid, node);
+                    self.circuit
+                        .values
+                        .insert(sane_circuit::value_symbol_name(&ln), ls);
                 }
                 (true, false) => {
-                    self.circuit.resistor(&rn, prev, node);
-                    self.values.insert(sane_mna::value_symbol_name(&rn), rs);
+                    self.circuit.elements.resistor(&rn, prev, node);
+                    self.circuit
+                        .values
+                        .insert(sane_circuit::value_symbol_name(&rn), rs);
                 }
                 (false, true) => {
-                    self.circuit.inductor(&ln, prev, node);
-                    self.values.insert(sane_mna::value_symbol_name(&ln), ls);
+                    self.circuit.elements.inductor(&ln, prev, node);
+                    self.circuit
+                        .values
+                        .insert(sane_circuit::value_symbol_name(&ln), ls);
                 }
                 (false, false) => {
-                    self.circuit.resistor(&rn, prev, node);
-                    self.values.insert(sane_mna::value_symbol_name(&rn), 1e-9);
+                    self.circuit.elements.resistor(&rn, prev, node);
+                    self.circuit
+                        .values
+                        .insert(sane_circuit::value_symbol_name(&rn), 1e-9);
                 }
             }
             if cs != 0.0 {
                 let cn = format!("{name}.C{k}");
-                self.circuit.capacitor(&cn, node, n_ref);
-                self.values.insert(sane_mna::value_symbol_name(&cn), cs);
+                self.circuit.elements.capacitor(&cn, node, n_ref);
+                self.circuit
+                    .values
+                    .insert(sane_circuit::value_symbol_name(&cn), cs);
             }
             if gs != 0.0 {
                 let gn = format!("{name}.G{k}");
-                self.circuit.resistor(&gn, node, n_ref);
-                self.values
-                    .insert(sane_mna::value_symbol_name(&gn), 1.0 / gs);
+                self.circuit.elements.resistor(&gn, node, n_ref);
+                self.circuit
+                    .values
+                    .insert(sane_circuit::value_symbol_name(&gn), 1.0 / gs);
             }
             prev = node;
         }

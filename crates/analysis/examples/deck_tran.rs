@@ -13,8 +13,7 @@
 
 use std::time::Instant;
 
-use sane_analysis::Model;
-use sane_solve::TransientMethod;
+use sane_analysis::{Model, TransientOptions};
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -36,26 +35,29 @@ fn main() {
         .collect();
     let t1 = Instant::now();
     let traj = model
-        .transient(TransientMethod::Esdirk32, &[], &t, 1e-4, 1e-7)
+        .at(&[])
+        .and_then(|pt| pt.transient(&t, &TransientOptions::default()))
         .expect("transient");
     let solve_ms = t1.elapsed().as_secs_f64() * 1e3;
-    let events = model.transient_events();
+    let events = &traj.events;
 
     println!(
         "{path}: dim={} build={build_ms:.1} ms solve={solve_ms:.1} ms events={}",
         model.dim(),
         events.len()
     );
-    for (name, te, dir) in events.iter().take(6) {
+    for e in events.iter().take(6) {
         println!(
-            "  event {name} at {te:.6e} ({})",
-            if *dir > 0 { "rising" } else { "falling" }
+            "  event {} at {:.6e} ({})",
+            e.name,
+            e.t,
+            if e.direction > 0 { "rising" } else { "falling" }
         );
     }
     if events.len() > 6 {
         println!("  ... {} more", events.len() - 6);
     }
-    let rows = traj.rows();
+    let rows = traj.x.outer_iter().map(|r| r.to_vec()).collect::<Vec<_>>();
     for node in &nodes {
         let Some(k) = model.resolve(node) else {
             println!("  {node}: unknown node");
@@ -63,7 +65,7 @@ fn main() {
         };
         let last = rows.last().map(|r| r[k]).unwrap_or(f64::NAN);
         let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
-        for r in rows {
+        for r in &rows {
             lo = lo.min(r[k]);
             hi = hi.max(r[k]);
         }

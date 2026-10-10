@@ -3,7 +3,7 @@
 //! another, what a deck written with that value gives. Loops over a
 //! parameter and `$error`s on parameter values hold as assertions.
 
-use sane_analysis::{Model, ModelError};
+use sane_analysis::{Model, ModelError, TransientOptions};
 
 const SWITCHED: &str = "\
 .veriloga
@@ -26,7 +26,7 @@ fn deck(module: &str, params: &str) -> String {
 }
 
 fn current(model: &Model, overrides: &[(&str, f64)]) -> Result<f64, ModelError> {
-    let op = model.operating_point(overrides)?;
+    let op = model.at(overrides).and_then(|pt| pt.operating_point())?;
     Ok(-op.vector()[model.resolve("V1").unwrap()])
 }
 
@@ -46,7 +46,9 @@ fn override_across_a_branch() {
 fn set_across_a_branch() {
     let model = Model::from_netlist(&deck(SWITCHED, "k=-1")).expect("model");
     close(current(&model, &[]).unwrap(), 2.0);
-    model.set("N1.k", 0.5).expect("k is a parameter whatever its branch");
+    model
+        .set("N1.k", 0.5)
+        .expect("k is a parameter whatever its branch");
     close(current(&model, &[]).unwrap(), 0.5);
 }
 
@@ -57,7 +59,10 @@ fn subcircuit_instances_across_a_branch() {
          V1 a 0 1\nX1 a 0 cell k=1\nV2 b 0 1\nX2 b 0 cell k=-1\n.end\n"
     );
     let model = Model::from_netlist(&d).expect("model");
-    let op = model.operating_point(&[]).expect("dc");
+    let op = model
+        .at(&[])
+        .and_then(|pt| pt.operating_point())
+        .expect("dc");
     close(-op.vector()[model.resolve("V1").unwrap()], 1.0);
     close(-op.vector()[model.resolve("V2").unwrap()], 2.0);
 }
@@ -116,7 +121,10 @@ fn an_error_on_parameter_values_rejects_them() {
         "{bad:?}"
     );
     let built_bad = Model::from_netlist(&deck(GUARDED, "R=-1")).expect("model");
-    assert!(matches!(current(&built_bad, &[]), Err(ModelError::Invalid(_))));
+    assert!(matches!(
+        current(&built_bad, &[]),
+        Err(ModelError::Invalid(_))
+    ));
 }
 
 const COLLAPSIBLE: &str = "\
@@ -153,7 +161,10 @@ fn a_binding_across_a_topology_sets_it_up_anew() {
     close(current(&shorted, &[]).unwrap(), 1.0);
     // A node only the other structure has is its own there, by name; the
     // layout stays the model's.
-    let op = shorted.operating_point(&[("N1.R", 1.0)]).unwrap();
+    let op = shorted
+        .at(&[("N1.R", 1.0)])
+        .and_then(|pt| pt.operating_point())
+        .unwrap();
     close(op.get("N1.ai").unwrap(), 0.5);
     assert_eq!(op.vector().len(), shorted.dim());
     assert_eq!(
@@ -161,7 +172,10 @@ fn a_binding_across_a_topology_sets_it_up_anew() {
         None,
         "collapsed: no index of its own"
     );
-    let op = open.operating_point(&[("N1.R", 0.0)]).unwrap();
+    let op = open
+        .at(&[("N1.R", 0.0)])
+        .and_then(|pt| pt.operating_point())
+        .unwrap();
     close(op.get("N1.ai").unwrap(), 1.0);
     close(op.vector()[open.resolve("N1.ai").unwrap()], 1.0);
     // Set across, and back.
@@ -176,7 +190,11 @@ fn a_binding_across_a_topology_sets_it_up_anew() {
 #[test]
 fn sweeps_and_transients_cross_a_topology() {
     let model = Model::from_netlist(&deck(COLLAPSIBLE, "R=0")).expect("model");
-    let sweep = model.dc_sweep("N1.R", 0.0, 2.0, 1.0).expect("sweep");
+    let sweep = model
+        .at(&[])
+        .unwrap()
+        .dc_sweep("N1.R", &[0.0, 1.0, 2.0])
+        .expect("sweep");
     let i = sweep.signal("V1").expect("the source current");
     let want = [1.0, 0.5, 1.0 / 3.0];
     for (got, want) in i.iter().zip(want) {
@@ -185,18 +203,18 @@ fn sweeps_and_transients_cross_a_topology() {
     let ai = sweep.signal("N1.ai").expect("ai, by name");
     close(ai[0], 1.0); // collapsed onto a
     close(ai[1], 0.5);
+    let opts = TransientOptions {
+        rtol: 1e-6,
+        atol: 1e-9,
+        ..Default::default()
+    };
     let tr = model
-        .transient(
-            sane_solve::TransientMethod::default(),
-            &[("N1.R", 1.0)],
-            &[0.0, 1e-6],
-            1e-6,
-            1e-9,
-        )
+        .at(&[("N1.R", 1.0)])
+        .and_then(|pt| pt.transient(&[0.0, 1e-6], &opts))
         .expect("transient");
     close(-tr.signal("V1").unwrap()[1], 0.5);
     close(tr.signal("N1.ai").unwrap()[1], 0.5);
-    assert_eq!(tr.rows()[1].len(), model.dim());
+    assert_eq!(tr.x.ncols(), model.dim());
 }
 
 const MODE: &str = "\
@@ -222,7 +240,12 @@ fn an_integer_mode_is_structure() {
     let model = Model::from_netlist(&deck(MODE, "mode=0")).expect("model");
     close(current(&model, &[]).unwrap(), 1.0);
     close(current(&model, &[("N1.mode", 1.0)]).unwrap(), 3.0);
-    let x = model.operating_point(&[]).unwrap().vector().to_vec();
+    let x = model
+        .at(&[])
+        .and_then(|pt| pt.operating_point())
+        .unwrap()
+        .vector()
+        .to_vec();
     let p = model.pvec(&[("N1.mode", 1.0)]);
     let raw = model.currents(x, p, 0.0);
     assert!(

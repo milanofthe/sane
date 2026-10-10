@@ -17,7 +17,7 @@ impl Model {
     /// `C = dQ/dx`, computed natively (the engine's standard-reduction
     /// eigensolver -- no Python-side linear algebra, so no drift). `(re, im)` in
     /// rad/s.
-    pub fn poles(&self, x: Vec<f64>, p: Vec<f64>) -> Result<Vec<(f64, f64)>, ModelError> {
+    pub(crate) fn poles(&self, x: Vec<f64>, p: Vec<f64>) -> Result<Vec<(f64, f64)>, ModelError> {
         self.inner.bound(&p)?;
         let g = self.cdc().system_matrix_dc(&x, &p, 0.0);
         let c = self.cdc().jacobian_q_x(&x, &p, 0.0);
@@ -29,7 +29,7 @@ impl Model {
     /// Transmission zeros from source `input` to the unknown at `out_idx`, at the
     /// operating point `x`: the finite generalized eigenvalues of the Rosenbrock
     /// system-matrix pencil, computed natively (same eigensolver as `poles`).
-    pub fn zeros(
+    pub(crate) fn zeros(
         &self,
         input: &str,
         out_idx: usize,
@@ -66,7 +66,7 @@ impl Model {
     /// DC adjoint for the shift (the same all-parameter trick as the AC gradient),
     /// then `ds = d(mu)/mu^2`. Returns one `(s, [(name, ds_re, ds_im)])` per pole.
     #[allow(clippy::type_complexity)]
-    pub fn pole_gradient(
+    pub(crate) fn pole_gradient(
         &self,
         x: Vec<f64>,
         p: Vec<f64>,
@@ -205,7 +205,7 @@ impl Model {
     /// term is the `b`-column `-mu v_{n} sum_i w_hat_i b_i`. Returns one
     /// `(s, [(name, ds_re, ds_im)])` per zero.
     #[allow(clippy::type_complexity)]
-    pub fn zero_gradient(
+    pub(crate) fn zero_gradient(
         &self,
         input: &str,
         out_idx: usize,
@@ -247,18 +247,9 @@ impl Model {
         let mut cg = arc.lock().unwrap();
         let c = &mut *cg;
         let ((gr, gc, ge), (cr, cc, ce)) = self.dae().jacobian_iq_coo(c);
-        let isym = {
-            let e = c.sym(input);
-            match c.node(e) {
-                Node::Symbol(s) => *s,
-                _ => return Err(ModelError::Numeric(format!("'{input}' is not a symbol"))),
-            }
-        };
-        let bsym: Vec<ExprId> = self
-            .dae()
-            .currents
-            .iter()
-            .map(|&r| differentiate(c, r, isym))
+        let isyms = self.inner.drive(c, input)?;
+        let bsym: Vec<ExprId> = (self.dae().at_rest(c).0.iter())
+            .map(|&r| crate::d_drive(c, r, &isyms))
             .collect();
         let mut env: HashMap<SymbolId, f64> = HashMap::new();
         for (i, &s) in self.dae().x.iter().enumerate() {
@@ -376,72 +367,5 @@ impl Model {
             out.push(((s_arr[0], s_arr[1]), items));
         }
         Ok(out)
-    }
-
-    /// Exact pole sensitivity `(pole, dpole/dp)` for every finite pole w.r.t.
-    /// `param`, including the operating-point shift, computed natively (the same
-    /// pencil eigensolver as `poles`, so the poles are consistent). `(re, im)`.
-    pub fn pole_sensitivity(
-        &self,
-        input: &str,
-        param: &str,
-        x: Vec<f64>,
-        p: Vec<f64>,
-    ) -> Result<Vec<((f64, f64), (f64, f64))>, ModelError> {
-        self.inner.bound(&p)?;
-        let g = self.cdc().system_matrix_dc(&x, &p, 0.0);
-        let c = self.cdc().jacobian_q_x(&x, &p, 0.0);
-        let (dg, dc, _db) = self.ac_derivatives(input, param, x.clone(), p.clone(), 0.0)?;
-        crate::pencil_root_sensitivity(&g, &c, &dg, &dc)
-            .map(|v| {
-                v.into_iter()
-                    .map(|(s, ds)| ((s[0], s[1]), (ds[0], ds[1])))
-                    .collect()
-            })
-            .map_err(ModelError::Numeric)
-    }
-
-    /// Exact transmission-zero sensitivity `(zero, dzero/dp)` for every finite
-    /// zero of the `input -> out_idx` transfer w.r.t. `param`, native (same
-    /// Rosenbrock pencil and eigensolver as `zeros`). `(re, im)`.
-    pub fn zero_sensitivity(
-        &self,
-        input: &str,
-        out_idx: usize,
-        param: &str,
-        x: Vec<f64>,
-        p: Vec<f64>,
-    ) -> Result<Vec<((f64, f64), (f64, f64))>, ModelError> {
-        self.inner.bound(&p)?;
-        let n = self.dae().dim();
-        let g = self.cdc().system_matrix_dc(&x, &p, 0.0);
-        let c = self.cdc().jacobian_q_x(&x, &p, 0.0);
-        let bin = self.jacobian_i_input(input, x.clone(), p.clone(), 0.0)?; // dF/d(input)
-        let (dg, dc, db) = self.ac_derivatives(input, param, x.clone(), p.clone(), 0.0)?;
-        // Rosenbrock M = [[G, dF/din], [e_out, 0]], N = [[C, 0], [0, 0]] (the same
-        // convention as `zeros`); its parameter derivatives. d(dF/din)/dp = -dB.
-        let m = n + 1;
-        let mut mm = vec![vec![0.0; m]; m];
-        let mut nn = vec![vec![0.0; m]; m];
-        let mut dmm = vec![vec![0.0; m]; m];
-        let mut dnn = vec![vec![0.0; m]; m];
-        for i in 0..n {
-            for j in 0..n {
-                mm[i][j] = g[i][j];
-                nn[i][j] = c[i][j];
-                dmm[i][j] = dg[i][j];
-                dnn[i][j] = dc[i][j];
-            }
-            mm[i][n] = bin[i];
-            dmm[i][n] = -db[i];
-            mm[n][i] = if i == out_idx { 1.0 } else { 0.0 };
-        }
-        crate::pencil_root_sensitivity(&mm, &nn, &dmm, &dnn)
-            .map(|v| {
-                v.into_iter()
-                    .map(|(s, ds)| ((s[0], s[1]), (ds[0], ds[1])))
-                    .collect()
-            })
-            .map_err(ModelError::Numeric)
     }
 }

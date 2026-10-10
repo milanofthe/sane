@@ -5,7 +5,9 @@
 //!
 //! 1. **Native code**, when a [`Compiler`] is given (`rsdag-jit` has one):
 //!    after a few evaluations the tape is compiled in the background; once
-//!    it lands it wins.
+//!    it lands it wins. A large tape, one whose interpreted pass is long,
+//!    is compiled at once, and its passes wait for the compile rather than
+//!    interpret alongside it.
 //! 2. **Choice specialization** (interpreter): models branch by operating
 //!    region (`Select`) and the full tape evaluates both arms. After a
 //!    traced evaluation the tape is shortened against the current choices
@@ -22,8 +24,9 @@
 //! time; only a specialized episode is tied to its specialization, and
 //! falls back to the full tape when a region flips.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::hooks::{log, Level};
 use crate::{Program, SpecializedTape, Tape};
@@ -50,6 +53,14 @@ pub struct Policy {
     /// Evaluations before the background compile is kicked off: a couple of
     /// interpreted passes filter out one-shot tapes.
     pub kick_after: u32,
+    /// An interpreted pass at least this long marks the tape as large: its
+    /// compile is kicked at once, and while it is in flight a pass waits
+    /// for it, at most as long as the slowest interpreted pass so far,
+    /// before it interprets. One interpreted pass of a large tape costs
+    /// about what compiling it does, so waiting loses at most one pass and
+    /// saves every pass the compile would otherwise run alongside. `None`
+    /// counts evaluations alone.
+    pub eager_pass: Option<Duration>,
     /// Specialize over region choices at all.
     pub specialize: bool,
     /// Below this many `Select`s the shortening cannot pay for its guards.
@@ -84,6 +95,7 @@ impl Default for Policy {
         Policy {
             jit: true,
             kick_after: 3,
+            eager_pass: Some(Duration::from_millis(10)),
             specialize: true,
             spec_min_selects: 16,
             spec_min_shrink_pct: 15,
@@ -104,6 +116,10 @@ struct Jit {
     compiled: OnceLock<Option<Native>>,
     kicked: AtomicBool,
     evals: AtomicU32,
+    /// The slowest pass before the native code, in nanoseconds.
+    slowest: AtomicU64,
+    /// Set and notified when the compile lands, for the passes waiting.
+    landed: (Mutex<bool>, Condvar),
 }
 
 /// Specialization cache and its policy counters.
@@ -197,6 +213,8 @@ impl Adaptive {
                 compiled: OnceLock::new(),
                 kicked: AtomicBool::new(false),
                 evals: AtomicU32::new(0),
+                slowest: AtomicU64::new(0),
+                landed: (Mutex::new(false), Condvar::new()),
             }),
         }
     }
@@ -239,6 +257,13 @@ impl Adaptive {
     pub fn eval(&self, inputs: &[f64], work: &mut Vec<f64>, out: &mut Vec<f64>) {
         // Every call feeds the full-tape compile, whichever rung serves it.
         self.maybe_kick();
+        self.await_native();
+        let clock = self.clock();
+        self.eval_rung(inputs, work, out);
+        self.clocked(clock);
+    }
+
+    fn eval_rung(&self, inputs: &[f64], work: &mut Vec<f64>, out: &mut Vec<f64>) {
         if let Some(cache) = &self.spec {
             // Contention (parallel callers sharing one tape) falls past the
             // specialized rungs rather than serializing on the cache.
@@ -305,6 +330,14 @@ impl Adaptive {
     pub fn eval_prolog(&self, inputs: &[f64], work: &mut Vec<f64>) -> Episode {
         // An episode counts toward the compile as an evaluation does.
         self.maybe_kick();
+        self.await_native();
+        let clock = self.clock();
+        let ep = self.prolog_rung(inputs, work);
+        self.clocked(clock);
+        ep
+    }
+
+    fn prolog_rung(&self, inputs: &[f64], work: &mut Vec<f64>) -> Episode {
         // Read before the prolog: a form landing while it runs brings the
         // next main pass back here.
         let forms = self.forms();
@@ -382,6 +415,13 @@ impl Adaptive {
         out: &mut Vec<f64>,
     ) {
         self.maybe_kick();
+        self.await_native();
+        let clock = self.clock();
+        self.main_rung(ep, inputs, work, out);
+        self.clocked(clock);
+    }
+
+    fn main_rung(&self, ep: &mut Episode, inputs: &[f64], work: &mut Vec<f64>, out: &mut Vec<f64>) {
         // A faster form landed in the background since the prolog (the
         // native code, a function body's variant for this binding): the
         // episode runs the prolog again to take it, once per landing,
@@ -573,14 +613,57 @@ impl Adaptive {
         }
     }
 
-    /// Count the call; past the threshold, queue the full-tape compile. A
-    /// failed compile leaves the interpreter in place for good.
+    /// Whether an interpreted pass has marked the tape as large (see
+    /// [`Policy::eager_pass`]).
+    fn large(&self) -> bool {
+        let slowest = Duration::from_nanos(self.jit.slowest.load(Ordering::Relaxed));
+        self.policy.eager_pass.is_some_and(|d| slowest >= d)
+    }
+
+    /// The start of a pass to time: one before the native code, where a
+    /// large tape is to be told from a small one.
+    fn clock(&self) -> Option<Instant> {
+        let timed = self.policy.jit
+            && self.policy.eager_pass.is_some()
+            && self.compiler.is_some()
+            && self.jit.compiled.get().is_none();
+        timed.then(Instant::now)
+    }
+
+    /// A timed pass ended: keep the slowest.
+    fn clocked(&self, clock: Option<Instant>) {
+        if let Some(t) = clock {
+            let ns = u64::try_from(t.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            self.jit.slowest.fetch_max(ns, Ordering::Relaxed);
+        }
+    }
+
+    /// A large tape's compile in flight: wait for it to land, at most as
+    /// long as its slowest interpreted pass, the one that would otherwise
+    /// run alongside it.
+    fn await_native(&self) {
+        if !self.jit.kicked.load(Ordering::Relaxed)
+            || self.jit.compiled.get().is_some()
+            || !self.large()
+        {
+            return;
+        }
+        let wait = Duration::from_nanos(self.jit.slowest.load(Ordering::Relaxed));
+        let (lock, cv) = &self.jit.landed;
+        let landed = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = cv.wait_timeout_while(landed, wait, |landed| !*landed);
+    }
+
+    /// Count the call; past the threshold, or once a pass has shown the
+    /// tape large, queue the full-tape compile. A failed compile leaves the
+    /// interpreter in place for good.
     fn maybe_kick(&self) {
         let Some(compiler) = self.compiler.clone() else {
             return;
         };
+        let evals = self.jit.evals.fetch_add(1, Ordering::Relaxed) + 1;
         if !self.policy.jit
-            || self.jit.evals.fetch_add(1, Ordering::Relaxed) + 1 < self.policy.kick_after
+            || (evals < self.policy.kick_after && !self.large())
             || self.jit.kicked.swap(true, Ordering::Relaxed)
         {
             return;
@@ -598,6 +681,9 @@ impl Adaptive {
                 },
             );
             let _ = jit.compiled.set(compiled.map(Arc::from));
+            let (lock, cv) = &jit.landed;
+            *lock.lock().unwrap_or_else(|e| e.into_inner()) = true;
+            cv.notify_all();
         }));
     }
 }

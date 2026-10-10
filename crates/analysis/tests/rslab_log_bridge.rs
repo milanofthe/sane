@@ -26,7 +26,10 @@ D1 mid 0 DMOD
     log::set_sink(Some(capture));
     log::set_level(LogLevel::Debug);
     let model = Model::from_netlist(deck).expect("model");
-    let _ = model.operating_point(&[]).expect("op");
+    let _ = model
+        .at(&[])
+        .and_then(|pt| pt.operating_point())
+        .expect("op");
     log::set_level(LogLevel::Disabled);
     log::set_sink(None);
     let lines = LINES.lock().unwrap().clone();

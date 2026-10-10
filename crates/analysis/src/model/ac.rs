@@ -5,20 +5,20 @@
 use std::collections::HashMap;
 use std::f64::consts::PI;
 
+use ndarray::{s, Array2, Array3, Array4, ArrayView1, ArrayView2, ArrayView3};
 use num_complex::Complex64;
 use rayon::prelude::*;
 use rsdag::{differentiate, ExprId, Node, SymbolId};
 use sane_core::log;
 use sane_core::Graph;
-use sane_dae::{ac_param_derivatives, Dae as CoreDae};
+use sane_dae::Dae as CoreDae;
 use sane_solve::CompiledDc;
 
-use crate::model::{Model, ModelError};
+use crate::model::{Gradient, Model, ModelError, Point};
 
 /// Frequencies per block of an AC sweep: one pivoting factorization each, a
 /// unit of work for one worker.
 pub const AC_BLOCK: usize = 64;
-use crate::op_env;
 
 /// Cached weighted-adjoint tape for one AC input (see
 /// `Model::ensure_ac_vjp_tape`): weight symbols and the once-differentiated
@@ -54,51 +54,6 @@ struct AcAdjointSetup {
 }
 
 impl Model {
-    /// Exact total derivatives of the small-signal matrices w.r.t. `param`,
-    /// including the operating-point shift, via AD: returns `(dG, dC, dB)`.
-    pub fn ac_derivatives(
-        &self,
-        input: &str,
-        param: &str,
-        x: Vec<f64>,
-        p: Vec<f64>,
-        t: f64,
-    ) -> Result<(Vec<Vec<f64>>, Vec<Vec<f64>>, Vec<f64>), ModelError> {
-        self.inner.bound(&p)?;
-        let arc = self.context_arc();
-        let mut c = arc.lock().unwrap();
-        let dae = self.dae();
-        let pnames = self.cdc().param_names(&c);
-        let col = pnames
-            .iter()
-            .position(|n| n == param)
-            .ok_or_else(|| ModelError::Numeric(format!("unknown parameter '{param}'")))?;
-        // Build dF/dp before the state-sensitivity solve; without it the
-        // operating-point-shift term dx/dp is silently zero (issue #38).
-        self.cdc().ensure_param_jac(&mut c, dae);
-        let s = self.cdc().state_sensitivity(col, &x, &p, t);
-        if s.is_empty() {
-            return Err(ModelError::Numeric(
-                "ac_derivatives: singular Jacobian".to_string(),
-            ));
-        }
-        let sym_of = |ctx: &mut Graph, name: &str| -> Option<SymbolId> {
-            let e = ctx.sym(name);
-            match ctx.node(e) {
-                Node::Symbol(sy) => Some(*sy),
-                _ => None,
-            }
-        };
-        let input_sym = sym_of(&mut c, input)
-            .ok_or_else(|| ModelError::Numeric(format!("'{input}' is not a symbol")))?;
-        let p_sym = sym_of(&mut c, param)
-            .ok_or_else(|| ModelError::Numeric(format!("'{param}' is not a symbol")))?;
-        let env = op_env(&mut c, dae, &pnames, &x, &p, t);
-        Ok(ac_param_derivatives(
-            &mut c, dae, input_sym, p_sym, &s, &env,
-        ))
-    }
-
     /// Small-signal AC response `H(j2*pi*f)` from source `input` to the unknown at
     /// `out_idx`, at the operating point `x`, solved numerically per frequency in
     /// Rust: `e_out^T (G + jwC)^{-1} (-dF/d(input))`. Returns `(re, im)` per
@@ -108,7 +63,7 @@ impl Model {
     /// (`SANE_THREADS`): a block factors at its first frequency with pivoting
     /// and refactors numerically after it. The blocks are fixed, so the result
     /// does not depend on the thread count.
-    pub fn ac_response(
+    pub(crate) fn ac_response(
         &self,
         input: &str,
         out_idx: usize,
@@ -117,6 +72,23 @@ impl Model {
         freqs_hz: Vec<f64>,
     ) -> Result<Vec<(f64, f64)>, ModelError> {
         self.inner.bound(&p)?;
+        let rows = self.ac_solve(input, &[out_idx], &x, &p, &freqs_hz)?;
+        Ok(rows.iter().map(|r| (r[0].re, r[0].im)).collect())
+    }
+
+    /// The small-signal responses of the unknowns `outs` to the source
+    /// `input` at the operating point `(x, p)`, per frequency (`NaN` where
+    /// `G + jwC` is singular): one factorization per frequency for all of
+    /// them.
+    pub(crate) fn ac_solve(
+        &self,
+        input: &str,
+        outs: &[usize],
+        x: &[f64],
+        p: &[f64],
+        freqs_hz: &[f64],
+    ) -> Result<Vec<Vec<Complex64>>, ModelError> {
+        let (x, p) = (x.to_vec(), p.to_vec());
         // Transport delays are exact in AC: `hist_k = x_src(t - τ_k)` becomes
         // `e^{-jωτ_k} X_src`, an extra (frequency-dependent) coupling entry.
         self.ensure_hist_jac_ready();
@@ -138,7 +110,7 @@ impl Model {
         let bin = self.jacobian_i_input(input, x.clone(), p.clone(), 0.0)?;
         let b: Vec<Complex64> = bin.iter().map(|v| Complex64::new(-v, 0.0)).collect();
         let (dr, dc, dv, dtau) = self.delay_ac_entries(&x, &p);
-        let sym = crate::sparse_ac::SymbolicAc::new_with_delays(
+        let sym = crate::sparse_ac::SymbolicAc::new(
             n,
             (&gr, &gc, &gv),
             (&cr, &cc, &cv),
@@ -146,7 +118,8 @@ impl Model {
             false,
             2.0 * PI * freqs_hz.first().copied().unwrap_or(0.0),
         );
-        let blocks: Vec<Vec<(f64, f64)>> = sane_solve::parallel::install(|| {
+        let nan = Complex64::new(f64::NAN, f64::NAN);
+        let blocks: Vec<Vec<Vec<Complex64>>> = sane_solve::parallel::install(|| {
             freqs_hz
                 .par_chunks(AC_BLOCK)
                 .map(|block| {
@@ -161,19 +134,20 @@ impl Model {
                             // into a warning -- instead of silently coercing to
                             // 0.0, which reads as a flat ~-600 dB response and
                             // masquerades as a size limit (issue #39).
-                            let h = fac
-                                .as_mut()
-                                .and_then(|fa| fa.solve(2.0 * PI * f, &b))
-                                .map(|xx| xx[out_idx])
-                                .unwrap_or(Complex64::new(f64::NAN, f64::NAN));
-                            (h.re, h.im)
+                            match fac.as_mut().and_then(|fa| fa.solve(2.0 * PI * f, &b)) {
+                                Some(v) => outs.iter().map(|&i| v[i]).collect(),
+                                None => vec![nan; outs.len()],
+                            }
                         })
                         .collect()
                 })
                 .collect()
         });
-        let out: Vec<(f64, f64)> = blocks.concat();
-        let singular = out.iter().filter(|(re, _)| re.is_nan()).count();
+        let out: Vec<Vec<Complex64>> = blocks.concat();
+        let singular = out
+            .iter()
+            .filter(|r| r.iter().any(|h| h.re.is_nan()))
+            .count();
         task.finish(if singular > 0 {
             format!("points: {}, singular: {singular}", out.len())
         } else {
@@ -182,102 +156,11 @@ impl Model {
         Ok(out)
     }
 
-    /// The AC sweep over a log grid of `points` frequencies in `[fstart, fstop]`
-    /// at the operating point `(x, p)`: [`ac_response`](Self::ac_response) as
-    /// `(freqs, mag_db, phase_deg)`.
-    #[allow(clippy::type_complexity)]
-    pub fn ac_sweep(
-        &self,
-        input: &str,
-        out_idx: usize,
-        x: Vec<f64>,
-        p: Vec<f64>,
-        fstart: f64,
-        fstop: f64,
-        points: usize,
-    ) -> Result<(Vec<f64>, Vec<f64>, Vec<f64>), ModelError> {
-        self.inner.bound(&p)?;
-        if !(fstart > 0.0) || !(fstop > fstart) || points < 2 {
-            return Err(ModelError::Numeric(
-                "AC needs 0 < fstart < fstop and points >= 2".into(),
-            ));
-        }
-        let (l0, l1) = (fstart.log10(), fstop.log10());
-        let freqs: Vec<f64> = (0..points)
-            .map(|k| 10f64.powf(l0 + (l1 - l0) * k as f64 / (points - 1) as f64))
-            .collect();
-        let h = self.ac_response(input, out_idx, x, p, freqs.clone())?;
-        let mag_db = h
-            .iter()
-            .map(|&(re, im)| 20.0 * re.hypot(im).max(1e-30).log10())
-            .collect();
-        let phase_deg = h
-            .iter()
-            .map(|&(re, im)| im.atan2(re).to_degrees())
-            .collect();
-        Ok((freqs, mag_db, phase_deg))
-    }
-
-    /// Exact AC-transfer sensitivity `dH/dp(jw)` from `input` w.r.t. `param` at
-    /// the operating point `x`, computed natively (the complex solves run in
-    /// Rust). Returns `(re, im)` per frequency.
-    pub fn ac_sensitivity(
-        &self,
-        input: &str,
-        param: &str,
-        out_idx: usize,
-        x: Vec<f64>,
-        p: Vec<f64>,
-        freqs_hz: Vec<f64>,
-    ) -> Result<Vec<(f64, f64)>, ModelError> {
-        self.inner.bound(&p)?;
-        self.ensure_no_delays("ac_sensitivity")?;
-        let g = self.cdc().system_matrix_dc(&x, &p, 0.0);
-        let c = self.cdc().jacobian_q_x(&x, &p, 0.0);
-        // B = -dF/d(input); dB from the total small-signal derivatives.
-        let bin = self.jacobian_i_input(input, x.clone(), p.clone(), 0.0)?;
-        let b: Vec<f64> = bin.iter().map(|v| -v).collect();
-        let (dg, dc, db) = self.ac_derivatives(input, param, x.clone(), p.clone(), 0.0)?;
-        Ok(
-            crate::ac_response_sensitivity(&g, &c, &b, &dg, &dc, &db, out_idx, &freqs_hz)
-                .into_iter()
-                .map(|r| (r[0], r[1]))
-                .collect(),
-        )
-    }
-
-    /// Exact AC sensitivity `dH/dp` of the transfer `H(jw) = v[out_idx]` w.r.t.
-    /// **every** parameter at one frequency, by the adjoint. With the forward
-    /// state `A v = b` and adjoint `A^T lambda = e_out` (`A = G + jwC`), the
-    /// scalar functional `Psi(x,p) = lambda^T b - lambda^T A v` (lambda, v frozen)
-    /// has total derivative `dH/dp_k = dPsi/dp_k - mu^T dF/dp_k`, where
-    /// `G_dc^T mu = grad_x Psi` is one DC adjoint (the operating-point shift). All
-    /// pieces are exact first-order autodiff of one scalar -- no finite
-    /// differences, two complex solves plus one real solve total, all parameters
-    /// at once. Returns `(name, dHre/dp, dHim/dp)`.
-    pub fn ac_gradient(
-        &self,
-        input: &str,
-        out_idx: usize,
-        x: Vec<f64>,
-        p: Vec<f64>,
-        freq: f64,
-    ) -> Result<Vec<(String, f64, f64)>, ModelError> {
-        self.inner.bound(&p)?;
-        let (names, mut rows) = self.ac_gradient_sweep(input, out_idx, x, p, &[freq])?;
-        let (_, d) = rows.pop().unwrap_or_default();
-        Ok(names
-            .into_iter()
-            .zip(d)
-            .map(|(nm, (re, im))| (nm, re, im))
-            .collect())
-    }
-
     /// [`Model::ac_gradient`] over a sweep: per frequency the transfer `H`
     /// and `(dHre/dp, dHim/dp)` for every parameter (in the order of the
     /// returned names), the frequency-independent setup done once.
     #[allow(clippy::type_complexity)]
-    pub fn ac_gradient_sweep(
+    pub(crate) fn ac_gradient_sweep(
         &self,
         input: &str,
         out_idx: usize,
@@ -349,7 +232,7 @@ impl Model {
     /// symbolic tape) is set up once; the per-frequency step is a factored
     /// solve pair plus read-only tape evaluation, so the cost per call is
     /// constant (no symbolic-context growth).
-    pub fn ac_vjp_sweep(
+    pub(crate) fn ac_vjp_sweep(
         &self,
         input: &str,
         weights: &[Vec<(usize, f64, f64)>],
@@ -418,7 +301,7 @@ impl Model {
     /// AC transfer from source j to output i. Signature mirrors
     /// [`Model::ac_response`]; [`Model::sp_sweep`] is the overrides-based
     /// convenience on top.
-    pub fn sp_response(
+    pub(crate) fn sp_response(
         &self,
         ports: &[(String, usize, f64)],
         x: Vec<f64>,
@@ -455,7 +338,7 @@ impl Model {
     /// (driving port, frequency) via [`Model::ac_vjp_sweep`]; the wave
     /// normalisation `2*sqrt(z0_j/z0_i)` is folded into the seeds (the
     /// `-delta_ij` term is constant and drops out of the derivative).
-    pub fn sp_vjp(
+    pub(crate) fn sp_vjp(
         &self,
         ports: &[(String, usize, f64)],
         x: Vec<f64>,
@@ -637,16 +520,10 @@ impl Model {
         let dae = self.dae();
         let n = dae.dim();
         let ((gr, gc, ge), (cr, cc, ce)) = dae.jacobian_iq_coo(c);
-        let ie = c.sym(input);
-        let isym = match c.node(ie) {
-            Node::Symbol(sy) => *sy,
-            _ => return Err(ModelError::Numeric(format!("'{input}' is not a symbol"))),
-        };
-        let bsym: Vec<ExprId> = dae
-            .currents
-            .iter()
+        let isyms = self.inner.drive(c, input)?;
+        let bsym: Vec<ExprId> = (dae.at_rest(c).0.iter())
             .map(|&r| {
-                let d = differentiate(c, r, isym);
+                let d = crate::d_drive(c, r, &isyms);
                 c.neg(d)
             })
             .collect();
@@ -721,7 +598,7 @@ impl Model {
     /// `(v_re, v_im, grad_re[subset], grad_im[subset], H_re[subset^2], H_im[subset^2])`;
     /// the caller projects these onto the desired metric (mag/phase/real/imag).
     #[allow(clippy::type_complexity)]
-    pub fn ac_hessian(
+    pub(crate) fn ac_hessian(
         &self,
         input: &str,
         out_idx: usize,
@@ -774,13 +651,10 @@ impl Model {
         }
         // Symbolic G, C (sparse) and b_i = -dI/d(input).
         let ((gr, gc, ge), (cr, cc, ce)) = self.dae().jacobian_iq_coo(c);
-        let isym = sym_id(c, input);
-        let bsym: Vec<ExprId> = self
-            .dae()
-            .currents
-            .iter()
+        let isyms = self.inner.drive(c, input)?;
+        let bsym: Vec<ExprId> = (self.dae().at_rest(c).0.iter())
             .map(|&r| {
-                let d = differentiate(c, r, isym);
+                let d = crate::d_drive(c, r, &isyms);
                 c.neg(d)
             })
             .collect();
@@ -809,7 +683,7 @@ impl Model {
         }
         // Combined algebraic DAE in (x, v_re, v_im): the DC currents, then the
         // AC rows.
-        let mut currents = self.dae().currents.clone();
+        let mut currents = self.dae().at_rest(c).0.clone();
         currents.extend(ac_re);
         currents.extend(ac_im);
         let mut xs = self.dae().x.clone();
@@ -847,6 +721,8 @@ impl Model {
             sources: Vec::new(),
             source_names: Vec::new(),
             labels: Default::default(),
+            injection: Default::default(),
+            rest: Default::default(),
         };
         let cdc_c = CompiledDc::new(c, &combined);
         cdc_c.ensure_param_jac(c, &combined);
@@ -895,5 +771,347 @@ impl Model {
         let h_re = cdc_c.hessian(re_idx, &subset_cols, &ystar, &p_c, 0.0);
         let h_im = cdc_c.hessian(im_idx, &subset_cols, &ystar, &p_c, 0.0);
         Ok((v[out_idx].re, v[out_idx].im, g_re, g_im, h_re, h_im))
+    }
+}
+
+// --- the AC and S-parameter analyses at a point ---------------------------
+
+/// Small-signal responses of outputs to a source (see [`Point::ac`]):
+/// `h[[i, k]]` is `outputs[i]` per unit `input` at `freqs[k]`, linearized
+/// at the operating point.
+pub struct AcResponse {
+    /// The point it was solved at (of the binding's structure), and its
+    /// operating point.
+    at: Point,
+    x: Vec<f64>,
+    pub input: String,
+    pub outputs: Vec<String>,
+    outs: Vec<usize>,
+    pub freqs: Vec<f64>,
+    pub h: Array2<Complex64>,
+}
+
+/// Sensitivities of AC responses: `grad[[i, k, j]]` is
+/// `d outputs[i] / d params[j]` at `freqs[k]`.
+#[derive(Clone, Debug)]
+pub struct AcSensitivity {
+    pub freqs: Vec<f64>,
+    pub outputs: Vec<String>,
+    pub params: Vec<String>,
+    pub param_values: Vec<f64>,
+    /// `h[[i, k]]`, the responses.
+    pub h: Array2<Complex64>,
+    pub grad: Array3<Complex64>,
+}
+
+/// Hessians of AC responses: `h[[i, k, a, b]]` is
+/// `d^2 outputs[i] / d params[a] d params[b]` at `freqs[k]` (the real
+/// part's Hessian the real part, the imaginary part's the imaginary).
+#[derive(Clone, Debug)]
+pub struct AcHessian {
+    pub freqs: Vec<f64>,
+    pub outputs: Vec<String>,
+    pub params: Vec<String>,
+    pub param_values: Vec<f64>,
+    pub h: Array4<Complex64>,
+}
+
+/// Scattering parameters over the circuit's ports (see
+/// [`Point::s_parameters`]): `s[[k, i, j]]` at `freqs[k]`, port `j` driven.
+pub struct SParameters {
+    at: Point,
+    x: Vec<f64>,
+    /// Per port its drive source, its node's unknown and its reference
+    /// impedance.
+    ports: Vec<(String, usize, f64)>,
+    pub port_names: Vec<String>,
+    pub z0: Vec<f64>,
+    pub freqs: Vec<f64>,
+    pub s: Array3<Complex64>,
+}
+
+/// Sensitivities of scattering parameters: `grad[[k, i, j, q]]` is
+/// `d S_ij / d params[q]` at `freqs[k]`.
+#[derive(Clone, Debug)]
+pub struct SpSensitivity {
+    pub freqs: Vec<f64>,
+    pub params: Vec<String>,
+    pub param_values: Vec<f64>,
+    pub grad: Array4<Complex64>,
+}
+
+impl Point {
+    /// The small-signal responses of `outputs` (nodes, unknowns, branch
+    /// currents) to the source `input` at `freqs` (Hz), linearized at the
+    /// operating point.
+    pub fn ac(
+        &self,
+        input: &str,
+        outputs: &[&str],
+        freqs: &[f64],
+    ) -> Result<AcResponse, ModelError> {
+        if let Some((there, _)) = &self.other {
+            return there.ac(input, outputs, freqs);
+        }
+        let x = self.operating_point()?.x;
+        let outs = self.model.inner.outputs(outputs)?;
+        let rows = self.model.ac_solve(input, &outs, &x, &self.p, freqs)?;
+        let bad: Vec<bool> = rows
+            .iter()
+            .map(|r| r.iter().any(|h| h.re.is_nan()))
+            .collect();
+        super::warn_singular(&format!("AC from '{input}'"), freqs, &bad);
+        Ok(AcResponse {
+            at: self.clone(),
+            x,
+            input: input.to_string(),
+            outputs: outputs.iter().map(|o| o.to_string()).collect(),
+            h: Array2::from_shape_fn((outs.len(), freqs.len()), |(i, k)| rows[k][i]),
+            outs,
+            freqs: freqs.to_vec(),
+        })
+    }
+
+    /// The scattering parameters over the circuit's ports (deck `P`
+    /// elements, in order) at `freqs` (Hz): each port the Thevenin form it
+    /// lowers to, an ideal drive source behind its `z0`, so that
+    /// `S_ij = 2 sqrt(z0_j / z0_i) V_i - delta_ij` under unit drive of port
+    /// `j`.
+    pub fn s_parameters(&self, freqs: &[f64]) -> Result<SParameters, ModelError> {
+        if let Some((there, _)) = &self.other {
+            return there.s_parameters(freqs);
+        }
+        let inner = &self.model.inner;
+        if inner.ports.is_empty() {
+            return Err(ModelError::Numeric(
+                "the circuit has no ports (`P` elements, e.g. `P1 in 0 Z0=50`)".into(),
+            ));
+        }
+        let mut ports = Vec::with_capacity(inner.ports.len());
+        for (src, node, z0) in &inner.ports {
+            let i = inner
+                .resolve(node)
+                .ok_or_else(|| ModelError::UnknownRef(node.clone()))?;
+            ports.push((src.clone(), i, *z0));
+        }
+        let x = self.operating_point()?.x;
+        let flat = self
+            .model
+            .sp_response(&ports, x.clone(), self.p.clone(), freqs.to_vec())?;
+        let n = ports.len();
+        let s = Array3::from_shape_fn((flat.len(), n, n), |(k, i, j)| {
+            Complex64::new(flat[k][i * n + j].0, flat[k][i * n + j].1)
+        });
+        Ok(SParameters {
+            at: self.clone(),
+            x,
+            port_names: ports.iter().map(|p| p.0.clone()).collect(),
+            z0: ports.iter().map(|p| p.2).collect(),
+            ports,
+            freqs: freqs.to_vec(),
+            s,
+        })
+    }
+}
+
+impl AcResponse {
+    /// The response of `output` at every frequency.
+    pub fn of(&self, output: &str) -> Option<ArrayView1<'_, Complex64>> {
+        let i = self.outputs.iter().position(|o| o == output)?;
+        Some(self.h.row(i))
+    }
+
+    /// The magnitude of `output`'s response in dB.
+    pub fn mag_db(&self, output: &str) -> Option<Vec<f64>> {
+        Some(
+            self.of(output)?
+                .iter()
+                .map(|h| 20.0 * h.norm().max(1e-30).log10())
+                .collect(),
+        )
+    }
+
+    /// The phase of `output`'s response in degrees.
+    pub fn phase_deg(&self, output: &str) -> Option<Vec<f64>> {
+        Some(
+            self.of(output)?
+                .iter()
+                .map(|h| h.arg().to_degrees())
+                .collect(),
+        )
+    }
+
+    /// The derivatives of every response by the parameters under `wrt`
+    /// (all for none) at every frequency, exact: one adjoint per output and
+    /// frequency, the operating point's shift included.
+    pub fn sensitivity(&self, wrt: &[&str]) -> Result<AcSensitivity, ModelError> {
+        let model = &self.at.model;
+        let cols = model.inner.columns(wrt)?;
+        let names: Vec<String> = cols
+            .iter()
+            .map(|&c| model.inner.store.pnames[c].clone())
+            .collect();
+        let mut grad = Array3::zeros((self.outs.len(), self.freqs.len(), names.len()));
+        for (i, &o) in self.outs.iter().enumerate() {
+            let (all, rows) = model.ac_gradient_sweep(
+                &self.input,
+                o,
+                self.x.clone(),
+                self.at.p.clone(),
+                &self.freqs,
+            )?;
+            for (j, n) in names.iter().enumerate() {
+                let Some(a) = all.iter().position(|a| a == n) else {
+                    continue;
+                };
+                for (k, (_, g)) in rows.iter().enumerate() {
+                    grad[[i, k, j]] = Complex64::new(g[a].0, g[a].1);
+                }
+            }
+        }
+        Ok(AcSensitivity {
+            freqs: self.freqs.clone(),
+            outputs: self.outputs.clone(),
+            param_values: cols.iter().map(|&c| self.at.p[c]).collect(),
+            params: names,
+            h: self.h.clone(),
+            grad,
+        })
+    }
+
+    /// The gradient by every parameter of a real scalar `L` of the
+    /// responses, given its cotangents `cotangent[[i, k]] =
+    /// dL/dRe h[[i, k]] + j dL/dIm h[[i, k]]`: one weighted adjoint per
+    /// frequency, whatever the number of outputs and parameters.
+    pub fn vjp(&self, cotangent: ArrayView2<'_, Complex64>) -> Result<Gradient, ModelError> {
+        if cotangent.dim() != self.h.dim() {
+            return Err(ModelError::Numeric(format!(
+                "a cotangent per output and frequency: {:?} for {:?}",
+                cotangent.dim(),
+                self.h.dim()
+            )));
+        }
+        let weights: Vec<Vec<(usize, f64, f64)>> = (0..self.freqs.len())
+            .map(|k| {
+                (self.outs.iter().enumerate())
+                    .map(|(i, &o)| (o, cotangent[[i, k]].re, cotangent[[i, k]].im))
+                    .collect()
+            })
+            .collect();
+        let g = self.at.model.ac_vjp_sweep(
+            &self.input,
+            &weights,
+            self.x.clone(),
+            self.at.p.clone(),
+            self.freqs.clone(),
+        )?;
+        Ok(Gradient::from_pairs(g))
+    }
+
+    /// The Hessians of every response by the parameters under `wrt` (all
+    /// for none) at every frequency, exact (the second-order adjoint, the
+    /// operating point's shift included).
+    pub fn hessian(&self, wrt: &[&str]) -> Result<AcHessian, ModelError> {
+        let model = &self.at.model;
+        let cols = model.inner.columns(wrt)?;
+        let names: Vec<String> = cols
+            .iter()
+            .map(|&c| model.inner.store.pnames[c].clone())
+            .collect();
+        let np = names.len();
+        let mut h = Array4::zeros((self.outs.len(), self.freqs.len(), np, np));
+        for (i, &o) in self.outs.iter().enumerate() {
+            for (k, &f) in self.freqs.iter().enumerate() {
+                let (_, _, _, _, hr, hi) = model.ac_hessian(
+                    &self.input,
+                    o,
+                    self.x.clone(),
+                    self.at.p.clone(),
+                    f,
+                    names.clone(),
+                )?;
+                for a in 0..np {
+                    for b in 0..np {
+                        h[[i, k, a, b]] = Complex64::new(hr[a][b], hi[a][b]);
+                    }
+                }
+            }
+        }
+        Ok(AcHessian {
+            freqs: self.freqs.clone(),
+            outputs: self.outputs.clone(),
+            param_values: cols.iter().map(|&c| self.at.p[c]).collect(),
+            params: names,
+            h,
+        })
+    }
+}
+
+impl SParameters {
+    /// `S_ij` at every frequency.
+    pub fn of(&self, i: usize, j: usize) -> Vec<Complex64> {
+        self.s.slice(s![.., i, j]).to_vec()
+    }
+
+    /// The derivatives of every `S_ij` by the parameters under `wrt` (all
+    /// for none), exact (an adjoint per port pair and frequency).
+    pub fn sensitivity(&self, wrt: &[&str]) -> Result<SpSensitivity, ModelError> {
+        let model = &self.at.model;
+        let cols = model.inner.columns(wrt)?;
+        let names: Vec<String> = cols
+            .iter()
+            .map(|&c| model.inner.store.pnames[c].clone())
+            .collect();
+        let n = self.ports.len();
+        let mut grad = Array4::zeros((self.freqs.len(), n, n, names.len()));
+        for (j, (src, _, zj)) in self.ports.iter().enumerate() {
+            for (i, (_, oi, zi)) in self.ports.iter().enumerate() {
+                let (all, rows) = model.ac_gradient_sweep(
+                    src,
+                    *oi,
+                    self.x.clone(),
+                    self.at.p.clone(),
+                    &self.freqs,
+                )?;
+                let scale = 2.0 * (zj / zi).sqrt();
+                for (k, (_, g)) in rows.iter().enumerate() {
+                    for (q, name) in names.iter().enumerate() {
+                        if let Some(a) = all.iter().position(|a| a == name) {
+                            grad[[k, i, j, q]] = Complex64::new(g[a].0, g[a].1) * scale;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(SpSensitivity {
+            freqs: self.freqs.clone(),
+            param_values: cols.iter().map(|&c| self.at.p[c]).collect(),
+            params: names,
+            grad,
+        })
+    }
+
+    /// The gradient by every parameter of a real scalar `L` of the
+    /// scattering parameters, given `cotangent[[k, i, j]] =
+    /// dL/dRe S_ij + j dL/dIm S_ij` at `freqs[k]`.
+    pub fn vjp(&self, cotangent: ArrayView3<'_, Complex64>) -> Result<Gradient, ModelError> {
+        if cotangent.dim() != self.s.dim() {
+            return Err(ModelError::Numeric(format!(
+                "a cotangent per frequency and port pair: {:?} for {:?}",
+                cotangent.dim(),
+                self.s.dim()
+            )));
+        }
+        let cot: Vec<Vec<(f64, f64)>> = (cotangent.outer_iter())
+            .map(|m| m.iter().map(|c| (c.re, c.im)).collect())
+            .collect();
+        let g = self.at.model.sp_vjp(
+            &self.ports,
+            self.x.clone(),
+            self.at.p.clone(),
+            self.freqs.clone(),
+            &cot,
+        )?;
+        Ok(Gradient::from_pairs(g))
     }
 }

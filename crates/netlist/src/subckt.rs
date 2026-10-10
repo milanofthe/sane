@@ -7,7 +7,7 @@
 //! local numeric environment used to evaluate `{...}` value expressions. A
 //! body depends on the subcircuit and that environment only, so it is
 //! written out once per both and shared by every instance that places it.
-//! The placement turns each body into a `sane_dae::Body`, and an instance
+//! The placement turns each body into a `sane_circuit::Circuit` with pins, and an instance
 //! renames the namespace to its path (`X1.`, `X1.X2.`).
 //! Subcircuit names are a global namespace (a common simplification); `.model`
 //! cards inside a subckt are collected unprefixed (global).

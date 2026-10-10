@@ -1,8 +1,8 @@
 use super::*;
 use std::collections::HashMap;
 
-use sane_dae::{assemble_dae, Dae, DeviceInstance};
-use sane_mna::Circuit;
+use sane_circuit::Elements;
+use sane_dae::{Dae, DeviceInstance};
 
 fn cdc_unknown_index(dae: &Dae, name: &str) -> usize {
     dae.unknowns
@@ -11,7 +11,7 @@ fn cdc_unknown_index(dae: &Dae, name: &str) -> usize {
         .expect("unknown")
 }
 
-fn params_vec(ctx: &Graph, dae: &Dae, vals: &[(&str, f64)]) -> Vec<f64> {
+fn params_vec(ctx: &mut Graph, dae: &Dae, vals: &[(&str, f64)]) -> Vec<f64> {
     let map: HashMap<&str, f64> = vals.iter().copied().collect();
     // Native devices read the global `$temp` and per-instance Tnom/Eg/XTI;
     // default them to nominal (so temperature scalings are identities) unless
@@ -42,13 +42,17 @@ fn params_vec(ctx: &Graph, dae: &Dae, vals: &[(&str, f64)]) -> Vec<f64> {
 #[test]
 fn divider_dc() {
     let mut ctx = Graph::new();
-    let mut c = Circuit::new();
+    let mut c = Elements::new();
     c.voltage_source("V1", 1, 0)
         .resistor("R1", 1, 2)
         .resistor("R2", 2, 0);
-    let dae = assemble_dae(&mut ctx, &c, &[]).unwrap();
+    let dae = sane_dae::assemble(&mut ctx, &sane_circuit::Circuit::flat(&c, &[])).unwrap();
     let cdc = CompiledDc::new(&mut ctx, &dae);
-    let p = params_vec(&ctx, &dae, &[("V1", 10.0), ("R1", 1000.0), ("R2", 1000.0)]);
+    let p = params_vec(
+        &mut ctx,
+        &dae,
+        &[("V1", 10.0), ("R1", 1000.0), ("R2", 1000.0)],
+    );
     let (x, conv, _) = cdc.solve_dc(&p, &[], 1e-12, 50);
     assert!(conv);
     // Tolerance accommodates the baseline GMIN_DC node-to-ground shunt
@@ -65,14 +69,14 @@ fn stage_solve_matches_dense() {
     // over the combined pattern must match a dense assembly. RC circuit so both
     // G (resistor) and C (capacitor) are non-empty.
     let mut ctx = Graph::new();
-    let mut c = Circuit::new();
+    let mut c = Elements::new();
     c.voltage_source("V1", 1, 0)
         .resistor("R1", 1, 2)
         .capacitor("C1", 2, 0);
-    let dae = assemble_dae(&mut ctx, &c, &[]).unwrap();
+    let dae = sane_dae::assemble(&mut ctx, &sane_circuit::Circuit::flat(&c, &[])).unwrap();
     let cdc = CompiledDc::new(&mut ctx, &dae);
     let n = cdc.dim();
-    let p = params_vec(&ctx, &dae, &[("V1", 5.0), ("R1", 1000.0), ("C1", 1e-6)]);
+    let p = params_vec(&mut ctx, &dae, &[("V1", 5.0), ("R1", 1000.0), ("C1", 1e-6)]);
     let x = vec![0.3; n];
 
     let (jr, jc, dfdx) = cdc.jacobian_i_x_sparse(&x, &p, 0.0);
@@ -83,7 +87,7 @@ fn stage_solve_matches_dense() {
     );
 
     // Dense J_stage = G + alpha*C + gmin*I; pick dx_true, form rhs = J*dx_true.
-    let (alpha, gmin) = (2000.0, 1e-12);
+    let (alpha, gmin) = (2000.0, sane_core::constants::GMIN_DC);
     let mut jd = vec![vec![0.0; n]; n];
     for k in 0..dfdx.len() {
         jd[jr[k]][jc[k]] += dfdx[k];
@@ -100,11 +104,10 @@ fn stage_solve_matches_dense() {
         .collect();
 
     let sym = cdc.stage_symbolic().expect("stage symbolic");
-    let mut fac = sym.pattern.factorizer();
-    let mut valbuf = Vec::new();
-    assert!(cdc.factorize_stage(&mut fac, &dfdx, &cvals, alpha, gmin, &mut valbuf));
+    let mut matrix = crate::stage_matrix::StageMatrix::new(&cdc, &sym);
+    assert!(matrix.assemble(&dfdx, &cvals, alpha));
     let mut dx = vec![0.0; n];
-    assert!(fac.solve_into(&rhs, &mut dx), "stage solve");
+    assert!(matrix.solve(&rhs, &mut dx), "stage solve");
     for i in 0..n {
         assert!(
             (dx[i] - dx_true[i]).abs() < 1e-9,
@@ -116,18 +119,18 @@ fn stage_solve_matches_dense() {
 }
 
 #[test]
-fn esdirk32_rc_step() {
-    // RC step response: the ESDIRK32 integrator must track the analytic
+fn transient_rc_step() {
+    // RC step response: the transient must track the analytic
     // 1 - e^{-t/RC} on the assembled DAE.
     let mut ctx = Graph::new();
-    let mut c = Circuit::new();
+    let mut c = Elements::new();
     c.voltage_source("V1", 1, 0)
         .resistor("R1", 1, 2)
         .capacitor("C1", 2, 0);
-    let dae = assemble_dae(&mut ctx, &c, &[]).unwrap();
+    let dae = sane_dae::assemble(&mut ctx, &sane_circuit::Circuit::flat(&c, &[])).unwrap();
     let cdc = CompiledDc::new(&mut ctx, &dae);
     let n = cdc.dim();
-    let p = params_vec(&ctx, &dae, &[("V1", 1.0), ("R1", 1000.0), ("C1", 1e-6)]); // RC = 1ms
+    let p = params_vec(&mut ctx, &dae, &[("V1", 1.0), ("R1", 1000.0), ("C1", 1e-6)]); // RC = 1ms
     let v1 = cdc_unknown_index(&dae, "v1");
     let v2 = cdc_unknown_index(&dae, "v2");
 
@@ -137,8 +140,9 @@ fn esdirk32_rc_step() {
     let t_eval: Vec<f64> = (0..=50).map(|k| k as f64 * 1e-4).collect(); // 0..5 ms
     let dtm = Some(5e-5);
     let y_irk = cdc
-        .solve_transient_irk(TransientMethod::Esdirk32, &p, &x0, &t_eval, 1e-6, 1e-9, dtm)
-        .expect("esdirk32");
+        .solve_transient(&p, &x0, &t_eval, 1e-6, 1e-9, dtm)
+        .expect("transient")
+        .rows;
 
     let analytic = 1.0 - (-5.0f64).exp();
     assert!(
@@ -154,16 +158,16 @@ fn ideal_transformer_steps_voltage() {
     // secondary (loaded by RL) sits at V_p/2 = 5 V. Power is conserved by the
     // ampere-turn balance, so the primary draws 2x the secondary current.
     let mut ctx = Graph::new();
-    let mut c = Circuit::new();
+    let mut c = Elements::new();
     c.voltage_source("V1", 1, 0).resistor("RL", 2, 0);
     let devs = vec![DeviceInstance::new(
-        Box::new(sane_veriloga::builtin_device("sane_transformer", "X1", &[])),
+        std::sync::Arc::new(sane_veriloga::builtin_device("sane_transformer", "X1", &[])),
         vec![1, 0, 2, 0], // [p+, p-, s+, s-]
     )];
-    let dae = assemble_dae(&mut ctx, &c, &devs).unwrap();
+    let dae = sane_dae::assemble(&mut ctx, &sane_circuit::Circuit::flat(&c, &devs)).unwrap();
     let cdc = CompiledDc::new(&mut ctx, &dae);
     let p = params_vec(
-        &ctx,
+        &mut ctx,
         &dae,
         &[("V1", 10.0), ("RL", 1000.0), ("X1.ratio", 2.0)],
     );
@@ -190,20 +194,20 @@ fn companion_continuation_converges() {
     // only on circuits the global gmin / source homotopies cannot solve, so a
     // fixture would not trigger it.
     let mut ctx = Graph::new();
-    let mut c = Circuit::new();
+    let mut c = Elements::new();
     c.voltage_source("V1", 1, 0).resistor("R1", 1, 2);
     let devs = vec![DeviceInstance::new(
-        Box::new(sane_veriloga::builtin_device("sane_diode", "D1", &[])),
+        std::sync::Arc::new(sane_veriloga::builtin_device("sane_diode", "D1", &[])),
         vec![2, 0],
     )];
-    let dae = assemble_dae(&mut ctx, &c, &devs).unwrap();
+    let dae = sane_dae::assemble(&mut ctx, &sane_circuit::Circuit::flat(&c, &devs)).unwrap();
     assert!(
         !dae.companion.is_empty(),
         "diode should emit a companion network"
     );
     let cdc = CompiledDc::new(&mut ctx, &dae);
     let p = params_vec(
-        &ctx,
+        &mut ctx,
         &dae,
         &[
             ("V1", 1.0),
@@ -217,7 +221,7 @@ fn companion_continuation_converges() {
     let (xref, conv_ref, _) = cdc.solve_dc(&p, &[], 1e-12, 100);
     assert!(conv_ref);
     let (xc, conv_c, _) = cdc.companion_continuation(
-        &p,
+        &crate::dc::Binding::new(&p),
         &Convergence::from_tol(1e-12),
         0,
         SolverTricks::default(),
@@ -238,16 +242,16 @@ fn convergence_criterion_presets_solve() {
     // preset of the per-component criterion, and the converged residual must
     // honor each preset's per-row floor.
     let mut ctx = Graph::new();
-    let mut c = Circuit::new();
+    let mut c = Elements::new();
     c.voltage_source("V1", 1, 0).resistor("R1", 1, 2);
     let devs = vec![DeviceInstance::new(
-        Box::new(sane_veriloga::builtin_device("sane_diode", "D1", &[])),
+        std::sync::Arc::new(sane_veriloga::builtin_device("sane_diode", "D1", &[])),
         vec![2, 0],
     )];
-    let dae = assemble_dae(&mut ctx, &c, &devs).unwrap();
+    let dae = sane_dae::assemble(&mut ctx, &sane_circuit::Circuit::flat(&c, &devs)).unwrap();
     let cdc = CompiledDc::new(&mut ctx, &dae);
     let p = params_vec(
-        &ctx,
+        &mut ctx,
         &dae,
         &[
             ("V1", 1.0),
@@ -273,7 +277,8 @@ fn convergence_criterion_presets_solve() {
     // The default-converged residual meets the tight per-row floor.
     let res = cdc.currents(&xd, &p, 0.0);
     assert!(
-        cdc.residual_converged(&res, &xd, GMIN_DC, &Convergence::default()),
+        cdc.criterion(&Convergence::default())
+            .residual_ok(&res, &xd, GMIN_DC),
         "default solve must satisfy its own residual criterion"
     );
 }
@@ -284,16 +289,16 @@ fn relative_kcl_criterion_scales_with_node_current() {
     // small RELATIVE to the branch currents into that node (reltol*sum|I| +
     // abstol), and rejects one that is not -- unlike the absolute-only floor.
     let mut ctx = Graph::new();
-    let mut c = Circuit::new();
+    let mut c = Elements::new();
     c.voltage_source("V1", 1, 0).resistor("R1", 1, 2);
     let devs = vec![DeviceInstance::new(
-        Box::new(sane_veriloga::builtin_device("sane_diode", "D1", &[])),
+        std::sync::Arc::new(sane_veriloga::builtin_device("sane_diode", "D1", &[])),
         vec![2, 0],
     )];
-    let dae = assemble_dae(&mut ctx, &c, &devs).unwrap();
+    let dae = sane_dae::assemble(&mut ctx, &sane_circuit::Circuit::flat(&c, &devs)).unwrap();
     let cdc = CompiledDc::new(&mut ctx, &dae);
     let p = params_vec(
-        &ctx,
+        &mut ctx,
         &dae,
         &[
             ("V1", 1.0),
@@ -339,7 +344,7 @@ fn relative_kcl_criterion_scales_with_node_current() {
         "relative-small imbalance accepted"
     );
     assert!(
-        !cdc.residual_converged(&res, &x, 0.0, &conv),
+        !cdc.criterion(&conv).residual_ok(&res, &x, 0.0),
         "same imbalance rejected by the strict floor"
     );
     // An imbalance above the relative floor is rejected.
@@ -354,22 +359,22 @@ fn relative_kcl_criterion_scales_with_node_current() {
 fn hessian_matches_finite_differences() {
     // Diode (exp nonlinearity -> real curvature) in series with a resistor.
     let mut ctx = Graph::new();
-    let mut c = Circuit::new();
+    let mut c = Elements::new();
     c.voltage_source("V1", 1, 0).resistor("R1", 1, 2);
     let devs = vec![DeviceInstance::new(
-        Box::new(sane_veriloga::builtin_device("sane_diode", "D1", &[])),
+        std::sync::Arc::new(sane_veriloga::builtin_device("sane_diode", "D1", &[])),
         vec![2, 0],
     )];
-    let dae = assemble_dae(&mut ctx, &c, &devs).unwrap();
+    let dae = sane_dae::assemble(&mut ctx, &sane_circuit::Circuit::flat(&c, &devs)).unwrap();
     let cdc = CompiledDc::new(&mut ctx, &dae);
 
     let pnames: Vec<String> = dae
-        .params(&ctx)
+        .params(&mut ctx)
         .iter()
         .map(|&s| ctx.symbol_name(s).to_string())
         .collect();
     let p = params_vec(
-        &ctx,
+        &mut ctx,
         &dae,
         &[
             ("V1", 1.0),
@@ -414,7 +419,7 @@ fn partition_isolates_nonlinear_block() {
     // diode-touched nodes should land in the nonlinear block V; the rest of
     // the ladder is the linear block L.
     let mut ctx = Graph::new();
-    let mut c = Circuit::new();
+    let mut c = Elements::new();
     c.voltage_source("V1", 1, 0);
     let stages = 80;
     for k in 1..=stages {
@@ -422,10 +427,10 @@ fn partition_isolates_nonlinear_block() {
         c.capacitor(&format!("C{k}"), k + 1, 0);
     }
     let devs = vec![DeviceInstance::new(
-        Box::new(sane_veriloga::builtin_device("sane_diode", "D1", &[])),
+        std::sync::Arc::new(sane_veriloga::builtin_device("sane_diode", "D1", &[])),
         vec![stages + 1, 0],
     )];
-    let dae = assemble_dae(&mut ctx, &c, &devs).unwrap();
+    let dae = sane_dae::assemble(&mut ctx, &sane_circuit::Circuit::flat(&c, &devs)).unwrap();
     let cdc = CompiledDc::new(&mut ctx, &dae);
     let (nl, nv) = cdc.partition_sizes().expect("should partition");
     // Only the diode anode node varies; everything else is linear.
@@ -442,7 +447,7 @@ fn partitioned_solve_matches_residual() {
     // method-independent check that the cached-factorization Schur solve is
     // numerically equivalent to a full LU.
     let mut ctx = Graph::new();
-    let mut c = Circuit::new();
+    let mut c = Elements::new();
     c.voltage_source("V1", 1, 0);
     let stages = 80;
     for k in 1..=stages {
@@ -451,10 +456,10 @@ fn partitioned_solve_matches_residual() {
     }
     // Diode from the last node to ground (forward-biased by the source).
     let devs = vec![DeviceInstance::new(
-        Box::new(sane_veriloga::builtin_device("sane_diode", "D1", &[])),
+        std::sync::Arc::new(sane_veriloga::builtin_device("sane_diode", "D1", &[])),
         vec![stages + 1, 0],
     )];
-    let dae = assemble_dae(&mut ctx, &c, &devs).unwrap();
+    let dae = sane_dae::assemble(&mut ctx, &sane_circuit::Circuit::flat(&c, &devs)).unwrap();
     let cdc = CompiledDc::new(&mut ctx, &dae);
     assert!(cdc.partition_sizes().is_some(), "should be partitioned");
     let mut vals = vec![
@@ -467,7 +472,7 @@ fn partitioned_solve_matches_residual() {
         vals.push((Box::leak(format!("R{k}").into_boxed_str()) as &str, 1000.0));
         vals.push((Box::leak(format!("C{k}").into_boxed_str()) as &str, 1e-9));
     }
-    let p = params_vec(&ctx, &dae, &vals);
+    let p = params_vec(&mut ctx, &dae, &vals);
     let (x, conv, _) = cdc.solve_dc(&p, &[], 1e-10, 100);
     assert!(conv, "partitioned DC did not converge");
     // The currents at the solution must be ~zero (DC).
@@ -482,16 +487,16 @@ fn partitioned_solve_matches_residual() {
 #[test]
 fn diode_rectifier_dc() {
     let mut ctx = Graph::new();
-    let mut c = Circuit::new();
+    let mut c = Elements::new();
     c.voltage_source("V1", 1, 0).resistor("R1", 1, 2);
     let devs = vec![DeviceInstance::new(
-        Box::new(sane_veriloga::builtin_device("sane_diode", "D1", &[])),
+        std::sync::Arc::new(sane_veriloga::builtin_device("sane_diode", "D1", &[])),
         vec![2, 0],
     )];
-    let dae = assemble_dae(&mut ctx, &c, &devs).unwrap();
+    let dae = sane_dae::assemble(&mut ctx, &sane_circuit::Circuit::flat(&c, &devs)).unwrap();
     let cdc = CompiledDc::new(&mut ctx, &dae);
     let p = params_vec(
-        &ctx,
+        &mut ctx,
         &dae,
         &[
             ("V1", 0.72),
@@ -509,10 +514,10 @@ fn diode_rectifier_dc() {
 /// Build a one-source test circuit (`V1` with the given shape, loaded by a 1k
 /// resistor) and return its compiled DAE plus the parameter vector.
 fn one_source(ctx: &mut Graph, src: SourceFn, params: &[(&str, f64)]) -> (CompiledDc, Vec<f64>) {
-    let mut c = Circuit::new();
+    let mut c = Elements::new();
     c.voltage_source("V1", 1, 0).set_source(src);
     c.resistor("R1", 1, 0);
-    let dae = assemble_dae(ctx, &c, &[]).unwrap();
+    let dae = sane_dae::assemble(ctx, &sane_circuit::Circuit::flat(&c, &[])).unwrap();
     let cdc = CompiledDc::new(ctx, &dae);
     let p = params_vec(ctx, &dae, params);
     (cdc, p)
@@ -524,15 +529,15 @@ fn transient_tricks_toggle_is_correctness_neutral() {
     // solution: toggling them off via the modular trick set must still integrate
     // the RC step to the analytic 1 - e^{-t/RC}.
     let mut ctx = Graph::new();
-    let mut c = Circuit::new();
+    let mut c = Elements::new();
     c.voltage_source("V1", 1, 0)
         .resistor("R1", 1, 2)
         .capacitor("C1", 2, 0);
-    let dae = assemble_dae(&mut ctx, &c, &[]).unwrap();
+    let dae = sane_dae::assemble(&mut ctx, &sane_circuit::Circuit::flat(&c, &[])).unwrap();
     let mut cdc = CompiledDc::new(&mut ctx, &dae);
     let (r, cap) = (1000.0, 1e-6);
     let tau = r * cap;
-    let p = params_vec(&ctx, &dae, &[("V1", 1.0), ("R1", r), ("C1", cap)]);
+    let p = params_vec(&mut ctx, &dae, &[("V1", 1.0), ("R1", r), ("C1", cap)]);
     let v2 = cdc_unknown_index(&dae, "v2");
     let mut x0 = vec![0.0; cdc.dim()];
     x0[cdc_unknown_index(&dae, "v1")] = 1.0;
@@ -543,16 +548,9 @@ fn transient_tricks_toggle_is_correctness_neutral() {
         ..SolverTricks::default()
     });
     let traj = cdc
-        .solve_transient(
-            TransientMethod::Esdirk32,
-            &p,
-            &x0,
-            &times,
-            TRANSIENT_RTOL,
-            TRANSIENT_ATOL,
-            None,
-        )
-        .expect("transient");
+        .solve_transient(&p, &x0, &times, TRANSIENT_RTOL, TRANSIENT_ATOL, None)
+        .expect("transient")
+        .rows;
     let want = 1.0 - (-1.0f64).exp(); // at t = tau
     assert!(
         (traj[1][v2] - want).abs() < 5e-3,
@@ -641,15 +639,15 @@ fn fundamental_reads_sin_and_pulse() {
 #[test]
 fn rc_step_transient() {
     let mut ctx = Graph::new();
-    let mut c = Circuit::new();
+    let mut c = Elements::new();
     c.voltage_source("V1", 1, 0)
         .resistor("R1", 1, 2)
         .capacitor("C1", 2, 0);
-    let dae = assemble_dae(&mut ctx, &c, &[]).unwrap();
+    let dae = sane_dae::assemble(&mut ctx, &sane_circuit::Circuit::flat(&c, &[])).unwrap();
     let cdc = CompiledDc::new(&mut ctx, &dae);
     let (r, cap) = (1000.0, 1e-6);
     let tau = r * cap; // 1e-3 s
-    let p = params_vec(&ctx, &dae, &[("V1", 1.0), ("R1", r), ("C1", cap)]);
+    let p = params_vec(&mut ctx, &dae, &[("V1", 1.0), ("R1", r), ("C1", cap)]);
 
     // Consistent IC: v1 = 1 (source), v2 = 0 (discharged), branch current
     // i_V1 set by the assembler's sign convention is recovered by diffsol's
@@ -661,16 +659,9 @@ fn rc_step_transient() {
 
     let times: Vec<f64> = (0..=5).map(|k| k as f64 * tau).collect();
     let traj = cdc
-        .solve_transient(
-            TransientMethod::Esdirk32,
-            &p,
-            &x0,
-            &times,
-            TRANSIENT_RTOL,
-            TRANSIENT_ATOL,
-            None,
-        )
-        .expect("transient");
+        .solve_transient(&p, &x0, &times, TRANSIENT_RTOL, TRANSIENT_ATOL, None)
+        .expect("transient")
+        .rows;
     for (k, t) in times.iter().enumerate() {
         let want = 1.0 - (-t / tau).exp();
         let got = traj[k][v2_idx];
@@ -682,19 +673,19 @@ fn rc_step_transient() {
 #[test]
 fn mosfet_cs_gmin_homotopy() {
     let mut ctx = Graph::new();
-    let mut c = Circuit::new();
+    let mut c = Elements::new();
     // VDD=5 at node 1, RD from 1->drain(2), gate tied to a 2V source node 3.
     c.voltage_source("VDD", 1, 0)
         .resistor("RD", 1, 2)
         .voltage_source("VG", 3, 0);
     let devs = vec![DeviceInstance::new(
-        Box::new(sane_veriloga::builtin_device("sane_mos", "M1", &[])),
+        std::sync::Arc::new(sane_veriloga::builtin_device("sane_mos", "M1", &[])),
         vec![2, 3, 0, 0], // d g s b (body at ground)
     )];
-    let dae = assemble_dae(&mut ctx, &c, &devs).unwrap();
+    let dae = sane_dae::assemble(&mut ctx, &sane_circuit::Circuit::flat(&c, &devs)).unwrap();
     let cdc = CompiledDc::new(&mut ctx, &dae);
     let p = params_vec(
-        &ctx,
+        &mut ctx,
         &dae,
         &[
             ("VDD", 5.0),
@@ -726,18 +717,18 @@ fn mosfet_cs_gmin_homotopy() {
 fn device_limiting_preserves_operating_point() {
     // MOSFET common-source (channel control -> fetlim).
     let mut ctx = Graph::new();
-    let mut c = Circuit::new();
+    let mut c = Elements::new();
     c.voltage_source("VDD", 1, 0)
         .resistor("RD", 1, 2)
         .voltage_source("VG", 3, 0);
     let devs = vec![DeviceInstance::new(
-        Box::new(sane_veriloga::builtin_device("sane_mos", "M1", &[])),
+        std::sync::Arc::new(sane_veriloga::builtin_device("sane_mos", "M1", &[])),
         vec![2, 3, 0, 0],
     )];
-    let dae = assemble_dae(&mut ctx, &c, &devs).unwrap();
+    let dae = sane_dae::assemble(&mut ctx, &sane_circuit::Circuit::flat(&c, &devs)).unwrap();
     let cdc = CompiledDc::new(&mut ctx, &dae);
     let p = params_vec(
-        &ctx,
+        &mut ctx,
         &dae,
         &[
             ("VDD", 5.0),
@@ -775,16 +766,16 @@ fn device_limiting_preserves_operating_point() {
 
     // Diode rectifier (forward junction -> pnjlim).
     let mut ctx = Graph::new();
-    let mut c = Circuit::new();
+    let mut c = Elements::new();
     c.voltage_source("V1", 1, 0).resistor("R1", 1, 2);
     let devs = vec![DeviceInstance::new(
-        Box::new(sane_veriloga::builtin_device("sane_diode", "D1", &[])),
+        std::sync::Arc::new(sane_veriloga::builtin_device("sane_diode", "D1", &[])),
         vec![2, 0],
     )];
-    let dae = assemble_dae(&mut ctx, &c, &devs).unwrap();
+    let dae = sane_dae::assemble(&mut ctx, &sane_circuit::Circuit::flat(&c, &devs)).unwrap();
     let cdc = CompiledDc::new(&mut ctx, &dae);
     let p = params_vec(
-        &ctx,
+        &mut ctx,
         &dae,
         &[
             ("V1", 0.72),
@@ -815,13 +806,13 @@ fn device_limiting_preserves_operating_point() {
 #[test]
 fn symbolic_reuse_present() {
     let mut ctx = Graph::new();
-    let mut c = Circuit::new();
+    let mut c = Elements::new();
     c.voltage_source("V1", 1, 0).resistor("R1", 1, 2);
     let devs = vec![DeviceInstance::new(
-        Box::new(sane_veriloga::builtin_device("sane_bjt", "Q1", &[])),
+        std::sync::Arc::new(sane_veriloga::builtin_device("sane_bjt", "Q1", &[])),
         vec![2, 1, 0],
     )];
-    let dae = assemble_dae(&mut ctx, &c, &devs).unwrap();
+    let dae = sane_dae::assemble(&mut ctx, &sane_circuit::Circuit::flat(&c, &devs)).unwrap();
     let cdc = CompiledDc::new(&mut ctx, &dae);
     assert!(
         cdc.symbolic.is_some(),

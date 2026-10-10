@@ -14,7 +14,7 @@
 
 use std::time::Instant;
 
-use sane_analysis::Model;
+use sane_analysis::{log_grid, Model};
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -38,7 +38,8 @@ fn main() {
     };
 
     // Warm up: DC solve + first pool build, so timing is the sweep itself.
-    match model.ac(&[], &input, &output, fstart, fstop, 16) {
+    let pt = model.at(&[]).expect("binding");
+    match pt.ac(&input, &[&output], &log_grid(fstart, fstop, 16)) {
         Ok(_) => {}
         Err(e) => {
             eprintln!("{path}: AC failed (input={input}, output={output}): {e:?}");
@@ -48,12 +49,11 @@ fn main() {
 
     let threads = sane_solve::parallel::threads();
     let t0 = Instant::now();
-    let ac = model
-        .ac(&[], &input, &output, fstart, fstop, points)
-        .expect("ac sweep");
+    let ac = (pt.ac(&input, &[&output], &log_grid(fstart, fstop, points))).expect("ac sweep");
     let dt = t0.elapsed();
 
-    let sum: f64 = ac.mag_db.iter().sum();
+    let mag_db = ac.mag_db(&output).unwrap();
+    let sum: f64 = mag_db.iter().sum();
     let name = std::path::Path::new(&path)
         .file_stem()
         .and_then(|s| s.to_str())
@@ -62,7 +62,7 @@ fn main() {
         "{name:<22} points={points} threads={threads} \
          elapsed={:>8.3} ms  mag_db[0]={:>8.2}  mag_db[last]={:>8.2}  checksum={sum:.4}",
         dt.as_secs_f64() * 1e3,
-        ac.mag_db.first().copied().unwrap_or(0.0),
-        ac.mag_db.last().copied().unwrap_or(0.0),
+        mag_db.first().copied().unwrap_or(0.0),
+        mag_db.last().copied().unwrap_or(0.0),
     );
 }

@@ -18,8 +18,9 @@
 //! the next iteration's residual is the probe, and a step that did not
 //! contract is retracted to a fraction before that Jacobian is used.
 
+use crate::limiting::Limit;
 use sane_core::constants::{LINE_SEARCH_SHRINK, NEWTON_STALL_FACTOR, NEWTON_STALL_WINDOW};
-use sane_dae::{Limit, UnknownKind};
+use sane_dae::UnknownKind;
 
 use crate::{limiting, Convergence};
 
@@ -103,11 +104,21 @@ impl<'a> Criterion<'a> {
 
     /// The scaled update norm `max_i |dx_i| / (reltol |x_i| + floor_i)` and
     /// the index attaining it; `< 1` is the update half of convergence. A
-    /// non-finite update scores infinite.
-    pub fn update_norm<T: Magnitude>(&self, dx: &[T], x: &[T]) -> (f64, usize) {
+    /// non-finite update scores infinite. A component within `rounding`, the
+    /// move the residual's own rounding makes (where the system knows it),
+    /// scores none: no iteration resolves it further.
+    pub fn update_norm<T: Magnitude>(
+        &self,
+        dx: &[T],
+        x: &[T],
+        rounding: Option<&[f64]>,
+    ) -> (f64, usize) {
         let mut worst = (0.0f64, 0usize);
         for i in 0..dx.len() {
             let d = dx[i].mag();
+            if rounding.is_some_and(|r| d <= r[i]) {
+                continue;
+            }
             let sc = (self.conv.reltol * x[i].mag() + self.update_floor(i)).max(f64::MIN_POSITIVE);
             let w = if d.is_finite() { d / sc } else { f64::INFINITY };
             if w > worst.0 {
@@ -115,11 +126,6 @@ impl<'a> Criterion<'a> {
             }
         }
         worst
-    }
-
-    /// Every update within `reltol * |x| + floor`.
-    pub fn update_ok<T: Magnitude>(&self, dx: &[T], x: &[T]) -> bool {
-        self.update_norm(dx, x).0 < 1.0
     }
 }
 
@@ -184,15 +190,15 @@ where
 /// pin, a limited step that no longer moves) and returns early instead of
 /// running out its budget; the cascade's next stage is the answer to a stall,
 /// not more of the same iteration.
+#[derive(Default)]
 pub(crate) struct StallGuard {
     history: std::collections::VecDeque<f64>,
 }
 
 impl StallGuard {
-    pub fn new() -> Self {
-        StallGuard {
-            history: std::collections::VecDeque::with_capacity(NEWTON_STALL_WINDOW + 1),
-        }
+    /// Forget the iterations of an earlier solve, keeping the buffer.
+    fn reset(&mut self) {
+        self.history.clear();
     }
 
     /// Record this iteration's residual norm; `true` when the last window
@@ -240,6 +246,415 @@ impl Backtrack {
     }
 }
 
+// --- the core -------------------------------------------------------------
+
+/// A scalar a Newton iterates over: real (DC, transient stages) or complex
+/// (harmonic balance).
+pub(crate) trait Scalar:
+    Copy
+    + Default
+    + Magnitude
+    + std::ops::Add<Output = Self>
+    + std::ops::Sub<Output = Self>
+    + std::ops::Mul<f64, Output = Self>
+{
+}
+
+impl<T> Scalar for T where
+    T: Copy
+        + Default
+        + Magnitude
+        + std::ops::Add<Output = T>
+        + std::ops::Sub<Output = T>
+        + std::ops::Mul<f64, Output = T>
+{
+}
+
+/// What a Newton solves: a residual `r(x)`, its Jacobian and the linear
+/// solves on it, every shift the system carries (a gmin shunt, a pin, a
+/// homotopy) part of `r` and `J`. The step is `x -= J^-1 r`. The defaults are
+/// the plain system: no rounding measure, no limiting, the 2-norm.
+pub(crate) trait System<T: Scalar> {
+    /// The residual at `x` into `res`, and with `jacobian` the Jacobian
+    /// there (evaluated, for [`factor`](Self::factor)). `false` where the
+    /// evaluation fails.
+    fn eval(&mut self, x: &[T], jacobian: bool, res: &mut [T]) -> bool;
+
+    /// Factor the Jacobian the last evaluation with `jacobian` gave; `false`
+    /// where it is singular.
+    fn factor(&mut self) -> bool;
+
+    /// `dx = J^-1 rhs` on the current factors; `false` where there are none
+    /// or the solve fails.
+    fn solve(&mut self, rhs: &[T], dx: &mut [T]) -> bool;
+
+    /// [`solve`](Self::solve) on the factors of an earlier iteration, before
+    /// this one's Jacobian is factored: the early acceptance probe (see
+    /// [`Policy::early_accept`]). `false` where there are none.
+    fn probe(&mut self, _rhs: &[T], _dx: &mut [T]) -> bool {
+        false
+    }
+
+    /// The chord solve of the composite step (see [`Policy::composite`]) on
+    /// the factors just built; `false` where the system offers none.
+    fn chord(&mut self, _rhs: &[T], _dx: &mut [T]) -> bool {
+        false
+    }
+
+    /// Whether `res` at `x` is within the rounding of the terms each row
+    /// sums (solved: no step can do better), and the 2-norm of those terms
+    /// (below it two residual norms tell nothing apart).
+    fn rounding(&mut self, _x: &[T], _res: &[T]) -> (bool, f64) {
+        (false, 0.0)
+    }
+
+    /// Per unknown, the move the residual's own rounding makes through the
+    /// iteration matrix, where the system knows it: an update within it is
+    /// the rounding's, not the iteration's.
+    fn update_rounding(&self) -> Option<&[f64]> {
+        None
+    }
+
+    /// An acceptance of the residual half the system grants beyond its
+    /// floors (the SPICE-relative test of the node-adaptive fallback).
+    fn accept_residual(&mut self, _x: &[T], _res: &[T]) -> bool {
+        false
+    }
+
+    /// Shape `step` (the update `x - x_new`): shorten it to the device
+    /// limits, keep what the iterate keeps (a real DC harmonic); the
+    /// fraction kept.
+    fn limit(&self, _x: &[T], _step: &mut [T]) -> f64 {
+        1.0
+    }
+
+    /// The residual norm the globalization and the stall rule compare.
+    fn norm(&self, _x: &[T], res: &[T]) -> f64 {
+        res.iter().map(|r| r.mag() * r.mag()).sum::<f64>().sqrt()
+    }
+
+    /// Whether the factors are stale (a modified Newton re-evaluates the
+    /// Jacobian then); a full Newton does every iteration.
+    fn stale(&self) -> bool {
+        true
+    }
+
+    /// Mark the factors stale (a modified Newton that contracts too slowly).
+    fn mark_stale(&mut self) {}
+}
+
+/// When a Newton has converged: the residual within its floors *and* the
+/// update within its floors -- or the residual within its rounding, which no
+/// step improves on. A half that is off holds; with both off only the
+/// rounding converges.
+pub(crate) struct Contract<'a> {
+    pub criterion: Criterion<'a>,
+    /// The residual half: every row within [`Criterion::residual_floor`].
+    pub residual: bool,
+    /// The update half: [`Criterion::update_norm`] below this fraction.
+    pub update: Option<f64>,
+}
+
+/// How the Jacobian is kept.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Jacobian {
+    /// Evaluated and factored every iteration.
+    Full,
+    /// Kept while it contracts (modified Newton): re-evaluated when the
+    /// system says it is stale, marked so when the update norm falls by less
+    /// than `theta` per iteration or would not reach the tolerance in the
+    /// iterations left (Hairer-Wanner IV.8).
+    Modified { theta: f64 },
+}
+
+/// How a step is globalized.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Globalization {
+    /// The full (limited) step.
+    None,
+    /// The forward backtracking search ([`backtrack`]), `tries` probes.
+    LineSearch { tries: usize },
+    /// The retroactive search ([`Backtrack`]): the full step is taken, and
+    /// one whose residual grew by more than `growth` is retracted to a
+    /// fraction (each retraction an iteration), `tries` probes.
+    Retract { growth: f64, tries: usize },
+}
+
+/// How a Newton iterates (see [`solve`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Policy {
+    pub max_iter: usize,
+    pub jacobian: Jacobian,
+    pub globalization: Globalization,
+    /// Device limiting of every step.
+    pub limiting: bool,
+    /// The stall rule ([`StallGuard`]) while the residual half fails.
+    pub stall: bool,
+    /// Once the residual half holds, test the update half with the previous
+    /// iteration's factors before factoring this one's (SPICE's last-step
+    /// update test: near a solution the stale factors differ by `O(|dx|)`).
+    pub early_accept: bool,
+    /// After a full line-searched step, one chord step on the factors just
+    /// built (Traub's composite step), taken where it contracts the residual.
+    pub composite: bool,
+    /// Where it does not converge, return the lowest-residual iterate rather
+    /// than the last (a damped iteration that drifts back up at its end).
+    pub keep_best: bool,
+    /// Log every iteration (residual norm, update norm, largest step) at
+    /// DEBUG, for classifying non-convergence.
+    pub trace: bool,
+}
+
+/// What a Newton came to: converged or not, and the iterations it took.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Outcome {
+    pub converged: bool,
+    pub iters: usize,
+}
+
+/// The vectors a Newton works in, kept by a caller that solves many times.
+#[derive(Default)]
+pub(crate) struct Scratch<T> {
+    res: Vec<T>,
+    dx: Vec<T>,
+    trial: Vec<T>,
+    prev: Vec<T>,
+    best: Vec<T>,
+    stall: StallGuard,
+}
+
+impl<T: Scalar> Scratch<T> {
+    fn fit(&mut self, n: usize) {
+        for v in [
+            &mut self.res,
+            &mut self.dx,
+            &mut self.trial,
+            &mut self.prev,
+            &mut self.best,
+        ] {
+            v.resize(n, T::default());
+        }
+    }
+}
+
+/// Solve `sys` from `x` (the solution on return, else the last iterate, or
+/// the best where [`Policy::keep_best`]) as `policy` says, to `contract`: the
+/// one Newton loop of the solver.
+pub(crate) fn solve<T, S>(
+    sys: &mut S,
+    x: &mut [T],
+    contract: &Contract<'_>,
+    policy: &Policy,
+    ws: &mut Scratch<T>,
+) -> Outcome
+where
+    T: Scalar,
+    S: System<T>,
+{
+    ws.fit(x.len());
+    let mut best_fnorm = f64::INFINITY;
+    let out = iterate(sys, x, contract, policy, ws, &mut best_fnorm);
+    if !out.converged && policy.keep_best && best_fnorm.is_finite() {
+        x.copy_from_slice(&ws.best);
+    }
+    out
+}
+
+/// [`solve`]'s loop, the best residual norm met in `best_fnorm` (its
+/// iterate in `ws.best`) where [`Policy::keep_best`].
+fn iterate<T, S>(
+    sys: &mut S,
+    x: &mut [T],
+    contract: &Contract<'_>,
+    policy: &Policy,
+    ws: &mut Scratch<T>,
+    best_fnorm: &mut f64,
+) -> Outcome
+where
+    T: Scalar,
+    S: System<T>,
+{
+    let n = x.len();
+    let Scratch {
+        res,
+        dx,
+        trial,
+        prev,
+        best,
+        stall,
+    } = ws;
+    stall.reset();
+    let (mut prev_wn, mut prev_fnorm) = (f64::INFINITY, f64::INFINITY);
+    let mut retract: Option<Backtrack> = None;
+    let fail = |iters| Outcome {
+        converged: false,
+        iters,
+    };
+    let done = |iters| Outcome {
+        converged: true,
+        iters,
+    };
+    let update = |dx: &[T], x: &[T], rounding: Option<&[f64]>| -> (bool, f64) {
+        match contract.update {
+            Some(tol) => {
+                let wn = contract.criterion.update_norm(dx, x, rounding).0;
+                (wn < tol, wn)
+            }
+            None => (true, 0.0),
+        }
+    };
+    let halves = contract.residual || contract.update.is_some();
+    for it in 0..policy.max_iter {
+        let jacobian = match policy.jacobian {
+            Jacobian::Full => true,
+            Jacobian::Modified { .. } => sys.stale(),
+        };
+        if !sys.eval(x, jacobian, res) {
+            return fail(it);
+        }
+        let fnorm = sys.norm(x, res);
+        // The retroactive search: a step whose residual grew (or broke down)
+        // is retracted before its Jacobian is used.
+        if let Globalization::Retract { growth, tries } = policy.globalization {
+            if prev_fnorm.is_finite() && !(fnorm <= growth * prev_fnorm) {
+                let bt = retract.get_or_insert_with(|| Backtrack::new(tries));
+                if let Some(alpha) = bt.shrink() {
+                    for i in 0..n {
+                        x[i] = prev[i] - dx[i] * alpha;
+                    }
+                    continue;
+                }
+            }
+            retract = None;
+        }
+        if !fnorm.is_finite() {
+            return fail(it);
+        }
+        if policy.keep_best && fnorm < *best_fnorm {
+            *best_fnorm = fnorm;
+            best.copy_from_slice(x);
+        }
+        let res_ok = !contract.residual
+            || contract.criterion.residual_ok(res, x, 0.0)
+            || sys.accept_residual(x, res);
+        let (rounded, floor) = sys.rounding(x, res);
+        if rounded {
+            return done(it);
+        }
+        // the residual half alone: solved where it holds, no step to take
+        if contract.residual && contract.update.is_none() && res_ok {
+            return done(it + 1);
+        }
+        if policy.stall && !res_ok && stall.stalled(fnorm) {
+            return fail(it);
+        }
+        if halves
+            && policy.early_accept
+            && res_ok
+            && sys.probe(res, dx)
+            && update(dx, x, sys.update_rounding()).0
+        {
+            apply(x, dx);
+            return done(it);
+        }
+        if jacobian && !sys.factor() {
+            return fail(it);
+        }
+        if !sys.solve(res, dx) {
+            return fail(it);
+        }
+        let (update_ok, wn) = update(dx, x, sys.update_rounding());
+        if policy.trace {
+            let (k, mx) = (dx.iter().enumerate())
+                .map(|(i, d)| (i, d.mag()))
+                .fold((0, 0.0f64), |a, b| if b.1 > a.1 { b } else { a });
+            sane_core::log::debug(&format!(
+                "NEWTON it={it} fnorm={fnorm:.3e} res_ok={res_ok} wn={wn:.3e} maxdx={mx:.3e}@{k}"
+            ));
+        }
+        if policy.limiting {
+            sys.limit(x, dx);
+        }
+        if halves && res_ok && update_ok {
+            apply(x, dx);
+            return done(it + 1);
+        }
+        let alpha = match policy.globalization {
+            Globalization::None => {
+                apply(x, dx);
+                1.0
+            }
+            Globalization::LineSearch { tries } => {
+                // the last probe leaves its residual: the new iterate's
+                backtrack(x, dx, trial, fnorm, floor, tries, |t| {
+                    match sys.eval(t, false, res) {
+                        true => sys.norm(t, res),
+                        false => f64::INFINITY,
+                    }
+                })
+            }
+            Globalization::Retract { .. } => {
+                prev.copy_from_slice(x);
+                apply(x, dx);
+                1.0
+            }
+        };
+        if policy.composite && alpha == 1.0 && policy.globalization != Globalization::None {
+            composite(sys, x, res, dx, trial, policy.limiting);
+        }
+        if let Jacobian::Modified { theta } = policy.jacobian {
+            if !jacobian {
+                let ratio = wn / prev_wn;
+                let tol = contract.update.unwrap_or(1.0);
+                let left = (policy.max_iter - it - 1) as f64;
+                let predicted = match ratio < 1.0 {
+                    true => ratio.powf(left) * wn / (1.0 - ratio),
+                    false => f64::INFINITY,
+                };
+                if ratio > theta || predicted > tol {
+                    sys.mark_stale();
+                }
+            }
+        }
+        prev_wn = wn;
+        prev_fnorm = fnorm;
+    }
+    fail(policy.max_iter)
+}
+
+/// Traub's composite step after a full step to `x`: one chord step on the
+/// factors just built from the residual `res` there, taken where it
+/// contracts the residual.
+fn composite<T: Scalar, S: System<T>>(
+    sys: &mut S,
+    x: &mut [T],
+    res: &mut [T],
+    dx: &mut [T],
+    trial: &mut [T],
+    limiting: bool,
+) {
+    let f1 = sys.norm(x, res);
+    if !sys.chord(res, dx) {
+        return;
+    }
+    if limiting {
+        sys.limit(x, dx);
+    }
+    for i in 0..x.len() {
+        trial[i] = x[i] - dx[i];
+    }
+    if sys.eval(trial, false, res) && sys.norm(trial, res) < f1 {
+        x.copy_from_slice(trial);
+    }
+}
+
+/// `x -= dx`.
+fn apply<T: Scalar>(x: &mut [T], dx: &[T]) {
+    for (xi, &d) in x.iter_mut().zip(dx) {
+        *xi = *xi - d;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,7 +683,7 @@ mod tests {
 
     #[test]
     fn stall_guard_trips_on_a_plateau_only() {
-        let mut g = StallGuard::new();
+        let mut g = StallGuard::default();
         // geometric decrease: never stalled
         for k in 0..30 {
             assert!(
@@ -276,7 +691,7 @@ mod tests {
                 "converging iteration flagged at {k}"
             );
         }
-        let mut g = StallGuard::new();
+        let mut g = StallGuard::default();
         // a plateau trips after the window
         let mut tripped = None;
         for k in 0..30 {

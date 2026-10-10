@@ -15,14 +15,16 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 # `extension-module` is added by maturin (see pyproject.toml), not here, so that
 # plain `cargo test` can still link against libpython.
-pyo3 = { version = "0.22", features = ["abi3-py39"] }
+pyo3 = { version = "0.22", features = ["abi3-py39", "num-complex"] }
+# numpy arrays over the results' own memory (the version for this pyo3).
+numpy = "0.22"
 # Extraction is allocation-heavy (parse + symbolic build + AD + tape compile do
 # many small allocations). The OS heap serialises these -- catastrophically so
 # under the worker pool (measured ~4.5x slowdown on the IBM grids). mimalloc cuts
 # single-threaded extract ~24% and lets the parallel passes actually scale.
 mimalloc = "0.1"
 sane-core.workspace = true
-sane-mna.workspace = true
+sane-circuit.workspace = true
 sane-dae = { path = "../dae" }
 sane-device = { path = "../device" }
 sane-netlist = { path = "../netlist" }

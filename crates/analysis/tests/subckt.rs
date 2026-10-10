@@ -1,6 +1,7 @@
 //! Subcircuit instances are calls of one function per body structure: the
 //! instances of a subcircuit share it whatever their parameter values, and
-//! solve, differentiate and name like the elements they contain.
+//! solve, differentiate and name like the elements they contain. A body
+//! instantiated at one place only is carried into that place instead.
 
 use sane_analysis::Model;
 
@@ -23,26 +24,34 @@ X3 in 0 quarter
 fn instances_share_one_function_per_body() {
     let parsed = sane_netlist::parse(DECK).unwrap();
     let mut ctx = sane_core::Graph::new();
-    let dae = parsed.assemble(&mut ctx).unwrap();
-    // `half` (all four instances, two nested in `quarter`) and `quarter`;
-    // the resistors' noise stays the bodies' (see `Observers`). The currents
-    // and charges call their copies specialized to rest, one per body.
+    let dae = sane_dae::assemble(&mut ctx, &parsed).unwrap();
+    // `half` (all four instances, two nested in `quarter`), and the
+    // resistors' noise levels as `half`'s observers, which no instance
+    // calls until asked for (see `Observers`). `quarter`, instantiated at
+    // one place only, is no function: its two `half` calls are the top
+    // level's. The currents and charges call `half`'s copy specialized to
+    // rest.
     let bodies: std::collections::BTreeSet<String> = (0..ctx.n_funcs() as u32)
         .map(|f| ctx.func(rsdag::FuncId(f)).name().to_string())
         .collect();
-    assert_eq!(bodies.len(), 2, "{bodies:?}");
-    assert_eq!(ctx.n_funcs(), 4);
+    let names = ["half", "half, observers"];
+    assert_eq!(
+        bodies,
+        names.iter().map(|s| s.to_string()).collect(),
+        "{bodies:?}"
+    );
+    assert_eq!(ctx.n_funcs(), 3);
     // every node of the hierarchy is a node unknown, internal nodes included
     for node in ["out", "X1.mid", "X2.mid", "X3.m", "X3.X1.mid", "X3.X2.mid"] {
-        assert!(parsed.node(node).is_some(), "{node}");
+        assert!(parsed.find_node(node).is_some(), "{node}");
     }
-    assert_eq!(dae.n_nodes, parsed.node_names.len() - 1);
+    assert_eq!(dae.n_nodes, parsed.node_names().len() - 1);
 }
 
 #[test]
 fn instances_solve_and_differentiate_by_their_names() {
     let m = Model::from_netlist(DECK).unwrap();
-    let op = m.operating_point(&[]).unwrap();
+    let op = m.at(&[]).and_then(|pt| pt.operating_point()).unwrap();
     // 6k under 2k from 4 V (to the solver's gmin shunts)
     let v = |n: &str| op.get(n).unwrap();
     assert!((v("out") - 3.0).abs() < 1e-6);
@@ -52,8 +61,8 @@ fn instances_solve_and_differentiate_by_their_names() {
     // each instance keeps its own parameters
     assert_eq!(m.get("X2.R1"), Some(3e3));
     assert_eq!(m.get("X3.X1.R2"), Some(1e3));
-    let s = op.sensitivity("out").unwrap();
-    let grad = |p: &str| s.grad[s.names.iter().position(|n| n == p).unwrap()];
+    let s = op.sensitivity(&["out"], &[]).unwrap();
+    let grad = |p: &str| s.get("out", p).unwrap();
     // out = 4 * R_X2 / (R_X1 + R_X2), R_X2 = X2.R1 + X2.R2 = 6k, R_X1 = 2k
     let close = |a: f64, b: f64| (a - b).abs() < 1e-6 * b.abs();
     assert!(close(grad("X2.R1"), 4.0 * 2e3 / 8e3_f64.powi(2)));

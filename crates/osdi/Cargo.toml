@@ -18,5 +18,5 @@ workspace = true
 
 [dev-dependencies]
 sane-dae = { path = "../dae" }
-sane-mna = { path = "../mna" }
+sane-circuit = { path = "../circuit" }
 sane-solve = { path = "../solve" }

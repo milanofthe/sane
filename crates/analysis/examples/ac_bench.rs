@@ -16,7 +16,7 @@
 
 use std::time::Instant;
 
-use sane_analysis::Model;
+use sane_analysis::{log_grid, Model};
 
 fn ladder(n: usize) -> String {
     // VS -> node 1, then R_k from node k to k+1, C_k from k+1 to ground.
@@ -40,17 +40,18 @@ fn main() {
     let output = format!("{}", n + 1); // last ladder node
 
     // Warm up (DC solve + first pool build) so timing is the sweep itself.
-    let _ = model.ac(&[], "VS", &output, 1.0, 1e8, 16).expect("warmup");
+    let pt = model.at(&[]).expect("binding");
+    let _ = pt
+        .ac("VS", &[&output], &log_grid(1.0, 1e8, 16))
+        .expect("warmup");
 
     let threads = sane_solve::parallel::threads();
     let t0 = Instant::now();
-    let ac = model
-        .ac(&[], "VS", &output, 1.0, 1e8, points)
-        .expect("ac sweep");
+    let ac = (pt.ac("VS", &[&output], &log_grid(1.0, 1e8, points))).expect("ac sweep");
     let dt = t0.elapsed();
 
     // Checksum: identical across thread counts iff the math is unchanged.
-    let sum: f64 = ac.mag_db.iter().sum();
+    let sum: f64 = ac.mag_db(&output).unwrap().iter().sum();
     println!(
         "sections={n} nodes~={n} points={points} threads={threads} \
          elapsed={:.3} ms  mag_db[checksum]={sum:.6}",

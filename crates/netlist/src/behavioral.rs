@@ -1,10 +1,10 @@
 //! Behavioral (`B`) source expression parser: turns `V=...` / `I=...` right-hand
-//! sides into a [`sane_mna::BExpr`] tree over node voltages `V(node)`, branch
+//! sides into a [`sane_circuit::BExpr`] tree over node voltages `V(node)`, branch
 //! currents `I(element)`, parameters and arithmetic / functions. Node names are
 //! resolved to indices through the caller's node table; element names stay as
 //! strings (resolved to branch currents in the DAE layer).
 
-use sane_mna::BExpr;
+use sane_circuit::BExpr;
 
 use crate::expr::{lex, Tok};
 

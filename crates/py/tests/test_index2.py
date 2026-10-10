@@ -92,8 +92,7 @@ def test_a_cv_loop_integrates(deck):
     (a *voltage* heuristic) could not deliver that within the iteration budget,
     and shrinking the step only made the required current larger: underflow."""
     model, _ = build(deck)
-    traj = model.transient(T)
-    v1 = np.asarray(traj.to_dict()["v1"]).ravel()
+    v1 = model.at().transient(T).signal("n1")
     # It runs and stays finite -- that is the regression. Accuracy is NOT
     # asserted here: with the step left free the controller has no truncation
     # error to see on the pinned branch and strides far, which is exactly what
@@ -108,7 +107,7 @@ def test_dt_max_restores_index_2_accuracy(deck):
     """Bounding the step is the caller's lever (the engine only warns): with it,
     the pinned node is exact again."""
     model, _ = build(deck)
-    v1 = np.asarray(model.transient(T, dt_max=5e-4).to_dict()["v1"]).ravel()
+    v1 = model.at().transient(T, dt_max=5e-4).signal("n1")
     assert np.max(np.abs(v1 - REF)) < 1e-4
 
 
@@ -117,7 +116,7 @@ def test_an_li_cutset_integrates():
     the node voltage follows `L*di/dt`. It integrates for the same reason -- no
     solver-side step clamp stands in the way -- and `dt_max` makes it exact."""
     model, _ = build(LI_CUTSET)
-    v2 = np.asarray(model.transient(T, dt_max=5e-4).to_dict()["v2"]).ravel()
+    v2 = model.at().transient(T, dt_max=5e-4).signal("n2")
     # KCL pins i(L1) = I1(t), so v(n2) = R2 * i = sin(100 t)
     assert np.max(np.abs(v2 - REF)) < 1e-4
 
@@ -127,5 +126,5 @@ def test_breaking_the_loop_removes_the_diagnosis():
     with it the deck is index 1 and integrates to full accuracy."""
     model, msg = build(INDEX1_REFERENCE)
     assert msg is None
-    v1 = np.asarray(model.transient(T).to_dict()["v1"]).ravel()
+    v1 = model.at().transient(T).signal("n1")
     assert np.max(np.abs(v1 - REF)) < 1e-3

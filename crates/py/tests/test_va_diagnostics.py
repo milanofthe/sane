@@ -65,23 +65,26 @@ N1 1 0 incmod
 .end"""
 
 
-def test_error_in_true_guard_fails_to_load():
+def test_error_in_true_guard_rejects_the_binding():
+    # An `$error` on parameter values is an assertion: the model builds, a
+    # binding where it fires is no point to analyze at.
+    model = sane.Model.from_netlist(VA_ERROR_GUARD)
     with pytest.raises(ValueError, match="bad must be non-positive"):
-        sane.Circuit.parse(VA_ERROR_GUARD).extract()
+        model.at()
 
 
 def test_warning_surfaces_as_convergence_warning():
     with pytest.warns(SaneConvergenceWarning, match="preview model"):
-        sane.Circuit.parse(VA_WARNING).extract()
+        sane.Model.from_netlist(VA_WARNING)
 
 
 def test_unresolved_include_warns():
     with pytest.warns(SaneConvergenceWarning, match="include"):
-        sane.Circuit.parse(VA_UNRESOLVED_INCLUDE).extract()
+        sane.Model.from_netlist(VA_UNRESOLVED_INCLUDE)
 
 
 def test_healthy_va_model_does_not_warn():
     healthy = VA_WARNING.replace('    $warning("warnmod is a preview model");\n', "")
     with warnings.catch_warnings():
         warnings.simplefilter("error", SaneConvergenceWarning)
-        sane.Circuit.parse(healthy).extract()
+        sane.Model.from_netlist(healthy)

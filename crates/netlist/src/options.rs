@@ -15,6 +15,8 @@ pub(crate) struct NetlistOptions {
     pub(crate) scale: Option<f64>,
     /// Minimum conductance hint (`.option gmin=`); surfaced in diagnostics.
     pub(crate) gmin: Option<f64>,
+    /// The DC convergence settings (`.option reltol= abstol= vntol= itl1=`).
+    pub(crate) dc: sane_circuit::DcSettings,
 }
 
 impl NetlistOptions {
@@ -56,13 +58,15 @@ pub(crate) fn is_handled_directive(head: &str) -> bool {
         ".inc",
         ".lib",
         ".endl",
+        ".nodeset",
     ];
     HANDLED.iter().any(|d| head.eq_ignore_ascii_case(d))
 }
 
 /// Scan for global `.temp` / `.option` directives (the last occurrence wins,
-/// matching SPICE). `.option scale/gmin/temp` and a bare `.temp <value>` are
-/// recognised; unknown options are left for the compatibility report.
+/// matching SPICE). `.option scale/gmin/temp`, the DC convergence settings
+/// `reltol/abstol/vntol/itl1` and a bare `.temp <value>` are recognised;
+/// unknown options are left for the compatibility report.
 pub(crate) fn collect_options(lines: &[Line]) -> NetlistOptions {
     let mut opt = NetlistOptions::default();
     let env: HashMap<String, f64> = {
@@ -88,6 +92,10 @@ pub(crate) fn collect_options(lines: &[Line]) -> NetlistOptions {
                     "scale" => opt.scale = Some(val),
                     "gmin" => opt.gmin = Some(val),
                     "temp" | "temper" => opt.temp_c = Some(val),
+                    "reltol" => opt.dc.reltol = Some(val),
+                    "abstol" => opt.dc.abstol = Some(val),
+                    "vntol" => opt.dc.vntol = Some(val),
+                    "itl1" if val >= 1.0 => opt.dc.max_iter = Some(val as usize),
                     _ => {}
                 }
             }
@@ -173,4 +181,32 @@ pub(crate) fn resolve_params(lines: &[Line], temp_c: f64) -> HashMap<String, f64
         }
     }
     env
+}
+
+/// The `.nodeset V(net)=value ...` targets: node name, volts. Unlike `.ic` (a
+/// hard transient initial condition) a node-set is a *soft* DC convergence
+/// aid: it pins the nodes in a first solve phase to break the symmetry of a
+/// bistable circuit, then releases them. Node voltages only (SPICE allows no
+/// branch currents in a node-set).
+pub(crate) fn collect_nodeset(text: &str) -> Vec<(String, f64)> {
+    let mut out = Vec::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if !line.to_ascii_lowercase().starts_with(".nodeset") {
+            continue;
+        }
+        for tok in line.split_whitespace().skip(1) {
+            let Some((lhs, rhs)) = tok.split_once('=') else {
+                continue;
+            };
+            let Some(val) = crate::parse_value(rhs.trim()) else {
+                continue;
+            };
+            let lhs = lhs.trim();
+            if lhs.to_ascii_lowercase().starts_with("v(") && lhs.ends_with(')') {
+                out.push((lhs[2..lhs.len() - 1].to_string(), val));
+            }
+        }
+    }
+    out
 }

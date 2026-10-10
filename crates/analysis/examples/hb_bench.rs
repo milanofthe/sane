@@ -15,7 +15,7 @@
 
 use std::time::Instant;
 
-use sane_analysis::Model;
+use sane_analysis::{HbOptions, Model};
 
 fn rectifier_chain(n: usize) -> String {
     // SIN drive -> (R, diode-to-ground) chain: n nonlinear devices, n+1 nodes.
@@ -37,16 +37,18 @@ fn main() {
     sane_analysis::logging::init_from_env(); // SANE_LOG=debug surfaces stage timings
     let model = Model::from_netlist(&rectifier_chain(n)).expect("build model");
 
+    let pt = model.at(&[]).expect("binding");
+    let opts = HbOptions {
+        f0: Some(f0),
+        harmonics,
+        ..HbOptions::default()
+    };
     // Warm up: DC solve + first pool build, so timing is the HB solve itself.
-    let _ = model
-        .harmonic_balance(&[], f0, harmonics, None)
-        .expect("warmup");
+    let _ = pt.harmonic_balance(&opts).expect("warmup");
 
     let threads = sane_solve::parallel::threads();
     let t0 = Instant::now();
-    let hb = model
-        .harmonic_balance(&[], f0, harmonics, None)
-        .expect("hb solve");
+    let hb = pt.harmonic_balance(&opts).expect("hb solve");
     let dt = t0.elapsed();
 
     // Checksum over every chain node's harmonic magnitudes (public accessor).
@@ -57,9 +59,9 @@ fn main() {
         })
         .sum();
     println!(
-        "stages={n} harmonics={harmonics} threads={threads} converged={} \
+        "stages={n} harmonics={harmonics} threads={threads} iters={} \
          elapsed={:>8.3} ms  spectrum[checksum]={sum:.6}",
-        hb.converged,
+        hb.iters,
         dt.as_secs_f64() * 1e3,
     );
 }

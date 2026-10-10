@@ -10,13 +10,13 @@ use sane_solve::CompiledDc;
 fn dc_node(src: &str, node: &str) -> f64 {
     let parsed = parse(src).expect("parse");
     let mut ctx = Graph::new();
-    let dae = parsed.assemble(&mut ctx).unwrap();
+    let dae = sane_dae::assemble(&mut ctx, &parsed).unwrap();
     let cdc = CompiledDc::new(&mut ctx, &dae);
     let pnames = cdc.param_names(&ctx);
     let p: Vec<f64> = parsed.pvec(&pnames);
     let (x, conv, _) = cdc.solve_dc(&p, &[], 1e-10, 100);
     assert!(conv, "DC did not converge for:\n{src}");
-    let k = parsed.node(node).expect("node");
+    let k = parsed.find_node(node).expect("node");
     let idx = dae
         .unknowns
         .iter()
@@ -80,7 +80,7 @@ fn diode_series_resistance_drops_voltage() {
     let src = format!("V1 in 0 1\nR1 in a 1k\nD1 a 0 dm\n.model dm D(Is=1e-14 Rs={rs})\n.end");
     let parsed = parse(&src).expect("parse");
     let mut ctx = Graph::new();
-    let dae = parsed.assemble(&mut ctx).unwrap();
+    let dae = sane_dae::assemble(&mut ctx, &parsed).unwrap();
     // The internal node adds one unknown.
     assert!(
         dae.unknowns.iter().any(|u| u == "D1.ai"),
@@ -93,11 +93,11 @@ fn diode_series_resistance_drops_voltage() {
     let (x, conv, _) = cdc.solve_dc(&p, &[], 1e-10, 100);
     assert!(conv, "DC did not converge");
     let idx = |name: &str| dae.unknowns.iter().position(|u| u == name).unwrap();
-    let a = parsed.node("a").unwrap();
+    let a = parsed.find_node("a").unwrap();
     let v_a = x[idx(&format!("v{a}"))];
     let v_int = x[idx("D1.ai")];
     // Diode current = current through R1 = (v_in - v_a)/R1.
-    let v_in = x[idx(&format!("v{}", parsed.node("in").unwrap()))];
+    let v_in = x[idx(&format!("v{}", parsed.find_node("in").unwrap()))];
     let i = (v_in - v_a) / 1000.0;
     let drop = v_a - v_int;
     assert!(

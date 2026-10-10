@@ -84,6 +84,11 @@ pub struct Function {
     /// graph that calls a subset of one takes it, so a body is compiled once
     /// per function rather than once per program.
     interpreted: std::sync::Mutex<Vec<Body>>,
+    /// The program the interpreted bodies are views of (see
+    /// [`crate::tape::Lowered`]): the outputs they computed so far lowered
+    /// once, so the bodies of several output sets (a residual; with its
+    /// partials; a charge) share it.
+    lowered: std::sync::Mutex<Option<Arc<crate::tape::Lowered>>>,
     /// Derivative output `d outputs[out] / d params[param]`, by index: the
     /// outputs whose role is [`OutputRole::Derivative`].
     deriv_index: HashMap<(u32, u32), u32>,
@@ -91,6 +96,9 @@ pub struct Function {
     /// [`Graph::output_support`](crate::Graph::output_support)). An output
     /// never changes once pushed, so neither does its support.
     support: std::sync::Mutex<Vec<Option<Arc<[u32]>>>>,
+    /// What each node of the outputs' cone depends on among the parameters
+    /// that are no model parameters, once asked for (see `Graph::derive`).
+    pub(crate) deps: std::sync::Mutex<Option<Arc<crate::graph::Deps>>>,
     /// What each output reads, per way through and set of moving
     /// parameters (see `Graph::reads`).
     reads: std::sync::Mutex<HashMap<ReadsKey, Arc<[Arc<[u32]>]>>>,
@@ -207,8 +215,10 @@ impl Function {
             output_roles: Vec::new(),
             extern_body,
             interpreted: Default::default(),
+            lowered: Default::default(),
             deriv_index: HashMap::default(),
             support: Default::default(),
+            deps: Default::default(),
             reads: Default::default(),
             globals: Default::default(),
             composite: Default::default(),
@@ -222,6 +232,7 @@ impl Function {
         if !matches!(role, OutputRole::Derivative { .. }) {
             self.globals = Default::default();
             self.composite = Default::default();
+            self.deps = Default::default();
         }
         let k = self.outputs.len() as u32;
         self.outputs.push(output);
@@ -375,6 +386,16 @@ impl Function {
                 return c.clone();
             }
         }
+        self.build_body(ctx, needed)
+    }
+
+    /// The body of exactly the outputs `needed`, interpreted and kept (an
+    /// extern function's own).
+    fn build_body<K: crate::field::Field>(
+        &self,
+        ctx: &crate::graph::Graph<K>,
+        needed: &[u32],
+    ) -> Body {
         if let Some(b) = &self.extern_body {
             return Body {
                 bundle: b.clone(),
@@ -420,14 +441,12 @@ impl Function {
             .map(|r| matches!(r, ParamRole::Param))
             .chain(globals.iter().map(|_| true))
             .collect();
-        let (tape, pure) = if pure.iter().any(|&p| p) {
-            (
-                crate::tape::Tape::compile_split(ctx, &roots, &inputs, &pure),
-                pure,
-            )
+        let pure = if pure.iter().any(|&p| p) {
+            pure
         } else {
-            (crate::tape::Tape::compile(ctx, &roots, &inputs), Vec::new())
+            Vec::new()
         };
+        let tape = self.view(ctx, &roots, &inputs, &pure);
         // A body whose selects a binding decides runs each binding's
         // variant (see `crate::variant`).
         let variants = !pure.is_empty() && tape.has_param_selects(&pure);
@@ -439,6 +458,75 @@ impl Function {
         let body = Body { bundle, slot_of };
         self.interpreted.lock().unwrap().push(body.clone());
         body
+    }
+
+    /// The tape of `roots` (outputs of this function) over `inputs`, split
+    /// by `pure` when it is not empty: a view of the program lowered for
+    /// the bodies so far, lowered anew over these roots too where it does
+    /// not hold them.
+    fn view<K: crate::field::Field>(
+        &self,
+        ctx: &crate::graph::Graph<K>,
+        roots: &[ExprId],
+        inputs: &[crate::node::SymbolId],
+        pure: &[bool],
+    ) -> crate::tape::Tape {
+        let split = (!pure.is_empty()).then_some(pure);
+        let held = self.lowered.lock().unwrap().clone();
+        let lowered = match held {
+            Some(l) if l.serves(roots, inputs, split) => l,
+            held => {
+                let mut all: Vec<ExprId> = (held.iter())
+                    .filter(|l| l.signature(inputs, split))
+                    .flat_map(|l| l.roots().to_vec())
+                    .collect();
+                all.extend_from_slice(roots);
+                let l = Arc::new(crate::tape::Lowered::new(ctx, &all, inputs, split));
+                *self.lowered.lock().unwrap() = Some(l.clone());
+                l
+            }
+        };
+        lowered.tape(ctx, roots)
+    }
+
+    /// [`body_for`](Self::body_for) exactly: a body carrying the outputs
+    /// `needed` that are expressions and no other, built if there is none.
+    /// A program that reads fewer outputs than a body it was given computes
+    /// (a view of a program lowered for more, see [`crate::tape::Lowered`])
+    /// takes this one.
+    pub fn body_exact<K: crate::field::Field>(
+        &self,
+        ctx: &crate::graph::Graph<K>,
+        needed: &[u32],
+    ) -> Body {
+        if self.extern_body.is_none() {
+            let mut exprs: Vec<u32> = (needed.iter().copied())
+                .filter(|&k| matches!(self.outputs[k as usize], Output::Expr(_)))
+                .collect();
+            exprs.sort_unstable();
+            exprs.dedup();
+            let built = self.interpreted.lock().unwrap();
+            let exact = (built.iter())
+                .find(|c| self.covers(c, needed) && c.bundle.n_outputs() == exprs.len());
+            if let Some(c) = exact {
+                return c.clone();
+            }
+        }
+        self.build_body(ctx, needed)
+    }
+
+    /// The function output each slot of `bundle` carries, when it is one of
+    /// this function's interpreted bodies.
+    pub(crate) fn slot_outputs(&self, bundle: &Arc<dyn ExternBundle>) -> Option<Vec<u32>> {
+        let built = self.interpreted.lock().unwrap();
+        let body = built.iter().find(|c| Arc::ptr_eq(&c.bundle, bundle))?;
+        let mut outs = vec![u32::MAX; body.bundle.n_outputs()];
+        for (k, s) in body.slot_of.iter().enumerate() {
+            if let Some(s) = s {
+                outs[*s as usize] = k as u32;
+            }
+        }
+        Some(outs)
     }
 
     /// Whether `body` carries every output of `needed` that is an expression.

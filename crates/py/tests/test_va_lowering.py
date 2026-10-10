@@ -61,14 +61,14 @@ def test_idt_constant_ic_does_not_warn():
 
     with warnings.catch_warnings():
         warnings.simplefilter("error", SaneConvergenceWarning)
-        sane.Circuit.parse(VA_IDT_IC).extract()
+        sane.Model.from_netlist(VA_IDT_IC)
 
 
 def test_idt_nonconstant_ic_warns():
     # A non-constant ic cannot seed a numeric solve: surfaced as a warning.
     varying = VA_IDT_IC.replace("idt(V(a,c), 0.5)", "idt(V(a,c), V(a,c))")
     with pytest.warns(SaneConvergenceWarning, match="not a constant"):
-        sane.Circuit.parse(varying).extract()
+        sane.Model.from_netlist(varying)
 
 
 def test_idt_zero_ic_does_not_warn():
@@ -77,22 +77,22 @@ def test_idt_zero_ic_does_not_warn():
 
     with warnings.catch_warnings():
         warnings.simplefilter("error", SaneConvergenceWarning)
-        sane.Circuit.parse(zero_ic).extract()
+        sane.Model.from_netlist(zero_ic)
 
 
 def test_guarded_divide_finite_residual_and_jacobian_at_zero():
-    dae = sane.Circuit.parse(VA_GUARDED_DIV).extract()
+    dae = sane.Model.from_netlist(VA_GUARDED_DIV)
 
     # The currents I(x=0) and the full state Jacobian dI/dx at x=0 must be finite.
     zero = [0.0] * dae.dim
-    p = [float(dae.values.get(n, 0.0)) for n in dae.params]
-    for v in dae._d.currents(zero, p, 0.0):
+    p = dae.param_vector()
+    for v in dae.currents(zero, p):
         assert math.isfinite(v), "current is non-finite at x=0"
-    for row in dae._d.jacobian_i_x(zero, p, 0.0):
+    for row in dae.jacobian_i_x(zero, p):
         for entry in row:
             assert math.isfinite(entry), "Jacobian entry non-finite at x=0"
 
     # And the DC solve (whose first Newton evaluation is at the x=0 guess) must
     # converge to a finite solution vector.
-    op = dae.operating_point()
-    assert all(math.isfinite(v) for v in op.vector)
+    op = dae.at().operating_point()
+    assert all(math.isfinite(v) for v in op.x)

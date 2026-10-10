@@ -10,7 +10,10 @@ fn current(decls: &str, body: &str) -> f64 {
          analog begin\n{body}\n  end\nendmodule\n.endveriloga\nV1 a 0 1\nN1 a 0 m\n.end\n"
     );
     let model = Model::from_netlist(&deck).expect("model");
-    let op = model.operating_point(&[]).expect("dc");
+    let op = model
+        .at(&[])
+        .and_then(|pt| pt.operating_point())
+        .expect("dc");
     -op.vector()[model.resolve("V1").unwrap()]
 }
 

@@ -1,12 +1,11 @@
 // Index-2 topologies must be detected on the PARSED deck, not just on a
 // hand-built circuit: the netlist front end is what users actually feed in.
-use sane_mna::index2;
+use sane_circuit::index2;
 
 fn report(src: &str) -> index2::Index2Report {
     let parsed = sane_netlist::parse(src).expect("parse");
     // the nonlinear devices conduct too, so they break cutsets
-    let (elements, terminals) =
-        sane_dae::topology(&parsed.circuit, &parsed.devices, &parsed.instances);
+    let (elements, terminals) = sane_circuit::topology(&parsed);
     index2::detect(&elements, &terminals)
 }
 

@@ -6,9 +6,10 @@
 //! node-set pins one node, breaks the symmetry, and the solve falls into a
 //! stable branch.
 
+use sane_circuit::Circuit;
 use sane_core::Graph;
 use sane_dae::Dae;
-use sane_netlist::{parse, ParsedCircuit};
+use sane_netlist::parse;
 use sane_solve::{CompiledDc, Convergence};
 
 // Cross-coupled inverters with *high-impedance* outputs (a unit load resistor on
@@ -25,17 +26,17 @@ B1 0 a I=0.5 - 0.3183098862*atan(10*(V(b)-0.5))
 B2 0 b I=0.5 - 0.3183098862*atan(10*(V(a)-0.5))
 .end";
 
-fn build() -> (Graph, ParsedCircuit, Dae, CompiledDc, Vec<f64>) {
+fn build() -> (Graph, Circuit, Dae, CompiledDc, Vec<f64>) {
     let parsed = parse(LATCH).expect("parse");
     let mut ctx = Graph::new();
-    let dae = parsed.assemble(&mut ctx).unwrap();
+    let dae = sane_dae::assemble(&mut ctx, &parsed).unwrap();
     let cdc = CompiledDc::new(&mut ctx, &dae);
     let p: Vec<f64> = parsed.pvec(&cdc.param_names(&ctx));
     (ctx, parsed, dae, cdc, p)
 }
 
-fn node_idx(parsed: &ParsedCircuit, dae: &Dae, node: &str) -> usize {
-    let k = parsed.node(node).expect("node");
+fn node_idx(parsed: &Circuit, dae: &Dae, node: &str) -> usize {
+    let k = parsed.find_node(node).expect("node");
     dae.unknowns
         .iter()
         .position(|u| *u == format!("v{k}"))

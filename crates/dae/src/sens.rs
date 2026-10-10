@@ -87,26 +87,26 @@ pub fn augment_with_scaled_sensitivities(
     for (k, &(p, scale)) in params.iter().enumerate() {
         let pname = ctx.symbol_name(p).to_string();
         // Mint the sensitivity unknowns u_j.
-        let (u, new_x): (Vec<ExprId>, Vec<SymbolId>) = (0..n)
-            .map(|j| sym2(ctx, &format!("S[{pname}]{j}")))
-            .unzip();
+        let (u, new_x): (Vec<ExprId>, Vec<SymbolId>) =
+            (0..n).map(|j| sym2(ctx, &format!("S[{pname}]{j}"))).unzip();
         unknowns.extend((dae.unknowns.iter()).map(|name| format!("d({name})/d({pname})")));
         // The current `G u + k dI/dp` and the charge `C u + k dQ/dp`.
         let scale = ctx.konst_f64(scale);
-        let [i_u, q_u] = [(&g, &gp), (&c, &cp)].map(|((rows, cols, exprs), (prows, pcols, pexprs))| {
-            let mut terms: Vec<Vec<ExprId>> = vec![Vec::new(); n];
-            for ((&r, &col), &e) in rows.iter().zip(cols).zip(exprs) {
-                terms[r].push(ctx.mul(e, u[col]));
-            }
-            for ((&r, &col), &e) in prows.iter().zip(pcols).zip(pexprs) {
-                if col == k {
-                    terms[r].push(ctx.mul(scale, e));
+        let [i_u, q_u] =
+            [(&g, &gp), (&c, &cp)].map(|((rows, cols, exprs), (prows, pcols, pexprs))| {
+                let mut terms: Vec<Vec<ExprId>> = vec![Vec::new(); n];
+                for ((&r, &col), &e) in rows.iter().zip(cols).zip(exprs) {
+                    terms[r].push(ctx.mul(e, u[col]));
                 }
-            }
-            (terms.into_iter())
-                .map(|t| ctx.reduce(ReduceOp::Sum, t))
-                .collect::<Vec<_>>()
-        });
+                for ((&r, &col), &e) in prows.iter().zip(pcols).zip(pexprs) {
+                    if col == k {
+                        terms[r].push(ctx.mul(scale, e));
+                    }
+                }
+                (terms.into_iter())
+                    .map(|t| ctx.reduce(ReduceOp::Sum, t))
+                    .collect::<Vec<_>>()
+            });
         kinds.extend(std::iter::repeat_n(UnknownKind::DeviceState, n));
         x.extend(new_x);
         currents.extend(i_u);
@@ -127,13 +127,15 @@ pub fn augment_with_scaled_sensitivities(
         t: dae.t,
         events: dae.events.clone(),
         delays: dae.delays.clone(),
-        companion: Vec::new(),
+        companion: dae.companion.clone(),
         observers: dae.observers.clone(),
         dc_seeds: dae.dc_seeds.clone(),
-        limits: Vec::new(),
+        limits: dae.limits.clone(),
         sources: dae.sources.clone(),
         source_names: dae.source_names.clone(),
         labels: dae.labels.clone(),
+        injection: Default::default(),
+        rest: Default::default(),
     }
 }
 
@@ -263,4 +265,60 @@ pub fn lagrangian_hessian(ctx: &mut Graph, dae: &Dae, params: &[SymbolId]) -> He
         xp,
         pp,
     }
+}
+
+/// The Jacobians and time rates a linearly implicit method freezes at its
+/// step start, as entries: `dI/dx` and `dQ/dx` (the charges' rows offset by
+/// `n`), then `dI/dt` and `dQ/dt` (in column `n`). A stage takes them along
+/// its direction `w = (v, τ)`, `E_r = Σ entry_k w[col_k]` over the entries of
+/// row `r`; how that moves with the start is `dE/dx = Σ d(entry_k)/dx
+/// w[col_k]`, from the entries' gradients by the states, with a parameter
+/// from their [`param_column`]. The gradients are the step's, whatever the
+/// stage: one evaluation per step, the directions contracted after.
+pub struct Frozen {
+    pub rows: Vec<usize>,
+    pub cols: Vec<usize>,
+    pub entries: Vec<ExprId>,
+    /// The entries' gradients by the states: `(entry, column, expression)`.
+    pub x: (Vec<usize>, Vec<usize>, Vec<ExprId>),
+}
+
+/// Build [`Frozen`].
+pub fn frozen(ctx: &mut Graph, dae: &Dae) -> Frozen {
+    let n = dae.dim();
+    let ((ir, ic, ie), (qr, qc, qe)) = dae.jacobian_iq_coo(ctx);
+    let ((tir, _, tie), (tqr, _, tqe)) = dae.jacobian_t_iq_coo(ctx);
+    let mut rows: Vec<usize> = ir;
+    rows.extend(qr.iter().map(|&r| n + r));
+    rows.extend_from_slice(&tir);
+    rows.extend(tqr.iter().map(|&r| n + r));
+    let mut cols: Vec<usize> = ic;
+    cols.extend_from_slice(&qc);
+    cols.extend(std::iter::repeat_n(n, tie.len() + tqe.len()));
+    let entries: Vec<ExprId> = ie.into_iter().chain(qe).chain(tie).chain(tqe).collect();
+    let x_cols: Vec<(usize, SymbolId)> = dae.x.iter().copied().enumerate().collect();
+    let x = coo(ctx, &entries, &x_cols);
+    Frozen {
+        rows,
+        cols,
+        entries,
+        x,
+    }
+}
+
+/// The derivative of `rows` by the parameter `p`: the rows it moves, and
+/// how. A parameter enters the rows of its own elements, so the column is
+/// as sparse as they are.
+pub fn param_column(ctx: &mut Graph, rows: &[ExprId], p: SymbolId) -> (Vec<usize>, Vec<ExprId>) {
+    let (mut r, mut e) = (Vec::new(), Vec::new());
+    for (i, row) in rsdag::sparse_jacobian(ctx, rows, &[p])
+        .into_iter()
+        .enumerate()
+    {
+        for (_, d) in row {
+            r.push(i);
+            e.push(d);
+        }
+    }
+    (r, e)
 }

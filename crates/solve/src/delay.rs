@@ -26,6 +26,33 @@
 
 use std::borrow::Borrow;
 
+use rsdag::Tape;
+
+/// What each transport delay delays: an unknown, as assembled, or an
+/// expression over the unknowns and time, as a transform rewrote it (a node
+/// eliminated into its neighbours, merged onto another).
+pub(crate) enum DelaySources {
+    /// Each source an unknown, by index.
+    Unknowns(Vec<usize>),
+    /// One tape over the system's inputs: the sources, their explicit time
+    /// derivatives, then the entries of their gradient w.r.t. the unknowns
+    /// `jac` names as `(delay, unknown)`.
+    Exprs {
+        n: usize,
+        tape: Box<Tape>,
+        jac: Vec<(usize, usize)>,
+    },
+}
+
+impl DelaySources {
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            DelaySources::Unknowns(ix) => ix.len(),
+            DelaySources::Exprs { n, .. } => *n,
+        }
+    }
+}
+
 /// Growable power-of-two ring of `f64` with head/tail eviction.
 #[derive(Debug, Clone)]
 struct Ring {
@@ -117,11 +144,17 @@ impl DelayHistory {
     /// `horizon` (the maximum delay; pass `f64::INFINITY` to keep everything,
     /// e.g. for a stored forward pass an adjoint sweeps later).
     pub fn new(n_signals: usize, horizon: f64) -> DelayHistory {
+        Self::with_capacity(n_signals, horizon, 64)
+    }
+
+    /// As [`new`](Self::new), with room for `knots` knots before it grows.
+    pub fn with_capacity(n_signals: usize, horizon: f64, knots: usize) -> DelayHistory {
+        let ring = || Ring::with_capacity(knots);
         DelayHistory {
-            times: Ring::with_capacity(64),
-            vals: (0..n_signals).map(|_| Ring::with_capacity(64)).collect(),
-            ders_in: (0..n_signals).map(|_| Ring::with_capacity(64)).collect(),
-            ders_out: (0..n_signals).map(|_| Ring::with_capacity(64)).collect(),
+            times: ring(),
+            vals: (0..n_signals).map(|_| ring()).collect(),
+            ders_in: (0..n_signals).map(|_| ring()).collect(),
+            ders_out: (0..n_signals).map(|_| ring()).collect(),
             horizon,
             cursors: vec![0; n_signals],
         }
@@ -262,6 +295,32 @@ impl DelayHistory {
         h00 * y0 + h10 * h * m0 + h01 * y1 + h11 * h * m1
     }
 
+    /// The time rate of signal `sig` at `tq`: the derivative of
+    /// [`eval`](Self::eval) there, its right limit on a knot (a kink in the
+    /// history opens the interval after it with the slope that leaves it).
+    /// Zero outside the stored range, where `eval` holds a value.
+    #[inline]
+    pub fn rate(&mut self, sig: usize, tq: f64) -> f64 {
+        let n = self.times.len;
+        debug_assert!(n > 0, "DelayHistory::rate on empty history");
+        if n == 1 || tq < self.times.get(0) || tq >= self.times.get(n - 1) {
+            return 0.0;
+        }
+        let i = self.locate(sig, tq);
+        let t0 = self.times.get(i);
+        let h = self.times.get(i + 1) - t0;
+        let th = (tq - t0) / h;
+        let t2 = th * th;
+        let d00 = 6.0 * t2 - 6.0 * th;
+        let d10 = 3.0 * t2 - 4.0 * th + 1.0;
+        let d11 = 3.0 * t2 - 2.0 * th;
+        let y0 = self.vals[sig].get(i);
+        let y1 = self.vals[sig].get(i + 1);
+        let m0 = self.ders_out[sig].get(i);
+        let m1 = self.ders_in[sig].get(i + 1);
+        d00 * (y0 - y1) / h + d10 * m0 + d11 * m1
+    }
+
     /// Bracket index for `tq` (`times[i] <= tq < times[i+1]`), starting from
     /// the signal's cursor: O(1) for the monotone stage-query pattern, a few
     /// linear probes for small retreats, binary search otherwise.
@@ -319,6 +378,31 @@ impl DelayHistory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The rate of a history of a cubic is the cubic's derivative, and on a
+    /// kink the slope leaving it.
+    #[test]
+    fn rate_exact_on_cubics_and_right_of_kinks() {
+        let g = |t: f64| 1.0 - 2.0 * t + 0.5 * t * t + 3.0 * t * t * t;
+        let gp = |t: f64| -2.0 + t + 9.0 * t * t;
+        let mut h = DelayHistory::new(1, f64::INFINITY);
+        for &t in &[0.0, 0.13, 0.4, 0.45, 0.9, 1.7] {
+            h.push(t, &[g(t)], &[gp(t)]);
+        }
+        for &t in &[0.0, 0.05, 0.13, 0.42, 0.9, 1.2, 1.69] {
+            assert!((h.rate(0, t) - gp(t)).abs() < 1e-10, "t={t}");
+        }
+        assert_eq!(h.rate(0, -0.1), 0.0);
+        assert_eq!(h.rate(0, 1.7), 0.0);
+        // a kink at 1: flat before, slope 2 after
+        let mut k = DelayHistory::new(1, f64::INFINITY);
+        k.push(0.0, &[1.0], &[0.0]);
+        k.push(1.0, &[1.0], &[0.0]);
+        k.patch_last_out([2.0]);
+        k.push(2.0, &[3.0], &[2.0]);
+        assert_eq!(k.rate(0, 0.5), 0.0);
+        assert!((k.rate(0, 1.0) - 2.0).abs() < 1e-12);
+    }
 
     /// Hermite on knots of a cubic reproduces the cubic exactly.
     #[test]
@@ -424,6 +508,14 @@ use std::cell::RefCell;
 
 std::thread_local! {
     static HIST_VALUES: RefCell<Vec<f64>> = const { RefCell::new(Vec::new()) };
+    static HIST_PUBLISHED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times history values were published on this thread: a reader
+/// that published them itself knows they are still its own while this is
+/// unchanged.
+pub(crate) fn hist_publications() -> u64 {
+    HIST_PUBLISHED.with(|c| c.get())
 }
 
 /// Publish the interpolated delay-history values for subsequent residual /
@@ -438,6 +530,7 @@ where
         h.clear();
         h.extend(vals.into_iter().map(|v| *v.borrow()));
     });
+    HIST_PUBLISHED.with(|c| c.set(c.get() + 1));
 }
 
 /// The current value of delay-history input `k` (0.0 when unset -- delay-free

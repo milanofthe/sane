@@ -95,7 +95,7 @@ def as_jax(f):
         return np.atleast_1d(np.asarray(f(np.asarray(p)), dtype=np.float64))
 
     def _backward_host(p, gy):
-        _, stash = f._forward(f.values_from(np.asarray(p)))
+        _, stash = f.forward(np.asarray(p))
         return np.asarray(
             f._vjp(np.asarray(gy).reshape(-1), stash), dtype=np.float64
         )

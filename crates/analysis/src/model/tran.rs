@@ -1,278 +1,235 @@
-//! Transient analyses on [`Model`]: the adaptive solve, exact forward
-//! (augmented-system) sensitivities, and the discrete transient adjoint.
+//! Transient analysis at a [`Point`]: the trajectory and its forward
+//! sensitivities (see `sane_solve::transient_sens`).
 
-use std::collections::HashMap;
+use std::sync::Arc;
 
-use rsdag::Node;
-use sane_core::constants::{DC_OP_MAXIT, DC_OP_TOL};
+use ndarray::{Array2, Array3, ArrayView2};
 use sane_core::log;
-use sane_dae::augment_with_scaled_sensitivities;
-use sane_solve::CompiledDc;
 
-use crate::model::{Model, ModelError};
+use super::restructure::Layout;
+use super::{Gradient, Model, ModelError, Point};
 
-impl Model {
-    /// Exact forward transient sensitivity: integrate the circuit and the
-    /// sensitivity systems `dx(t)/dp` for each parameter in `subset` together.
-    /// Returns `(n, traj)` (see the analysis layer for the slice layout).
-    pub fn transient_sensitivity(
-        &self,
-        subset: Vec<String>,
-        t_eval: Vec<f64>,
-        rtol: f64,
-        atol: f64,
-        values: Option<HashMap<String, f64>>,
-    ) -> Result<(usize, Vec<Vec<f64>>), ModelError> {
-        let p = self.binding_of(values.as_ref());
-        if let Some(o) = self.restructured_at(&p)? {
-            let (m, traj) =
-                o.model
-                    .transient_sensitivity(subset, t_eval, rtol, atol, Some(o.values()))?;
-            // The state, then one block per parameter, each in this layout.
-            let rows = (traj.iter())
-                .map(|r| r.chunks(m).flat_map(|b| o.layout.map(b)).collect())
-                .collect();
-            return Ok((self.dim(), rows));
+/// How a transient integrates (see [`Point::transient`]).
+#[derive(Clone, Debug)]
+pub struct TransientOptions {
+    /// The local error tolerances, relative and absolute.
+    pub rtol: f64,
+    pub atol: f64,
+    /// The largest step the error control may take; `None` leaves the step
+    /// to it.
+    pub dt_max: Option<f64>,
+    /// The initial state, in the model's layout (a consistent one is found
+    /// from it); `None` starts from the operating point.
+    pub x0: Option<Vec<f64>>,
+}
+
+impl Default for TransientOptions {
+    fn default() -> Self {
+        TransientOptions {
+            rtol: 1e-4,
+            atol: 1e-7,
+            dt_max: None,
+            x0: None,
         }
-        self.ensure_no_delays("transient_sensitivity")?;
+    }
+}
+
+/// A switching surface a transient crossed: its name (`instance#k`), the
+/// time, and `+1` when the surface expression rose through zero, `-1` when
+/// it fell.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Event {
+    pub name: String,
+    pub t: f64,
+    pub direction: i8,
+}
+
+/// A transient solution: the state at each requested time, labeled, and the
+/// switching events crossed. Its derivatives by the parameters are methods.
+pub struct Trajectory {
+    /// The point it was integrated at (of the binding's structure) and how.
+    at: Point,
+    opts: TransientOptions,
+    pub t: Vec<f64>,
+    /// `x[[k, i]]` is unknown `i` (of the model asked) at `t[k]`.
+    pub x: Array2<f64>,
+    /// Integrated in a model of another structure than the asking one (see
+    /// [`super::restructure`]): the states there, and its layout in the
+    /// asking model.
+    there: Option<(Array2<f64>, Arc<Layout>)>,
+    pub events: Vec<Event>,
+}
+
+/// Forward sensitivities of a trajectory's outputs over time:
+/// `grad[[i, k, j]]` is `d outputs[i] / d params[j]` at `t[k]`.
+#[derive(Clone, Debug)]
+pub struct TrajectorySensitivity {
+    pub t: Vec<f64>,
+    pub outputs: Vec<String>,
+    pub params: Vec<String>,
+    pub param_values: Vec<f64>,
+    /// `values[[i, k]]` is `outputs[i]` at `t[k]`.
+    pub values: Array2<f64>,
+    pub grad: Array3<f64>,
+}
+
+impl Point {
+    /// The transient response at the time points `t` (the first is the
+    /// start), integrated as `opts` says.
+    pub fn transient(&self, t: &[f64], opts: &TransientOptions) -> Result<Trajectory, ModelError> {
+        if let Some((there, layout)) = &self.other {
+            let x0 = (opts.x0.as_ref()).map(|x| layout.unmap(x, there.model.dim(), 0.0));
+            let mut tr = there.transient(t, &TransientOptions { x0, ..opts.clone() })?;
+            let rows: Vec<Vec<f64>> = (tr.x.outer_iter())
+                .map(|r| layout.map(&r.to_vec()))
+                .collect();
+            let shown = super::stack(&rows, self.model.dim());
+            tr.there = Some((std::mem::replace(&mut tr.x, shown), layout.clone()));
+            return Ok(tr);
+        }
+        let inner = &self.model.inner;
+        let cdc = &inner.cdc;
+        let x0 = (opts.x0.clone())
+            .or_else(|| self.transient_start())
+            .unwrap_or_default();
+        let run = cdc
+            .solve_transient(&self.p, &x0, t, opts.rtol, opts.atol, opts.dt_max)
+            .map_err(|e| self.model.failure(e))?;
+        let names = cdc.event_names();
+        let events = (run.events.iter())
+            .map(|e| Event {
+                name: names[e.index].clone(),
+                t: e.t,
+                direction: e.direction,
+            })
+            .collect();
+        let rows = run.rows;
+        Ok(Trajectory {
+            at: self.clone(),
+            opts: opts.clone(),
+            t: t.to_vec(),
+            x: super::stack(&rows, inner.dae.dim()),
+            there: None,
+            events,
+        })
+    }
+}
+
+impl Trajectory {
+    /// The time series of a node, unknown or branch current.
+    pub fn signal(&self, reference: &str) -> Option<Vec<f64>> {
+        let i = self.at.model.inner.resolve(reference)?;
+        let x = self.there.as_ref().map_or(&self.x, |(x, _)| x);
+        Some(x.column(i).to_vec())
+    }
+
+    /// Forward sensitivities of `outputs` by the parameters under `wrt`
+    /// (all for none) over the trajectory's times: the derivative of every
+    /// step the integration took (see `sane_solve::transient_sens`), the
+    /// trajectory integrated again with them. From the operating point the
+    /// sensitivities start at the point's; from a given state, at zero.
+    pub fn sensitivity(
+        &self,
+        outputs: &[&str],
+        wrt: &[&str],
+    ) -> Result<TrajectorySensitivity, ModelError> {
+        let model = &self.at.model;
+        model.ensure_no_delays("transient sensitivity")?;
+        let inner = &model.inner;
+        let outs = inner.outputs(outputs)?;
+        let cols = inner.columns(wrt)?;
         let mut task = log::task(
             "SENS-TRANSIENT",
             "sens_tran",
-            &format!("(params: {}, points: {})", subset.len(), t_eval.len()),
+            &format!("(params: {}, points: {})", cols.len(), self.t.len()),
         );
-        let arc = self.context_arc();
-        let mut c = arc.lock().unwrap();
-        let dae = self.dae();
-        let n = dae.dim();
-        // dF/dp must exist before the per-parameter state-sensitivity solves below
-        // (issue #38); otherwise dx/dp collapses silently to zero.
-        self.cdc().ensure_param_jac(&mut c, dae);
-        let pnames = self.cdc().param_names(&c);
-        let bound = self.values();
-        let val_of = |nm: &str| -> f64 {
-            values
-                .as_ref()
-                .and_then(|v| v.get(nm).copied())
-                .or_else(|| bound.get(nm).copied())
-                .unwrap_or(0.0)
-        };
-        let p_base: Vec<f64> = pnames.iter().map(|nm| val_of(nm)).collect();
-        let (op, conv, _) = self.cdc().solve_dc(&p_base, &[], DC_OP_TOL, DC_OP_MAXIT);
-        if !conv {
-            return Err(ModelError::Numeric(
-                "transient_sensitivity: DC operating point did not converge".to_string(),
-            ));
+        {
+            let arc = model.context_arc();
+            let mut c = arc.lock().unwrap();
+            inner
+                .cdc
+                .ensure_transient_sensitivity(&mut c, &inner.dae, &cols);
         }
-        let mut x0_aug = op.clone();
-        // Integrate log-parameter-scaled sensitivity states u = |p0|·dx/dp:
-        // they live on circuit magnitudes, so the scalar atol/rtol error
-        // control keeps sane step sizes (raw dx/dp states can be ~1/p0 times
-        // larger and crush the step at every zero crossing). Unscaled dx/dp
-        // is restored below, so the returned layout is unchanged.
-        let mut subset_syms = Vec::with_capacity(subset.len());
-        let mut scales = Vec::with_capacity(subset.len());
-        for name in &subset {
-            let col = pnames
+        let o = &self.opts;
+        let x0 = (o.x0.clone())
+            .or_else(|| self.at.transient_start())
+            .unwrap_or_default();
+        let (run, sens) = (inner.cdc)
+            .solve_transient_sensitivity(
+                &self.at.p,
+                &x0,
+                o.x0.is_none(),
+                &self.t,
+                o.rtol,
+                o.atol,
+                o.dt_max,
+                &cols,
+                &outs,
+            )
+            .map_err(|e| model.failure(e))?;
+        task.finish(format!("outputs: {}", outs.len()));
+        let (nt, np) = (self.t.len(), cols.len());
+        Ok(TrajectorySensitivity {
+            t: self.t.clone(),
+            outputs: outputs.iter().map(|o| o.to_string()).collect(),
+            params: cols
                 .iter()
-                .position(|nm| nm == name)
-                .ok_or_else(|| ModelError::Numeric(format!("unknown parameter '{name}'")))?;
-            let s0 = self.cdc().state_sensitivity(col, &op, &p_base, 0.0);
-            if s0.is_empty() {
-                return Err(ModelError::Numeric(
-                    "transient_sensitivity: singular Jacobian".to_string(),
-                ));
-            }
-            let p0 = val_of(name);
-            let k = if p0 != 0.0 { p0.abs() } else { 1.0 };
-            scales.push(k);
-            x0_aug.extend(s0.iter().map(|v| v * k));
-            let e = c.sym(name);
-            match c.node(e) {
-                Node::Symbol(sy) => subset_syms.push((*sy, k)),
-                _ => return Err(ModelError::Numeric(format!("'{name}' is not a symbol"))),
-            }
+                .map(|&c| inner.store.pnames[c].clone())
+                .collect(),
+            param_values: cols.iter().map(|&c| self.at.p[c]).collect(),
+            values: Array2::from_shape_fn((outs.len(), nt), |(i, k)| run.rows[k][outs[i]]),
+            grad: Array3::from_shape_fn((outs.len(), nt, np), |(i, k, j)| sens[k][i * np + j]),
+        })
+    }
+
+    /// The gradient of a scalar `L` of the waveforms of `outputs` by the
+    /// parameters under `wrt` (all for none), given its cotangents
+    /// `cotangent[[i, k]] = dL/d outputs[i](t[k])`: the cotangents
+    /// contracted with the forward sensitivities.
+    pub fn vjp(
+        &self,
+        outputs: &[&str],
+        cotangent: ArrayView2<'_, f64>,
+        wrt: &[&str],
+    ) -> Result<Gradient, ModelError> {
+        if cotangent.dim() != (outputs.len(), self.t.len()) {
+            return Err(ModelError::Numeric(format!(
+                "a cotangent per output and time: {:?} for {:?}",
+                cotangent.dim(),
+                (outputs.len(), self.t.len())
+            )));
         }
-        let aug = augment_with_scaled_sensitivities(&mut c, dae, &subset_syms);
-        let aug_cdc = CompiledDc::new(&mut c, &aug);
-        let p_aug: Vec<f64> = aug_cdc
-            .param_names(&c)
-            .iter()
-            .map(|nm| val_of(nm))
-            .collect();
-        drop(c);
-        let mut traj = aug_cdc
-            .solve_transient(
-                sane_solve::TransientMethod::Esdirk32,
-                &p_aug,
-                &x0_aug,
-                &t_eval,
-                rtol,
-                atol,
-                None,
-            )
-            .map_err(ModelError::Numeric)?;
-        for row in &mut traj {
-            for (ki, k) in scales.iter().enumerate() {
-                for v in &mut row[n * (ki + 1)..n * (ki + 2)] {
-                    *v /= k;
+        let s = self.sensitivity(outputs, wrt)?;
+        let grad = (0..s.params.len())
+            .map(|j| {
+                let mut g = 0.0;
+                for i in 0..outputs.len() {
+                    for k in 0..self.t.len() {
+                        g += cotangent[[i, k]] * s.grad[[i, k, j]];
+                    }
                 }
-            }
-        }
-        task.finish(format!("augmented dim: {}", aug.dim()));
-        Ok((n, traj))
-    }
-
-    /// Fixed-grid ESDIRK32 transient on the exact grid `t_eval` (the forward
-    /// pass [`transient_adjoint`](Self::transient_adjoint) differentiates). `p` is
-    /// the parameter vector in `params()` order; an empty `x0` starts from the
-    /// DC operating point. Returns the state at every grid point.
-    pub fn solve_transient_grid(
-        &self,
-        p: Vec<f64>,
-        x0: Option<Vec<f64>>,
-        t_eval: Vec<f64>,
-        dc_guess: Option<Vec<f64>>,
-    ) -> Result<Vec<Vec<f64>>, ModelError> {
-        if let Some(o) = self.restructured_at(&p)? {
-            let x0 = x0.map(|x| o.state(&x, 0.0));
-            let guess = dc_guess.map(|x| o.state(&x, 0.0));
-            return Ok(o.rows(o.model.solve_transient_grid(o.p(), x0, t_eval, guess)?));
-        }
-        // As `solve_transient`: the operating point at `p` unless the caller
-        // gives a start or a guess for one.
-        let x0 = match (x0, &dc_guess) {
-            (Some(x0), _) => Some(x0),
-            (None, None) => self.inner.transient_start(&p),
-            (None, Some(_)) => None,
-        };
-        self.cdc()
-            .solve_transient_grid(
-                &p,
-                &x0.unwrap_or_default(),
-                &t_eval,
-                &dc_guess.unwrap_or_default(),
-            )
-            .map_err(ModelError::Numeric)
-    }
-
-    /// Discrete transient adjoint (VJP): the gradient of a scalar objective
-    /// `L(x_0..x_N)` over the fixed-grid ESDIRK32 trajectory on `t_eval`,
-    /// w.r.t. EVERY parameter -- from one forward transient plus `S-1` backward
-    /// transposed stage solves per step. Cost is independent of the parameter count,
-    /// the complement of [`transient_sensitivity`](Self::transient_sensitivity)
-    /// (whose cost is linear in the parameters but yields whole trajectories).
-    ///
-    /// `cotangent[k]` is `dL/dx_k` (length `dim`); the initial state is the DC
-    /// operating point and its parameter dependence is included. The forward
-    /// trajectory this gradient belongs to is exactly
-    /// `CompiledDc::solve_transient_grid` on the same grid. Returns
-    /// `(param_names, dL/dp)`.
-    pub fn transient_adjoint(
-        &self,
-        t_eval: Vec<f64>,
-        cotangent: Vec<Vec<f64>>,
-        values: Option<HashMap<String, f64>>,
-        dc_guess: Option<Vec<f64>>,
-    ) -> Result<(Vec<String>, Vec<f64>), ModelError> {
-        let p = self.binding_of(values.as_ref());
-        if let Some(o) = self.restructured_at(&p)? {
-            let m = o.model.dim();
-            let cot = cotangent.iter().map(|c| o.layout.pull(c, m)).collect();
-            let guess = dc_guess.map(|x| o.state(&x, 0.0));
-            let (names, g) = o
-                .model
-                .transient_adjoint(t_eval, cot, Some(o.values()), guess)?;
-            let mine = self.params().to_vec();
-            return Ok((mine.clone(), o.by_name(&names, &g, &mine)));
-        }
-        self.ensure_no_delays("transient_adjoint")?;
-        let mut task = log::task(
-            "TRANSIENT-ADJOINT",
-            "adjoint",
-            &format!("(points: {})", t_eval.len()),
-        );
-        let arc = self.context_arc();
-        let mut c = arc.lock().unwrap();
-        self.cdc().ensure_param_jac(&mut c, self.dae());
-        let pnames = self.cdc().param_names(&c);
-        drop(c);
-        let bound = self.values();
-        let val_of = |nm: &str| {
-            values
-                .as_ref()
-                .and_then(|v| v.get(nm).copied())
-                .or_else(|| bound.get(nm).copied())
-                .unwrap_or(0.0)
-        };
-        let p: Vec<f64> = pnames.iter().map(|nm| val_of(nm)).collect();
-        let g = self
-            .cdc()
-            .transient_adjoint(&p, &[], &t_eval, &cotangent, &dc_guess.unwrap_or_default())
-            .map_err(ModelError::Numeric)?;
-        task.finish(format!("params: {}", pnames.len()));
-        Ok((pnames, g))
-    }
-
-    /// The parameter vector of `values` over the bound ones, the way the
-    /// transient sensitivities and adjoint bind (a parameter neither gives
-    /// is zero).
-    fn binding_of(&self, values: Option<&HashMap<String, f64>>) -> Vec<f64> {
-        let bound = self.values();
-        (self.params().iter())
-            .map(|nm| {
-                values
-                    .and_then(|v| v.get(nm).copied())
-                    .or_else(|| bound.get(nm).copied())
-                    .unwrap_or(0.0)
+                g
             })
-            .collect()
+            .collect();
+        Ok(Gradient {
+            params: s.params,
+            grad,
+        })
     }
+}
 
-    /// Append the topological cause to a transient failure, when there is one.
-    /// An index-2 deck fails in the step-size machinery (the constraint has no
-    /// truncation error to control), which reads as a bare underflow unless the
-    /// engine names the loop or cutset behind it.
-    fn explain_failure(&self, err: String) -> String {
+impl Model {
+    /// A transient failure as an error, with the index-2 loops and cutsets
+    /// of the deck named where there are any: their unknowns are rates of
+    /// the others, which a failure there often traces back to.
+    fn failure(&self, err: String) -> ModelError {
         let rep = &self.inner.index2;
         if !rep.is_index2() {
-            return err;
+            return ModelError::Numeric(err);
         }
-        format!(
-            "{err} -- this deck is index 2 ({}); its constraint is differentiated, which the integrator cannot resolve. Break it with the parasitic that exists in reality: a series resistance in the loop, a shunt across the cutset.",
+        ModelError::Numeric(format!(
+            "{err} -- this deck is index 2 ({}): a series resistance in the loop, a shunt across the cutset, the parasitic that exists in reality, makes it index 1.",
             rep.summary()
-        )
-    }
-    /// Transient solve over `t_eval` (ESDIRK32 on the Rust DAE). `x0` defaults
-    /// to the DC operating point. Returns one state vector per time point.
-    /// The single transient entry point: integrate with `method` over `t_eval`
-    /// from `x0` (the consistent DC start if `None`), returning the raw state
-    /// rows. The labeled [`Model::transient`] convenience delegates here.
-    pub fn solve_transient(
-        &self,
-        method: sane_solve::TransientMethod,
-        p: Vec<f64>,
-        t_eval: Vec<f64>,
-        x0: Option<Vec<f64>>,
-        rtol: f64,
-        atol: f64,
-        dt_max: Option<f64>,
-    ) -> Result<Vec<Vec<f64>>, ModelError> {
-        if let Some(o) = self.restructured_at(&p)? {
-            let x0 = x0.map(|x| o.state(&x, 0.0));
-            let rows = o
-                .model
-                .solve_transient(method, o.p(), t_eval, x0, rtol, atol, dt_max)?;
-            return Ok(o.rows(rows));
-        }
-        // Without a start of the caller's, the operating point at `p`: the one
-        // an operating point or an earlier transient there already solved.
-        let x0 = x0
-            .or_else(|| self.inner.transient_start(&p))
-            .unwrap_or_default();
-        self.cdc()
-            .solve_transient(method, &p, &x0, &t_eval, rtol, atol, dt_max)
-            // a step-size failure on an index-2 deck has a topological cause;
-            // say so rather than leaving the caller with a bare underflow
-            .map_err(|e| ModelError::Numeric(self.explain_failure(e)))
+        ))
     }
 }

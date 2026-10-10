@@ -1,60 +1,7 @@
-//! Circuit intermediate representation for SANE.
-//!
-//! This crate owns the topology-level data model that the whole pipeline shares
-//! -- [`Circuit`], [`Element`], [`Kind`], [`SourceFn`], [`Coupling`] and the
-//! behavioral-source tree ([`BExpr`] / [`BehavioralSource`]) -- together with
-//! [`value_symbol_name`], the reserved-namespace rename that keeps element value
-//! symbols from colliding with the solver's internally minted unknowns.
-//!
-//! Node `0` is ground throughout. The analyses build their systems from a
-//! [`Circuit`] in the `dae` crate (`I(x, t) + d/dt Q(x) = 0`).
+//! The element graph: linear and controlled elements, inductor couplings
+//! and behavioral sources over integer nodes.
 
-/// Topological index-2 detection (CV loops / LI cutsets).
-pub mod index2;
-
-mod source;
-pub use source::SourceFn;
-
-/// Symbol name for an element's value parameter, kept out of the namespace
-/// SANE reserves for the solver's own unknowns.
-///
-/// An element's name doubles as the symbol of its defining value (`R1` is the
-/// resistance, `V1` the source voltage, ...). Node voltages, however, are minted
-/// internally as `v{k}`, branch currents as `i_{elem}`; time is `t`. Symbols
-/// are interned by name, so
-/// an element whose name lands in that reserved space would be hash-consed onto
-/// an unknown rather than staying a free parameter. The classic case is a power
-/// grid with a voltage source literally named `v91`: it would share the symbol
-/// of node 91's voltage, so its DC value silently vanishes from the parameter
-/// set and the source stops constraining its node.
-///
-/// This maps any reserved-looking element name to a private, collision-free
-/// spelling (a leading `_`, which no SPICE element name can have, since element
-/// names start with their type letter); all ordinary names pass through
-/// unchanged. It MUST be applied consistently wherever an element value symbol
-/// is created and wherever its numeric value is bound by name, so the parameter
-/// symbol and its value key always agree.
-pub fn value_symbol_name(name: &str) -> String {
-    if is_reserved_unknown_name(name) {
-        format!("_{name}")
-    } else {
-        name.to_string()
-    }
-}
-
-/// Whether `name` collides with SANE's internally generated unknown / time
-/// symbol namespace (see [`value_symbol_name`]).
-fn is_reserved_unknown_name(name: &str) -> bool {
-    if name == "t" {
-        return true;
-    }
-    // `v{digits}` (node voltage).
-    let node_voltage = name
-        .strip_prefix('v')
-        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()));
-    // ... or a prefixed branch-current unknown.
-    node_voltage || name.starts_with("i_")
-}
+use crate::SourceFn;
 
 /// Element kind. The element name doubles as its parameter symbol.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -150,17 +97,19 @@ pub struct BehavioralSource {
     pub expr: BExpr,
 }
 
-/// A circuit: a set of elements over integer nodes (0 = ground), plus mutual
-/// couplings between inductors.
-#[derive(Default, Debug)]
-pub struct Circuit {
+/// The element graph of a circuit: its linear and controlled elements over
+/// integer nodes (0 = ground), the mutual couplings between its inductors and
+/// its behavioral sources. Devices and subcircuit instances are the
+/// [`Circuit`](crate::Circuit)'s.
+#[derive(Clone, Default, Debug)]
+pub struct Elements {
     elements: Vec<Element>,
     couplings: Vec<Coupling>,
     behavioral: Vec<BehavioralSource>,
     max_node: usize,
 }
 
-impl Circuit {
+impl Elements {
     pub fn new() -> Self {
         Self::default()
     }

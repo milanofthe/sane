@@ -8,8 +8,131 @@ use num_complex::Complex64;
 use rsdag::{differentiate, ExprId, Node, SymbolId};
 use sane_core::log;
 
-use crate::model::{Model, ModelError};
+use ndarray::{Array2, Array3, ArrayView1};
+
+use crate::model::{Model, ModelError, Point};
 use crate::{noise_on_dae, solve_complex};
+
+/// Output-referred noise (see [`Point::noise`]): `psd[[i, k]]` is the power
+/// spectral density of `outputs[i]` at `freqs[k]` (V^2/Hz for a voltage,
+/// A^2/Hz for a current), linearized at the operating point.
+pub struct NoiseSpectrum {
+    at: Point,
+    x: Vec<f64>,
+    outs: Vec<usize>,
+    pub freqs: Vec<f64>,
+    pub outputs: Vec<String>,
+    pub psd: Array2<f64>,
+}
+
+/// Sensitivities of noise spectra: `grad[[i, k, j]]` is
+/// `d psd[[i, k]] / d params[j]`.
+#[derive(Clone, Debug)]
+pub struct NoiseSensitivity {
+    pub freqs: Vec<f64>,
+    pub outputs: Vec<String>,
+    pub params: Vec<String>,
+    pub param_values: Vec<f64>,
+    pub psd: Array2<f64>,
+    pub grad: Array3<f64>,
+}
+
+impl Point {
+    /// The noise of `outputs` (nodes, unknowns, branch currents) at `freqs`
+    /// (Hz, each positive): every noise source of the circuit (resistor
+    /// thermal noise, the devices' white, flicker and tabular sources)
+    /// carried to each output, linearized at the operating point.
+    pub fn noise(&self, outputs: &[&str], freqs: &[f64]) -> Result<NoiseSpectrum, ModelError> {
+        if let Some((there, _)) = &self.other {
+            return there.noise(outputs, freqs);
+        }
+        let model = &self.model;
+        let x = self.operating_point()?.x;
+        // a transport delay couples its signal at e^{-jw tau}, as in AC
+        model.ensure_hist_jac_ready();
+        let (dr, dc, dv, dtau) = model.delay_ac_entries(&x, &self.p);
+        let outs = model.inner.outputs(outputs)?;
+        let rows = {
+            let arc = model.context_arc();
+            let mut c = arc.lock().unwrap();
+            noise_on_dae(
+                &mut c,
+                model.dae(),
+                model.cdc(),
+                &outs,
+                &x,
+                &self.p,
+                freqs,
+                (&dr, &dc, &dv, &dtau),
+            )
+            .map_err(ModelError::Numeric)?
+        };
+        let bad: Vec<bool> = rows.iter().map(|r| r.iter().any(|v| v.is_nan())).collect();
+        super::warn_singular("noise", freqs, &bad);
+        Ok(NoiseSpectrum {
+            at: self.clone(),
+            x,
+            psd: Array2::from_shape_fn((outs.len(), freqs.len()), |(i, k)| rows[k][i]),
+            outs,
+            freqs: freqs.to_vec(),
+            outputs: outputs.iter().map(|o| o.to_string()).collect(),
+        })
+    }
+}
+
+impl NoiseSpectrum {
+    /// The power spectral density of `output` at every frequency.
+    pub fn of(&self, output: &str) -> Option<ArrayView1<'_, f64>> {
+        let i = self.outputs.iter().position(|o| o == output)?;
+        Some(self.psd.row(i))
+    }
+
+    /// The spectral density of `output`, the square root of its PSD (V or
+    /// A per square-root hertz).
+    pub fn density(&self, output: &str) -> Option<Vec<f64>> {
+        Some(self.of(output)?.iter().map(|v| v.sqrt()).collect())
+    }
+
+    /// The RMS noise of `output` over the band of `freqs`: the square root
+    /// of the PSD integrated by the trapezoidal rule.
+    pub fn rms(&self, output: &str) -> Option<f64> {
+        let psd = self.of(output)?;
+        let area: f64 = (1..self.freqs.len())
+            .map(|k| 0.5 * (psd[k - 1] + psd[k]) * (self.freqs[k] - self.freqs[k - 1]))
+            .sum();
+        Some(area.sqrt())
+    }
+
+    /// The derivatives of every PSD by the parameters under `wrt` (all for
+    /// none) at every frequency, exact (the operating point's shift
+    /// included). White and flicker sources only.
+    pub fn sensitivity(&self, wrt: &[&str]) -> Result<NoiseSensitivity, ModelError> {
+        let model = &self.at.model;
+        model.ensure_no_delays("noise sensitivity")?;
+        let cols = model.inner.columns(wrt)?;
+        let names: Vec<String> = cols
+            .iter()
+            .map(|&c| model.inner.store.pnames[c].clone())
+            .collect();
+        let mut grad = Array3::zeros((self.outs.len(), self.freqs.len(), names.len()));
+        for (i, &o) in self.outs.iter().enumerate() {
+            for (k, &f) in self.freqs.iter().enumerate() {
+                let (_, g) = model.noise_gradient(o, self.x.clone(), self.at.p.clone(), f)?;
+                for (j, name) in names.iter().enumerate() {
+                    grad[[i, k, j]] = g.iter().find(|(n, _)| n == name).map_or(0.0, |&(_, d)| d);
+                }
+            }
+        }
+        Ok(NoiseSensitivity {
+            freqs: self.freqs.clone(),
+            outputs: self.outputs.clone(),
+            param_values: cols.iter().map(|&c| self.at.p[c]).collect(),
+            params: names,
+            psd: self.psd.clone(),
+            grad,
+        })
+    }
+}
 
 impl Model {
     /// Exact analytic output-noise sensitivity `dN/dp` at one frequency w.r.t.
@@ -21,7 +144,7 @@ impl Model {
     /// `Phi = Re(-lambda^T A xi) + sum_q |T_q|^2 fac_q psd_q`: explicit `dPhi/dp`
     /// plus one DC adjoint for the bias shift (same trick as the AC gradient; no
     /// finite differences). White/flicker sources only. Returns `(N, [(name, dN/dp)])`.
-    pub fn noise_gradient(
+    pub(crate) fn noise_gradient(
         &self,
         out_idx: usize,
         x: Vec<f64>,
@@ -77,18 +200,21 @@ impl Model {
             }
         }
         env.insert(self.dae().t, 0.0);
-        let idx_of = |sid: SymbolId| self.dae().x.iter().position(|&s| s == sid);
 
         // Per source: injection u_q (as node indices), numeric S_q = fac*sp, the
         // transimpedance T_q = lambda.u_q, and (white/flicker) the PSD expr.
         let mut nval = 0.0;
         let mut r = vec![Complex64::new(0.0, 0.0); n]; // r = sum_q 2 conj(T_q) S_q u_q
         let mut psd_terms: Vec<(f64, ExprId)> = Vec::new(); // (|T_q|^2 fac, psd_expr)
-        let levels = self.dae().noise_levels(c, &env);
-        let flat = self.dae().observers.flatten(c);
-        for (ns, level) in flat.noise.iter().zip(levels) {
+        let at = self.cdc().noise_at(c, self.dae(), &x, &p);
+        let noise = self.dae().observers.noise(c);
+        let injection = self.dae().noise_injection(c);
+        // the injections' own dependence: sum over sources and rows of
+        // Re(2 S_q conj(T_q) lambda_i) times d current_i / d generator_q
+        let mut inj_terms: Vec<(f64, ExprId)> = Vec::new();
+        for ((ns, src), inj) in noise.iter().zip(at).zip(injection.iter()) {
             // Tabular sources: not yet in the gradient.
-            let sane_dae::NoiseLevel::Spectral { psd: sp, fexp } = level else {
+            let sane_dae::NoiseLevel::Spectral { psd: sp, fexp } = src.level else {
                 continue;
             };
             if !sp.is_finite() || sp <= 0.0 || !fexp.is_finite() {
@@ -96,22 +222,19 @@ impl Model {
             }
             let fac = if fexp == 0.0 { 1.0 } else { freq.powf(-fexp) };
             let sq = sp * fac;
-            // injection: +1 at hi index, -1 at lo index
+            // the injection where the generator enters, at the point
+            let idxs = &src.injection;
             let mut tq = Complex64::new(0.0, 0.0);
-            let mut idxs: Vec<(usize, f64)> = Vec::new();
-            if let Some(i) = ns.hi.and_then(idx_of) {
-                idxs.push((i, 1.0));
-            }
-            if let Some(i) = ns.lo.and_then(idx_of) {
-                idxs.push((i, -1.0));
-            }
-            for &(i, sgn) in &idxs {
-                tq += lam[i] * sgn;
+            for &(i, u) in idxs {
+                tq += lam[i] * u;
             }
             nval += sq * tq.norm_sqr();
             let wgt = 2.0 * sq * tq.conj();
-            for &(i, sgn) in &idxs {
-                r[i] += wgt * sgn;
+            for &(i, u) in idxs {
+                r[i] += wgt * u;
+            }
+            for &(i, e) in inj.iter() {
+                inj_terms.push(((wgt * lam[i]).re, e));
             }
             psd_terms.push((tq.norm_sqr() * fac, ns.psd));
         }
@@ -137,9 +260,9 @@ impl Model {
             let t = c.mul(coef, ce[k]);
             phi = c.add(phi, t);
         }
-        for (wgt, psd) in &psd_terms {
+        for (wgt, e) in psd_terms.iter().chain(&inj_terms) {
             let coef = c.konst_f64(*wgt);
-            let t = c.mul(coef, *psd);
+            let t = c.mul(coef, *e);
             phi = c.add(phi, t);
         }
 
@@ -170,35 +293,5 @@ impl Model {
             grad[k] -= nu[i] * prv[t];
         }
         Ok((nval, pnames.into_iter().zip(grad).collect()))
-    }
-
-    /// Output-referred noise PSD from the unknown at `out_idx`, at `(x, p)`.
-    pub fn noise_raw(
-        &self,
-        out_idx: usize,
-        x: Vec<f64>,
-        p: Vec<f64>,
-        fstart: f64,
-        fstop: f64,
-        points: usize,
-    ) -> Result<(Vec<f64>, Vec<f64>), ModelError> {
-        self.inner.bound(&p)?;
-        self.ensure_no_delays("noise")?;
-        let arc = self.context_arc();
-        let mut c = arc.lock().unwrap();
-        let temp_k = self.temp_k();
-        noise_on_dae(
-            &mut c,
-            self.dae(),
-            self.cdc(),
-            out_idx,
-            &x,
-            &p,
-            fstart,
-            fstop,
-            points,
-            temp_k,
-        )
-        .map_err(ModelError::Numeric)
     }
 }

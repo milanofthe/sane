@@ -11,12 +11,12 @@
 
 use std::time::Instant;
 
+use sane_circuit::Elements;
 use sane_core::Graph;
-use sane_dae::{assemble_dae, Dae, DeviceInstance};
-use sane_mna::Circuit;
-use sane_solve::{CompiledDc, TransientMethod};
+use sane_dae::{Dae, DeviceInstance};
+use sane_solve::CompiledDc;
 
-fn params(ctx: &Graph, dae: &Dae, vsrc: f64, r: f64, cval: f64) -> Vec<f64> {
+fn params(ctx: &mut Graph, dae: &Dae, vsrc: f64, r: f64, cval: f64) -> Vec<f64> {
     let tnom = sane_core::constants::TEMP_NOMINAL_K;
     dae.params(ctx)
         .iter()
@@ -48,13 +48,13 @@ fn params(ctx: &Graph, dae: &Dae, vsrc: f64, r: f64, cval: f64) -> Vec<f64> {
 /// Diode ladder (nonlinear DC Newton: every node has a junction).
 fn diode_ladder(k: usize) -> (Graph, Dae) {
     let mut ctx = Graph::new();
-    let mut c = Circuit::new();
+    let mut c = Elements::new();
     c.voltage_source("V1", 1, 0);
     let mut devs = Vec::new();
     for i in 1..=k {
         c.resistor(&format!("R{i}"), i, i + 1);
         devs.push(DeviceInstance::new(
-            Box::new(sane_veriloga::builtin_device(
+            std::sync::Arc::new(sane_veriloga::builtin_device(
                 "sane_diode",
                 format!("D{i}"),
                 &[],
@@ -62,7 +62,7 @@ fn diode_ladder(k: usize) -> (Graph, Dae) {
             vec![i + 1, 0],
         ));
     }
-    let dae = assemble_dae(&mut ctx, &c, &devs).unwrap();
+    let dae = sane_dae::assemble(&mut ctx, &sane_circuit::Circuit::flat(&c, &devs)).unwrap();
     (ctx, dae)
 }
 
@@ -71,7 +71,7 @@ fn diode_ladder(k: usize) -> (Graph, Dae) {
 /// and the stage factorization at scale.
 fn rc_grid(w: usize, h: usize, diodes: usize) -> (Graph, Dae) {
     let mut ctx = Graph::new();
-    let mut c = Circuit::new();
+    let mut c = Elements::new();
     let id = |x: usize, y: usize| 1 + y * w + x;
     c.voltage_source("V1", id(0, 0), 0);
     let mut r = 0usize;
@@ -92,7 +92,7 @@ fn rc_grid(w: usize, h: usize, diodes: usize) -> (Graph, Dae) {
     for d in 0..diodes {
         let node = id((d * 7 + 3) % w, (d * 5 + 2) % h);
         devs.push(DeviceInstance::new(
-            Box::new(sane_veriloga::builtin_device(
+            std::sync::Arc::new(sane_veriloga::builtin_device(
                 "sane_diode",
                 format!("D{d}"),
                 &[],
@@ -100,7 +100,7 @@ fn rc_grid(w: usize, h: usize, diodes: usize) -> (Graph, Dae) {
             vec![node, 0],
         ));
     }
-    let dae = assemble_dae(&mut ctx, &c, &devs).unwrap();
+    let dae = sane_dae::assemble(&mut ctx, &sane_circuit::Circuit::flat(&c, &devs)).unwrap();
     (ctx, dae)
 }
 
@@ -121,7 +121,7 @@ fn main() {
         let t_ext = Instant::now();
         let cdc = CompiledDc::new(&mut ctx, &dae);
         let ext_ms = t_ext.elapsed().as_secs_f64() * 1e3;
-        let p = params(&ctx, &dae, 3.0, 1000.0, 0.0);
+        let p = params(&mut ctx, &dae, 3.0, 1000.0, 0.0);
         let (_, conv, iters) = cdc.solve_dc(&p, &[], 1e-9, 200);
         assert!(conv, "diode ladder k={k} must converge");
         let best = time_best(5, || cdc.solve_dc(&p, &[], 1e-9, 200));
@@ -145,7 +145,7 @@ fn main() {
         {
             let (mut ctx, dae) = rc_grid(w, h, 0);
             let cdc = CompiledDc::new(&mut ctx, &dae);
-            let p = params(&ctx, &dae, 1.0, 100.0, 1e-9);
+            let p = params(&mut ctx, &dae, 1.0, 100.0, 1e-9);
             let (_, conv, iters) = cdc.solve_dc(&p, &[], 1e-9, 200);
             assert!(conv, "linear rc grid {w}x{h} must converge");
             let best = time_best(3, || cdc.solve_dc(&p, &[], 1e-9, 200));
@@ -159,7 +159,7 @@ fn main() {
         let t_ext = Instant::now();
         let cdc = CompiledDc::new(&mut ctx, &dae);
         let ext_ms = t_ext.elapsed().as_secs_f64() * 1e3;
-        let p = params(&ctx, &dae, 1.0, 100.0, 1e-9);
+        let p = params(&mut ctx, &dae, 1.0, 100.0, 1e-9);
         let (_, conv, iters) = cdc.solve_dc(&p, &[], 1e-9, 200);
         assert!(conv, "rc grid {w}x{h} must converge");
         let best = time_best(3, || cdc.solve_dc(&p, &[], 1e-9, 200));
@@ -174,19 +174,12 @@ fn main() {
     {
         let (mut ctx, dae) = rc_grid(30, 30, 4);
         let cdc = CompiledDc::new(&mut ctx, &dae);
-        let p = params(&ctx, &dae, 1.0, 100.0, 1e-9);
+        let p = params(&mut ctx, &dae, 1.0, 100.0, 1e-9);
         let t_eval: Vec<f64> = (0..=100).map(|i| i as f64 * 1e-9).collect();
         let best = time_best(3, || {
-            cdc.solve_transient(
-                TransientMethod::Esdirk32,
-                &p,
-                &[],
-                &t_eval,
-                1e-6,
-                1e-9,
-                None,
-            )
-            .expect("transient")
+            cdc.solve_transient(&p, &[], &t_eval, 1e-6, 1e-9, None)
+                .expect("transient")
+                .rows
         });
         println!(
             "tran rc-grid      30x30   dim={:6}  {:9.2} ms / 100ns span",

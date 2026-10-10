@@ -1,7 +1,6 @@
-"""The raw numeric interface (`Model.core`): currents, charges, the residual
-and the sparse Jacobians agree with each other and with finite differences.
+"""The evaluations at a given state: currents, charges, the residual and the
+sparse Jacobians agree with each other and with finite differences.
 
-Run after `maturin develop -m crates/py/Cargo.toml`:
     python -m pytest crates/py/tests/test_raw_api.py
 """
 
@@ -23,11 +22,11 @@ def _dense(coo, shape):
 
 
 def test_raw_numeric_interface_is_consistent():
-    model = sane.Circuit.parse(DECK).extract()
-    d = model.core
+    model = sane.Model.from_netlist(DECK)
+    d = model
     n = model.dim
-    p = [float(model.values.get(k, 0.0)) for k in model.params]
-    x = list(np.asarray(model.operating_point().vector) + 0.01)
+    p = list(model.param_vector())
+    x = list(model.at().operating_point().x + 0.01)
     xdot = list(np.linspace(-1.0, 1.0, n))
 
     i = np.array(d.currents(x, p, 0.0))

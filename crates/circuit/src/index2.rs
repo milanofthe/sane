@@ -22,9 +22,9 @@
 
 use std::collections::HashMap;
 
-use crate::{Element, Kind};
 #[cfg(test)]
-use crate::Circuit;
+use crate::Elements;
+use crate::{Element, Kind};
 
 /// One offending topology: the elements that form it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -145,7 +145,11 @@ pub fn detect(elems: &[Element], device_terminals: &[Vec<usize>]) -> Index2Repor
         .max(
             elems
                 .iter()
-                .flat_map(|e| [e.a, e.b].into_iter().chain(e.ctrl.into_iter().flat_map(|(p, q)| [p, q])))
+                .flat_map(|e| {
+                    [e.a, e.b]
+                        .into_iter()
+                        .chain(e.ctrl.into_iter().flat_map(|(p, q)| [p, q]))
+                })
                 .max()
                 .unwrap_or(0),
         )
@@ -282,9 +286,9 @@ fn path_between(adj: &HashMap<usize, Vec<(usize, &str)>>, from: usize, to: usize
 mod tests {
     use super::*;
 
-    fn cv_circuit() -> Circuit {
+    fn cv_circuit() -> Elements {
         // PSIM's ex_id2_1: V1-C1-C2 close a loop
-        let mut c = Circuit::new();
+        let mut c = Elements::new();
         c.voltage_source("V1", 1, 0);
         c.resistor("R1", 1, 0);
         c.resistor("R2", 2, 0);
@@ -307,7 +311,7 @@ mod tests {
 
     #[test]
     fn a_capacitor_straight_across_a_source_is_a_loop() {
-        let mut c = Circuit::new();
+        let mut c = Elements::new();
         c.voltage_source("V1", 1, 0);
         c.resistor("R1", 1, 0);
         c.capacitor("C1", 1, 0);
@@ -320,7 +324,7 @@ mod tests {
     #[test]
     fn a_resistor_in_the_loop_breaks_it() {
         // the same circuit with the loop opened by a series resistor is index 1
-        let mut c = Circuit::new();
+        let mut c = Elements::new();
         c.voltage_source("V1", 1, 0);
         c.resistor("R1", 1, 0);
         c.resistor("R2", 2, 0);
@@ -333,7 +337,7 @@ mod tests {
     #[test]
     fn detects_an_inductor_current_source_cutset() {
         // I1 drives a node reachable only through L1: {I1, L1} is a cutset
-        let mut c = Circuit::new();
+        let mut c = Elements::new();
         c.current_source("I1", 0, 1);
         c.inductor("L1", 1, 2);
         c.resistor("R2", 2, 0);
@@ -345,7 +349,7 @@ mod tests {
 
     #[test]
     fn a_resistor_across_the_cutset_breaks_it() {
-        let mut c = Circuit::new();
+        let mut c = Elements::new();
         c.current_source("I1", 0, 1);
         c.inductor("L1", 1, 2);
         c.resistor("R1", 1, 0); // gives the source a path around the inductor
@@ -359,7 +363,7 @@ mod tests {
         // outside the linear element list, so ignoring them makes every node
         // reachable only through a transistor look isolated: the false positive
         // that fired on the op-amp decks in the corpus.
-        let mut c = Circuit::new();
+        let mut c = Elements::new();
         c.current_source("I0", 0, 1);
         c.inductor("L1", 1, 2);
         c.resistor("R2", 2, 0);
@@ -379,7 +383,7 @@ mod tests {
     fn a_current_source_cutset_without_an_inductor_is_not_index_2() {
         // Only current sources bridge the two halves: that is a floating-node
         // deck, a different diagnosis.
-        let mut c = Circuit::new();
+        let mut c = Elements::new();
         c.current_source("I1", 0, 1);
         c.resistor("R1", 2, 0);
         assert!(detect(c.elements(), &[]).li_cutsets.is_empty());
@@ -387,7 +391,7 @@ mod tests {
 
     #[test]
     fn a_plain_rc_lowpass_is_index_1() {
-        let mut c = Circuit::new();
+        let mut c = Elements::new();
         c.voltage_source("V1", 1, 0);
         c.resistor("R1", 1, 2);
         c.capacitor("C1", 2, 0);

@@ -18,9 +18,7 @@ use rustc_hash::FxHashMap as HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
-use sane_dae::Instance;
-use sane_device::{DeviceInstance, ParamDefaults};
-use sane_mna::Circuit;
+use sane_circuit::Circuit;
 
 mod behavioral;
 mod compat;
@@ -52,175 +50,6 @@ pub use compat::CompatReport;
 use preprocess::preprocess;
 use preprocess::Line;
 use subckt::{hierarchy, Inst, Item};
-
-/// Result of parsing a netlist.
-pub struct ParsedCircuit {
-    /// The topological circuit (linear elements), ready for MNA assembly.
-    pub circuit: Circuit,
-    /// Nonlinear device placements (diodes, transistors).
-    pub devices: Vec<DeviceInstance>,
-    /// Subcircuit instances, each its body placed in the body's own names.
-    pub instances: Vec<Instance>,
-    /// Node name -> integer index (ground is 0).
-    pub node_index: HashMap<String, usize>,
-    /// Integer index -> node name (index 0 is ground, `"0"`).
-    pub node_names: Vec<String>,
-    /// Element name -> numeric value, when a value was given.
-    pub values: HashMap<String, f64>,
-    /// Power ports (`P` elements) in deck order, for S-parameter extraction.
-    pub ports: Vec<PortDef>,
-    /// Diagnostics: directives ignored and parameters dropped (see [`CompatReport`]).
-    pub report: CompatReport,
-}
-
-/// A power port (`P<name> n+ n- [Z0=..]`): the Thevenin form the S-parameter
-/// extraction assumes. The element lowers to an ideal source (named like the
-/// port, so it doubles as the AC drive) behind a `Z0` series resistor onto
-/// `node`; the source value symbol is the port name, the resistor's is
-/// `<name>.z0`.
-#[derive(Debug, Clone)]
-pub struct PortDef {
-    /// Element name (`P1`, ...), also the drive-source name for AC/SP.
-    pub name: String,
-    /// Network-side terminal (the deck's `n+` token, original spelling).
-    pub node: String,
-    /// Reference impedance in ohms.
-    pub z0: f64,
-}
-
-impl std::fmt::Debug for ParsedCircuit {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ParsedCircuit")
-            .field("circuit", &self.circuit)
-            .field("devices", &self.devices.len())
-            .field("instances", &self.instances.len())
-            .field("node_names", &self.node_names)
-            .field("values", &self.values)
-            .finish()
-    }
-}
-
-impl Default for ParsedCircuit {
-    fn default() -> Self {
-        ParsedCircuit::new()
-    }
-}
-
-impl ParsedCircuit {
-    /// An empty circuit, ground alone: the start of one built in memory.
-    pub fn new() -> ParsedCircuit {
-        ParsedCircuit {
-            circuit: Circuit::new(),
-            devices: Vec::new(),
-            instances: Vec::new(),
-            node_index: [("0".to_string(), 0)].into_iter().collect(),
-            node_names: vec!["0".to_string()],
-            values: HashMap::default(),
-            ports: Vec::new(),
-            report: CompatReport::default(),
-        }
-    }
-
-    /// The circuit's DAE: the top level assembled, every subcircuit instance
-    /// a call of its body's function. An error names the device whose model
-    /// does not lower.
-    pub fn assemble(&self, ctx: &mut sane_core::Graph) -> Result<sane_dae::Dae, String> {
-        sane_dae::assemble(ctx, &self.circuit, &self.devices, &self.instances)
-    }
-
-    /// [`assemble`](Self::assemble) with the devices' structure decided at
-    /// `values` (by parameter symbol name) where those set a parameter.
-    pub fn assemble_at(
-        &self,
-        ctx: &mut sane_core::Graph,
-        values: &dyn Fn(&str) -> Option<f64>,
-    ) -> Result<sane_dae::Dae, String> {
-        sane_dae::assemble_at(ctx, &self.circuit, &self.devices, &self.instances, values)
-    }
-
-    /// Every placed device, subcircuit bodies' included, under its name in
-    /// the top frame (see [`ParamDefaults`]).
-    fn defaults(&self) -> ParamDefaults<'_> {
-        fn add<'a>(
-            d: &mut ParamDefaults<'a>,
-            instances: &'a [Instance],
-            outer: &dyn Fn(&str) -> String,
-        ) {
-            for inst in instances {
-                let rename = |n: &str| outer(&inst.rename(n));
-                d.add(&inst.body.devices, &rename);
-                add(d, &inst.body.instances, &rename);
-            }
-        }
-        let mut d = ParamDefaults::new(&self.devices);
-        add(&mut d, &self.instances, &|n| n.to_string());
-        d
-    }
-
-    /// Parameter value by symbol name (`R1`, `M1.W`): the deck's bound value,
-    /// else the placed device's module default. `None` for a symbol neither
-    /// the deck nor a device gives a value.
-    pub fn param_value(&self, name: &str) -> Option<f64> {
-        self.values
-            .get(name)
-            .copied()
-            .or_else(|| self.defaults().get(name))
-    }
-
-    /// The name of the parameter symbol device instance `inst` reads its
-    /// module parameter `param` from: the card's (`nmos.vth0`, shared by
-    /// the card's instances) or its own (`M1.w`, `X1.M1.w`). `None` when no
-    /// placed device has that instance name.
-    pub fn param_symbol(&self, inst: &str, param: &str) -> Option<String> {
-        fn find(
-            devices: &[DeviceInstance],
-            instances: &[Instance],
-            rename: &dyn Fn(&str) -> String,
-            inst: &str,
-            param: &str,
-        ) -> Option<String> {
-            let hit = devices
-                .iter()
-                .find(|d| d.model.instance_name().is_some_and(|n| rename(n) == inst));
-            if let Some(d) = hit {
-                return d.model.param_symbol(param).map(|s| rename(&s));
-            }
-            instances.iter().find_map(|i| {
-                let r = |n: &str| rename(&i.rename(n));
-                find(&i.body.devices, &i.body.instances, &r, inst, param)
-            })
-        }
-        find(
-            &self.devices,
-            &self.instances,
-            &|n| n.to_string(),
-            inst,
-            param,
-        )
-    }
-
-    /// The parameter vector for `names` (the engine's column order): bound
-    /// values, device defaults for unstated parameters, `0.0` for anything
-    /// still unbound. The one way to turn a parsed deck into a `p` vector.
-    pub fn pvec(&self, names: &[String]) -> Vec<f64> {
-        let defaults = self.defaults();
-        names
-            .iter()
-            .map(|n| {
-                self.values
-                    .get(n)
-                    .copied()
-                    .or_else(|| defaults.get(n))
-                    .unwrap_or(0.0)
-            })
-            .collect()
-    }
-
-    /// Look up the integer index of a node by name (case-insensitive).
-    pub fn node(&self, name: &str) -> Option<usize> {
-        self.node_index.get(&name.to_ascii_lowercase()).copied()
-    }
-}
 
 /// A parse failure located in the deck.
 ///
@@ -261,54 +90,33 @@ impl std::fmt::Display for ParseError {
     }
 }
 
-struct NodeMap {
-    index: HashMap<String, usize>,
-    names: Vec<String>,
-}
-
-impl NodeMap {
-    fn new() -> Self {
-        let mut index = HashMap::default();
-        // Keys are lowercased for case-insensitive node identity.
-        for g in ["0", "gnd", "ground"] {
-            index.insert(g.to_string(), 0);
-        }
-        Self {
-            index,
-            names: vec!["0".to_string()],
-        }
-    }
-
-    fn resolve(&mut self, name: &str) -> usize {
-        let key = name.to_ascii_lowercase();
-        if let Some(&idx) = self.index.get(&key) {
-            return idx;
-        }
-        let idx = self.names.len();
-        self.names.push(name.to_string());
-        self.index.insert(key, idx);
-        idx
-    }
-}
-
-/// Parse a netlist into a [`ParsedCircuit`]. Any failure is logged once here
-/// (the single boundary, via `sane_core::log::error`) and returned as a typed
+/// Parse a netlist into a [`Circuit`]. Any failure is logged once here (the
+/// single boundary, via `sane_core::log::error`) and returned as a typed
 /// `ParseError`, so every parse error surfaces uniformly through the logging
 /// system as well as the return value.
-pub fn parse(text: &str) -> Result<ParsedCircuit, ParseError> {
+pub fn parse(text: &str) -> Result<Circuit, ParseError> {
     parse_with_base(text, None)
 }
 
 /// Like [`parse`], but resolves relative `.include` / `.lib` paths in the deck
 /// against `base_dir` (typically the directory of the netlist file). `None`
 /// uses the process working directory.
-pub fn parse_with_base(text: &str, base_dir: Option<&Path>) -> Result<ParsedCircuit, ParseError> {
+pub fn parse_with_base(text: &str, base_dir: Option<&Path>) -> Result<Circuit, ParseError> {
+    parse_report(text, base_dir).map(|(c, _)| c)
+}
+
+/// [`parse_with_base`], with the report of what the deck states that the
+/// parser does not take (see [`CompatReport`]).
+pub fn parse_report(
+    text: &str,
+    base_dir: Option<&Path>,
+) -> Result<(Circuit, CompatReport), ParseError> {
     parse_impl(text, base_dir).inspect_err(|e| {
         sane_core::log::error(&format!("netlist parse: line {}: {}", e.line, e.msg));
     })
 }
 
-fn parse_impl(text: &str, base_dir: Option<&Path>) -> Result<ParsedCircuit, ParseError> {
+fn parse_impl(text: &str, base_dir: Option<&Path>) -> Result<(Circuit, CompatReport), ParseError> {
     // Splice in `.include` / `.lib` references first (they carry whole
     // `.model` / `.subckt` / `.veriloga` blocks), then pull out inline
     // `.veriloga ... .endveriloga` blocks and compile them.
@@ -336,12 +144,8 @@ fn parse_impl(text: &str, base_dir: Option<&Path>) -> Result<ParsedCircuit, Pars
     let models = parse_model_cards(&card_lines, &params);
 
     let mut st = Placer {
-        nodes: NodeMap::new(),
         circuit: Circuit::new(),
-        devices: Vec::new(),
-        values: HashMap::default(),
         report: CompatReport::default(),
-        ports: Vec::new(),
         params: &params,
         models: &models,
         model_aliases: &model_aliases,
@@ -352,14 +156,10 @@ fn parse_impl(text: &str, base_dir: Option<&Path>) -> Result<ParsedCircuit, Pars
         bodies: HashMap::default(),
     };
 
-    let instances = st.place_items(&items, base_dir)?;
+    st.place_items(&items, base_dir)?;
     let Placer {
-        nodes,
-        circuit,
-        devices,
-        mut values,
+        mut circuit,
         mut report,
-        ports,
         ..
     } = st;
 
@@ -370,7 +170,7 @@ fn parse_impl(text: &str, base_dir: Option<&Path>) -> Result<ParsedCircuit, Pars
     // can still override it downstream. Always bound (not only for VA), since
     // native junction devices read it; it is an unused parameter for a purely
     // linear deck.
-    values.insert(
+    circuit.values.insert(
         sane_core::constants::TEMP_SYMBOL.to_string(),
         options.temp_kelvin(),
     );
@@ -383,38 +183,21 @@ fn parse_impl(text: &str, base_dir: Option<&Path>) -> Result<ParsedCircuit, Pars
         ));
     }
 
-    Ok(ParsedCircuit {
-        circuit,
-        devices,
-        instances,
-        node_index: nodes.index,
-        node_names: nodes.names,
-        values,
-        ports,
-        report,
-    })
+    circuit.dc = options.dc;
+    circuit.nodeset = options::collect_nodeset(&text);
+    Ok((circuit, report))
 }
 
 /// A subcircuit body placed: what every instance of it shares, in the
 /// body's names.
 pub(crate) struct Placed {
-    body: Arc<sane_dae::Body>,
-    /// The body's nodes, each by its name in the body.
-    nodes: Vec<String>,
-    values: Vec<(String, f64)>,
+    body: Arc<Circuit>,
     report: CompatReport,
-    ports: Vec<PortDef>,
 }
 
 impl Placer<'_> {
-    /// Place `items` in order; the subcircuit instances among them are
-    /// returned, placed. Stops at `.end`.
-    fn place_items(
-        &mut self,
-        items: &[Item],
-        base_dir: Option<&Path>,
-    ) -> Result<Vec<Instance>, ParseError> {
-        let mut instances = Vec::new();
+    /// Place `items` in order. Stops at `.end`.
+    fn place_items(&mut self, items: &[Item], base_dir: Option<&Path>) -> Result<(), ParseError> {
         for item in items {
             match item {
                 Item::Line(line) => {
@@ -422,20 +205,16 @@ impl Placer<'_> {
                         break;
                     }
                 }
-                Item::Inst(inst) => instances.push(self.place_instance(inst, base_dir)?),
+                Item::Inst(inst) => self.place_instance(inst, base_dir)?,
             }
         }
-        Ok(instances)
+        Ok(())
     }
 
-    /// Wire a subcircuit instance into this frame: its body's ports onto the
-    /// nodes they connect to, its internal nodes and bound values under the
-    /// instance's names. The body is placed once, for every instance of it.
-    fn place_instance(
-        &mut self,
-        inst: &Inst,
-        base_dir: Option<&Path>,
-    ) -> Result<Instance, ParseError> {
+    /// Wire a subcircuit instance into this frame (see
+    /// [`Circuit::instance`]). The body is placed once, for every instance
+    /// of it.
+    fn place_instance(&mut self, inst: &Inst, base_dir: Option<&Path>) -> Result<(), ParseError> {
         let key = Arc::as_ptr(&inst.body);
         let placed = match self.bodies.get(&key) {
             Some(placed) => placed.clone(),
@@ -445,43 +224,19 @@ impl Placer<'_> {
                 placed
             }
         };
-        let mut instance = Instance {
-            name: inst.name.clone(),
-            nodes: Vec::new(),
-            body: placed.body.clone(),
-        };
-        instance.nodes = placed
-            .nodes
-            .iter()
-            .map(|node| {
-                match inst
-                    .body
-                    .ports
-                    .iter()
-                    .position(|p| p.eq_ignore_ascii_case(node))
-                {
-                    Some(i) => self.nodes.resolve(&inst.conn[i]),
-                    None => self.nodes.resolve(&instance.rename(node)),
-                }
-            })
+        let conn: Vec<&str> = inst.conn.iter().map(|c| c.as_str()).collect();
+        let instance =
+            (self.circuit.instance(&inst.name, &placed.body, &conn)).map_err(|m| err(0, &m))?;
+        let unknown: Vec<String> = (placed.report.unknown_params.iter())
+            .map(|p| instance.rename(p))
             .collect();
-        for (k, v) in &placed.values {
-            self.values.insert(instance.rename(k), *v);
-        }
         let report = &placed.report;
+        self.report.unknown_params.extend(unknown);
         self.report
             .ignored_directives
             .extend(report.ignored_directives.iter().cloned());
-        self.report
-            .unknown_params
-            .extend(report.unknown_params.iter().map(|p| instance.rename(p)));
         self.report.notes.extend(report.notes.iter().cloned());
-        self.ports.extend(placed.ports.iter().map(|p| PortDef {
-            name: instance.rename(&p.name),
-            node: instance.rename(&p.node),
-            z0: p.z0,
-        }));
-        Ok(instance)
+        Ok(())
     }
 
     /// Place a subcircuit body over its own nodes and names.
@@ -490,15 +245,12 @@ impl Placer<'_> {
         body: &subckt::Body,
         base_dir: Option<&Path>,
     ) -> Result<Placed, ParseError> {
-        let ns = body.ns.as_str();
-        let items = &body.items;
-        let mut body = Placer {
-            nodes: NodeMap::new(),
-            circuit: Circuit::new(),
-            devices: Vec::new(),
-            values: HashMap::default(),
+        let mut circuit = Circuit::new();
+        circuit.ns = body.ns.clone();
+        circuit.pins = body.ports.clone();
+        let mut placer = Placer {
+            circuit,
             report: CompatReport::default(),
-            ports: Vec::new(),
             params: self.params,
             models: self.models,
             model_aliases: self.model_aliases,
@@ -508,28 +260,16 @@ impl Placer<'_> {
             osdi_models: std::mem::take(&mut self.osdi_models),
             bodies: std::mem::take(&mut self.bodies),
         };
-        let instances = body.place_items(items, base_dir);
-        self.bodies = std::mem::take(&mut body.bodies);
+        let placed = placer.place_items(&body.items, base_dir);
+        self.bodies = std::mem::take(&mut placer.bodies);
         #[cfg(not(target_arch = "wasm32"))]
         {
-            self.osdi_models = std::mem::take(&mut body.osdi_models);
+            self.osdi_models = std::mem::take(&mut placer.osdi_models);
         }
-        let nodes: Vec<String> = body.nodes.names[1..].to_vec();
+        placed?;
         Ok(Placed {
-            body: Arc::new(sane_dae::Body {
-                ns: ns.to_string(),
-                node_names: nodes
-                    .iter()
-                    .map(|n| n.strip_prefix(ns).unwrap_or(n).to_string())
-                    .collect(),
-                circuit: body.circuit,
-                devices: body.devices,
-                instances: instances?,
-            }),
-            nodes,
-            values: body.values.into_iter().collect(),
-            report: body.report,
-            ports: body.ports,
+            body: Arc::new(placer.circuit),
+            report: placer.report,
         })
     }
 
@@ -569,6 +309,8 @@ impl Placer<'_> {
                     }
                     return Ok(true);
                 }
+                #[cfg(target_arch = "wasm32")]
+                let _ = base_dir;
                 #[cfg(target_arch = "wasm32")]
                 return Err(err_at(
                     line_no,

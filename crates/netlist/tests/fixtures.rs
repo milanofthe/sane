@@ -22,7 +22,7 @@ fn all_fixtures_parse_and_extract() {
 
         let parsed = parse(&text).unwrap_or_else(|e| panic!("{name}: parse failed: {e}"));
         let mut ctx = Graph::new();
-        let dae = parsed.assemble(&mut ctx).unwrap();
+        let dae = sane_dae::assemble(&mut ctx, &parsed).unwrap();
         assert!(dae.dim() > 0, "{name}: empty DAE");
 
         let rows: Vec<ExprId> = dae.currents.iter().chain(&dae.charges).copied().collect();
@@ -38,7 +38,7 @@ fn all_fixtures_parse_and_extract() {
             "{name:24} dim={:2} states={:2} params={:2} | row nodes={:3} | jac {}x{} nnz={:2} nodes={:3}",
             dae.dim(),
             states,
-            dae.params(&ctx).len(),
+            dae.params(&mut ctx).len(),
             res_nodes,
             dae.dim(),
             dae.dim(),

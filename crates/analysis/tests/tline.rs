@@ -2,18 +2,25 @@
 //! matched single-step propagation, the classic mismatch reflection
 //! staircase against the analytic bounce diagram, and the delay guards.
 
-use sane_analysis::Model;
-use sane_solve::TransientMethod;
+use sane_analysis::{Model, TransientOptions};
 
 fn tran(model: &Model, tstop: f64, npts: usize) -> (Vec<f64>, Vec<Vec<f64>>) {
     let t: Vec<f64> = (0..npts)
         .map(|k| tstop * k as f64 / (npts - 1) as f64)
         .collect();
+    let opts = TransientOptions {
+        rtol: 1e-6,
+        atol: 1e-9,
+        ..Default::default()
+    };
     let rows = model
-        .transient(TransientMethod::Esdirk32, &[], &t, 1e-6, 1e-9)
+        .at(&[])
+        .and_then(|pt| pt.transient(&t, &opts))
         .expect("transient")
-        .rows()
-        .to_vec();
+        .x
+        .outer_iter()
+        .map(|r| r.to_vec())
+        .collect::<Vec<_>>();
     (t, rows)
 }
 
@@ -22,7 +29,10 @@ fn tran(model: &Model, tstop: f64, npts: usize) -> (Vec<f64>, Vec<Vec<f64>>) {
 fn dc_is_transparent() {
     let deck = "* dc\nV1 in 0 5\nT1 in 0 out 0 Z0=50 TD=1n\nR1 out 0 100\n.end\n";
     let model = Model::from_netlist(deck).expect("model");
-    let op = model.operating_point(&[]).expect("dc");
+    let op = model
+        .at(&[])
+        .and_then(|pt| pt.operating_point())
+        .expect("dc");
     let out = model.resolve("out").expect("out");
     let inn = model.resolve("in").expect("in");
     assert!(
@@ -117,25 +127,53 @@ fn mismatch_staircase_matches_bounce_diagram() {
 fn unsupported_analyses_error_cleanly() {
     let deck = "* g\nV1 in 0 0 SIN(0 1 1k)\nT1 in 0 out 0 Z0=50 TD=1n\nR1 out 0 50\n.end\n";
     let model = Model::from_netlist(deck).expect("model");
-    let op = model.operating_point(&[]).expect("dc works");
-    let x = op.vector().to_vec();
-    let p = model.pvec(&[]);
+    let op = model
+        .at(&[])
+        .and_then(|pt| pt.operating_point())
+        .expect("dc works");
 
-    assert!(model.harmonic_balance(&[], 1e3, 4, None).is_err());
-    assert!(model.poles_zeros(&[], "V1", "out").is_err());
-    // AC IS supported (exact e^{-j w tau}); see tests/ac_delay.rs
+    let hb = sane_analysis::HbOptions {
+        f0: Some(1e3),
+        harmonics: 4,
+        ..Default::default()
+    };
+    assert!(model.at(&[]).unwrap().harmonic_balance(&hb).is_err());
+    assert!(model.at(&[]).unwrap().poles().is_err());
+    // AC and noise ARE supported (exact e^{-j w tau}); see tests/ac_delay.rs
+    // and `noise_through_a_matched_line`
+    assert!(model.at(&[]).unwrap().ac("V1", &["out"], &[1e3]).is_ok());
+    assert!(model.at(&[]).unwrap().noise(&["out"], &[1e3]).is_ok());
+    assert!(op.sensitivity(&["out"], &[]).is_err());
     assert!(model
-        .ac_response("V1", 0, x.clone(), p.clone(), vec![1e3])
-        .is_ok());
-    assert!(model.sensitivity("out", x.clone(), p.clone(), 0.0).is_err());
-    assert!(model
-        .transient_sensitivity(vec!["R1".into()], vec![0.0, 1e-9], 1e-4, 1e-7, None)
+        .at(&[])
+        .and_then(|pt| pt.transient(&[0.0, 1e-9], &TransientOptions::default()))
+        .and_then(|tr| tr.sensitivity(&["out"], &["R1"]))
         .is_err());
     assert!(model
-        .transient_adjoint(vec![0.0, 1e-9], vec![vec![0.0; model.dim()]; 2], None, None)
+        .at(&[])
+        .and_then(|pt| pt.transient(&[0.0, 1e-9], &TransientOptions::default()))
+        .and_then(|tr| tr.vjp(&["out"], ndarray::Array2::zeros((1, 2)).view(), &["R1"]))
         .is_err());
-    assert!(model
-        .cdc()
-        .solve_transient_grid(&p, &[], &[0.0, 1e-9], &[])
-        .is_err());
+}
+
+/// Noise travels a matched lossless line unchanged in power: the source
+/// resistor's and the load's noise at the far end is what it is at a direct
+/// connection, at every frequency (the line only adds phase).
+#[test]
+fn noise_through_a_matched_line() {
+    let psd = |deck: &str| {
+        let model = Model::from_netlist(deck).expect("model");
+        let freqs = [1e6, 1.3e8, 7.7e8, 2e9];
+        let n = model
+            .at(&[])
+            .unwrap()
+            .noise(&["out"], &freqs)
+            .expect("noise");
+        n.psd.row(0).to_vec()
+    };
+    let line = psd("V1 s 0 0\nR1 s in 50\nT1 in 0 out 0 Z0=50 TD=1n\nR2 out 0 50\n");
+    let direct = psd("V1 s 0 0\nR1 s out 50\nR2 out 0 50\n");
+    for (a, b) in line.iter().zip(&direct) {
+        assert!((a - b).abs() <= 1e-9 * b, "{a} vs {b}");
+    }
 }

@@ -3,10 +3,10 @@
 //! per step. The loop-closing tool for an allocation-free stepping loop.
 //!
 //! ```text
-//! cargo run -q --release --example tran_allocs -- graetz.cir 1 1e-6 trap
+//! cargo run -q --release --example tran_allocs -- graetz.cir 1 1e-6
 //! ```
 //!
-//! Args: `deck tstop dt_max [esdirk32|trap]`. With `ALLOC_SITES=N` every
+//! Args: `deck tstop dt_max`. With `ALLOC_SITES=N` every
 //! `N`th allocation of the timed run records its backtrace, and the most
 //! frequent call sites are listed; build with `--profile profiling` for
 //! file and line.
@@ -19,8 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use sane_analysis::Model;
-use sane_solve::TransientMethod;
+use sane_analysis::{Model, TransientOptions};
 
 struct Counting;
 
@@ -94,11 +93,10 @@ fn site(bt: &Backtrace, depth: usize) -> String {
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let usage = "usage: tran_allocs deck.cir tstop dt_max [esdirk32|trap]";
+    let usage = "usage: tran_allocs deck.cir tstop dt_max";
     let path = args.next().expect(usage);
     let tstop: f64 = args.next().and_then(|a| a.parse().ok()).expect(usage);
     let dt_max: f64 = args.next().and_then(|a| a.parse().ok()).expect(usage);
-    let method = TransientMethod::from_name(&args.next().unwrap_or_default()).expect(usage);
     let every: u64 = std::env::var("ALLOC_SITES")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -107,16 +105,25 @@ fn main() {
     let model = Model::from_netlist(&std::fs::read_to_string(&path).expect("read deck"))
         .expect("build model");
     let steps = (tstop / dt_max).round() as usize;
-    let npts = (steps + 1).min(100_001);
+    // `ALLOC_POINTS=N` asks for N output points instead of one per step: the
+    // output rows are allocated before the first step, so few of them leave
+    // the stepping's own allocations.
+    let npts = std::env::var("ALLOC_POINTS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(steps + 1)
+        .clamp(2, 100_001);
     let t: Vec<f64> = (0..npts)
         .map(|k| tstop * k as f64 / (npts - 1) as f64)
         .collect();
-    let p = model.pvec(&[]);
+    let pt = model.at(&[]).expect("parameters");
+    let opts = TransientOptions {
+        dt_max: Some(dt_max),
+        ..Default::default()
+    };
     // a short run first: the programs compiled, the buffers grown
     let warm: Vec<f64> = t.iter().copied().take(3).collect();
-    model
-        .solve_transient(method, p.clone(), warm, None, 1e-4, 1e-7, Some(dt_max))
-        .expect("transient");
+    pt.transient(&warm, &opts).expect("transient");
 
     let (a0, b0) = (
         ALLOCS.load(Ordering::Relaxed),
@@ -124,9 +131,7 @@ fn main() {
     );
     SAMPLE.store(every, Ordering::Relaxed);
     let t0 = Instant::now();
-    model
-        .solve_transient(method, p, t, None, 1e-4, 1e-7, Some(dt_max))
-        .expect("transient");
+    pt.transient(&t, &opts).expect("transient");
     let secs = t0.elapsed().as_secs_f64();
     SAMPLE.store(0, Ordering::Relaxed);
     let (a, b) = (
@@ -134,7 +139,7 @@ fn main() {
         BYTES.load(Ordering::Relaxed) - b0,
     );
     println!(
-        "{path} {method:?}: {secs:.2} s, {a} allocations ({:.1} per step), {:.1} MB",
+        "{path}: {secs:.2} s, {a} allocations ({:.1} per step), {:.1} MB",
         a as f64 / steps.max(1) as f64,
         b as f64 / 1e6
     );
@@ -145,11 +150,24 @@ fn main() {
     }
     let mut tally: HashMap<String, usize> = HashMap::new();
     for bt in &sites {
-        *tally.entry(site(bt, 4)).or_default() += 1;
+        *tally
+            .entry(site(
+                bt,
+                std::env::var("ALLOC_DEPTH")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(4),
+            ))
+            .or_default() += 1;
     }
     let mut tally: Vec<_> = tally.into_iter().collect();
     tally.sort_by_key(|s| std::cmp::Reverse(s.1));
-    for (site, k) in tally.iter().take(12) {
+    for (site, k) in tally.iter().take(
+        std::env::var("ALLOC_TOP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(12),
+    ) {
         println!(
             "{:5.1}% ({k} samples)\n{site}",
             100.0 * *k as f64 / sites.len() as f64

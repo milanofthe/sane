@@ -1,7 +1,7 @@
 use rsdag::{eval, Node, SymbolId};
+use sane_circuit::Elements;
 use sane_core::Graph;
-use sane_dae::{assemble_dae, DeviceInstance};
-use sane_mna::Circuit;
+use sane_dae::DeviceInstance;
 use sane_veriloga::{device::VerilogADevice, elaborate, parse_modules};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -33,11 +33,11 @@ fn switch_branch_single_arm_is_constrained() {
     let src = "module sw1(p,n,c); inout p,n,c; electrical p,n,c; \
                analog begin if (V(c) > 0.5) V(p,n) <+ 0.0; end endmodule";
     let mut ctx = Graph::new();
-    let mut c = Circuit::new();
+    let mut c = Elements::new();
     c.voltage_source("VP", 1, 0).voltage_source("VC", 2, 0);
     let dev = VerilogADevice::new("X1", elab(src));
-    let devs = vec![DeviceInstance::new(Box::new(dev), vec![1, 0, 2])];
-    let dae = assemble_dae(&mut ctx, &c, &devs).unwrap();
+    let devs = vec![DeviceInstance::new(std::sync::Arc::new(dev), vec![1, 0, 2])];
+    let dae = sane_dae::assemble(&mut ctx, &sane_circuit::Circuit::flat(&c, &devs)).unwrap();
     let sw = dae
         .unknowns
         .iter()
@@ -77,7 +77,7 @@ fn switchable_resistor_branch() {
                parameter real g = 1e-3; parameter integer on = 1; \
                analog begin if (on) I(p,n) <+ g*V(p,n); else V(p,n) <+ 0.0; end endmodule";
     let mut ctx = Graph::new();
-    let mut c = Circuit::new();
+    let mut c = Elements::new();
     c.voltage_source("V1", 1, 0);
     let dev = VerilogADevice::with_instance(
         "X1",
@@ -85,8 +85,8 @@ fn switchable_resistor_branch() {
         rustc_hash::FxHashMap::from_iter([("g".into(), 1e-3), ("on".into(), 1.0)]),
         Default::default(),
     );
-    let devs = vec![DeviceInstance::new(Box::new(dev), vec![1, 0])];
-    let dae = assemble_dae(&mut ctx, &c, &devs).unwrap();
+    let devs = vec![DeviceInstance::new(std::sync::Arc::new(dev), vec![1, 0])];
+    let dae = sane_dae::assemble(&mut ctx, &sane_circuit::Circuit::flat(&c, &devs)).unwrap();
     println!("UNKNOWNS = {:?}", dae.unknowns);
 
     // Consistent operating point: v1 = 2 V, branch current i = g*v1 = 2 mA,

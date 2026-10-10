@@ -37,6 +37,128 @@ use sane_core::constants::{
 };
 use std::sync::Arc;
 
+/// The harmonic residual `R_k = I_k + j k w0 Q_k` over the spectra as the
+/// Newton core solves it (see [`crate::newton::System`]): the spectra
+/// flattened (`idx(i, k)`); one fused AFT pass evaluates the residual and the
+/// device Jacobian waveforms together, whose spectra fill the block-Toeplitz
+/// Jacobian, refactored in place (the first factor pivots, later ones replay
+/// the frozen pivot sequence).
+struct Harmonics<'h, 'a> {
+    hb: &'h CompiledHb<'a>,
+    p: &'h [f64],
+    w0: f64,
+    /// The fused pass's sample buffer (time-major, output sequences
+    /// contiguous).
+    aft: Vec<f64>,
+    csc: GeneralCsc<Complex64>,
+    solver: Option<KluSolver<Complex64>>,
+    /// The max-norm of the last residual.
+    norm: f64,
+    /// The spectra of the iterate, per unknown.
+    spectra: Vec<Vec<Complex64>>,
+}
+
+impl crate::newton::System<Complex64> for Harmonics<'_, '_> {
+    fn eval(&mut self, x: &[Complex64], _jacobian: bool, res: &mut [Complex64]) -> bool {
+        let hb = self.hb;
+        let (n, m, h) = (hb.n, hb.m, hb.h);
+        // Synthesise the state waveforms once per iteration (#51), then one
+        // fused AFT pass evaluates residual and Jacobian values together --
+        // the step program emits both, so the residual costs no extra work.
+        for (s, c) in self.spectra.iter_mut().zip(x.chunks(h)) {
+            s.copy_from_slice(c);
+        }
+        let x_time = sane_core::log_stage!("hb/synth", hb.synth(&self.spectra));
+        hb.eval_aft(&x_time, self.p, self.w0, &mut self.aft);
+        sane_core::log_stage!("hb/res_fft", {
+            for i in 0..n {
+                let row = |o: usize| &self.aft[o * m..(o + 1) * m];
+                let r = hb.row_residual(row(i), row(n + i), self.w0);
+                res[i * h..(i + 1) * h].copy_from_slice(&r);
+            }
+        });
+        self.norm = self.norm(x, res);
+        true
+    }
+
+    fn factor(&mut self) -> bool {
+        let hb = self.hb;
+        let (n, m, w0) = (hb.n, hb.m, self.w0);
+        let nzx = hb.cdc.jx_rows.len();
+        // FFT the device Jacobian waveforms to the entry spectra used by the
+        // Toeplitz blocks (LTI entries skip the FFT, DC bin only).
+        let (gx_spec, gxd_spec) = sane_core::log_stage!("hb/jac_fft", {
+            let jac = &self.aft[2 * n * m..];
+            (
+                hb.entry_spectra(&jac[..nzx * m], &hb.cdc.jx_var, hb.k),
+                hb.entry_spectra(&jac[nzx * m..], &hb.cdc.jxd_var, hb.k),
+            )
+        });
+        // Scatter the values straight into the CSC skeleton from the slot
+        // recipe (duplicate positions sum).
+        sane_core::log_stage!("hb/scatter", {
+            self.csc.values.fill(Complex64::new(0.0, 0.0));
+            for (e, slot) in hb.slots.iter().enumerate() {
+                let v = match *slot {
+                    Slot::G { nz, dk } => spec_at(&gx_spec[nz], dk),
+                    Slot::C { nz, dk, k } => {
+                        Complex64::new(0.0, k as f64 * w0) * spec_at(&gxd_spec[nz], dk)
+                    }
+                    Slot::Gmin => Complex64::new(GMIN_DC, 0.0),
+                };
+                self.csc.values[hb.slot_of[e]] += v;
+            }
+        });
+        let refactored = sane_core::log_stage!(
+            "hb/refactor",
+            matches!(
+                self.solver.as_mut().map(|sl| sl.refactor(&self.csc)),
+                Some(Ok(()))
+            )
+        );
+        if !refactored {
+            self.solver = sane_core::log_stage!(
+                "hb/factor",
+                hb.sym.factor(&self.csc, &KluSettings::default())
+            )
+            .ok();
+        }
+        self.solver.is_some()
+    }
+
+    fn solve(&mut self, rhs: &[Complex64], dx: &mut [Complex64]) -> bool {
+        let Some(lu) = &self.solver else {
+            return false;
+        };
+        match sane_core::log_stage!("hb/backsolve", lu.solve(rhs)) {
+            Ok(d) => {
+                dx.copy_from_slice(&d);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// The DC harmonic stays real.
+    fn limit(&self, _x: &[Complex64], step: &mut [Complex64]) -> f64 {
+        for i in 0..self.hb.n {
+            step[i * self.hb.h].im = 0.0;
+        }
+        1.0
+    }
+
+    /// The max-norm (Newton on the harmonic residual is not monotone in it
+    /// near a solution; the retraction allows for that by its growth bound).
+    fn norm(&self, _x: &[Complex64], res: &[Complex64]) -> f64 {
+        res.iter().map(|c| c.norm()).fold(0.0_f64, f64::max)
+    }
+}
+
+/// Spectra of `h` coefficients per unknown from their flattening.
+fn unflatten(x: &[Complex64], h: usize) -> Vec<Vec<Complex64>> {
+    x.chunks(h).map(|c| c.to_vec()).collect()
+}
+
 /// Result of a harmonic-balance solve.
 pub struct HbResult {
     /// `spectra[i][k]` is the complex Fourier coefficient of harmonic `k`
@@ -243,12 +365,6 @@ impl<'a> CompiledHb<'a> {
             pjs,
             x_time,
         })
-    }
-
-    /// Global index of harmonic `k` of unknown `i` in the flattened system.
-    #[inline]
-    fn idx(&self, i: usize, k: usize) -> usize {
-        i * self.h + k
     }
 
     /// Build the harmonic-balance problem. `harmonics` is `K`; `samples` is the
@@ -554,167 +670,72 @@ impl<'a> CompiledHb<'a> {
             .collect()
     }
 
-    /// Newton on the harmonic residual from a given start spectrum. Returns the
-    /// updated spectra, whether it converged, the iteration count, and the final
-    /// residual norm. The block-sparse Jacobian is refilled in place each step;
-    /// the symbolic factorisation is reused.
+    /// Newton on the harmonic residual from a given start spectrum: the
+    /// Newton core on the harmonic system (see [`Harmonics`]), the full
+    /// Jacobian every iteration (the transform pass that yields the residual
+    /// yields it too), the retroactive search, converged when every harmonic
+    /// row is within the floor of its unknown's kind. The update half is not
+    /// demanded (measured: a quarter more iterations on the easy drives and
+    /// 2.5x on a hard continuation for no change in the spectrum); `tol` is
+    /// the harmonic KCL tolerance. Returns the updated spectra, whether it
+    /// converged, the iteration count, and the final residual norm.
     fn newton_from(
         &self,
         p: &[f64],
-        mut spectra: Vec<Vec<Complex64>>,
+        spectra: Vec<Vec<Complex64>>,
         w0: f64,
         tol: f64,
         max_iter: usize,
     ) -> (Vec<Vec<Complex64>>, bool, usize, f64) {
-        let dim = self.n * self.h;
-        let mut last_norm = f64::INFINITY;
-        let mut converged = false;
-        let mut iters = 0;
-        // Per-solve factorization state: the first iteration factors with full
-        // pivoting, later ones replay the frozen pivot sequence (KLU numeric-only
-        // refactor) on the refreshed harmonic-block values.
-        let mut csc = GeneralCsc {
-            n: dim,
-            col_ptr: self.col_ptr.clone(),
-            row_idx: self.row_idx.clone(),
-            values: vec![Complex64::new(0.0, 0.0); self.row_idx.len()],
+        let (n, h) = (self.n, self.h);
+        // the contract per harmonic row: the floor of its unknown's kind
+        let kinds: Vec<_> = (0..n)
+            .flat_map(|i| std::iter::repeat_n(self.cdc.kinds[i], h))
+            .collect();
+        let contract = crate::newton::Contract {
+            criterion: crate::newton::Criterion::new(&kinds, crate::Convergence::from_tol(tol)),
+            residual: true,
+            update: None,
         };
-        let mut solver: Option<KluSolver<Complex64>> = None;
-        // The fused pass's sample buffer (time-major, output sequences
-        // contiguous), reused across iterations.
-        let mut aft = Vec::new();
-        let (n, m) = (self.n, self.m);
-        let nzx = self.cdc.jx_rows.len();
-        // the previous iterate and its step, for the retroactive backtracking
-        let mut retract: Option<(Vec<Vec<Complex64>>, Vec<Complex64>)> = None;
-        let mut prev_norm = f64::INFINITY;
-        let mut bt = crate::newton::Backtrack::new(LINE_SEARCH_TRIES);
-        // `tol` is the absolute floor of both residual and update, with the
-        // engine's relative tolerance (see `Convergence::from_tol`).
-        let crit = self.cdc.criterion(&crate::Convergence::from_tol(tol));
-        for it in 0..max_iter.max(1) {
-            iters = it + 1;
-            // Synthesise the state waveforms once per iteration (#51), then one
-            // fused AFT pass evaluates residual and Jacobian values together --
-            // the step program emits both, so the residual costs no extra work.
-            let x_time = sane_core::log_stage!("hb/synth", self.synth(&spectra));
-            self.eval_aft(&x_time, p, w0, &mut aft);
-            let r: Vec<Vec<Complex64>> = sane_core::log_stage!(
-                "hb/res_fft",
-                (0..n)
-                    .map(|i| {
-                        let row = |o: usize| &aft[o * m..(o + 1) * m];
-                        self.row_residual(row(i), row(n + i), w0)
-                    })
-                    .collect()
-            );
-            let rnorm = r.iter().flatten().map(|c| c.norm()).fold(0.0_f64, f64::max);
-            // Retroactive backtracking (see `newton`): the residual of this
-            // iterate is the probe of the previous step. A step that grew the
-            // residual beyond `HB_BACKTRACK_GROWTH` is retracted to a fraction
-            // and re-evaluated before its Jacobian is used; the transform pass
-            // that produced the residual also produced that Jacobian, so
-            // probing forward would cost the same pass twice. Ordinary
-            // non-monotone steps pass: Newton on the harmonic residual is not
-            // monotone in the max-norm near a solution.
-            if let Some((prev, dx)) = &retract {
-                if !(rnorm <= prev_norm * HB_BACKTRACK_GROWTH) {
-                    if let Some(alpha) = bt.shrink() {
-                        for i in 0..self.n {
-                            for kk in 0..self.h {
-                                spectra[i][kk] = prev[i][kk] + dx[self.idx(i, kk)] * alpha;
-                            }
-                            spectra[i][0].im = 0.0;
-                        }
-                        continue;
-                    }
-                }
-            }
-            bt = crate::newton::Backtrack::new(LINE_SEARCH_TRIES);
-            last_norm = rnorm;
-            // The residual half of the shared contract, per harmonic: every
-            // row of unknown `i` within the floor of `i`'s kind.
-            // The residual half of the shared contract, per harmonic: every
-            // row of unknown `i` within the floor of `i`'s kind. The update
-            // half is not demanded here (measured: a quarter more iterations
-            // on the easy drives and 2.5x on a hard continuation for no change
-            // in the spectrum); `tol` is the harmonic KCL tolerance.
-            if (0..self.n).all(|i| {
-                let floor = crit.residual_floor(i);
-                r[i].iter().all(|c| c.norm() <= floor)
-            }) {
-                converged = true;
-                break;
-            }
-            if !rnorm.is_finite() {
-                break; // diverged
-            }
-            prev_norm = rnorm;
-
-            // FFT the device Jacobian waveforms to the entry spectra used by the
-            // Toeplitz blocks (LTI entries skip the FFT, DC bin only).
-            let (gx_spec, gxd_spec) = sane_core::log_stage!("hb/jac_fft", {
-                let jac = &aft[2 * n * m..];
-                (
-                    self.entry_spectra(&jac[..nzx * m], &self.cdc.jx_var, self.k),
-                    self.entry_spectra(&jac[nzx * m..], &self.cdc.jxd_var, self.k),
-                )
-            });
-
-            // Scatter the values straight into the CSC skeleton from the slot
-            // recipe (duplicate positions sum).
-            sane_core::log_stage!("hb/scatter", {
-                for v in csc.values.iter_mut() {
-                    *v = Complex64::new(0.0, 0.0);
-                }
-                for (e, slot) in self.slots.iter().enumerate() {
-                    let v = match *slot {
-                        Slot::G { nz, dk } => spec_at(&gx_spec[nz], dk),
-                        Slot::C { nz, dk, k } => {
-                            Complex64::new(0.0, k as f64 * w0) * spec_at(&gxd_spec[nz], dk)
-                        }
-                        Slot::Gmin => Complex64::new(GMIN_DC, 0.0),
-                    };
-                    csc.values[self.slot_of[e]] += v;
-                }
-            });
-            // rhs = -R (flattened), solve J dX = -R.
-            let mut rhs = vec![Complex64::new(0.0, 0.0); dim];
-            for i in 0..self.n {
-                for kk in 0..self.h {
-                    rhs[self.idx(i, kk)] = -r[i][kk];
-                }
-            }
-            let dx: Vec<Complex64> = {
-                let refactored = sane_core::log_stage!(
-                    "hb/refactor",
-                    matches!(solver.as_mut().map(|sl| sl.refactor(&csc)), Some(Ok(())))
-                );
-                if !refactored {
-                    solver = match sane_core::log_stage!(
-                        "hb/factor",
-                        self.sym.factor(&csc, &KluSettings::default())
-                    ) {
-                        Ok(sl) => Some(sl),
-                        Err(_) => break, // singular block matrix; report non-convergence
-                    };
-                }
-                let lu = solver.as_ref().unwrap();
-                match sane_core::log_stage!("hb/backsolve", lu.solve(&rhs)) {
-                    Ok(d) => d,
-                    Err(_) => break,
-                }
-            };
-            let prev = spectra.clone();
-            for i in 0..self.n {
-                for kk in 0..self.h {
-                    spectra[i][kk] += dx[self.idx(i, kk)];
-                }
-                spectra[i][0].im = 0.0; // DC stays real
-            }
-            retract = Some((prev, dx));
-        }
-        (spectra, converged, iters, last_norm)
+        let policy = crate::newton::Policy {
+            max_iter: max_iter.max(1),
+            jacobian: crate::newton::Jacobian::Full,
+            globalization: crate::newton::Globalization::Retract {
+                growth: HB_BACKTRACK_GROWTH,
+                tries: LINE_SEARCH_TRIES,
+            },
+            // keeps the DC harmonic real (see `Harmonics::limit`)
+            limiting: true,
+            stall: false,
+            early_accept: false,
+            composite: false,
+            keep_best: false,
+            trace: false,
+        };
+        let mut x: Vec<Complex64> = spectra.into_iter().flatten().collect();
+        let mut sys = Harmonics {
+            hb: self,
+            p,
+            w0,
+            aft: Vec::new(),
+            csc: GeneralCsc {
+                n: n * h,
+                col_ptr: self.col_ptr.clone(),
+                row_idx: self.row_idx.clone(),
+                values: vec![Complex64::new(0.0, 0.0); self.row_idx.len()],
+            },
+            solver: None,
+            norm: f64::INFINITY,
+            spectra: vec![vec![Complex64::new(0.0, 0.0); h]; n],
+        };
+        let out = crate::newton::solve(
+            &mut sys,
+            &mut x,
+            &contract,
+            &policy,
+            &mut Default::default(),
+        );
+        (unflatten(&x, h), out.converged, out.iters, sys.norm)
     }
 
     /// Solve the periodic steady state by Newton on the harmonic residual,

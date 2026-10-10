@@ -28,7 +28,10 @@ endmodule
 fn opvars_evaluate_at_dc_point() {
     let deck = format!("* opvar readout\n{DECK_HEAD}V1 in 0 2.0\nN1 in 0 vares\n.end\n");
     let model = Model::from_netlist(&deck).expect("model");
-    let op = model.operating_point(&[]).expect("dc");
+    let op = model
+        .at(&[])
+        .and_then(|pt| pt.operating_point())
+        .expect("dc");
     let vars = op.op_vars();
     assert_eq!(vars.len(), 2, "ival and pwr exported, scratch not");
     let ival = vars.iter().find(|v| v.name == "N1.ival").expect("N1.ival");
@@ -50,7 +53,10 @@ fn opvars_per_instance_through_template_clones() {
          V1 in 0 2.0\nN1 in 0 vares\nN2 in 0 vares R=500\n.end\n"
     );
     let model = Model::from_netlist(&deck).expect("model");
-    let op = model.operating_point(&[]).expect("dc");
+    let op = model
+        .at(&[])
+        .and_then(|pt| pt.operating_point())
+        .expect("dc");
     let vars = op.op_vars();
     assert_eq!(vars.len(), 4, "two op-vars per instance");
     let get = |n: &str| vars.iter().find(|v| v.name == n).map(|v| v.value).expect(n);

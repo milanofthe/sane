@@ -1,5 +1,5 @@
 use super::*;
-use sane_mna::SourceFn;
+use sane_circuit::SourceFn;
 
 #[test]
 fn parse_error_carries_column_and_renders_caret() {
@@ -48,9 +48,9 @@ fn parses_engineering_values() {
 #[test]
 fn maps_nodes_with_ground_aliases() {
     let p = parse("R1 in 0 1k\nC1 in gnd 1u\n.end").unwrap();
-    assert_eq!(p.node("0"), Some(0));
-    assert_eq!(p.node("gnd"), Some(0));
-    assert_eq!(p.node("in"), Some(1));
+    assert_eq!(p.find_node("0"), Some(0));
+    assert_eq!(p.find_node("gnd"), Some(0));
+    assert_eq!(p.find_node("in"), Some(1));
     assert_eq!(p.values["R1"], 1e3);
 }
 
@@ -81,8 +81,8 @@ fn mixed_case_inline_comment_and_continuation() {
     let p = parse("R1 IN OUT 1k ; load resistor\n.model DM D\n+ (Is=1e-14 N=1)\nD1 out 0 dm\n.END")
         .unwrap();
     // Case-insensitive node identity.
-    assert_eq!(p.node("in"), p.node("IN"));
-    assert_eq!(p.node("OUT"), p.node("out"));
+    assert_eq!(p.find_node("in"), p.find_node("IN"));
+    assert_eq!(p.find_node("OUT"), p.find_node("out"));
     assert_eq!(p.values["R1"], 1e3);
     // .model continued across a `+` line still binds.
     assert!((bound(&p, "D1", "Is") - 1e-14).abs() < 1e-26);
@@ -119,53 +119,51 @@ fn leading_continuation_line_does_not_panic() {
 
 #[test]
 fn compat_report_flags_ignored_directives_and_unknown_params() {
-    let p = parse(
+    let (_, p) = parse_report(
         ".model dmod D Is=1e-15 bogusparam=3\n\
          V1 a 0 1\n\
          D1 a 0 dmod foo=2 m=2\n\
          .print dc v(a)\n\
          .save all\n\
          .end",
+        None,
     )
     .unwrap();
     // Analysis/output directives this parser does not act on are listed.
-    assert!(p.report.ignored_directives.contains(".print"));
-    assert!(p.report.ignored_directives.contains(".save"));
+    assert!(p.ignored_directives.contains(".print"));
+    assert!(p.ignored_directives.contains(".save"));
     // Unknown model-card and instance params are surfaced, not dropped silently.
-    assert!(p
-        .report
-        .unknown_params
-        .iter()
-        .any(|s| s.contains("bogusparam")));
-    assert!(p.report.unknown_params.iter().any(|s| s.contains("foo")));
+    assert!(p.unknown_params.iter().any(|s| s.contains("bogusparam")));
+    assert!(p.unknown_params.iter().any(|s| s.contains("foo")));
     // The `m=` instance modifier is NOT flagged as an unknown parameter.
-    assert!(!p.report.unknown_params.iter().any(|s| s.ends_with(": m")));
-    assert!(!p.report.is_clean());
+    assert!(!p.unknown_params.iter().any(|s| s.ends_with(": m")));
+    assert!(!p.is_clean());
 
     // BJT parasitic resistances on the card activate the series-resistance
     // topology and must bind as known parameters, not report as unknown.
-    let b = parse(
+    let (b, b_report) = parse_report(
         ".model qmod NPN(Is=1e-14 Rb=500 Rc=10 Re=2 Cje=1p)\n\
          V1 a 0 1\n\
          Q1 a a 0 qmod\n\
          .end",
+        None,
     )
     .unwrap();
-    assert!(!b.report.unknown_params.iter().any(|s| s.contains("Rb")));
-    assert!(!b.report.unknown_params.iter().any(|s| s.contains("Rc")));
-    assert!(!b.report.unknown_params.iter().any(|s| s.contains("Re")));
+    assert!(!b_report.unknown_params.iter().any(|s| s.contains("Rb")));
+    assert!(!b_report.unknown_params.iter().any(|s| s.contains("Rc")));
+    assert!(!b_report.unknown_params.iter().any(|s| s.contains("Re")));
     assert_eq!(bound(&b, "Q1", "Rb"), 500.0);
 
     // A plain, fully-supported deck reports clean.
-    let q = parse("V1 a 0 1\nR1 a 0 1k\n.end").unwrap();
-    assert!(q.report.is_clean(), "summary: {}", q.report.summary());
+    let (_, q) = parse_report("V1 a 0 1\nR1 a 0 1k\n.end", None).unwrap();
+    assert!(q.is_clean(), "summary: {}", q.summary());
 }
 
 /// Evaluate the first terminal current of parsed device `di` at a fixed
 /// terminal bias, binding parameters from the parse's value map. Verilog-A
 /// devices fold their parallel multiplicity `m` into the lowered graph, so the
 /// modifier is observable only through the current.
-fn device_terminal_current(p: &crate::ParsedCircuit, di: usize, bias: &[f64]) -> f64 {
+fn device_terminal_current(p: &sane_circuit::Circuit, di: usize, bias: &[f64]) -> f64 {
     use std::collections::HashMap as Map;
     let mut ctx = sane_core::Graph::new();
     let n = p.devices[di].model.n_terminals();
@@ -304,8 +302,8 @@ fn subckt_flatten_and_param_override() {
     )
     .unwrap();
     // Internal node got the instance prefix; ports mapped to caller nodes.
-    assert!(p.node("X1.mid").is_some());
-    assert!(p.node("X2.mid").is_some());
+    assert!(p.find_node("X1.mid").is_some());
+    assert!(p.find_node("X2.mid").is_some());
     assert_eq!(p.values["X1.R1"], 1000.0);
     assert_eq!(p.values["X2.R1"], 2000.0); // instance param override
 }
@@ -331,7 +329,7 @@ fn behavioral_elements_inside_subckt() {
     // The subckt-internal node carries the instance prefix (so the in-expr
     // references were remapped through the flattener, not left dangling).
     assert!(
-        p.node("X1.mid").is_some(),
+        p.find_node("X1.mid").is_some(),
         "internal node X1.mid should exist"
     );
 }
@@ -368,7 +366,7 @@ fn subckt_prefixes_controller_names() {
          .end",
     )
     .unwrap();
-    let (elements, _) = sane_dae::topology(&p.circuit, &p.devices, &p.instances);
+    let (elements, _) = sane_circuit::topology(&p);
     let h = elements.iter().find(|e| e.name == "X1.H1").unwrap();
     assert_eq!(h.ctrl_elem.as_deref(), Some("X1.Vs"));
 }
@@ -418,7 +416,7 @@ fn sin_source_binds_and_marks() {
     let w = 2.0 * std::f64::consts::PI * 1000.0;
     assert!((p.values["V1.sin_w"] - w).abs() < 1e-6);
     let v1 = p
-        .circuit
+        .elements
         .elements()
         .iter()
         .find(|e| e.name == "V1")
@@ -433,7 +431,7 @@ fn bare_source_form_binds_waveform() {
     let p = parse("V1 1 0 dc 0 sin 0 1 1k\nR1 1 0 1k\n.end").unwrap();
     assert_eq!(p.values["V1.sin_amp"], 1.0);
     let v1 = p
-        .circuit
+        .elements
         .elements()
         .iter()
         .find(|e| e.name == "V1")
@@ -453,11 +451,14 @@ fn global_nodes_pass_through_subckts() {
     )
     .unwrap();
     // X1's internal R1 must connect to the TOP vdd (voltage divider a = 2.5)
-    let (elements, _) = sane_dae::topology(&p.circuit, &p.devices, &p.instances);
+    let (elements, _) = sane_circuit::topology(&p);
     let r1 = elements.iter().find(|e| e.name == "X1.R1").unwrap();
-    assert_eq!((r1.a, r1.b), (p.node("vdd").unwrap(), p.node("a").unwrap()));
+    assert_eq!(
+        (r1.a, r1.b),
+        (p.find_node("vdd").unwrap(), p.find_node("a").unwrap())
+    );
     let mut ctx = sane_core::Graph::new();
-    let dae = p.assemble(&mut ctx).unwrap();
+    let dae = sane_dae::assemble(&mut ctx, &p).unwrap();
     assert!(
         dae.unknowns.iter().any(|u| u == "vvdd" || u == "v1"),
         "{:?}",
@@ -487,15 +488,15 @@ fn parses_voltage_switch() {
 #[test]
 fn pulse_pwl_exp_sources() {
     let p = parse("V1 1 0 PULSE(0 5 1n 1n 1n 5n 10n)\n.end").unwrap();
-    assert_eq!(p.circuit.elements()[0].source, Some(SourceFn::Pulse));
+    assert_eq!(p.elements.elements()[0].source, Some(SourceFn::Pulse));
     assert_eq!(p.values["V1.pulse_v2"], 5.0);
 
     let p = parse("V2 1 0 PWL(0 0 1m 1 2m 0)\n.end").unwrap();
-    assert_eq!(p.circuit.elements()[0].source, Some(SourceFn::Pwl(3)));
+    assert_eq!(p.elements.elements()[0].source, Some(SourceFn::Pwl(3)));
     assert_eq!(p.values["V2.pwl_v1"], 1.0);
 
     let p = parse("V3 1 0 EXP(0 1 0 1m 5m 2m)\n.end").unwrap();
-    assert_eq!(p.circuit.elements()[0].source, Some(SourceFn::Exp));
+    assert_eq!(p.elements.elements()[0].source, Some(SourceFn::Exp));
     assert_eq!(p.values["V3.exp_v2"], 1.0);
 }
 
@@ -509,9 +510,9 @@ fn parses_current_switch() {
 
 #[test]
 fn parses_current_controlled_sources() {
-    use sane_mna::Kind;
+    use sane_circuit::Kind;
     let p = parse("V1 1 0 1\nR1 1 0 1k\nF1 2 0 V1 10\nH1 3 0 V1 5\nRL 2 0 1k\n.end").unwrap();
-    let kinds: Vec<Kind> = p.circuit.elements().iter().map(|e| e.kind).collect();
+    let kinds: Vec<Kind> = p.elements.elements().iter().map(|e| e.kind).collect();
     assert!(kinds.contains(&Kind::Cccs));
     assert!(kinds.contains(&Kind::Ccvs));
 }
@@ -520,14 +521,14 @@ fn parses_current_controlled_sources() {
 fn parses_devices() {
     let p = parse("V1 in 0 5\nR1 in d 1k\nD1 d 0 dmod\nQ1 c b e\n.model dmod D\n.end").unwrap();
     assert_eq!(p.devices.len(), 2); // diode + bjt
-    assert_eq!(p.devices[0].terminals, vec![p.node("d").unwrap(), 0]);
+    assert_eq!(p.devices[0].terminals, vec![p.find_node("d").unwrap(), 0]);
     // R1 is the only linear non-source... plus V1; devices are separate.
-    assert!(p.node("c").is_some() && p.node("b").is_some() && p.node("e").is_some());
+    assert!(p.find_node("c").is_some() && p.find_node("b").is_some() && p.find_node("e").is_some());
 }
 
 /// The value device instance `inst` reads for its module parameter `param`,
 /// through the symbol it binds it to.
-fn bound(p: &ParsedCircuit, inst: &str, param: &str) -> f64 {
+fn bound(p: &sane_circuit::Circuit, inst: &str, param: &str) -> f64 {
     let sym = p.param_symbol(inst, param).expect("a placed device");
     p.param_value(&sym)
         .unwrap_or_else(|| panic!("{sym} unbound"))

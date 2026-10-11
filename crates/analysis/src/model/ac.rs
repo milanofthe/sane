@@ -2,55 +2,33 @@
 //! machinery: responses, per-frequency sensitivities, all-parameter gradients
 //! (VJPs over a cached weighted-adjoint tape) and the AC Hessian.
 
+use sane_solve::Triplets;
 use std::collections::HashMap;
 use std::f64::consts::PI;
+use std::sync::Arc;
 
 use ndarray::{s, Array2, Array3, Array4, ArrayView1, ArrayView2, ArrayView3};
 use num_complex::Complex64;
 use rayon::prelude::*;
-use rsdag::{differentiate, ExprId, Node, SymbolId};
+use rsdag::{ExprId, Node, SymbolId};
 use sane_core::log;
 use sane_core::Graph;
-use sane_dae::Dae as CoreDae;
+use sane_dae::{Dae as CoreDae, UnknownId};
 use sane_solve::CompiledDc;
 
 use crate::model::{Gradient, Model, ModelError, Point};
 
-/// Frequencies per block of an AC sweep: one pivoting factorization each, a
-/// unit of work for one worker.
-pub const AC_BLOCK: usize = 64;
-
-/// Cached weighted-adjoint tape for one AC input (see
-/// `Model::ensure_ac_vjp_tape`): weight symbols and the once-differentiated
-/// `dPsi/dx`, `dPsi/dp` expressions.
-pub(crate) struct AcVjpTape {
-    wb: Vec<SymbolId>,
-    wg: Vec<SymbolId>,
-    wc: Vec<SymbolId>,
-    g_pos: Vec<(usize, usize)>,
-    c_pos: Vec<(usize, usize)>,
-    dpsi_dx: Vec<ExprId>,
-    dpsi_dp: Vec<ExprId>,
-}
+pub use sane_core::constants::AC_BLOCK;
 
 /// Frequency-independent state shared by one AC adjoint call (see
-/// `Model::ac_adjoint_setup`).
+/// `Model::ac_adjoint_setup`): the operating point's adjoint context, the
+/// system over its layout, the excitation and the pull over the pencil and
+/// the input's coupling.
 struct AcAdjointSetup {
-    n: usize,
-    input: String,
-    gr_s: Vec<usize>,
-    gc_s: Vec<usize>,
-    gv_s: Vec<f64>,
-    cr_s: Vec<usize>,
-    cc_s: Vec<usize>,
-    cv_s: Vec<f64>,
+    at: super::adjoint::AdjointPoint,
+    sys: crate::sparse_ac::SymbolicAc,
     b: Vec<Complex64>,
-    pnames: Vec<String>,
-    prr: Vec<usize>,
-    prc: Vec<usize>,
-    prv: Vec<f64>,
-    gsys: crate::sparse_ac::AcSystem,
-    env: HashMap<SymbolId, f64>,
+    pull: std::sync::Arc<super::adjoint::PullLayout>,
 }
 
 impl Model {
@@ -91,7 +69,6 @@ impl Model {
         let (x, p) = (x.to_vec(), p.to_vec());
         // Transport delays are exact in AC: `hist_k = x_src(t - τ_k)` becomes
         // `e^{-jωτ_k} X_src`, an extra (frequency-dependent) coupling entry.
-        self.ensure_hist_jac_ready();
         let mut task = sane_core::log::task(
             "AC",
             "ac",
@@ -105,8 +82,16 @@ impl Model {
         let n = self.dae().dim();
         // Sparse A = G(+gmin) + jwC over the fixed pattern: symbolic analysis
         // once, numeric refactor per frequency (never densified).
-        let (gr, gc, gv) = self.cdc().system_triplets_dc(&x, &p);
-        let (cr, cc, cv) = self.cdc().jacobian_q_x_sparse(&x, &p, 0.0);
+        let Triplets {
+            rows: gr,
+            cols: gc,
+            vals: gv,
+        } = self.cdc().system_triplets_dc(&x, &p);
+        let Triplets {
+            rows: cr,
+            cols: cc,
+            vals: cv,
+        } = self.cdc().jacobian_q_x_sparse(&x, &p, 0.0);
         let bin = self.jacobian_i_input(input, x.clone(), p.clone(), 0.0)?;
         let b: Vec<Complex64> = bin.iter().map(|v| Complex64::new(-v, 0.0)).collect();
         let (dr, dc, dv, dtau) = self.delay_ac_entries(&x, &p);
@@ -168,53 +153,47 @@ impl Model {
         p: Vec<f64>,
         freqs: &[f64],
     ) -> Result<(Vec<String>, Vec<((f64, f64), Vec<(f64, f64)>)>), ModelError> {
-        self.inner.bound(&p)?;
         self.ensure_no_delays("ac_gradient")?;
         let _g = log::scope("sens/ac_gradient");
-        let setup = self.ac_adjoint_setup(input, &x, &p)?;
-        let np = setup.pnames.len();
+        let w_ref = 2.0 * PI * freqs.first().copied().unwrap_or(0.0);
+        let setup = self.ac_adjoint_setup(input, &x, &p, w_ref)?;
+        let mut fac = setup.sys.solver();
+        let mut e_out = vec![Complex64::new(0.0, 0.0); setup.at.n];
+        e_out[out_idx] = Complex64::new(1.0, 0.0);
         let mut rows = Vec::with_capacity(freqs.len());
         for &f in freqs {
-            let w = 2.0 * PI * f;
-            let sys = crate::sparse_ac::AcSystem::assemble(
-                setup.n,
-                (&setup.gr_s, &setup.gc_s, &setup.gv_s),
-                (&setup.cr_s, &setup.cc_s, &setup.cv_s),
-                w,
-            );
-            let lu = sys
-                .factored()
-                .ok_or_else(|| ModelError::Numeric("ac_gradient: singular A".to_string()))?;
-            let v = lu
-                .solve(&setup.b)
-                .map_err(|_| ModelError::Numeric("ac_gradient: singular A".to_string()))?;
-            let mut e_out = vec![Complex64::new(0.0, 0.0); setup.n];
-            e_out[out_idx] = Complex64::new(1.0, 0.0);
-            let lam = lu
-                .solve_transpose(&e_out)
-                .map_err(|_| ModelError::Numeric("ac_gradient: singular A^T".to_string()))?;
-
-            // Two weight assignments on the SAME tape: the real and imaginary
-            // parts of Psi = lam^T (b - A v) (see AcVjpTape).
-            let (u_re, expl_re) = self.ac_adjoint_pull(&setup, &lam, &v, w, false)?;
-            let (u_im, expl_im) = self.ac_adjoint_pull(&setup, &lam, &v, w, true)?;
-
-            // Operating-point shift: one complex DC transpose solve carries re/im.
-            let urhs: Vec<Complex64> = (0..setup.n)
-                .map(|m| Complex64::new(u_re[m], u_im[m]))
-                .collect();
-            let mu = setup.gsys.solve_transpose(&urhs).ok_or_else(|| {
-                ModelError::Numeric("ac_gradient: singular DC Jacobian".to_string())
-            })?;
-            let mut d: Vec<(f64, f64)> = (0..np).map(|k| (expl_re[k], expl_im[k])).collect();
-            for t in 0..setup.prv.len() {
-                let (i, k) = (setup.prr[t], setup.prc[t]);
-                d[k].0 -= mu[i].re * setup.prv[t];
-                d[k].1 -= mu[i].im * setup.prv[t];
-            }
+            let (v, d) = self.ac_adjoint_step(&setup, &mut fac, 2.0 * PI * f, &e_out)?;
+            let d = d.iter().map(|g| (g.re, g.im)).collect();
             rows.push(((v[out_idx].re, v[out_idx].im), d));
         }
-        Ok((setup.pnames, rows))
+        Ok((setup.at.pnames, rows))
+    }
+
+    /// One frequency of an AC adjoint: the response `v = A^{-1} B` and the
+    /// derivative by every parameter of `seed^T v`, total (the operating
+    /// point moving): the pull of `Phi = lam^T (B - A v)`, `A^T lam = seed`,
+    /// with `B = -b`.
+    fn ac_adjoint_step(
+        &self,
+        setup: &AcAdjointSetup,
+        fac: &mut crate::sparse_ac::AcSweepSolver<'_>,
+        w: f64,
+        seed: &[Complex64],
+    ) -> Result<(Vec<Complex64>, Vec<Complex64>), ModelError> {
+        let singular = || ModelError::Numeric("ac: singular A".to_string());
+        let v = fac.solve(w, &setup.b).ok_or_else(singular)?.to_vec();
+        let lam = fac.solve_transpose(w, seed).ok_or_else(singular)?.to_vec();
+        let one = Complex64::new(1.0, 0.0);
+        let phi = super::adjoint::Bilinear {
+            l: &lam,
+            r: &v,
+            a_g: -one,
+            a_c: Complex64::new(0.0, -w),
+            a_b: -one,
+            extra: &[],
+        };
+        let (dx, dp) = self.pull(&setup.at, &setup.pull, &phi)?;
+        Ok((v, self.total(&setup.at, &dx, dp)?))
     }
 
     /// Native VJP sweep for S-parameter (and general multi-output AC) losses:
@@ -227,11 +206,7 @@ impl Model {
     /// `H_i = e_i^T A^{-1} b` is linear in `e_i`, that sum equals
     /// `Re(d/dp[e~^T A^{-1} b])` with the weighted adjoint seed
     /// `e~ = sum_i conj(c_i) e_i` -- ONE forward + one adjoint solve per
-    /// frequency, regardless of how many outputs carry cotangent. All
-    /// frequency-independent work (excitation, sparse patterns, the
-    /// symbolic tape) is set up once; the per-frequency step is a factored
-    /// solve pair plus read-only tape evaluation, so the cost per call is
-    /// constant (no symbolic-context growth).
+    /// frequency, regardless of how many outputs carry cotangent.
     pub(crate) fn ac_vjp_sweep(
         &self,
         input: &str,
@@ -240,7 +215,6 @@ impl Model {
         p: Vec<f64>,
         freqs: Vec<f64>,
     ) -> Result<Vec<(String, f64)>, ModelError> {
-        self.inner.bound(&p)?;
         self.ensure_no_delays("ac_vjp_sweep")?;
         let _g = log::scope("sens/ac_vjp_sweep");
         if weights.len() != freqs.len() {
@@ -248,49 +222,25 @@ impl Model {
                 "ac_vjp_sweep: weights/freqs length mismatch".into(),
             ));
         }
-        let setup = self.ac_adjoint_setup(input, &x, &p)?;
-        let np = setup.pnames.len();
-        let mut acc = vec![0.0; np];
+        let w_ref = 2.0 * PI * freqs.first().copied().unwrap_or(0.0);
+        let setup = self.ac_adjoint_setup(input, &x, &p, w_ref)?;
+        let mut fac = setup.sys.solver();
+        let mut acc = vec![0.0; setup.at.pnames.len()];
         for (k, f) in freqs.iter().enumerate() {
             if weights[k].is_empty() {
                 continue;
             }
-            let w = 2.0 * PI * f;
-            let sys = crate::sparse_ac::AcSystem::assemble(
-                setup.n,
-                (&setup.gr_s, &setup.gc_s, &setup.gv_s),
-                (&setup.cr_s, &setup.cc_s, &setup.cv_s),
-                w,
-            );
-            let lu = sys
-                .factored()
-                .ok_or_else(|| ModelError::Numeric("ac_vjp_sweep: singular A".to_string()))?;
-            let v = lu
-                .solve(&setup.b)
-                .map_err(|_| ModelError::Numeric("ac_vjp_sweep: singular A".to_string()))?;
             // Weighted adjoint seed e~ = sum_i conj(c_i) e_i.
-            let mut seed = vec![Complex64::new(0.0, 0.0); setup.n];
+            let mut seed = vec![Complex64::new(0.0, 0.0); setup.at.n];
             for &(idx, cre, cim) in &weights[k] {
                 seed[idx] += Complex64::new(cre, -cim);
             }
-            let lam = lu
-                .solve_transpose(&seed)
-                .map_err(|_| ModelError::Numeric("ac_vjp_sweep: singular A^T".to_string()))?;
-
-            let (u_re, expl_re) = self.ac_adjoint_pull(&setup, &lam, &v, w, false)?;
-            let urhs: Vec<Complex64> = (0..setup.n).map(|m| Complex64::new(u_re[m], 0.0)).collect();
-            let mu = setup.gsys.solve_transpose(&urhs).ok_or_else(|| {
-                ModelError::Numeric("ac_vjp_sweep: singular DC Jacobian".to_string())
-            })?;
-            for t in 0..setup.prv.len() {
-                let (i, kk) = (setup.prr[t], setup.prc[t]);
-                acc[kk] -= mu[i].re * setup.prv[t];
-            }
-            for (kk, a) in acc.iter_mut().enumerate() {
-                *a += expl_re[kk];
+            let (_, d) = self.ac_adjoint_step(&setup, &mut fac, 2.0 * PI * f, &seed)?;
+            for (a, g) in acc.iter_mut().zip(d) {
+                *a += g.re;
             }
         }
-        Ok(setup.pnames.iter().cloned().zip(acc).collect())
+        Ok(setup.at.pnames.iter().cloned().zip(acc).collect())
     }
 
     /// S-parameter sweep at an explicit operating point `(x, p)`: `ports` are
@@ -390,203 +340,38 @@ impl Model {
         }
         if acc.is_empty() {
             // all-zero cotangent: still return the parameter axis
-            let pnames = self.cdc().param_names(&self.context_arc().lock().unwrap());
-            acc = pnames.into_iter().map(|nm| (nm, 0.0)).collect();
+            let pnames = self.cdc().param_names();
+            acc = pnames.iter().map(|nm| (nm.clone(), 0.0)).collect();
         }
         Ok(acc)
     }
 
-    /// Frequency-independent setup shared by the AC adjoint pulls: sparse
-    /// numeric G/C (+ the DC shift system), the excitation, dF/dp triplets,
-    /// the cached symbolic tape and the operating-point environment.
+    /// Frequency-independent setup shared by the AC adjoint steps: the
+    /// operating point's adjoint context, `A = G + jwC` analyzed at `w_ref`,
+    /// the excitation `B = -dI/d(input)` and the pull.
     fn ac_adjoint_setup(
         &self,
         input: &str,
         x: &[f64],
         p: &[f64],
+        w_ref: f64,
     ) -> Result<AcAdjointSetup, ModelError> {
-        let n = self.dae().dim();
-        let (gr_s, gc_s, gv_s) = self.cdc().system_triplets_dc(x, p);
-        let (cr_s, cc_s, cv_s) = self.cdc().jacobian_q_x_sparse(x, p, 0.0);
+        let at = self.adjoint_point(x, p)?;
+        let g = self.cdc().system_triplets_dc(x, p);
+        let c = self.cdc().jacobian_q_x_sparse(x, p, 0.0);
+        let sys = crate::sparse_ac::SymbolicAc::new(
+            at.n,
+            (&g.rows, &g.cols, &g.vals),
+            (&c.rows, &c.cols, &c.vals),
+            (&[], &[], &[], &[]),
+            false,
+            w_ref,
+        )
+        .ok_or_else(|| ModelError::Numeric("ac: structurally singular A".to_string()))?;
         let bin = self.jacobian_i_input(input, x.to_vec(), p.to_vec(), 0.0)?;
-        let b: Vec<Complex64> = bin.iter().map(|&val| Complex64::new(-val, 0.0)).collect();
-        self.cdc()
-            .ensure_param_jac(&mut self.context_arc().lock().unwrap(), self.dae());
-        let pnames = self.cdc().param_names(&self.context_arc().lock().unwrap());
-        let ((prr, prc, prv), _) = self.cdc().jacobian_p_sparse(x, p, 0.0);
-        let empty: (Vec<usize>, Vec<usize>, Vec<f64>) = (Vec::new(), Vec::new(), Vec::new());
-        let gsys = crate::sparse_ac::AcSystem::assemble(
-            n,
-            (&gr_s, &gc_s, &gv_s),
-            (&empty.0, &empty.1, &empty.2),
-            0.0,
-        );
-        self.ensure_ac_vjp_tape(input)?;
-        // Operating-point environment (weights are filled per pull).
-        let arc = self.context_arc();
-        let mut cg = arc.lock().unwrap();
-        let c = &mut *cg;
-        let mut env: HashMap<SymbolId, f64> = HashMap::new();
-        for (i, &sy) in self.dae().x.iter().enumerate() {
-            env.insert(sy, x.get(i).copied().unwrap_or(0.0));
-        }
-        for (j, name) in pnames.iter().enumerate() {
-            let e = c.sym(name);
-            if let Node::Symbol(sy) = c.node(e) {
-                env.insert(*sy, p.get(j).copied().unwrap_or(0.0));
-            }
-        }
-        env.insert(self.dae().t, 0.0);
-        drop(cg);
-        Ok(AcAdjointSetup {
-            n,
-            input: input.to_string(),
-            gr_s,
-            gc_s,
-            gv_s,
-            cr_s,
-            cc_s,
-            cv_s,
-            b,
-            pnames,
-            prr,
-            prc,
-            prv,
-            gsys,
-            env,
-        })
-    }
-
-    /// Evaluate one weight assignment of the cached tape: returns
-    /// `(dPsi/dx, dPsi/dp)` for `Psi = lam^T (b - A v)` -- the real part with
-    /// `imag = false`, the imaginary part with `imag = true`. Read-only on the
-    /// symbolic context (no growth).
-    fn ac_adjoint_pull(
-        &self,
-        setup: &AcAdjointSetup,
-        lam: &[Complex64],
-        v: &[Complex64],
-        w: f64,
-        imag: bool,
-    ) -> Result<(Vec<f64>, Vec<f64>), ModelError> {
-        let cache = self.ac_vjp_tape_cache();
-        let tapes = cache.lock().unwrap();
-        let tape = tapes
-            .get(&setup.input)
-            .ok_or_else(|| ModelError::Numeric("ac adjoint tape missing".into()))?;
-        let mut env = setup.env.clone();
-        for (i, &sy) in tape.wb.iter().enumerate() {
-            env.insert(sy, if imag { lam[i].im } else { lam[i].re });
-        }
-        for (t, &sy) in tape.wg.iter().enumerate() {
-            let (i, j) = tape.g_pos[t];
-            let pr = lam[i].re * v[j].re - lam[i].im * v[j].im;
-            let pi = lam[i].re * v[j].im + lam[i].im * v[j].re;
-            env.insert(sy, if imag { pi } else { pr });
-        }
-        for (t, &sy) in tape.wc.iter().enumerate() {
-            let (i, j) = tape.c_pos[t];
-            let pr = lam[i].re * v[j].re - lam[i].im * v[j].im;
-            let pi = lam[i].re * v[j].im + lam[i].im * v[j].re;
-            env.insert(sy, if imag { -pr * w } else { pi * w });
-        }
-        let arc = self.context_arc();
-        let cg = arc.lock().unwrap();
-        let u = rsdag::eval(&cg, &tape.dpsi_dx, &env);
-        let expl = rsdag::eval(&cg, &tape.dpsi_dp, &env);
-        Ok((u, expl))
-    }
-
-    /// Build (once per input) the weighted-adjoint tape: the Psi functional
-    /// with weight SYMBOLS in place of the per-frequency `(lambda, v)`
-    /// constants, differentiated w.r.t. every state and parameter. With
-    /// weights as symbols the tape is frequency-independent, so every later
-    /// pull is pure evaluation and the context stops growing per call (the
-    /// old per-frequency `konst` embedding grew the arena on every VJP).
-    ///
-    /// Sign convention: `Psi = sum_i w_b[i]*b_i - sum_t w_g[t]*G_t + sum_t
-    /// w_c[t]*C_t`; the assignments in [`Model::ac_adjoint_pull`] reproduce
-    /// `Re` / `Im` of `lam^T (b - (G + jwC) v)`.
-    fn ensure_ac_vjp_tape(&self, input: &str) -> Result<(), ModelError> {
-        {
-            let cache = self.ac_vjp_tape_cache();
-            if cache.lock().unwrap().contains_key(input) {
-                return Ok(());
-            }
-        }
-        let arc = self.context_arc();
-        let mut cg = arc.lock().unwrap();
-        let c = &mut *cg;
-        let dae = self.dae();
-        let n = dae.dim();
-        let ((gr, gc, ge), (cr, cc, ce)) = dae.jacobian_iq_coo(c);
-        let isyms = self.inner.drive(c, input)?;
-        let bsym: Vec<ExprId> = (dae.at_rest(c).0.iter())
-            .map(|&r| {
-                let d = crate::d_drive(c, r, &isyms);
-                c.neg(d)
-            })
-            .collect();
-        // Weight symbols, namespaced per input so tapes never collide.
-        let mk = |c: &mut Graph, tag: &str, k: usize| -> (ExprId, SymbolId) {
-            let e = c.sym(&format!("$acvjp${input}${tag}{k}"));
-            match c.node(e) {
-                Node::Symbol(sy) => (e, *sy),
-                _ => unreachable!("fresh weight name is always a symbol"),
-            }
-        };
-        let mut psi = c.zero();
-        let mut wb = Vec::with_capacity(n);
-        for (i, &bi) in bsym.iter().enumerate() {
-            let (we, ws) = mk(c, "b", i);
-            wb.push(ws);
-            let term = c.mul(we, bi);
-            psi = c.add(psi, term);
-        }
-        let mut wg = Vec::with_capacity(ge.len());
-        let mut g_pos = Vec::with_capacity(ge.len());
-        for (t, &gt) in ge.iter().enumerate() {
-            let (we, ws) = mk(c, "g", t);
-            wg.push(ws);
-            g_pos.push((gr[t], gc[t]));
-            let term = c.mul(we, gt);
-            psi = c.sub(psi, term);
-        }
-        let mut wc = Vec::with_capacity(ce.len());
-        let mut c_pos = Vec::with_capacity(ce.len());
-        for (t, &ct) in ce.iter().enumerate() {
-            let (we, ws) = mk(c, "c", t);
-            wc.push(ws);
-            c_pos.push((cr[t], cc[t]));
-            let term = c.mul(we, ct);
-            psi = c.add(psi, term);
-        }
-        let dpsi_dx: Vec<ExprId> = dae.x.iter().map(|&xm| differentiate(c, psi, xm)).collect();
-        let pnames = self.cdc().param_names(c);
-        let mut dpsi_dp = Vec::with_capacity(pnames.len());
-        for name in &pnames {
-            let e = c.sym(name);
-            let ps = match c.node(e) {
-                Node::Symbol(sy) => *sy,
-                _ => return Err(ModelError::Numeric(format!("'{name}' is not a symbol"))),
-            };
-            dpsi_dp.push(differentiate(c, psi, ps));
-        }
-        drop(cg);
-        let tape = AcVjpTape {
-            wb,
-            wg,
-            wc,
-            g_pos,
-            c_pos,
-            dpsi_dx,
-            dpsi_dp,
-        };
-        self.ac_vjp_tape_cache()
-            .lock()
-            .unwrap()
-            .insert(input.to_string(), tape);
-        Ok(())
+        let b = bin.iter().map(|&v| Complex64::new(-v, 0.0)).collect();
+        let pull = self.pencil_pull(Some(input), None)?;
+        Ok(AcAdjointSetup { at, sys, b, pull })
     }
 
     /// Exact analytic AC Hessian via the **second-order adjoint** -- no finite
@@ -613,19 +398,30 @@ impl Model {
         let w = 2.0 * PI * freq;
         // Numeric forward solve A v = b (sparse, KLU) to assemble the combined
         // solution y*.
-        let (gr_s, gc_s, gv_s) = self.cdc().system_triplets_dc(&x, &p);
-        let (cr_s, cc_s, cv_s) = self.cdc().jacobian_q_x_sparse(&x, &p, 0.0);
+        let Triplets {
+            rows: gr_s,
+            cols: gc_s,
+            vals: gv_s,
+        } = self.cdc().system_triplets_dc(&x, &p);
+        let Triplets {
+            rows: cr_s,
+            cols: cc_s,
+            vals: cv_s,
+        } = self.cdc().jacobian_q_x_sparse(&x, &p, 0.0);
         let bin = self.jacobian_i_input(input, x.clone(), p.clone(), 0.0)?;
         let bvec: Vec<Complex64> = bin.iter().map(|&val| Complex64::new(-val, 0.0)).collect();
-        let v = crate::sparse_ac::AcSystem::assemble(
+        let singular = || ModelError::Numeric("ac_hessian: singular A".to_string());
+        let sys = crate::sparse_ac::SymbolicAc::new(
             n,
             (&gr_s, &gc_s, &gv_s),
             (&cr_s, &cc_s, &cv_s),
+            (&[], &[], &[], &[]),
+            false,
             w,
         )
-        .solve(&bvec)
-        .ok_or_else(|| ModelError::Numeric("ac_hessian: singular A".to_string()))?;
-        let pnames = self.cdc().param_names(&self.context_arc().lock().unwrap());
+        .ok_or_else(singular)?;
+        let v = sys.solver().solve(w, &bvec).ok_or_else(singular)?.to_vec();
+        let pnames = self.cdc().param_names();
 
         let arc = self.context_arc();
         let mut cg = arc.lock().unwrap();
@@ -651,7 +447,7 @@ impl Model {
         }
         // Symbolic G, C (sparse) and b_i = -dI/d(input).
         let ((gr, gc, ge), (cr, cc, ce)) = self.dae().jacobian_iq_coo(c);
-        let isyms = self.inner.drive(c, input)?;
+        let isyms = self.inner.drive(input)?;
         let bsym: Vec<ExprId> = (self.dae().at_rest(c).0.iter())
             .map(|&r| {
                 let d = crate::d_drive(c, r, &isyms);
@@ -690,8 +486,8 @@ impl Model {
         xs.extend(vre_s);
         xs.extend(vim_s);
         let mut names = self.dae().unknowns.clone();
-        names.extend((0..n).map(|i| format!("vre{i}")));
-        names.extend((0..n).map(|i| format!("vim{i}")));
+        names.extend((0..n).map(|i| UnknownId::Internal(format!("vre{i}"))));
+        names.extend((0..n).map(|i| UnknownId::Internal(format!("vim{i}"))));
         let zero = c.zero();
         let combined = CoreDae {
             charges: vec![zero; currents.len()],
@@ -714,20 +510,16 @@ impl Model {
             unknowns: names,
             x: xs,
             t: self.dae().t,
-            companion: Vec::new(),
+            hints: Default::default(),
             observers: Default::default(),
-            dc_seeds: Vec::new(),
-            limits: Vec::new(),
             sources: Vec::new(),
-            source_names: Vec::new(),
             labels: Default::default(),
             injection: Default::default(),
             rest: Default::default(),
         };
-        let cdc_c = CompiledDc::new(c, &combined);
-        cdc_c.ensure_param_jac(c, &combined);
-        cdc_c.ensure_hessian(c, &combined);
-        let cnames = cdc_c.param_names(c);
+        drop(cg);
+        let cdc_c = CompiledDc::shared(arc, Arc::new(combined));
+        let cnames = cdc_c.param_names();
 
         // Combined solution y* = (x, v_re, v_im) and the parameter vector in the
         // combined system's parameter order.
@@ -926,7 +718,7 @@ impl AcResponse {
         Some(
             self.of(output)?
                 .iter()
-                .map(|h| 20.0 * h.norm().max(1e-30).log10())
+                .map(|h| 20.0 * h.norm().max(sane_core::constants::DB_MAG_FLOOR).log10())
                 .collect(),
         )
     }

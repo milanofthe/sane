@@ -4,7 +4,9 @@
 //! resolved to indices through the caller's node table; element names stay as
 //! strings (resolved to branch currents in the DAE layer).
 
-use sane_circuit::BExpr;
+use rsdag::CmpOp;
+use sane_circuit::{BCall, BExpr, BOp};
+use sane_core::MathFn;
 
 use crate::expr::{lex, Tok};
 
@@ -52,10 +54,12 @@ impl BP<'_> {
                 // Arithmetic. Comparisons bind looser than everything (so
                 // `a + b > c` parses as `(a + b) > c`), `^` is right-associative.
                 Some(Tok::Op(op)) => {
-                    let (lbp, rbp) = match op {
-                        '+' | '-' => (3, 4),
-                        '*' | '/' => (5, 6),
-                        '^' => (8, 7),
+                    let (lbp, rbp, op) = match op {
+                        '+' => (3, 4, BOp::Add),
+                        '-' => (3, 4, BOp::Sub),
+                        '*' => (5, 6, BOp::Mul),
+                        '/' => (5, 6, BOp::Div),
+                        '^' => (8, 7, BOp::Pow),
                         _ => break,
                     };
                     if lbp < min_bp {
@@ -73,7 +77,7 @@ impl BP<'_> {
                     }
                     self.pos += 1;
                     let rhs = self.expr(rbp)?;
-                    lhs = BExpr::Bin(cmp_sentinel(&cmp), Box::new(lhs), Box::new(rhs));
+                    lhs = BExpr::Bin(BOp::Cmp(cmp_op(&cmp)), Box::new(lhs), Box::new(rhs));
                 }
                 _ => break,
             }
@@ -119,7 +123,11 @@ impl BP<'_> {
                         let e = if self.peek() == Some(&Tok::Comma) {
                             self.pos += 1;
                             let b = self.node_ref()?;
-                            BExpr::Bin('-', Box::new(BExpr::NodeV(a)), Box::new(BExpr::NodeV(b)))
+                            BExpr::Bin(
+                                BOp::Sub,
+                                Box::new(BExpr::NodeV(a)),
+                                Box::new(BExpr::NodeV(b)),
+                            )
                         } else {
                             BExpr::NodeV(a)
                         };
@@ -150,8 +158,7 @@ impl BP<'_> {
                         }
                         // Reject unknown functions / wrong arity at parse time,
                         // so the B-source never silently lowers to zero.
-                        validate_call(&lname, args.len())?;
-                        Ok(BExpr::Call(lname, args))
+                        Ok(BExpr::Call(call_of(&lname, args.len())?, args))
                     }
                 } else {
                     // a named parameter (stays symbolic, bound later)
@@ -163,42 +170,44 @@ impl BP<'_> {
     }
 }
 
-/// Map a comparison operator to the single sentinel char stored in
-/// [`BExpr::Bin`]. The arithmetic ops (`+ - * / ^`) and these sentinels are
-/// disjoint, so the DAE lowering ([`translate_bexpr`]) can dispatch on the char.
-fn cmp_sentinel(op: &str) -> char {
+/// The comparison a comparison token spells.
+fn cmp_op(op: &str) -> CmpOp {
     match op {
-        "<" => '<',
-        ">" => '>',
-        "<=" => 'l',
-        ">=" => 'g',
-        "==" => 'e',
-        "!=" => 'n',
+        "<" => CmpOp::Lt,
+        ">" => CmpOp::Gt,
+        "<=" => CmpOp::Le,
+        ">=" => CmpOp::Ge,
+        "==" => CmpOp::Eq,
+        "!=" => CmpOp::Ne,
         _ => unreachable!("lexer only emits the six comparison operators"),
     }
 }
 
-/// The functions a behavioral (`B`) source may call, with their arity. Kept in
-/// lockstep with the lowering in `sane_dae::translate_bexpr`; an unknown name or
-/// wrong argument count is a hard parse error rather than a silent zero.
-fn validate_call(name: &str, argc: usize) -> Result<(), String> {
-    let arity: &[usize] = match name {
-        "sin" | "cos" | "tan" | "exp" | "ln" | "log" | "log10" | "sqrt" | "tanh" | "sinh"
-        | "cosh" | "abs" | "atan" | "floor" => &[1],
-        "pow" | "pwr" | "min" | "max" => &[2],
-        "if" => &[3], // if(cond, then, else): cond != 0 ? then : else
-        _ => {
-            return Err(format!(
-                "unknown function '{name}' in B source (supported: sin cos tan exp ln log \
-                 sqrt tanh sinh cosh abs atan floor pow min max if)"
-            ))
-        }
+/// What a behavioral (`B`) source calls by `name` with `argc` arguments:
+/// an elementary function (see [`MathFn`]; `pwr` is `pow`) or `if(cond,
+/// then, else)`. An unknown name or a wrong argument count is a hard parse
+/// error rather than a silent zero.
+fn call_of(name: &str, argc: usize) -> Result<BCall, String> {
+    let (call, arity) = match name {
+        "pwr" => (BCall::Math(MathFn::Pow), 2),
+        "if" => (BCall::If, 3),
+        _ => match MathFn::from_spice(name) {
+            Some(f) => (BCall::Math(f), f.arity()),
+            None => {
+                let known: Vec<&str> = (MathFn::ALL.iter().map(|f| f.name()))
+                    .chain(["log", "pwr", "if"])
+                    .collect();
+                return Err(format!(
+                    "unknown function '{name}' in B source (supported: {})",
+                    known.join(" ")
+                ));
+            }
+        },
     };
-    if !arity.contains(&argc) {
+    if argc != arity {
         return Err(format!(
-            "function '{name}' expects {} argument(s), got {argc}",
-            arity[0]
+            "function '{name}' expects {arity} argument(s), got {argc}"
         ));
     }
-    Ok(())
+    Ok(call)
 }

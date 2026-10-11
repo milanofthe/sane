@@ -37,8 +37,6 @@ mod resolve;
 mod source;
 mod subckt;
 // Verilog-A block extraction and module registration.
-#[cfg(test)]
-mod tests;
 mod va;
 
 use model_cards::parse_model_cards;
@@ -57,7 +55,7 @@ use subckt::{hierarchy, Inst, Item};
 /// means the column is unknown (line-level error); [`ParseError::render`] then
 /// omits the caret. Use `render` with the original deck text for a Verilog-A
 /// style `file:line:col` header with a source line and caret.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ParseError {
     pub line: usize,
     pub col: usize,

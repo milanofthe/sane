@@ -43,7 +43,8 @@ impl Transform {
     /// caller computes).
     fn dae(&self, model: &Model) -> (Dae, Vec<String>) {
         let inner = &model.inner;
-        let mut c = inner.ctx.lock().unwrap();
+        let dae = inner.dae();
+        let mut c = inner.cdc.graph();
         match self {
             Transform::Fold(values) => {
                 let mut fold = Vec::with_capacity(values.len());
@@ -53,12 +54,12 @@ impl Transform {
                         fold.push((*s, *v));
                     }
                 }
-                (inner.dae.fold_params(&mut c, &fold), Vec::new())
+                (dae.fold_params(&mut c, &fold), Vec::new())
             }
-            Transform::Linearize => (linearize(&mut c, &inner.dae), Vec::new()),
+            Transform::Linearize => (linearize(&mut c, dae), Vec::new()),
             Transform::Eliminate(keep) => {
                 let keep: HashSet<String> = keep.iter().cloned().collect();
-                eliminate_nodes(&mut c, &inner.dae, &keep)
+                eliminate_nodes(&mut c, dae, &keep)
             }
             Transform::Prune => unreachable!("a pruned DAE is its caller's"),
         }
@@ -71,19 +72,17 @@ impl Model {
     /// one's, the parameters the DAE's, valued as here.
     fn derive(&self, t: Transform, dae: Dae) -> Model {
         let inner = &self.inner;
-        let mut c = inner.ctx.lock().unwrap();
-        let cdc = CompiledDc::new(&mut c, &dae);
-        let pnames = cdc.param_names(&c);
+        let cdc = CompiledDc::shared(inner.cdc.context().clone(), Arc::new(dae));
+        let pnames = cdc.param_names().to_vec();
         let mut values = self.values();
         if let Transform::Fold(folded) = &t {
             for (name, _) in folded {
                 values.remove(name);
             }
         }
-        let store = ParamStore::new(pnames, values, column_defaults(&cdc, &dae));
-        let assertions = assertion_tape(&c, &dae.assertions, &cdc);
-        let structure = assertion_tape(&c, &dae.structure, &cdc);
-        drop(c);
+        let store = ParamStore::new(pnames, values, column_defaults(&cdc));
+        let assertions = assertion_tape(&cdc, |d| &d.assertions);
+        let structure = assertion_tape(&cdc, |d| &d.structure);
         let index2 = match t {
             Transform::Fold(_) => inner.index2.clone(),
             _ => Default::default(),
@@ -95,15 +94,13 @@ impl Model {
         lineage.push(t);
         Model {
             inner: Arc::new(ModelInner {
-                ctx: inner.ctx.clone(),
-                unknowns: dae.unknowns.clone(),
-                dae,
+                names: cdc.dae().unknown_names(),
                 cdc,
                 index2,
                 store,
                 node_names: inner.node_names.clone(),
                 ports: inner.ports.clone(),
-                ac_vjp_tapes: Mutex::new(HashMap::new()),
+                pull_layouts: Mutex::new(HashMap::new()),
                 dc: Mutex::new(self.dc_options()),
                 assertions,
                 structure,
@@ -132,8 +129,8 @@ impl Model {
         omegas: &[f64],
     ) -> (Model, Vec<(String, String)>) {
         let (reduced, pruned) = {
-            let mut c = self.inner.ctx.lock().unwrap();
-            let pnames = self.inner.cdc.param_names(&c);
+            let pnames = self.inner.cdc.param_names();
+            let mut c = self.inner.cdc.graph();
             let mut p_pairs = Vec::with_capacity(pnames.len());
             for (j, name) in pnames.iter().enumerate() {
                 let e = c.sym(name);
@@ -141,7 +138,7 @@ impl Model {
                     p_pairs.push((*s, p.get(j).copied().unwrap_or(0.0)));
                 }
             }
-            reduce_graph(&mut c, &self.inner.dae, x, &p_pairs, omegas, rel_tol)
+            reduce_graph(&mut c, self.inner.dae(), x, &p_pairs, omegas, rel_tol)
         };
         (self.derive(Transform::Prune, reduced), pruned)
     }

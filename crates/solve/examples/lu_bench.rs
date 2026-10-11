@@ -117,11 +117,11 @@ fn time_best<R>(reps: usize, mut f: impl FnMut() -> R) -> f64 {
 fn main() {
     // 1) Nonlinear DC Newton: diode ladders of growing size.
     for &k in &[200usize, 1000, 4000] {
-        let (mut ctx, dae) = diode_ladder(k);
+        let (ctx, dae) = diode_ladder(k);
         let t_ext = Instant::now();
-        let cdc = CompiledDc::new(&mut ctx, &dae);
+        let cdc = CompiledDc::new(ctx, dae);
         let ext_ms = t_ext.elapsed().as_secs_f64() * 1e3;
-        let p = params(&mut ctx, &dae, 3.0, 1000.0, 0.0);
+        let p = params(&mut cdc.graph(), cdc.dae(), 3.0, 1000.0, 0.0);
         let (_, conv, iters) = cdc.solve_dc(&p, &[], 1e-9, 200);
         assert!(conv, "diode ladder k={k} must converge");
         let best = time_best(5, || cdc.solve_dc(&p, &[], 1e-9, 200));
@@ -143,9 +143,9 @@ fn main() {
         // Pure linear grid (no devices): the power-grid regime, no partition,
         // Newton converges in 1-2 iterations -- factor-dominated.
         {
-            let (mut ctx, dae) = rc_grid(w, h, 0);
-            let cdc = CompiledDc::new(&mut ctx, &dae);
-            let p = params(&mut ctx, &dae, 1.0, 100.0, 1e-9);
+            let (ctx, dae) = rc_grid(w, h, 0);
+            let cdc = CompiledDc::new(ctx, dae);
+            let p = params(&mut cdc.graph(), cdc.dae(), 1.0, 100.0, 1e-9);
             let (_, conv, iters) = cdc.solve_dc(&p, &[], 1e-9, 200);
             assert!(conv, "linear rc grid {w}x{h} must converge");
             let best = time_best(3, || cdc.solve_dc(&p, &[], 1e-9, 200));
@@ -155,11 +155,11 @@ fn main() {
                 best * 1e3
             );
         }
-        let (mut ctx, dae) = rc_grid(w, h, 8);
+        let (ctx, dae) = rc_grid(w, h, 8);
         let t_ext = Instant::now();
-        let cdc = CompiledDc::new(&mut ctx, &dae);
+        let cdc = CompiledDc::new(ctx, dae);
         let ext_ms = t_ext.elapsed().as_secs_f64() * 1e3;
-        let p = params(&mut ctx, &dae, 1.0, 100.0, 1e-9);
+        let p = params(&mut cdc.graph(), cdc.dae(), 1.0, 100.0, 1e-9);
         let (_, conv, iters) = cdc.solve_dc(&p, &[], 1e-9, 200);
         assert!(conv, "rc grid {w}x{h} must converge");
         let best = time_best(3, || cdc.solve_dc(&p, &[], 1e-9, 200));
@@ -172,9 +172,9 @@ fn main() {
 
     // 3) Transient (stage factorization + repeated stage solves).
     {
-        let (mut ctx, dae) = rc_grid(30, 30, 4);
-        let cdc = CompiledDc::new(&mut ctx, &dae);
-        let p = params(&mut ctx, &dae, 1.0, 100.0, 1e-9);
+        let (ctx, dae) = rc_grid(30, 30, 4);
+        let cdc = CompiledDc::new(ctx, dae);
+        let p = params(&mut cdc.graph(), cdc.dae(), 1.0, 100.0, 1e-9);
         let t_eval: Vec<f64> = (0..=100).map(|i| i as f64 * 1e-9).collect();
         let best = time_best(3, || {
             cdc.solve_transient(&p, &[], &t_eval, 1e-6, 1e-9, None)

@@ -29,18 +29,18 @@
 //!
 //! Values are supplied in the caller's *entry order* (the tape's Jacobian
 //! nonzeros followed by augmentation entries such as the gmin diagonal), with
-//! duplicate `(row, col)` positions summed into one CSC slot -- the same
-//! semantics faer's argsort provided. Row equilibration (the
-//! `row_equilibration` solver trick) is the backend's built-in scaling: KLU's
-//! row-max scaling when the trick is on, and the supernodal paths' own
-//! equilibration (always on there); it is folded into factorization and
-//! solves, so callers never scale right-hand sides.
+//! duplicate `(row, col)` positions summed into one CSC slot. Row
+//! equilibration (the `row_equilibration` solver trick) is the backend's
+//! built-in scaling: KLU's row-max scaling when the trick is on, and the
+//! supernodal paths' own equilibration (always on there); it is folded into
+//! factorization and solves, so callers never scale right-hand sides.
 
 use std::sync::OnceLock;
 
+use num_complex::Complex64;
 use rslab::{
     CscMatrix, GeneralCsc, KluSettings, KluSolver, KluSymbolic, LdltSolver, LdltSymbolic, LuSolver,
-    LuSymbolic, SolveWork, SolverSettings, Threads,
+    LuSymbolic, Scalar, SolveWork, SolverSettings, Threads,
 };
 
 /// rslab's log records routed into SANE's logger. rslab's `Info` lines (one
@@ -84,15 +84,7 @@ pub(crate) fn install_log_bridge() {
     });
 }
 
-/// Flops per factor entry, as KLU's analysis predicts them a priori, from
-/// which a pattern is factored by the supernodal backends instead of KLU.
-/// Size alone does not tell: a 25k-unknown gate-level circuit (4.8 flops
-/// per entry) refactors 3.7x faster in KLU and solves 3.5x faster, a
-/// 45k-unknown power grid (14) 2.2x and 2.1x, a 3.6e3-unknown RC grid (19)
-/// 1.3x; RC grids of 1e4 and 2e4 unknowns (30, 38) factor 2x faster
-/// supernodal and refactor 1.5x, a 1.3e5-unknown power grid (94) factors
-/// 3.9x faster (one thread each, real values).
-const SUPERNODAL_FLOPS_PER_ENTRY: f64 = 25.0;
+use sane_core::constants::SUPERNODAL_FLOPS_PER_ENTRY;
 
 /// The supernodal backends' settings: SANE's thread count, one thread inside
 /// a parallel sweep (whose tasks solve sequentially).
@@ -244,24 +236,133 @@ fn in_place<S, E>(
     }
 }
 
-/// A one-shot KLU factorization of `(row, col, value)` triplets that solves
-/// forward, transposed and for many right-hand sides on the same factors.
-pub struct TripletLu {
-    klu: KluSolver<f64>,
+/// Sparse entries as parallel `(rows, cols, values)` lists, duplicates
+/// summing: the form the Jacobians leave the compiled system in.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Triplets<T = f64> {
+    pub rows: Vec<usize>,
+    pub cols: Vec<usize>,
+    pub vals: Vec<T>,
 }
 
-impl TripletLu {
-    pub fn solve(&self, b: &[f64]) -> Option<Vec<f64>> {
+impl<T> Triplets<T> {
+    pub fn len(&self) -> usize {
+        self.vals.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.vals.is_empty()
+    }
+
+    /// The entries `(row, col, value)`.
+    pub fn iter(&self) -> impl Iterator<Item = (usize, usize, &T)> {
+        (self.rows.iter().zip(&self.cols).zip(&self.vals)).map(|((&r, &c), v)| (r, c, v))
+    }
+}
+
+impl<T: Copy + Default + std::ops::AddAssign> Triplets<T> {
+    /// The `n x n` dense matrix, by rows, duplicates summed.
+    pub fn to_dense(&self, n: usize) -> Vec<Vec<T>> {
+        let mut m = vec![vec![T::default(); n]; n];
+        for (r, c, &v) in self.iter() {
+            m[r][c] += v;
+        }
+        m
+    }
+}
+
+/// The compressed-column layout of a fixed set of entry positions: the
+/// distinct positions sorted by column, then row, and the slot each entry
+/// (in the caller's order) sums into. Every sparse system of the engine is
+/// laid out by it: the real Newton patterns, the complex AC and
+/// harmonic-balance ones.
+#[derive(Clone, Debug)]
+pub struct Csc {
+    pub n: usize,
+    pub col_ptr: Vec<usize>,
+    pub row_idx: Vec<usize>,
+    /// Entry `k` -> its CSC slot; duplicate positions share one.
+    pub slot: Vec<usize>,
+}
+
+impl Csc {
+    /// The layout of the entries at `(rows[k], cols[k])` in an `n x n`
+    /// matrix; `None` if one lies outside it.
+    pub fn new(n: usize, rows: &[usize], cols: &[usize]) -> Option<Self> {
+        debug_assert_eq!(rows.len(), cols.len());
+        let mut order: Vec<usize> = (0..rows.len()).collect();
+        order.sort_unstable_by_key(|&k| (cols[k], rows[k]));
+        let mut col_ptr = vec![0usize; n + 1];
+        let mut row_idx: Vec<usize> = Vec::with_capacity(rows.len());
+        let mut slot = vec![0usize; rows.len()];
+        let (mut prev_r, mut prev_c) = (usize::MAX, usize::MAX);
+        for &k in &order {
+            let (r, c) = (rows[k], cols[k]);
+            if r >= n || c >= n {
+                return None;
+            }
+            if r != prev_r || c != prev_c {
+                row_idx.push(r);
+                col_ptr[c + 1] += 1;
+                (prev_r, prev_c) = (r, c);
+            }
+            slot[k] = row_idx.len() - 1;
+        }
+        for j in 0..n {
+            col_ptr[j + 1] += col_ptr[j];
+        }
+        Some(Csc {
+            n,
+            col_ptr,
+            row_idx,
+            slot,
+        })
+    }
+
+    /// The number of distinct positions.
+    pub fn nnz(&self) -> usize {
+        self.row_idx.len()
+    }
+
+    /// The entry values `vals` (the caller's order) summed into `out`, one
+    /// per slot.
+    pub fn scatter<T: Scalar>(&self, vals: &[T], out: &mut [T]) {
+        out.fill(T::zero());
+        for (&k, &v) in self.slot.iter().zip(vals) {
+            out[k] = out[k] + v;
+        }
+    }
+
+    /// The layout's matrix with `values` (one per slot).
+    fn matrix<T: Scalar>(&self, values: Vec<T>) -> GeneralCsc<T> {
+        GeneralCsc {
+            n: self.n,
+            col_ptr: self.col_ptr.clone(),
+            row_idx: self.row_idx.clone(),
+            values,
+        }
+    }
+}
+
+/// A one-shot factorization (KLU) of triplets, real or complex, that solves
+/// forward, transposed and for many right-hand sides on the same factors.
+pub struct TripletLu<T: Scalar = f64> {
+    klu: KluSolver<T>,
+}
+
+impl<T: Scalar> TripletLu<T> {
+    pub fn solve(&self, b: &[T]) -> Option<Vec<T>> {
         self.klu.solve(b).ok()
     }
 
-    pub fn solve_transpose(&self, b: &[f64]) -> Option<Vec<f64>> {
+    /// `A^T x = b`, the plain transpose.
+    pub fn solve_transpose(&self, b: &[T]) -> Option<Vec<T>> {
         self.klu.solve_transpose(b).ok()
     }
 
     /// `k` right-hand sides, column-major (`rhs[a * n + i]`); the solutions
     /// in the same layout.
-    pub fn solve_many(&self, rhs: &[f64], k: usize) -> Option<Vec<f64>> {
+    pub fn solve_many(&self, rhs: &[T], k: usize) -> Option<Vec<T>> {
         self.klu.solve_many(rhs, k).ok()
     }
 }
@@ -269,15 +370,94 @@ impl TripletLu {
 /// One-shot factorization of triplets (duplicates summed) for the adjoint and
 /// sensitivity paths. `None` if the matrix is structurally or numerically
 /// singular.
-pub fn factor_triplets(
+pub fn factor_triplets<T: Scalar>(
     n: usize,
     rows: &[usize],
     cols: &[usize],
-    values: &[f64],
-) -> Option<TripletLu> {
-    let a = GeneralCsc::from_triplets(n, rows, cols, values).ok()?;
-    let klu = KluSolver::factor(&a, &KluSettings::default()).ok()?;
+    values: &[T],
+) -> Option<TripletLu<T>> {
+    let csc = Csc::new(n, rows, cols)?;
+    let mut vals = vec![T::zero(); csc.nnz()];
+    csc.scatter(values, &mut vals);
+    let klu = KluSolver::factor(&csc.matrix(vals), &KluSettings::default()).ok()?;
     Some(TripletLu { klu })
+}
+
+/// A complex system over a fixed layout with its KLU analysis, made once on
+/// reference values (the matching is value dependent) and shared by every
+/// factorizer of it: an AC sweep's frequencies, a harmonic-balance Newton's
+/// iterations.
+pub struct ComplexPattern {
+    csc: Csc,
+    sym: KluSymbolic,
+}
+
+impl ComplexPattern {
+    /// The analysis of `csc` at the slot values `reference`; `None` if it is
+    /// structurally singular.
+    pub fn new(csc: Csc, reference: &[Complex64]) -> Option<Self> {
+        let sym =
+            KluSymbolic::analyze(&csc.matrix(reference.to_vec()), &KluSettings::default()).ok()?;
+        Some(ComplexPattern { csc, sym })
+    }
+
+    pub fn csc(&self) -> &Csc {
+        &self.csc
+    }
+
+    /// A factorizer of the pattern, for one solve loop or one sweep worker.
+    pub fn factorizer(&self) -> ComplexFactor<'_> {
+        ComplexFactor {
+            pat: self,
+            csc: self
+                .csc
+                .matrix(vec![Complex64::new(0.0, 0.0); self.csc.nnz()]),
+            klu: None,
+            work: SolveWork::default(),
+        }
+    }
+}
+
+/// The numeric factorization of a [`ComplexPattern`]'s values: the first
+/// pivots, every later one replays the frozen pivot sequence in place
+/// (numeric-only refactor), a full pivoting factor where the replay meets a
+/// vanished pivot.
+pub struct ComplexFactor<'p> {
+    pat: &'p ComplexPattern,
+    csc: GeneralCsc<Complex64>,
+    klu: Option<KluSolver<Complex64>>,
+    work: SolveWork<Complex64>,
+}
+
+impl ComplexFactor<'_> {
+    /// The values to factor, one per slot of the pattern's layout.
+    pub fn values_mut(&mut self) -> &mut [Complex64] {
+        &mut self.csc.values
+    }
+
+    /// Factor the values [`values_mut`](Self::values_mut) holds; `false` if
+    /// the matrix is numerically singular.
+    pub fn factor(&mut self) -> bool {
+        let csc = &self.csc;
+        if self.klu.as_mut().is_some_and(|s| s.refactor(csc).is_ok()) {
+            return true;
+        }
+        self.klu = self.pat.sym.factor(csc, &KluSettings::default()).ok();
+        self.klu.is_some()
+    }
+
+    /// `A x = b` on the last factorization; `false` without one.
+    pub fn solve_into(&mut self, b: &[Complex64], x: &mut [Complex64]) -> bool {
+        dump_system(&self.csc, b);
+        let w = &mut self.work;
+        (self.klu.as_ref()).is_some_and(|s| s.solve_into(b, x, w).is_ok())
+    }
+
+    /// `A^T x = b`, the plain transpose, on the last factorization.
+    pub fn solve_transpose_into(&mut self, b: &[Complex64], x: &mut [Complex64]) -> bool {
+        let w = &mut self.work;
+        (self.klu.as_ref()).is_some_and(|s| s.solve_transpose_into(b, x, w).is_ok())
+    }
 }
 
 /// Whether the pattern has a complete matching of rows to columns (a full
@@ -362,30 +542,12 @@ impl SparsePattern {
     /// in which case the system has no unique solution for any value set and
     /// callers report a singular solve exactly as before.
     pub fn new(n: usize, rows: &[usize], cols: &[usize]) -> Option<Self> {
-        debug_assert_eq!(rows.len(), cols.len());
-        // Deduplicate into CSC: sort entry indices by (col, row), assign one
-        // slot per distinct position, remember each entry's slot.
-        let mut order: Vec<usize> = (0..rows.len()).collect();
-        order.sort_unstable_by_key(|&k| (cols[k], rows[k]));
-        let mut col_ptr = vec![0usize; n + 1];
-        let mut row_idx: Vec<usize> = Vec::with_capacity(rows.len());
-        let mut slot = vec![0usize; rows.len()];
-        let (mut prev_r, mut prev_c) = (usize::MAX, usize::MAX);
-        for &k in &order {
-            let (r, c) = (rows[k], cols[k]);
-            if r >= n || c >= n {
-                return None;
-            }
-            if r != prev_r || c != prev_c {
-                row_idx.push(r);
-                col_ptr[c + 1] += 1;
-                (prev_r, prev_c) = (r, c);
-            }
-            slot[k] = row_idx.len() - 1;
-        }
-        for j in 0..n {
-            col_ptr[j + 1] += col_ptr[j];
-        }
+        let Csc {
+            col_ptr,
+            row_idx,
+            slot,
+            ..
+        } = Csc::new(n, rows, cols)?;
         // The unsymmetric analysis depends on the values and runs at the
         // first numeric factorization (see `sym`). Structural singularity
         // does not, and is reported here, at compile time.

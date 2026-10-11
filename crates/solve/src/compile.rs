@@ -3,48 +3,47 @@
 //! reusable symbolic LU, and the linear/nonlinear block classification.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use rsdag::{Crossing, ExprId, Node, ReduceOp, SymbolId, Tape};
 use sane_core::constants::*;
+use sane_core::log_stage;
+use sane_core::stimulus::Stimulus;
 use sane_core::Graph;
-use sane_core::{time_stage, Profile};
 use sane_dae::Dae;
 
 use crate::schur::Partition;
 use crate::{sparse, CompiledDc, InputSrc, SolverTricks, StepEval, Symbolic};
 
 impl CompiledDc {
-    /// Build from a DAE, computing its sparse symbolic Jacobians and compiling
-    /// evaluation tapes.
-    pub fn new(ctx: &mut Graph, dae: &Dae) -> Self {
-        Self::new_profiled(ctx, dae).0
+    /// Compile `dae`, over the graph `ctx` it lives in: its sparse symbolic
+    /// Jacobians, the evaluation tapes and the symbolic LU. The compiled
+    /// system keeps both, so what an analysis asks for later (a parameter
+    /// Jacobian, a Hessian, a noise program, a pull) builds on first use.
+    pub fn new(ctx: Graph, dae: Dae) -> Self {
+        Self::shared(Arc::new(Mutex::new(ctx)), Arc::new(dae))
     }
 
-    /// As [`new`](Self::new), but also return a [`Profile`] of the per-stage
-    /// build cost (sparse-Jacobian extraction, tape compilation, symbolic LU,
-    /// block classification) -- the instrumented extract pipeline.
-    pub fn new_profiled(ctx: &mut Graph, dae: &Dae) -> (Self, Profile) {
+    /// As [`new`](Self::new), over a graph others share (a model's
+    /// transforms compile into the graph of the model they derive from).
+    pub fn shared(graph: Arc<Mutex<Graph>>, system: Arc<Dae>) -> Self {
         sparse::install_log_bridge();
-        let mut prof = Profile::new();
-        // Default to sequential: measured, faer's rayon sparse-LU is neutral-to-
-        // harmful on the narrow elimination trees of 2D parasitic meshes (up to
-        // ~3x slower at n=1e4). The `set_parallelism` knob remains for opt-in
-        // experimentation; real throughput parallelism belongs at the outer
-        // loop (frequency / tolerance sweeps), not the inner LU.
+        let mut guard = graph.lock().unwrap();
+        let ctx = &mut *guard;
+        let dae = &*system;
         // Every row reads `I(x, t) + d/dt Q(x)`: the currents and charges,
         // and their Jacobians `G = dI/dx` and `C = dQ/dx`, one sparse
         // Jacobian over both.
-        time_stage!(prof, "at_rest", dae.at_rest(ctx));
-        let ((jr, jc, je), (xr, xc, xe)) =
-            time_stage!(prof, "jac_iq_coo", dae.jacobian_iq_coo(ctx));
+        log_stage!("at_rest", dae.at_rest(ctx));
+        let ((jr, jc, je), (xr, xc, xe)) = log_stage!("jac_iq_coo", dae.jacobian_iq_coo(ctx));
         // The rows' explicit time rates `dI/dt ++ dQ/dt`, by row (the
         // charges' rows after the currents'), then how they move with the
         // delayed signals, `dI/dhist ++ dQ/dhist`, by row and delay: a
         // delayed signal moves in time at its history's rate.
         let ((tr_i, _, te_i), (tr_q, _, te_q)) =
-            time_stage!(prof, "jac_t_coo", dae.jacobian_t_iq_coo(ctx));
+            log_stage!("jac_t_coo", dae.jacobian_t_iq_coo(ctx));
         let ((hr_i, hc_i, he_i), (hr_q, hc_q, he_q)) =
-            time_stage!(prof, "jac_hist_coo", dae.jacobian_hist_iq_coo(ctx));
+            log_stage!("jac_hist_coo", dae.jacobian_hist_iq_coo(ctx));
         let dt_rows: Vec<usize> = (tr_i.iter().copied())
             .chain(tr_q.iter().map(|&r| r + dae.dim()))
             .collect();
@@ -55,13 +54,13 @@ impl CompiledDc {
             .chain(he_i.iter().chain(&he_q))
             .copied()
             .collect();
-        let param_syms = time_stage!(prof, "params", dae.params(ctx));
+        let param_syms = log_stage!("params", dae.params(ctx));
 
         // The system as a function with roles; every program over it takes
         // its inputs in the function's signature: x, the parameters, t, the
         // delay histories. The solver also reads what a guard is, and which
         // way it has to cross, off the roles.
-        let sys = time_stage!(prof, "register", dae.register_function(ctx, "dae"));
+        let sys = log_stage!("register", dae.register_function(ctx, "dae"));
         // The noise generators are no input of a program: the rows it
         // computes are at rest, and what the noise program reads (levels,
         // where a generator enters) none carries.
@@ -101,7 +100,7 @@ impl CompiledDc {
         let index: HashMap<SymbolId, usize> =
             dae.x.iter().enumerate().map(|(i, &s)| (s, i)).collect();
         let at = |s: Option<SymbolId>| s.and_then(|s| index.get(&s).copied());
-        let limits = (dae.limits.iter())
+        let limits = (dae.hints.limits.iter())
             .map(|l| crate::limiting::Limit {
                 hi: at(l.hi),
                 lo: at(l.lo),
@@ -109,7 +108,7 @@ impl CompiledDc {
             })
             .filter(|l| l.hi.is_some() || l.lo.is_some())
             .collect();
-        let companion = (dae.companion.iter())
+        let companion = (dae.hints.companion.iter())
             .filter_map(|&(r, c, g)| Some((*index.get(&r)?, *index.get(&c)?, g)))
             .collect();
 
@@ -172,34 +171,33 @@ impl CompiledDc {
         let all: Vec<ExprId> = (tran.iter().chain(&event_roots).chain(&dt_roots))
             .copied()
             .collect();
-        let lowered = time_stage!(
-            prof,
+        let lowered = log_stage!(
             "tape_lower",
             rsdag::Lowered::new(&*ctx, &all, &input_syms, Some(&pure_inputs))
         );
         let view = |roots: &[ExprId]| crate::eval::step_eval(lowered.tape(&*ctx, roots));
         let tape_tau = (!taus.is_empty()).then(|| Tape::compile(ctx, &taus, &param_syms));
-        let tape_res_dc = time_stage!(prof, "tape_res_dc", view(currents));
-        let tape_step_dc = time_stage!(prof, "tape_step_dc", view(&step_dc));
-        let tape_tran_res = time_stage!(prof, "tape_tran_res", view(&tran[..2 * n_rows]));
-        let tape_tran_step = time_stage!(prof, "tape_tran_step", view(&tran));
-        let tape_c = time_stage!(prof, "tape_c", view(&xe));
-        let tape_dt = (!dt_roots.is_empty()).then(|| time_stage!(prof, "tape_dt", view(&dt_roots)));
+        let tape_res_dc = log_stage!("tape_res_dc", view(currents));
+        let tape_step_dc = log_stage!("tape_step_dc", view(&step_dc));
+        let tape_tran_res = log_stage!("tape_tran_res", view(&tran[..2 * n_rows]));
+        let tape_tran_step = log_stage!("tape_tran_step", view(&tran));
+        let tape_c = log_stage!("tape_c", view(&xe));
+        let tape_dt = (!dt_roots.is_empty()).then(|| log_stage!("tape_dt", view(&dt_roots)));
         // The switching surfaces, evaluated once per candidate transient step.
         let tape_event = (!event_roots.is_empty())
-            .then(|| time_stage!(prof, "tape_event", lowered.tape(&*ctx, &event_roots)));
+            .then(|| log_stage!("tape_event", lowered.tape(&*ctx, &event_roots)));
         drop(lowered);
         let event_names: Vec<String> = dae.events.iter().map(|e| e.name.clone()).collect();
 
         // The parameter Jacobians and the Lagrangian-Hessian are only needed
         // for sensitivity / second-order sensitivity, and both are heavy at scale,
-        // so they are built lazily (see `ensure_param_jac` / `ensure_hessian`).
-        // Keep the base input symbols so they can be compiled on demand.
+        // so they are built on first use (see `sens::SensCache`). Keep the
+        // base input symbols so they can be compiled then.
         let base_inputs = input_syms.clone();
 
         let n = dae.dim();
         let nnz_x = je.len();
-        let symbolic = time_stage!(prof, "symbolic_lu", Self::build_symbolic(n, &jr, &jc));
+        let symbolic = log_stage!("symbolic_lu", Self::build_symbolic(n, &jr, &jc));
 
         // Classify each Jacobian entry as constant (its symbolic derivative does
         // not depend on any unknown -> a linear element) or variable (depends on
@@ -220,8 +218,7 @@ impl CompiledDc {
             .collect();
         // Same classification for the C nonzeros (charge storage): a linear
         // capacitor's entry is constant, so its harmonic block stays diagonal.
-        let (jx_var, jxd_var): (Vec<bool>, Vec<bool>) = time_stage!(
-            prof,
+        let (jx_var, jxd_var): (Vec<bool>, Vec<bool>) = log_stage!(
             "variable_entries",
             (ctx.depends_on(&je, &vars), ctx.depends_on(&xe, &vars))
         );
@@ -244,8 +241,7 @@ impl CompiledDc {
                     }
                     rows.push((start, terms.len() - start));
                 }
-                let tape = time_stage!(
-                    prof,
+                let tape = log_stage!(
                     "tape_iscale",
                     crate::eval::step_eval(Tape::compile(ctx, &terms, &input_syms))
                 );
@@ -254,7 +250,7 @@ impl CompiledDc {
                 (None, Vec::new())
             };
 
-        let partition = time_stage!(prof, "partition", {
+        let partition = log_stage!("partition", {
             let var_entry = jx_var.clone();
             let mut is_nonlin = vec![false; n];
             for (k, &v) in var_entry.iter().enumerate() {
@@ -281,35 +277,28 @@ impl CompiledDc {
             }
         });
 
-        // Independent-source DC values for the source-stepping ramp. The DAE
-        // carries the structural list (`source_names`, every independent V/I
-        // element, subcircuit-scoped ones like `Xop.I0` included -- a name test
-        // cannot tell that source from `Q1.Is`, a saturation current, and the
-        // old dot-free heuristic silently skipped every subcircuit bias source,
-        // so the ramp excited a circuit around its own bias network). Hand-built
-        // DAEs carry no element list; they keep the top-level name heuristic.
-        let source_mask: Vec<bool> = if dae.source_names.is_empty() {
-            param_syms
-                .iter()
-                .map(|&s| {
-                    let nm = ctx.symbol_name(s);
-                    !nm.contains('.') && matches!(nm.chars().next(), Some('V' | 'v' | 'I' | 'i'))
-                })
-                .collect()
-        } else {
-            let names: std::collections::HashSet<&str> =
-                dae.source_names.iter().map(|s| s.as_str()).collect();
-            param_syms
-                .iter()
-                .map(|&s| names.contains(ctx.symbol_name(s)))
-                .collect()
-        };
+        // The independent sources' DC values: what the source-stepping ramp
+        // excites, every source of the hierarchy and nothing else.
+        let dc_values: std::collections::HashSet<SymbolId> =
+            dae.sources.iter().filter_map(|s| s.value).collect();
+        let source_mask: Vec<bool> = param_syms.iter().map(|s| dc_values.contains(s)).collect();
         sane_core::log::debug(&format!(
-            "DC source ramp: {} of {} params are independent-source values ({} structural)",
+            "DC source ramp: {} of {} params are independent-source values ({} sources)",
             source_mask.iter().filter(|&&b| b).count(),
             source_mask.len(),
-            dae.source_names.len()
+            dae.sources.len()
         ));
+        // The waveforms over the parameter columns (`None`: a parameter the
+        // vector does not carry, which takes its default).
+        let column: HashMap<SymbolId, usize> = param_syms
+            .iter()
+            .enumerate()
+            .map(|(j, &s)| (s, j))
+            .collect();
+        let stimuli: Vec<Stimulus<Option<usize>>> = (dae.sources.iter())
+            .filter_map(|s| s.stimulus.as_ref())
+            .map(|st| st.map(|s| column.get(s).copied()))
+            .collect();
 
         // Diagonal position of each unknown within the jacobian-x value array
         // (fixed by the pattern; the node-adaptive corrector loads these).
@@ -320,18 +309,14 @@ impl CompiledDc {
             }
         }
 
-        // Parameter name -> index, so the transient solver can resolve a source's
-        // time parameters by their instance-scoped name when emitting breakpoints.
-        let param_index: HashMap<String, usize> = param_syms
-            .iter()
-            .enumerate()
-            .map(|(i, &s)| (ctx.symbol_name(s).to_string(), i))
+        let param_names: Vec<String> = (param_syms.iter())
+            .map(|&s| ctx.symbol_name(s).to_string())
             .collect();
         let index2 = crate::index2::index2_unknowns(n, (&jr, &jc), (&xr, &xc));
         let cdc = CompiledDc {
+            graph: Arc::clone(&graph),
+            dae: Arc::clone(&system),
             n,
-            hjac: std::sync::OnceLock::new(),
-            noise: std::sync::OnceLock::new(),
             delay_src,
             tape_tau,
             kinds,
@@ -353,7 +338,6 @@ impl CompiledDc {
             tape_dt,
             dt_rows,
             dt_hist,
-            pjac: std::sync::OnceLock::new(),
             input_x_slots: input_src
                 .iter()
                 .enumerate()
@@ -377,33 +361,32 @@ impl CompiledDc {
                 .collect(),
             input_src,
             param_syms,
+            param_names,
             source_mask,
-            symbolic,
             jx_var,
             jxd_var,
-            partition,
-            chess: std::sync::OnceLock::new(),
-            frozen: std::sync::OnceLock::new(),
-            param_exprs: Default::default(),
-            sens_programs: Default::default(),
             base_inputs,
             base_pure: pure_inputs.clone(),
-            companion,
-            companion_symbolic: std::sync::OnceLock::new(),
-            input_jacs: Default::default(),
             limits,
             n_nodes,
             tape_iscale,
             iscale_rows,
-            nodeset: Vec::new(),
             tricks: SolverTricks::default(),
-            sources: dae.sources.clone(),
-            param_index,
-            last_gmin_hold: std::sync::atomic::AtomicU64::new(0),
-            last_gmin_row: std::sync::atomic::AtomicUsize::new(usize::MAX),
-            last_gmin_share: std::sync::atomic::AtomicU64::new(0),
+            stimuli,
+            dc: crate::dc::DcState {
+                symbolic,
+                partition,
+                companion,
+                companion_symbolic: std::sync::OnceLock::new(),
+                nodeset: Vec::new(),
+                last_gmin_hold: std::sync::atomic::AtomicU64::new(0),
+                last_gmin_row: std::sync::atomic::AtomicUsize::new(usize::MAX),
+                last_gmin_share: std::sync::atomic::AtomicU64::new(0),
+            },
+            sens: Default::default(),
         };
-        (cdc, prof)
+        drop(guard);
+        cdc
     }
 
     /// What the transport delays of `dae` delay (see

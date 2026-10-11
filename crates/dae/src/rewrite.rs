@@ -15,7 +15,7 @@ use rsdag::{ExprId, Node, SymbolId};
 use rustc_hash::FxHashMap;
 use sane_core::Graph;
 
-use crate::{Dae, DelaySpec, EventSpec};
+use crate::{Dae, DelaySpec, EventSpec, SolverHints, UnknownId};
 
 /// A rewrite of a DAE (see [`Dae::rewrite`]).
 pub(crate) struct Rewrite {
@@ -64,7 +64,7 @@ impl Dae {
                     .chain(&self.structure)
                     .map(|a| a.holds),
             )
-            .chain(self.limits.iter().filter_map(|l| l.when))
+            .chain(self.hints.limits.iter().filter_map(|l| l.when))
             .chain(label_keys.iter().copied())
             .collect();
         let mut new = sub(ctx, roots).into_iter();
@@ -92,8 +92,12 @@ impl Dae {
         };
         let assertions = carried(&self.assertions);
         let structure = carried(&self.structure);
-        let whens: Vec<Option<ExprId>> =
-            self.limits.iter().map(|l| l.when.map(|_| next())).collect();
+        let whens: Vec<Option<ExprId>> = self
+            .hints
+            .limits
+            .iter()
+            .map(|l| l.when.map(|_| next()))
+            .collect();
         let labels = (label_keys.iter())
             .map(|k| (next(), self.labels[k].clone()))
             .collect();
@@ -102,7 +106,7 @@ impl Dae {
         // name one: itself, the unknown it was merged onto, ground, or gone
         // (eliminated into an expression).
         let x: Vec<SymbolId> = rw.keep.iter().map(|&i| self.x[i]).collect();
-        let unknowns: Vec<String> = rw.keep.iter().map(|&i| self.unknowns[i].clone()).collect();
+        let unknowns: Vec<UnknownId> = rw.keep.iter().map(|&i| self.unknowns[i].clone()).collect();
         let kept: HashSet<SymbolId> = x.iter().copied().collect();
         let onto = |s: SymbolId| -> Option<Option<SymbolId>> {
             let e = match rw.subst.get(&s) {
@@ -115,7 +119,7 @@ impl Dae {
                 _ => None,
             }
         };
-        let limits = (self.limits.iter().zip(whens))
+        let limits = (self.hints.limits.iter().zip(whens))
             .filter_map(|(l, when)| {
                 let side = |s: Option<SymbolId>| match s {
                     None => Some(None),
@@ -129,7 +133,7 @@ impl Dae {
                 })
             })
             .collect();
-        let companion = (self.companion.iter())
+        let companion = (self.hints.companion.iter())
             .filter_map(|&(r, c, g)| Some((onto(r)??, onto(c)??, g)))
             .collect();
         // a node merged onto another, or onto ground, is an alias of it
@@ -138,19 +142,18 @@ impl Dae {
         for &i in &rw.keep {
             gone[i] = false;
         }
-        let name_of: FxHashMap<SymbolId, &String> = x.iter().copied().zip(&unknowns).collect();
-        for (i, name) in self.unknowns.iter().enumerate() {
+        let name_of: FxHashMap<SymbolId, &UnknownId> = x.iter().copied().zip(&unknowns).collect();
+        for (i, u) in self.unknowns.iter().enumerate() {
             if !gone[i] {
                 continue;
             }
             if let Some(onto) = onto(self.x[i]) {
-                aliases.push((name.clone(), onto.map(|s| name_of[&s].clone())));
+                aliases.push((u.name(), onto.map(|s| name_of[&s].name())));
             }
         }
-        let names: HashSet<&String> = unknowns.iter().collect();
-        let dc_seeds = (self.dc_seeds.iter())
-            .filter(|(name, _)| names.contains(name))
-            .cloned()
+        let dc_seeds = (self.hints.dc_seeds.iter())
+            .filter(|(s, _)| kept.contains(s))
+            .copied()
             .collect();
         Dae {
             currents,
@@ -163,12 +166,13 @@ impl Dae {
             param_defaults: self.param_defaults.clone(),
             events,
             delays,
-            companion,
             observers: self.observers.rewrite(ctx, &rw.subst),
-            dc_seeds,
-            limits,
+            hints: SolverHints {
+                companion,
+                dc_seeds,
+                limits,
+            },
             sources: self.sources.clone(),
-            source_names: self.source_names.clone(),
             assertions,
             structure,
             aliases,

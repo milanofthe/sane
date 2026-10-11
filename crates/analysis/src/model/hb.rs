@@ -38,11 +38,11 @@ impl Default for HbOptions {
     fn default() -> Self {
         HbOptions {
             f0: None,
-            harmonics: 8,
-            oversample: 16,
+            harmonics: sane_core::constants::HB_HARMONICS,
+            oversample: sane_core::constants::HB_OVERSAMPLE,
             samples: None,
-            tol: 1e-10,
-            max_iter: 60,
+            tol: sane_core::constants::HB_TOL,
+            max_iter: sane_core::constants::HB_MAX_ITER,
             continuation: None,
         }
     }
@@ -185,7 +185,6 @@ impl HarmonicBalance {
         let outs = model.inner.outputs(outputs)?;
         let cols = model.inner.columns(wrt)?;
         let hb = model.hb_compiled(self.harmonics, self.samples)?;
-        model.ensure_param_jac();
         let w0 = 2.0 * PI * self.f0;
         let mut task = log::task("SENS-HB", "sens_hb", &format!("(outputs: {})", outs.len()));
         let spectra = self.rows();
@@ -231,7 +230,6 @@ impl HarmonicBalance {
         let o = model.inner.outputs(&[output])?[0];
         let cols = model.inner.columns(wrt)?;
         let _g = log::scope("sens/hb_hessian");
-        model.ensure_hessian();
         let hb = model.hb_compiled(self.harmonics, self.samples)?;
         let h = hb
             .coeff_hessian(
@@ -297,18 +295,6 @@ impl Model {
         })
     }
 
-    fn ensure_param_jac(&self) {
-        let arc = self.context_arc();
-        self.cdc()
-            .ensure_param_jac(&mut arc.lock().unwrap(), self.dae());
-    }
-
-    fn ensure_hessian(&self) {
-        let arc = self.context_arc();
-        self.cdc()
-            .ensure_hessian(&mut arc.lock().unwrap(), self.dae());
-    }
-
     /// The HB Newton from the DC point `x_dc`, with source-stepping
     /// continuation as `continuation` asks; and the setup's time (ms).
     #[allow(clippy::too_many_arguments)]
@@ -335,9 +321,11 @@ impl Model {
         let hb = log_stage!("hb/setup", self.hb_compiled(harmonics, samples))?;
         let setup_ms = t.elapsed().as_secs_f64() * 1e3;
         let w0 = 2.0 * PI * f0;
-        let ramp: Vec<usize> = (self.inner.store.pnames.iter().enumerate())
-            .filter(|(_, n)| n.ends_with(".sin_amp"))
-            .map(|(i, _)| i)
+        // the sines' amplitudes, ramped from zero
+        let syms = self.cdc().param_syms();
+        let ramp: Vec<usize> = (self.dae().sources.iter())
+            .filter_map(|s| s.stimulus.as_ref()?.amplitude())
+            .filter_map(|a| syms.iter().position(|s| s == a))
             .collect();
         let res = log_stage!(
             "hb/solve",

@@ -152,7 +152,7 @@ pub fn eliminate_nodes(ctx: &mut Graph, dae: &Dae, keep: &HashSet<String>) -> (D
 
         let mut target = None;
         for i in 0..x.len() {
-            if !is_node[i] || keep.contains(&unknowns[i]) {
+            if !is_node[i] || keep.contains(&unknowns[i].name()) {
                 continue;
             }
             if stored.contains(&x[i]) || !ctx.is_zero(charges[i]) {
@@ -196,7 +196,7 @@ pub fn eliminate_nodes(ctx: &mut Graph, dae: &Dae, keep: &HashSet<String>) -> (D
                 *row = inlined[j];
             }
         }
-        eliminated.push(unknowns[i].clone());
+        eliminated.push(unknowns[i].name());
         currents.remove(i);
         charges.remove(i);
         unknowns.remove(i);
@@ -303,30 +303,6 @@ fn element_of(ctx: &Graph, dae: &Dae, t: ExprId, x_all: &HashSet<SymbolId>) -> S
     elem.join("+")
 }
 
-/// DC operating-point evaluation environment (`t = 0`): each state bound to
-/// its operating value, time to zero, and the given parameters. Shared by the
-/// graph-reduction passes.
-fn dc_op_env(
-    ctx: &mut Graph,
-    dae: &Dae,
-    x_op: &[f64],
-    p: &[(SymbolId, f64)],
-) -> HashMap<SymbolId, f64> {
-    let mut env: HashMap<SymbolId, f64> = HashMap::new();
-    // noise generators are zero in every evaluation
-    for g in dae.observers.generators(ctx) {
-        env.insert(g, 0.0);
-    }
-    for (i, &s) in dae.x.iter().enumerate() {
-        env.insert(s, x_op.get(i).copied().unwrap_or(0.0));
-    }
-    for &(s, v) in p {
-        env.insert(s, v);
-    }
-    env.insert(dae.t, 0.0);
-    env
-}
-
 /// Operating-point-guided graph reduction. Each KCL row's current and charge
 /// are `Reduce(Sum, [branch terms])`; at the linearization point `(x_op, p)`
 /// each current term has a DC current and a conductance, each charge term a
@@ -348,7 +324,7 @@ pub(crate) fn prune_graph(
     omegas: &[f64],
     rel_tol: f64,
 ) -> (Dae, Vec<(String, f64)>) {
-    let env = dc_op_env(ctx, dae, x_op, p);
+    let env = dae.point_env(ctx, x_op, p.iter().copied(), 0.0);
     // The noise generators and the element each belongs to (`R1` of
     // `R1#noise`, `M1` of `M1#noise2`).
     let owner: HashMap<SymbolId, String> = (dae.observers.generators(ctx).into_iter())
@@ -418,12 +394,12 @@ pub(crate) fn prune_graph(
             let rows = std::iter::once(r).chain(other);
             let mut max_rel = rows
                 .clone()
-                .map(|j| t.i / iscale[j].max(1e-300))
+                .map(|j| t.i / iscale[j].max(sane_core::constants::DIV_FLOOR))
                 .fold(0.0, f64::max);
             for (w, &om) in omegas.iter().enumerate() {
                 let a = adm(t.g, t.c, om);
                 for j in rows.clone() {
-                    max_rel = max_rel.max(a / nscale[j][w].max(1e-300));
+                    max_rel = max_rel.max(a / nscale[j][w].max(sane_core::constants::DIV_FLOOR));
                 }
             }
             // Never prune a term coupling a branch-current unknown, nor a
@@ -617,7 +593,7 @@ pub fn reduce_graph(
     // SHORT first: merge near-wire branches' nodes, so the remaining admittance
     // scales are sane before the OPEN pass (a wire would otherwise dominate a
     // node's scale and make every real branch there look negligible).
-    let env = dc_op_env(ctx, dae, x_op, p);
+    let env = dae.point_env(ctx, x_op, p.iter().copied(), 0.0);
     let (pairs, short_names) = detect_shorts(ctx, dae, &env, omegas, rel_tol);
     let (merged, survivors) = merge_nodes(ctx, dae, &pairs);
     let x_merged: Vec<f64> = survivors

@@ -216,7 +216,7 @@ impl<'a> StageWorkspace<'a> {
         atol: f64,
     ) -> Self {
         let n = cdc.n;
-        let mut program = Program::new(cdc, x0, p, t0);
+        let mut program = Program::new(cdc, p);
         if let Some(h) = dhist {
             program.set_delays(h, taus);
         }
@@ -312,7 +312,8 @@ impl CompiledDc {
         ti: f64,
         hg: f64,
     ) -> bool {
-        let tol = (10.0 * f64::EPSILON / ws.rtol).max(STAGE_TOL_MAX.min(ws.rtol.sqrt()));
+        let tol =
+            (STAGE_TOL_FLOOR_EPS * f64::EPSILON / ws.rtol).max(STAGE_TOL_MAX.min(ws.rtol.sqrt()));
         let contract = newton::Contract {
             criterion: self.criterion(&ws.tolerances()),
             residual: false,

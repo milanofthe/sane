@@ -15,9 +15,8 @@ sane-netlist = { path = "../netlist" }
 sane-solve = { path = "../solve", default-features = false }
 num-complex.workspace = true
 ndarray.workspace = true
-rslab.workspace = true
 rayon.workspace = true
-faer = { version = "0.24", default-features = false, features = ["std", "linalg", "sparse-linalg"] }
+faer = { version = "0.24", default-features = false, features = ["std", "linalg"] }
 
 [features]
 # Forward the solver's native backend.

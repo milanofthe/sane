@@ -4,8 +4,7 @@
 
 use crate::model::{Model, ModelError};
 
-/// A sparse matrix as `(rows, cols, values)`.
-type Coo = (Vec<usize>, Vec<usize>, Vec<f64>);
+use sane_solve::Triplets as Coo;
 
 impl Model {
     /// The currents `I(x, p, t)`. Every row reads `I(x, t) + d/dt Q(x)`.
@@ -41,7 +40,10 @@ impl Model {
         t: f64,
     ) -> Result<Vec<Vec<f64>>, ModelError> {
         self.inner.bound(&p)?;
-        Ok(self.cdc().jacobian_i_x(&x, &p, t))
+        Ok(self
+            .cdc()
+            .jacobian_i_x_sparse(&x, &p, t)
+            .to_dense(self.cdc().dim()))
     }
 
     /// `C = dQ/dx` as a dense matrix.
@@ -52,38 +54,38 @@ impl Model {
         t: f64,
     ) -> Result<Vec<Vec<f64>>, ModelError> {
         self.inner.bound(&p)?;
-        Ok(self.cdc().jacobian_q_x(&x, &p, t))
+        Ok(self
+            .cdc()
+            .jacobian_q_x_sparse(&x, &p, t)
+            .to_dense(self.cdc().dim()))
     }
 
-    /// Sparse `G = dI/dx` as `(rows, cols, values)` (COO).
+    /// Sparse `G = dI/dx` as triplets.
     pub fn jacobian_i_x_sparse(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> Result<Coo, ModelError> {
         self.inner.bound(&p)?;
         Ok(self.cdc().jacobian_i_x_sparse(&x, &p, t))
     }
 
-    /// Sparse `C = dQ/dx` as `(rows, cols, values)` (COO).
+    /// Sparse `C = dQ/dx` as triplets.
     pub fn jacobian_q_x_sparse(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> Result<Coo, ModelError> {
         self.inner.bound(&p)?;
         Ok(self.cdc().jacobian_q_x_sparse(&x, &p, t))
     }
 
-    /// Sparse `dI/dp` as `(rows, cols, values)` (COO).
+    /// Sparse `dI/dp` as triplets.
     pub fn jacobian_i_p_sparse(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> Result<Coo, ModelError> {
         self.inner.bound(&p)?;
         Ok(self.jacobian_p_sparse(&x, &p, t).0)
     }
 
-    /// Sparse `dQ/dp` as `(rows, cols, values)` (COO).
+    /// Sparse `dQ/dp` as triplets.
     pub fn jacobian_q_p_sparse(&self, x: Vec<f64>, p: Vec<f64>, t: f64) -> Result<Coo, ModelError> {
         self.inner.bound(&p)?;
         Ok(self.jacobian_p_sparse(&x, &p, t).1)
     }
 
-    /// `(dI/dp, dQ/dp)`, the parameter Jacobian built on first use.
+    /// `(dI/dp, dQ/dp)`.
     pub(crate) fn jacobian_p_sparse(&self, x: &[f64], p: &[f64], t: f64) -> (Coo, Coo) {
-        let arc = self.context_arc();
-        self.cdc()
-            .ensure_param_jac(&mut arc.lock().unwrap(), self.dae());
         self.cdc().jacobian_p_sparse(x, p, t)
     }
 
@@ -107,12 +109,10 @@ impl Model {
         t: f64,
     ) -> Result<Vec<f64>, ModelError> {
         self.inner.bound(&p)?;
-        let arc = self.context_arc();
-        let mut c = arc.lock().unwrap();
-        let dae = self.dae();
-        let mut b = vec![0.0; dae.dim()];
-        for s in self.inner.drive(&mut c, input)? {
-            let col = self.cdc().jacobian_i_input(&mut c, dae, s, &x, &p, t);
+        let syms = self.inner.drive(input)?;
+        let mut b = vec![0.0; self.dim()];
+        for s in syms {
+            let col = self.cdc().jacobian_i_input(s, &x, &p, t);
             b.iter_mut().zip(col).for_each(|(b, v)| *b += v);
         }
         Ok(b)

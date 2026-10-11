@@ -5,6 +5,7 @@
 //! numbers, named parameters/constants, and common functions.
 
 use rustc_hash::FxHashMap as HashMap;
+use sane_core::MathFn;
 
 use crate::parse_value;
 
@@ -269,13 +270,6 @@ fn compare(a: f64, op: &str, b: f64) -> bool {
 }
 
 fn call(name: &str, a: &[f64]) -> Result<f64, String> {
-    let one = |f: fn(f64) -> f64| -> Result<f64, String> {
-        if a.len() == 1 {
-            Ok(f(a[0]))
-        } else {
-            Err(format!("{name} expects 1 arg"))
-        }
-    };
     // Statistical (Monte-Carlo mismatch) functions: in a nominal/typical run
     // they evaluate to their nominal value (the first argument); the spread
     // arguments only matter under an explicit Monte-Carlo sweep. PDK model cards
@@ -291,27 +285,18 @@ fn call(name: &str, a: &[f64]) -> Result<f64, String> {
     match name {
         // `if(cond, then, else)` — the SPICE ternary in function form.
         "if" if a.len() == 3 => Ok(if a[0] != 0.0 { a[1] } else { a[2] }),
-        "sin" => one(f64::sin),
-        "cos" => one(f64::cos),
-        "tan" => one(f64::tan),
-        "asin" => one(f64::asin),
-        "acos" => one(f64::acos),
-        "atan" => one(f64::atan),
-        "exp" => one(f64::exp),
-        "ln" => one(f64::ln),
-        "log" | "log10" => one(f64::log10),
-        "sqrt" => one(f64::sqrt),
-        "abs" => one(f64::abs),
-        "pow" | "pwr" if a.len() == 2 => Ok(a[0].powf(a[1])),
-        "min" if a.len() == 2 => Ok(a[0].min(a[1])),
-        "max" if a.len() == 2 => Ok(a[0].max(a[1])),
+        "pwr" if a.len() == 2 => Ok(a[0].powf(a[1])),
         // Statistical: `agauss(nom, abs_var, sigma)`, `gauss(nom, rel_var,
         // sigma)`, `aunif(nom, abs_var)`, `unif(nom, rel_var)` all return `nom`
         // nominally; `limit(nom, abs)` likewise (deterministic nominal value).
         "agauss" | "gauss" => nominal(1),
         "aunif" | "unif" => nominal(1),
         "limit" => nominal(1),
-        _ => Err(format!("unknown function '{name}'")),
+        _ => match MathFn::from_spice(name) {
+            Some(f) if f.arity() == a.len() => Ok(f.eval(a)),
+            Some(f) => Err(format!("{name} expects {} args", f.arity())),
+            None => Err(format!("unknown function '{name}'")),
+        },
     }
 }
 

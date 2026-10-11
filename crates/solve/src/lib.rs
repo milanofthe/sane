@@ -23,12 +23,13 @@
 //!    The diagonal is kept in the sparsity pattern unconditionally so injecting
 //!    `gmin` never changes the pattern (and costs nothing when `gmin = 0`).
 
-use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::limiting::Limit;
 use rsdag::{Crossing, SymbolId, Tape};
-use sane_circuit::SourceFn;
+use sane_core::stimulus::Stimulus;
 use sane_core::Graph;
+use sane_dae::Dae;
 
 pub mod hb;
 pub use delay::DelayHistory;
@@ -47,6 +48,8 @@ mod program;
 mod rosenbrock;
 mod stage;
 mod stage_matrix;
+// The system at a point: currents, charges, Jacobians, small-signal matrices.
+mod system;
 // The hot-tape backend ladder (interpreter / specialized / native).
 mod eval;
 pub mod parallel;
@@ -55,17 +58,19 @@ mod schur;
 // Adjoint sensitivities and the second-order-adjoint Hessian.
 mod sens;
 pub(crate) mod sparse;
-pub use sparse::{dump_system, DumpValue};
+pub use sparse::{
+    dump_system, factor_triplets, ComplexFactor, ComplexPattern, Csc, DumpValue, TripletLu,
+    Triplets,
+};
 #[cfg(test)]
 mod tests;
 mod transient;
 mod transient_sens;
 
 pub use eval::Evaluator;
-pub(crate) use eval::{PrologToken, StepEval};
-use schur::{LinCache, Partition};
+pub(crate) use eval::{Bound, StepEval};
+use schur::LinCache;
 pub use sens::NoiseAt;
-use sens::{CompiledHessian, HistJac, ParamJac};
 
 use sane_core::constants::*;
 
@@ -124,7 +129,7 @@ pub struct SolverTricks {
     pub events: bool,
     /// `.nodeset` stiff-pin phase: when a node-set is registered
     /// ([`set_nodeset`](CompiledDc::set_nodeset)), seed every cold solve with the
-    /// symmetry-breaking pin phase. Gates the *data* in `self.nodeset` exactly as
+    /// symmetry-breaking pin phase. Gates the *data* in `self.dc.nodeset` exactly as
     /// `device_limiting` gates `self.limits`; off ignores the node-set (for A/B
     /// benchmarking whether it helps). No effect when no node-set is registered.
     pub nodeset: bool,
@@ -189,13 +194,14 @@ impl Default for Convergence {
 }
 
 impl Convergence {
-    /// The classic loose SPICE defaults (`reltol 1e-3`, `abstol 1e-12 A`,
-    /// `vntol 1e-6 V`): faster, SPICE-compatible, less accurate.
-    pub fn spice() -> Self {
+    /// The classic loose SPICE defaults (see [`SPICE_RELTOL`]): faster,
+    /// SPICE-compatible, less accurate.
+    #[cfg(test)]
+    pub(crate) fn spice() -> Self {
         Self {
-            reltol: 1e-3,
-            abstol: 1e-12,
-            vntol: 1e-6,
+            reltol: SPICE_RELTOL,
+            abstol: SPICE_ABSTOL,
+            vntol: SPICE_VNTOL,
         }
     }
 
@@ -272,6 +278,10 @@ pub struct TransientRun {
 
 /// A DAE compiled for repeated numeric evaluation/solve.
 pub struct CompiledDc {
+    /// The graph the programs compile from and the DAE they compile: what
+    /// is built on first use (see [`sens::SensCache`]) builds over them.
+    graph: Arc<Mutex<Graph>>,
+    dae: Arc<Dae>,
     n: usize,
     nnz_x: usize,
     /// Per unknown, whether it is index-2 (see [`index2`]): a rate of the
@@ -305,22 +315,14 @@ pub struct CompiledDc {
     tape_dt: Option<StepEval>,
     dt_rows: Vec<usize>,
     dt_hist: Vec<(usize, usize)>,
-    /// Compiled `dI/dp` and `dQ/dp` (parameter Jacobians) for exact adjoint
-    /// sensitivity, built lazily on first sensitivity / Hessian call (they are
-    /// ~O(n^2)-ish to build at scale and only needed for sensitivity), via
-    /// [`ensure_param_jac`].
-    pjac: std::sync::OnceLock<ParamJac>,
     input_src: Vec<InputSrc>,
     /// Precomputed (buffer slot, source index) lists for [`Self::patch_inputs`].
     input_x_slots: Vec<(u32, u32)>,
     input_t_slots: Vec<u32>,
     input_hist_slots: Vec<(u32, u32)>,
     param_syms: Vec<SymbolId>,
-    /// Lazily compiled `∂F/∂hist` (frequency-domain delay coupling), built by
-    /// [`ensure_hist_jac`](Self::ensure_hist_jac).
-    hjac: std::sync::OnceLock<HistJac>,
-    /// The noise sources compiled (see [`noise_at`](Self::noise_at)).
-    noise: std::sync::OnceLock<sens::NoiseProgram>,
+    /// Their names, in column order.
+    param_names: Vec<String>,
     /// Transport delays: what each delays (whose history the transient loop
     /// records and queries; the delay's output reads it through the tapes'
     /// history inputs), plus the taus compiled over the parameter inputs
@@ -338,9 +340,6 @@ pub struct CompiledDc {
     /// element value, no `.` in the name)? Used by source stepping to ramp only
     /// the excitation, leaving component values fixed.
     source_mask: Vec<bool>,
-    /// Reused sparse symbolic factorization (`None` only for degenerate
-    /// patterns faer rejects, in which case we rebuild per iteration).
-    symbolic: Option<Symbolic>,
     /// Per jx nonzero (aligned with `jx_rows`/`jx_cols`): does the entry vary
     /// with an unknown (a nonlinear/device entry) or is it constant (a linear,
     /// LTI element)? Computed once from the symbolic Jacobian. The DC Schur
@@ -348,41 +347,12 @@ pub struct CompiledDc {
     /// frequency-diagonal `(G + jkw0*C)`, a variable one couples harmonics.
     jx_var: Vec<bool>,
     jxd_var: Vec<bool>,
-    /// Linear/nonlinear partition of the Jacobian for cached-factorization
-    /// (Schur-complement) solves. `None` when partitioning is not worthwhile
-    /// (the nonlinear part is not a small fraction of the system).
-    partition: Option<Partition>,
-    /// Compiled second-order-adjoint Hessian (the Lagrangian second-derivative
-    /// blocks as a reusable tape), so every Hessian is a leaf-value re-eval. Built
-    /// lazily on first `hessian()` call (it is the heaviest, ~O(n^2) extract stage
-    /// and is only needed for second-order sensitivity), via [`ensure_hessian`].
-    chess: std::sync::OnceLock<CompiledHessian>,
-    /// The transient sensitivities' programs: the directional derivative's
-    /// state Jacobian, and per parameter column asked for its columns; built
-    /// by [`ensure_transient_sensitivity`](Self::ensure_transient_sensitivity).
-    frozen: std::sync::OnceLock<sens::FrozenState>,
-    param_exprs: std::sync::Mutex<HashMap<usize, std::sync::Arc<sens::ParamExprs>>>,
-    sens_programs: std::sync::Mutex<HashMap<Vec<usize>, std::sync::Arc<sens::SensProgram>>>,
-    /// Compiled `dI/d(input)` per input symbol (an independent source's value,
-    /// the AC and pole-zero excitation), built on the first query for that
-    /// input by [`input_jacobian`](Self::input_jacobian).
-    input_jacs: std::sync::Mutex<HashMap<SymbolId, std::sync::Arc<StepEval>>>,
-    /// Base input symbols (x, params, t, delay histories), kept so the lazy
-    /// parameter-Jacobian and Hessian tapes can be compiled on demand.
+    /// Base input symbols (x, params, t, delay histories), kept so the
+    /// programs built on first use take the same inputs.
     base_inputs: Vec<SymbolId>,
     /// Which of them are parameter-pure (solve-constant): the prolog split
     /// of the lazily built programs.
     base_pure: Vec<bool>,
-    /// Companion conductance network `(row, col, value)` from the device models
-    /// (their linear `lambda = 0` form) -- the per-device homotopy continuation.
-    companion: Vec<(usize, usize, f64)>,
-    /// Reused symbolic factorization for the companion-augmented homotopy matrix
-    /// `G + (1-lambda)*G_comp + gmin*I` (#52). Its pattern is the `G`
-    /// nonzeros plus the companion `(row, col)` positions plus the full diagonal --
-    /// fixed across the continuation, only the values change with `lambda`. Built
-    /// lazily on first `companion_solve` (the fallback path most circuits never
-    /// hit); `Some(None)` marks a degenerate pattern faer rejected.
-    companion_symbolic: std::sync::OnceLock<Option<Symbolic>>,
     /// Per-device controlling-voltage limits (`pnjlim`/`fetlim`), mapped to
     /// global unknown indices, applied between iterates when the `device_limiting`
     /// trick is on. Empty for transformed DAEs (which carry no device limits).
@@ -405,40 +375,19 @@ pub struct CompiledDc {
     /// Per node row: `(offset, len)` slice into `tape_iscale`'s outputs giving
     /// that node's current terms. Length `n_nodes`.
     iscale_rows: Vec<(usize, usize)>,
-    /// User `.nodeset` targets `(unknown_index, value)`. Empty by default. When
-    /// set, every *cold-started* DC solve runs a stiff-pin phase first
-    /// (symmetry breaking; see [`solve_dc_nodeset_with`](Self::solve_dc_nodeset_with)), so
-    /// all analyses honor the node-set without per-call-site plumbing. Warm
-    /// (non-empty `x0`) solves ignore it -- the warm start already supersedes it.
-    nodeset: Vec<(usize, f64)>,
     /// The modular numerical-trick set this model honors across all analyses (DC
     /// cascade shaping, the linear-solver and transient aids). [`solve_dc`] uses it
     /// as the default trick set; the transient / stage factorization read it
     /// directly. Configure with [`set_tricks`](CompiledDc::set_tricks); override
     /// per call with [`solve_dc_with`](CompiledDc::solve_dc_with).
     tricks: SolverTricks,
-    /// Independent-source stimulus shapes by element name (from the DAE), for
-    /// transient breakpoints and the HB fundamental.
-    sources: Vec<(String, SourceFn)>,
-    /// Parameter name -> index into `p`, to resolve a source's time parameters
-    /// (`"V1.pulse_td"`, ...) for breakpoints without re-borrowing the `Graph`.
-    param_index: HashMap<String, usize>,
-    /// Regularization flag for the most recent DC solve: the IEEE-754 bits of the
-    /// held gmin when the operating point converged only under a raised shunt
-    /// (gmin stepping could not reach the `GMIN_DC` floor), or `0` when the true
-    /// floor was reached. Set by [`source_continuation`], reset at the top of
-    /// [`solve_dc_conv_with`]; read via [`last_regularized_gmin`]. Drives the
-    /// analysis layer's settle fallback, so nothing else may set it -- the
-    /// second way a point can depend on gmin lives in `last_gmin_row` and is
-    /// combined only where the two are reported. Interior mutability (an atomic)
-    /// so the flag rides through the `&self` solve API without threading it
-    /// through every `(x, conv, iters)` return (issue #54).
-    last_gmin_hold: std::sync::atomic::AtomicU64,
-    /// The worst gmin-dominated unknown of the most recent DC solve, or
-    /// `usize::MAX` for none, alongside the IEEE-754 bits of its current share.
-    /// Read via [`last_gmin_dominance`]; same interior-mutability reasoning.
-    last_gmin_row: std::sync::atomic::AtomicUsize,
-    last_gmin_share: std::sync::atomic::AtomicU64,
+    /// The sources' waveforms over the parameter columns, for the transient
+    /// breakpoints and the HB fundamental.
+    stimuli: Vec<Stimulus<Option<usize>>>,
+    /// What the DC operating-point solve keeps.
+    dc: dc::DcState,
+    /// What the sensitivities build on first use.
+    sens: sens::SensCache,
 }
 impl CompiledDc {
     pub fn dim(&self) -> usize {
@@ -448,18 +397,32 @@ impl CompiledDc {
         self.nnz_x
     }
     /// Number of parameters (columns of `dI/dp` and `dQ/dp`), in `param_names` order.
-    pub fn param_count(&self) -> usize {
+    pub(crate) fn param_count(&self) -> usize {
         self.param_syms.len()
     }
     /// Parameter symbols, in column order.
     pub fn param_syms(&self) -> &[SymbolId] {
         &self.param_syms
     }
-    pub fn param_names(&self, ctx: &Graph) -> Vec<String> {
-        self.param_syms
-            .iter()
-            .map(|&s| ctx.symbol_name(s).to_string())
-            .collect()
+    /// Parameter names, in column order.
+    pub fn param_names(&self) -> &[String] {
+        &self.param_names
+    }
+
+    /// The DAE this compiles.
+    pub fn dae(&self) -> &Dae {
+        &self.dae
+    }
+
+    /// The graph the DAE lives in, shared.
+    pub fn context(&self) -> &Arc<Mutex<Graph>> {
+        &self.graph
+    }
+
+    /// The graph, locked. The compiled system takes the lock itself when it
+    /// builds a program on first use: hold none across its calls.
+    pub fn graph(&self) -> MutexGuard<'_, Graph> {
+        self.graph.lock().unwrap()
     }
 
     fn fill_inputs(&self, x: &[f64], p: &[f64], t: f64, inputs: &mut Vec<f64>) {
@@ -478,9 +441,10 @@ impl CompiledDc {
     /// input buffer a prior [`fill_inputs`](Self::fill_inputs) prepared. The
     /// parameter entries -- the bulk of a compact-model input vector (PSP103:
     /// ~800 of ~900) -- are constant over an integration, so the inner Newton
-    /// loops skip re-copying them on every evaluation.
+    /// loops skip re-copying them on every evaluation. A program's own
+    /// inputs after the system's (a pull's weights) stay as they are.
     fn patch_inputs(&self, x: &[f64], t: f64, inputs: &mut [f64]) {
-        debug_assert_eq!(inputs.len(), self.input_src.len(), "buffer not prepared");
+        debug_assert!(inputs.len() >= self.input_src.len(), "buffer not prepared");
         for &(dst, i) in &self.input_x_slots {
             inputs[dst as usize] = x.get(i as usize).copied().unwrap_or(0.0);
         }
@@ -490,132 +454,6 @@ impl CompiledDc {
         for &(dst, k) in &self.input_hist_slots {
             inputs[dst as usize] = crate::delay::hist_value(k as usize);
         }
-    }
-
-    /// The currents `I(x, p, t)`: the residual at rest.
-    pub fn currents(&self, x: &[f64], p: &[f64], t: f64) -> Vec<f64> {
-        let (mut inputs, mut work, mut out) = (Vec::new(), Vec::new(), Vec::new());
-        self.fill_inputs(x, p, t, &mut inputs);
-        self.tape_res_dc.eval(&inputs, &mut work, &mut out);
-        out
-    }
-
-    /// The charges `Q(x, p)`.
-    pub fn charges(&self, x: &[f64], p: &[f64], t: f64) -> Vec<f64> {
-        self.currents_charges(x, p, t).1
-    }
-
-    /// The currents and the charges in one evaluation.
-    pub(crate) fn currents_charges(&self, x: &[f64], p: &[f64], t: f64) -> (Vec<f64>, Vec<f64>) {
-        let (mut inputs, mut work, mut out) = (Vec::new(), Vec::new(), Vec::new());
-        self.fill_inputs(x, p, t, &mut inputs);
-        self.tape_tran_res.eval(&inputs, &mut work, &mut out);
-        let q = out.split_off(self.n);
-        (out, q)
-    }
-
-    /// The residual `F = I(x, t) + C(x) x'` at the state `x` moving at the
-    /// rate `xdot` (every row is affine in the rate).
-    pub fn residual(&self, x: &[f64], xdot: &[f64], p: &[f64], t: f64) -> Vec<f64> {
-        let mut f = self.currents(x, p, t);
-        let (r, c, v) = self.jacobian_q_x_sparse(x, p, t);
-        for k in 0..v.len() {
-            f[r[k]] += v[k] * xdot.get(c[k]).copied().unwrap_or(0.0);
-        }
-        f
-    }
-
-    fn dense(rows: &[usize], cols: &[usize], data: &[f64], n: usize) -> Vec<Vec<f64>> {
-        let mut m = vec![vec![0.0; n]; n];
-        for (k, &v) in data.iter().enumerate() {
-            m[rows[k]][cols[k]] = v;
-        }
-        m
-    }
-
-    /// Dense `G = dI/dx`.
-    pub fn jacobian_i_x(&self, x: &[f64], p: &[f64], t: f64) -> Vec<Vec<f64>> {
-        let (_, _, data) = self.jacobian_i_x_sparse(x, p, t);
-        Self::dense(&self.jx_rows, &self.jx_cols, &data, self.n)
-    }
-    /// Dense small-signal system matrix `G + GMIN_DC*I`: the Jacobian
-    /// regularized with the same node-to-ground shunt the DC / transient solves
-    /// carry, so a small-signal linearization (poles, zeros, AC, noise, MOR) is
-    /// consistent with the operating point that was actually solved. It also
-    /// keeps the pencil `G + sC` non-singular when an unknown is structurally
-    /// decoupled at the bias (e.g. the branch current of a grounded thermal
-    /// node in a self-heating compact model), which would make the raw `G`
-    /// singular and the eigen/solve fail.
-    pub fn system_matrix_dc(&self, x: &[f64], p: &[f64], t: f64) -> Vec<Vec<f64>> {
-        let mut g = self.jacobian_i_x(x, p, t);
-        for i in 0..self.n {
-            g[i][i] += GMIN_DC;
-        }
-        g
-    }
-    /// Dense `C = dQ/dx`.
-    pub fn jacobian_q_x(&self, x: &[f64], p: &[f64], t: f64) -> Vec<Vec<f64>> {
-        let (_, _, data) = self.jacobian_q_x_sparse(x, p, t);
-        Self::dense(&self.jxd_rows, &self.jxd_cols, &data, self.n)
-    }
-    /// Sparse `G = dI/dx` as `(rows, cols, values)`.
-    pub fn jacobian_i_x_sparse(
-        &self,
-        x: &[f64],
-        p: &[f64],
-        t: f64,
-    ) -> (Vec<usize>, Vec<usize>, Vec<f64>) {
-        let (mut inputs, mut work, mut out) = (Vec::new(), Vec::new(), Vec::new());
-        self.fill_inputs(x, p, t, &mut inputs);
-        self.tape_step_dc.eval(&inputs, &mut work, &mut out);
-        (
-            self.jx_rows.clone(),
-            self.jx_cols.clone(),
-            out[self.n..].to_vec(),
-        )
-    }
-    /// `G` at `(x, p)` and `t = 0`, its values in the compiled order of
-    /// `jx_rows`/`jx_cols`, through the prolog-split path the Newton loops
-    /// run (warm, native).
-    pub(crate) fn jacobian_dc(&self, x: &[f64], p: &[f64]) -> Vec<f64> {
-        let (mut inputs, mut work, mut out) = (Vec::new(), Vec::new(), Vec::new());
-        self.fill_inputs(x, p, 0.0, &mut inputs);
-        let mut tok = self.tape_step_dc.eval_prolog(&inputs, &mut work);
-        self.tape_step_dc
-            .eval_main(&mut tok, &inputs, &mut work, &mut out);
-        out.split_off(self.n)
-    }
-    /// Sparse `C = dQ/dx` as `(rows, cols, values)`.
-    pub fn jacobian_q_x_sparse(
-        &self,
-        x: &[f64],
-        p: &[f64],
-        t: f64,
-    ) -> (Vec<usize>, Vec<usize>, Vec<f64>) {
-        let (mut inputs, mut work, mut out) = (Vec::new(), Vec::new(), Vec::new());
-        self.fill_inputs(x, p, t, &mut inputs);
-        self.tape_c.eval(&inputs, &mut work, &mut out);
-        (self.jxd_rows.clone(), self.jxd_cols.clone(), out)
-    }
-
-    /// Sparse regularized small-signal conductance `G + GMIN_DC*I` at the
-    /// operating point `(x, p)` (`t = 0`), as triplets with the
-    /// gmin shunt appended on every diagonal -- the same regularization the DC
-    /// solve carried, so every small-signal analysis (AC, noise, symbolic
-    /// reduction) linearizes the system that was actually solved. The single
-    /// assembly point for the `A = G + jwC` builders.
-    pub fn system_triplets_dc(&self, x: &[f64], p: &[f64]) -> (Vec<usize>, Vec<usize>, Vec<f64>) {
-        let (mut r, mut c, mut v) = (
-            self.jx_rows.clone(),
-            self.jx_cols.clone(),
-            self.jacobian_dc(x, p),
-        );
-        for i in 0..self.n {
-            r.push(i);
-            c.push(i);
-            v.push(GMIN_DC);
-        }
-        (r, c, v)
     }
 
     /// Reusable symbolic factorization for the **implicit-RK stage** linear system
@@ -640,13 +478,13 @@ impl CompiledDc {
     }
 
     /// The number of transport delays.
-    pub fn delay_count(&self) -> usize {
+    pub(crate) fn delay_count(&self) -> usize {
         self.delay_src.len()
     }
 
     /// The delayed signals at `(x, t)`, into `out`, aligned with
     /// [`delay_taus`](Self::delay_taus).
-    pub fn delay_values(&self, x: &[f64], p: &[f64], t: f64, out: &mut Vec<f64>) {
+    pub(crate) fn delay_values(&self, x: &[f64], p: &[f64], t: f64, out: &mut Vec<f64>) {
         out.clear();
         match &self.delay_src {
             crate::delay::DelaySources::Unknowns(ix) => {
@@ -663,7 +501,14 @@ impl CompiledDc {
 
     /// The rates of the delayed signals as the state moves at `xdot`, into
     /// `out`.
-    pub fn delay_rates(&self, x: &[f64], xdot: &[f64], p: &[f64], t: f64, out: &mut Vec<f64>) {
+    pub(crate) fn delay_rates(
+        &self,
+        x: &[f64],
+        xdot: &[f64],
+        p: &[f64],
+        t: f64,
+        out: &mut Vec<f64>,
+    ) {
         out.clear();
         match &self.delay_src {
             crate::delay::DelaySources::Unknowns(ix) => {
@@ -716,7 +561,7 @@ impl CompiledDc {
     /// analyses honor the node-set without per-call-site plumbing. Pass an empty
     /// vector to clear.
     pub fn set_nodeset(&mut self, nodeset: Vec<(usize, f64)>) {
-        self.nodeset = nodeset;
+        self.dc.nodeset = nodeset;
     }
 
     /// The modular trick set this model honors (default [`SolverTricks::default`]).
@@ -731,11 +576,6 @@ impl CompiledDc {
         self.tricks = tricks;
     }
 
-    /// All independent-source waveform discontinuities in `(t0, t1]`, sorted and
-    /// near-coincident corners merged -- the instants the transient integrator
-    /// must land on exactly so a `C0` kink never falls *inside* a step (which would
-    /// violate the smooth-LTE assumption). Empty when every source is smooth (e.g.
-    /// a purely sinusoidal drive).
     /// What each unknown physically is, parallel to the unknown vector.
     pub fn unknown_kinds(&self) -> &[sane_dae::UnknownKind] {
         &self.kinds
@@ -746,36 +586,22 @@ impl CompiledDc {
         &self.event_names
     }
 
+    /// All independent-source waveform discontinuities in `(t0, t1]`, sorted and
+    /// near-coincident corners merged -- the instants the transient integrator
+    /// must land on exactly so a `C0` kink never falls *inside* a step (which would
+    /// violate the smooth-LTE assumption). Empty when every source is smooth (e.g.
+    /// a purely sinusoidal drive).
     pub fn transient_breakpoints(&self, p: &[f64], t0: f64, t1: f64) -> Vec<f64> {
-        let mut bps = Vec::new();
-        for (name, src) in &self.sources {
-            let resolve = |suffix: &str| {
-                self.param_index
-                    .get(&format!("{name}.{suffix}"))
-                    .and_then(|&i| p.get(i).copied())
-            };
-            src.breakpoints(resolve, t0, t1, &mut bps);
-        }
-        bps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        // Merge corners that coincide to within a hair of the span (e.g. a
-        // zero-width rise makes two corners land on the same instant).
-        let merge = (t1 - t0).abs() * 1e-9;
-        bps.dedup_by(|a, b| (*a - *b).abs() <= merge);
-        bps
+        let value = |c: &Option<usize>| c.and_then(|j| p.get(j).copied());
+        sane_core::stimulus::breakpoints(&self.stimuli, value, t0, t1)
     }
 
     /// The harmonic-balance fundamental (Hz): the tone of the first periodic source
     /// (a sine's frequency, a pulse train's `1/period`), or `None` if no source
     /// defines one.
     pub fn source_fundamental(&self, p: &[f64]) -> Option<f64> {
-        self.sources.iter().find_map(|(name, src)| {
-            let resolve = |suffix: &str| {
-                self.param_index
-                    .get(&format!("{name}.{suffix}"))
-                    .and_then(|&i| p.get(i).copied())
-            };
-            src.fundamental(resolve)
-        })
+        let value = |c: &Option<usize>| c.and_then(|j| p.get(j).copied());
+        self.stimuli.iter().find_map(|s| s.fundamental(value))
     }
 
     /// Transient solve of the DAE `I(x, t) + d/dt Q(x) = 0` over `t_eval` by
@@ -808,7 +634,6 @@ impl CompiledDc {
     /// `d x[outputs[o]] / d p[cols[j]]` at `o * cols.len() + j`. From an
     /// operating point (`x0` empty, or the point itself with `dc_start`) the
     /// sensitivities start at the point's, from a given state at zero.
-    /// Requires [`ensure_transient_sensitivity`](Self::ensure_transient_sensitivity).
     #[allow(clippy::too_many_arguments)]
     pub fn solve_transient_sensitivity(
         &self,

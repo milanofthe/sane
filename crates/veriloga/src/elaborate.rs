@@ -16,6 +16,8 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::ast::*;
 use crate::error::{Diagnostic, Diagnostics, Span};
+use crate::ops::AnalogOp;
+use sane_core::MathFn;
 
 #[derive(Clone, Debug)]
 pub struct ResolvedParam {
@@ -431,7 +433,7 @@ pub(crate) fn const_eval_with(e: &Expr, resolve: &dyn Fn(&str) -> Option<f64>) -
             // `analysis(...)` is a compile-time 0 for SANE's analysis-agnostic
             // model (see the lowering), so a flag like `doNoise = analysis("noise")`
             // folds and its guarded blocks resolve statically.
-            if name == "analysis" {
+            if AnalogOp::from_name(name) == Some(AnalogOp::Analysis) {
                 return Some(0.0);
             }
             let v: Vec<f64> = args
@@ -464,28 +466,14 @@ pub(crate) fn const_eval_with(e: &Expr, resolve: &dyn Fn(&str) -> Option<f64>) -
     })
 }
 
+/// A built-in function's value on constants: the elementary ones (see
+/// [`sane_core::MathFn`]) and `limexp`, the exponential.
 pub(crate) fn const_builtin(name: &str, a: &[f64]) -> Option<f64> {
-    let v = |i: usize| a.get(i).copied();
-    Some(match name {
-        "exp" | "limexp" => v(0)?.exp(),
-        "ln" => v(0)?.ln(),
-        "log" => v(0)?.log10(),
-        "sqrt" => v(0)?.sqrt(),
-        "abs" => v(0)?.abs(),
-        "sin" => v(0)?.sin(),
-        "cos" => v(0)?.cos(),
-        "tan" => v(0)?.tan(),
-        "atan" => v(0)?.atan(),
-        "tanh" => v(0)?.tanh(),
-        "sinh" => v(0)?.sinh(),
-        "cosh" => v(0)?.cosh(),
-        "floor" => v(0)?.floor(),
-        "ceil" => v(0)?.ceil(),
-        "pow" => v(0)?.powf(v(1)?),
-        "min" => v(0)?.min(v(1)?),
-        "max" => v(0)?.max(v(1)?),
-        _ => return None,
-    })
+    let f = match AnalogOp::from_name(name) {
+        Some(AnalogOp::Limexp) => MathFn::Exp,
+        _ => MathFn::from_veriloga(name)?,
+    };
+    (f.arity() == a.len()).then(|| f.eval(a))
 }
 
 pub(crate) fn bool_f64(b: bool) -> f64 {

@@ -160,7 +160,7 @@ impl Point {
             return Ok(done.clone());
         }
         let inner = &self.model.inner;
-        let mut task = sane_core::log::task("DC", "dc", &format!("(dim: {})", inner.dae.dim()));
+        let mut task = sane_core::log::task("DC", "dc", &format!("(dim: {})", inner.cdc.dim()));
         let seed = self.seed.as_deref().map_or(&[][..], |s| s.as_slice());
         let solved = inner.solve_op(&self.p, &self.dc, seed)?;
         task.finish(match &solved.1 {
@@ -194,7 +194,7 @@ impl Point {
         let col = inner
             .column(param)
             .ok_or_else(|| ModelError::UnknownParam(param.to_string()))?;
-        let n = inner.dae.dim();
+        let n = inner.cdc.dim();
         let mut x_all = Array2::from_elem((values.len(), n), f64::NAN);
         let (mut converged, mut solved) = (Vec::new(), Vec::new());
         let mut warm: Vec<f64> = Vec::new();
@@ -213,7 +213,7 @@ impl Point {
                     Some((there, layout)) => {
                         let m = &there.model.inner;
                         let warm = if warm.len() == n {
-                            layout.unmap(warm, m.dae.dim(), 0.0)
+                            layout.unmap(warm, m.cdc.dim(), 0.0)
                         } else {
                             Vec::new()
                         };

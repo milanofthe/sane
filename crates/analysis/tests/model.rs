@@ -1,9 +1,13 @@
-//! In-crate integration tests over the `Model` front end (Verilog-A engine
-//! parity, deck directives, sensitivity oracles). These need crate internals,
-//! so they live here rather than in `tests/`.
+//! Integration tests over the `Model` front end: Verilog-A engine parity,
+//! deck directives, sensitivity oracles.
 
-use super::*;
+use std::f64::consts::PI;
+
+use sane_analysis::*;
+use sane_core::constants::{DC_OP_MAXIT, DC_OP_TOL};
+use sane_core::Graph;
 use sane_netlist::parse;
+use sane_solve::CompiledDc;
 
 /// Label a DAE unknown for the UI: `v{k}` -> (node name, "voltage"), else
 /// (stripped name, "current").
@@ -1008,7 +1012,7 @@ mod bsim4_validation {
     fn bsim4_gstage_tran() {
         // Transient integration of the full BSIM4 stage. The drive is constant
         // DC, so the engine starts from a consistent operating point and the
-        // adaptive BDF advances the device + its capacitances in the time domain,
+        // the adaptive transient advances the device + its capacitances in the time domain,
         // remaining stable at the operating point. (The lowered charge model is
         // separately validated to be exact by the AC roll-off match above; a
         // continuous time-varying-source swing is undersampled by the engine's
@@ -1111,10 +1115,7 @@ mod hb_verify {
 
     fn unknown_idx(dae: &sane_dae::Dae, parsed: &sane_circuit::Circuit, node: &str) -> usize {
         let k = parsed.find_node(node).unwrap();
-        dae.unknowns
-            .iter()
-            .position(|u| *u == format!("v{k}"))
-            .unwrap()
+        dae.node(k).unwrap()
     }
 
     #[test]
@@ -1127,14 +1128,14 @@ mod hb_verify {
         let parsed = parse(net).unwrap();
         let mut ctx = Graph::new();
         let dae = sane_dae::assemble(&mut ctx, &parsed).unwrap();
-        let cdc = CompiledDc::new(&mut ctx, &dae);
-        let pnames = cdc.param_names(&ctx);
+        let cdc = CompiledDc::new(ctx, dae);
+        let pnames = cdc.param_names();
         let p: Vec<f64> = parsed.pvec(&pnames);
         let (x_dc, conv, _) = cdc.solve_dc(&p, &[], DC_OP_TOL, DC_OP_MAXIT);
         assert!(conv);
         let w0 = p[pnames.iter().position(|n| n == "V1.sin_w").unwrap()];
 
-        let nl = dae.nonlinearity(&ctx);
+        let nl = cdc.dae().nonlinearity(&cdc.graph());
         assert_eq!(nl.degree, rsdag::Degree::Finite(1));
         let k = 2;
         let m = hb_samples(&nl, k, 8);
@@ -1146,8 +1147,8 @@ mod hb_verify {
             res.residual_norm
         );
 
-        let in_i = unknown_idx(&dae, &parsed, "in");
-        let out_i = unknown_idx(&dae, &parsed, "out");
+        let in_i = unknown_idx(cdc.dae(), &parsed, "in");
+        let out_i = unknown_idx(cdc.dae(), &parsed, "out");
         let h_hb = res.spectra[out_i][1] / res.spectra[in_i][1];
         let (r, c) = (1e3, 1e-6);
         let h_ref = Complex64::new(1.0, 0.0) / Complex64::new(1.0, w0 * r * c);
@@ -1186,16 +1187,16 @@ mod hb_verify {
         let parsed = parse(net).unwrap();
         let mut ctx = Graph::new();
         let dae = sane_dae::assemble(&mut ctx, &parsed).unwrap();
-        let cdc = CompiledDc::new(&mut ctx, &dae);
-        let pnames = cdc.param_names(&ctx);
+        let cdc = CompiledDc::new(ctx, dae);
+        let pnames = cdc.param_names();
         let p: Vec<f64> = parsed.pvec(&pnames);
         let (x_dc, conv, _) = cdc.solve_dc(&p, &[], DC_OP_TOL, DC_OP_MAXIT);
         assert!(conv);
         let w0 = p[pnames.iter().position(|n| n == "V1.sin_w").unwrap()];
-        let mid = unknown_idx(&dae, &parsed, "mid");
+        let mid = unknown_idx(cdc.dae(), &parsed, "mid");
 
         // Harmonic balance.
-        let nl = dae.nonlinearity(&ctx);
+        let nl = cdc.dae().nonlinearity(&cdc.graph());
         assert!(!nl.is_polynomial(), "diode is transcendental");
         let k = 8;
         let m = hb_samples(&nl, k, 16);
@@ -1246,17 +1247,16 @@ mod hb_verify {
         let parsed = parse(net).unwrap();
         let mut ctx = Graph::new();
         let dae = sane_dae::assemble(&mut ctx, &parsed).unwrap();
-        let cdc = CompiledDc::new(&mut ctx, &dae);
-        cdc.ensure_param_jac(&mut ctx, &dae);
-        let pnames = cdc.param_names(&ctx);
+        let cdc = CompiledDc::new(ctx, dae);
+        let pnames = cdc.param_names();
         let p: Vec<f64> = parsed.pvec(&pnames);
         let (x_dc, conv, _) = cdc.solve_dc(&p, &[], DC_OP_TOL, DC_OP_MAXIT);
         assert!(conv);
         let w0 = p[pnames.iter().position(|n| n == "V1.sin_w").unwrap()];
-        let mid = unknown_idx(&dae, &parsed, "mid");
+        let mid = unknown_idx(cdc.dae(), &parsed, "mid");
 
         let k = 5usize;
-        let m = hb_samples(&dae.nonlinearity(&ctx), k, 16);
+        let m = hb_samples(&cdc.dae().nonlinearity(&cdc.graph()), k, 16);
         let hb = CompiledHb::new(&cdc, k, m).unwrap();
         let solve =
             |pv: &[f64]| -> Vec<Vec<Complex64>> { hb.solve(pv, &x_dc, w0, 1e-12, 80).spectra };
@@ -1289,17 +1289,15 @@ mod hb_verify {
         let parsed = parse(net).unwrap();
         let mut ctx = Graph::new();
         let dae = sane_dae::assemble(&mut ctx, &parsed).unwrap();
-        let cdc = CompiledDc::new(&mut ctx, &dae);
-        cdc.ensure_param_jac(&mut ctx, &dae);
-        cdc.ensure_hessian(&mut ctx, &dae);
-        let pnames = cdc.param_names(&ctx);
+        let cdc = CompiledDc::new(ctx, dae);
+        let pnames = cdc.param_names();
         let p: Vec<f64> = parsed.pvec(&pnames);
         let (x_dc, conv, _) = cdc.solve_dc(&p, &[], DC_OP_TOL, DC_OP_MAXIT);
         assert!(conv);
         let w0 = p[pnames.iter().position(|n| n == "V1.sin_w").unwrap()];
-        let mid = unknown_idx(&dae, &parsed, "mid");
+        let mid = unknown_idx(cdc.dae(), &parsed, "mid");
         let k = 5usize;
-        let m = hb_samples(&dae.nonlinearity(&ctx), k, 16);
+        let m = hb_samples(&cdc.dae().nonlinearity(&cdc.graph()), k, 16);
         let hb = CompiledHb::new(&cdc, k, m).unwrap();
 
         let j = pnames.iter().position(|n| n == "R1").unwrap();
@@ -1327,22 +1325,12 @@ mod hb_verify {
         );
     }
 
-    fn setup(
-        net: &str,
-    ) -> (
-        Graph,
-        sane_dae::Dae,
-        CompiledDc,
-        Vec<f64>,
-        Vec<f64>,
-        f64,
-        Vec<usize>,
-    ) {
+    fn setup(net: &str) -> (CompiledDc, Vec<f64>, Vec<f64>, f64, Vec<usize>) {
         let parsed = parse(net).unwrap();
         let mut ctx = Graph::new();
         let dae = sane_dae::assemble(&mut ctx, &parsed).unwrap();
-        let cdc = CompiledDc::new(&mut ctx, &dae);
-        let pnames = cdc.param_names(&ctx);
+        let cdc = CompiledDc::new(ctx, dae);
+        let pnames = cdc.param_names();
         let p: Vec<f64> = parsed.pvec(&pnames);
         let (x_dc, conv, _) = cdc.solve_dc(&p, &[], DC_OP_TOL, DC_OP_MAXIT);
         assert!(conv);
@@ -1353,7 +1341,7 @@ mod hb_verify {
             .filter(|(_, n)| n.ends_with(".sin_amp"))
             .map(|(i, _)| i)
             .collect();
-        (ctx, dae, cdc, p, x_dc, w0, ramp)
+        (cdc, p, x_dc, w0, ramp)
     }
 
     #[test]
@@ -1394,8 +1382,7 @@ mod hb_verify {
         // fixed point).
         let net = "V1 in 0 SIN(0.6 0.15 1000)\nR1 in mid 1k\nD1 mid 0 DMOD\n\
                    C1 mid 0 100n\n.model DMOD D(Is=1e-14 N=1 Vt=0.02585)\n.end";
-        let (ctx, _dae, cdc, p, x_dc, w0, ramp) = setup(net);
-        let _ = &ctx;
+        let (cdc, p, x_dc, w0, ramp) = setup(net);
         let nl = rsdag::Nonlinearity {
             degree: rsdag::Degree::Unbounded,
             ..Default::default()
@@ -1420,8 +1407,7 @@ mod hb_verify {
         // converges too, and both land on the same spectrum.
         let net = "V1 in 0 SIN(0 2.0 1000)\nR1 in mid 50\nD1 mid 0 DMOD\n\
                    C1 mid 0 100n\n.model DMOD D(Is=1e-14 N=1 Vt=0.02585)\n.end";
-        let (ctx, _dae, cdc, p, x_dc, w0, ramp) = setup(net);
-        let _ = &ctx;
+        let (cdc, p, x_dc, w0, ramp) = setup(net);
         let nl = rsdag::Nonlinearity {
             degree: rsdag::Degree::Unbounded,
             ..Default::default()
@@ -1486,7 +1472,7 @@ mod sensitivity_ad_tests {
 
     /// In the settled limit the exact transient sensitivity must converge to the
     /// exact DC sensitivity. A capacitively-loaded divider settles to
-    /// out = V*R2/(R1+R2); both methods (augmented-DAE forward sensitivity and the
+    /// out = V*R2/(R1+R2); both methods (forward transient sensitivity and the
     /// adjoint DC sensitivity) are pure autodiff and must agree.
     #[test]
     fn transient_sensitivity_settles_to_dc() {
@@ -1497,7 +1483,7 @@ mod sensitivity_ad_tests {
         let npts = ((tstop / tstep).round() as usize).clamp(1, 100_000);
         let t_eval: Vec<f64> = (0..=npts).map(|k| k as f64 * tstop / npts as f64).collect();
         // Forward transient sensitivity: d ln(out(tstop))/d ln R1, normalised by the
-        // baseline output at tstop (row [0..n) of the augmented trajectory).
+        // output at tstop.
         let s = (m.at(&[]).unwrap())
             .transient(&t_eval, &TransientOptions::default())
             .and_then(|tr| tr.sensitivity(&["out"], &["R1"]))

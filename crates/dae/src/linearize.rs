@@ -19,7 +19,7 @@ use rustc_hash::FxHashMap;
 use rsdag::{ExprId, SymbolId};
 use sane_core::Graph;
 
-use crate::Dae;
+use crate::{Dae, SolverHints};
 
 /// The operating-point freeze map: every unknown symbol `x_j` is mapped to a
 /// fresh constant symbol named `"{name}#op"`. Applied to a Jacobian entry, it
@@ -72,21 +72,12 @@ pub fn linearize(ctx: &mut Graph, dae: &Dae) -> Dae {
     {
         drives.push((s, ctx.symbol_expr(s)));
     }
-    let params = dae.params(ctx);
-    for name in &dae.source_names {
-        let value = sane_circuit::value_symbol_name(name);
-        let prefix = format!("{name}.");
-        for &p in &params {
-            let pn = ctx.symbol_name(p).to_string();
-            let drive = pn == value
-                || pn
-                    .strip_prefix(&prefix)
-                    .is_some_and(sane_circuit::SourceFn::is_level);
-            if drive {
-                let u = ctx.symbol_expr(p);
-                let op = ctx.sym(&format!("{pn}#op"));
-                drives.push((p, ctx.sub(u, op)));
-            }
+    let params: std::collections::HashSet<SymbolId> = dae.params(ctx).into_iter().collect();
+    for p in dae.sources.iter().flat_map(|s| s.drive()) {
+        if params.contains(&p) {
+            let u = ctx.symbol_expr(p);
+            let op = ctx.sym(&format!("{}#op", ctx.symbol_name(p)));
+            drives.push((p, ctx.sub(u, op)));
         }
     }
     let wrt: Vec<SymbolId> = drives.iter().map(|&(s, _)| s).collect();
@@ -133,11 +124,7 @@ pub fn linearize(ctx: &mut Graph, dae: &Dae) -> Dae {
         d.src = src;
     }
     lin.events.clear();
-    lin.limits.clear();
-    lin.companion.clear();
-    lin.dc_seeds.clear();
-    lin.sources.clear();
-    lin.source_names.clear();
+    lin.hints = SolverHints::default();
     lin
 }
 

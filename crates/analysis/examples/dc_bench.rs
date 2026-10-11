@@ -60,8 +60,8 @@ fn main() {
         };
         let mut ctx = Graph::new();
         let dae = sane_dae::assemble(&mut ctx, &parsed).unwrap();
-        let mut cdc = CompiledDc::new(&mut ctx, &dae);
-        let p = parsed.pvec(&cdc.param_names(&ctx));
+        let mut cdc = CompiledDc::new(ctx, dae);
+        let p = parsed.pvec(&cdc.param_names());
         let mut row = format!(
             "{:<28} {:>5} |",
             path.file_name().unwrap().to_string_lossy(),

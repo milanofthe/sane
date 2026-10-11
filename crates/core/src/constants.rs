@@ -17,15 +17,18 @@ pub const ELEMENTARY_CHARGE: f64 = 1.602176634e-19;
 /// Thermal voltage coefficient `k_B / q` [V/K] (~8.617e-5).
 pub const K_OVER_Q: f64 = BOLTZMANN / ELEMENTARY_CHARGE;
 
-/// Nominal circuit temperature [K] (27 degrees Celsius): the default operating
-/// temperature seen by Verilog-A `$temperature` / `$vt` when no sweep is active.
-pub const TEMP_NOMINAL_K: f64 = 300.15;
-
 /// Zero degrees Celsius in Kelvin (the Celsius<->Kelvin offset).
 pub const ZERO_CELSIUS_K: f64 = 273.15;
 
 /// Nominal circuit temperature in Celsius (27 degC), the SPICE default `.temp`.
 pub const TEMP_NOMINAL_C: f64 = 27.0;
+
+/// Nominal circuit temperature [K] (27 degrees Celsius): the default operating
+/// temperature seen by Verilog-A `$temperature` / `$vt` when no sweep is active.
+pub const TEMP_NOMINAL_K: f64 = ZERO_CELSIUS_K + TEMP_NOMINAL_C;
+
+/// Thermal voltage `kT/q` at the nominal temperature [V] (~25.865 mV).
+pub const VT_NOMINAL: f64 = K_OVER_Q * TEMP_NOMINAL_K;
 
 /// Reserved symbol name for the global circuit temperature [K]. Verilog-A
 /// `$temperature` lowers to this shared symbol (rather than a constant) so a
@@ -42,7 +45,7 @@ pub const TEMP_SYMBOL: &str = "$temp";
 /// (value and first derivative matched at the knot), bounding its growth to
 /// linear. This mirrors SPICE junction voltage limiting: it leaves normal
 /// operating points (`arg < EXP_VCRIT`) exactly unchanged while preventing the
-/// `exp` overflow that wrecks Newton / BDF trial steps. `exp(40) ~ 2.4e17`,
+/// `exp` overflow that wrecks Newton and transient trial steps. `exp(40) ~ 2.4e17`,
 /// far above any physical junction current yet far below `f64::MAX`.
 pub const EXP_VCRIT: f64 = 40.0;
 
@@ -56,13 +59,6 @@ pub const COMPANION_G: f64 = 1.0;
 // Verilog-A frontend (lowering / preprocessor)
 // ===========================================================================
 
-/// Boltzmann constant over elementary charge (`k/q`) [V/K] as used in Verilog-A
-/// `$vt` lowering. This is the historical literal baked into the lowered symbolic
-/// expressions; it differs from the computed [`K_OVER_Q`] by ~1e-9 relative
-/// (a handful of decimal digits), so it is kept as a distinct constant to keep
-/// already-lowered models bit-identical.
-pub const VERILOGA_K_OVER_Q: f64 = 8.617_333_262e-5;
-
 /// Cap on `for`-loop unrolling iterations (runaway guard).
 pub const MAX_UNROLL: usize = 100_000;
 
@@ -75,6 +71,14 @@ pub const VA_LOOP_GATED_CAP: usize = 64;
 
 /// Preprocessor: maximum macro-expansion / include nesting depth (recursion guard).
 pub const PREPROCESSOR_MAX_DEPTH: usize = 256;
+
+/// Diagnostics: the most include and macro-expansion contexts a span is
+/// walked back through to its root file.
+pub const DIAG_MAX_HOPS: usize = 32;
+
+/// `$simparam("gmin")`: the minimum conductance a model asks the simulator
+/// for, the DC solver's own (see [`GMIN_DC`]).
+pub const VA_SIMPARAM_GMIN: f64 = GMIN_DC;
 
 // ===========================================================================
 // DC solver: damped Newton, limiting, partitioning
@@ -113,10 +117,13 @@ pub const NEWTON_STALL_FACTOR: f64 = 0.95;
 pub const LINE_SEARCH_SHRINK: f64 = 0.5;
 
 /// Device limiting (`pnjlim`): thermal voltage `kT/q` used in the logarithmic
-/// junction-step limiting (same nominal value as the device models' thermal
-/// voltage). The limiting is path-only -- it never moves the converged operating
-/// point -- so this need not track a per-device `temp`.
-pub const LIMIT_VT: f64 = 0.025852;
+/// junction-step limiting, the nominal one. The limiting is path-only -- it
+/// never moves the converged operating point -- so this need not track a
+/// per-device `temp`.
+pub const LIMIT_VT: f64 = VT_NOMINAL;
+/// Device limiting (`pnjlim`): a junction step larger than this many thermal
+/// voltages is limited (SPICE3 `DEVpnjlim`).
+pub const PNJLIM_STEP_VT: f64 = 2.0;
 /// Device limiting (`pnjlim`): critical forward voltage above which the junction
 /// step is logarithmically limited. SPICE derives it per junction as
 /// `vcrit = Vt*ln(Vt/(sqrt(2)*Is))`, ~0.6-0.8 V for `Is` in 1e-14..1e-16. Only
@@ -126,6 +133,21 @@ pub const LIMIT_VCRIT: f64 = 0.6;
 /// Device limiting (`fetlim`): representative channel threshold voltage placing
 /// the bounded-step region for FET `vgs`. Path-only, like [`LIMIT_VCRIT`].
 pub const LIMIT_VTO: f64 = 0.5;
+/// Device limiting (`fetlim`, SPICE3 `DEVfetlim`), in volts about the
+/// threshold: the step a gate voltage may always take, its growth with the
+/// overdrive, the overdrive past which the channel counts as strongly
+/// inverted, the window about the threshold a step from below stops in, and
+/// the overdrive a turning-on step is held to.
+pub const FETLIM_STEP: f64 = 2.0;
+pub const FETLIM_STEP_GAIN: f64 = 2.0;
+pub const FETLIM_STRONG: f64 = 3.5;
+pub const FETLIM_NEAR: f64 = 0.5;
+pub const FETLIM_TURN_ON: f64 = 4.0;
+
+/// Newton iteration budget of one point of every DC continuation: a gmin or
+/// source step, a companion-homotopy point, a nodeset pin phase. Each starts
+/// near the predicted solution, so it converges fast or not at all.
+pub const CONTINUATION_MAX_ITER: usize = 100;
 
 /// Linear-block caching (Schur complement): only partition systems at least
 /// this large (below it, a plain sparse LU per iteration is already cheap).
@@ -149,6 +171,11 @@ pub const DC_ABSTOL: f64 = 1e-12;
 /// Absolute voltage floor: residual of a KVL (branch) row, and update of a
 /// node-voltage unknown.
 pub const DC_VNTOL: f64 = 1e-9;
+/// The classic loose SPICE convergence defaults (`reltol`, `abstol` [A],
+/// `vntol` [V]).
+pub const SPICE_RELTOL: f64 = 1e-3;
+pub const SPICE_ABSTOL: f64 = 1e-12;
+pub const SPICE_VNTOL: f64 = 1e-6;
 
 /// Operating-point solve settled by the analysis layer (deck paths): the Newton
 /// residual tolerance and iteration cap passed to `solve_dc`. Distinct from the
@@ -200,9 +227,6 @@ pub const GMIN_STEP_RATIO_FLOOR: f64 = 0.98;
 /// coarsest ratio need six levels; the budget bounds the pathological case
 /// where every level converges only after repeated refinement.
 pub const GMIN_STEP_MAX_LEVELS: usize = 64;
-/// gmin continuation: per-point Newton iteration budget (each point starts near
-/// the predicted solution, so it should converge fast).
-pub const GMIN_STEP_MAX_ITER: usize = 100;
 
 /// Pseudo-transient continuation: initial pseudo-step. The first BE step's
 /// anchor shunt is `1/PTC_H0 = 1e6` mho -- far above every circuit conductance
@@ -236,11 +260,7 @@ pub const GSET: f64 = 1.0;
 /// `max(GSET, GSET_ROW_SCALE * ||J_row(x0)||_inf)`, so the spring dominates
 /// that row's own couplings regardless of units.
 pub const GSET_ROW_SCALE: f64 = 10.0;
-/// Nodeset pin: per-phase Newton iteration budget.
-pub const NODESET_MAX_ITER: usize = 100;
 
-/// Source continuation: per-point Newton iteration budget.
-pub const SOURCE_STEP_MAX_ITER: usize = 100;
 /// Source stepping: a modest shunt conductance held during the ramp to
 /// regularize near-singular high-impedance nodes (mirror-loaded diff pairs) and
 /// damp region-boundary chatter; removed for the final `lambda = 1` polish.
@@ -322,6 +342,21 @@ pub const TRANSIENT_SPAN_EPS_FRAC: f64 = 1e-12;
 /// as a fraction of the first step (see `solve_transient`): short enough
 /// that the charges stay where the state put them.
 pub const TRANSIENT_IC_STEP_FRAC: f64 = 1e-3;
+
+/// The first step of a transient without a step cap, as a fraction of its
+/// span.
+pub const TRANSIENT_H0_FRAC: f64 = 1e-2;
+/// Breakpoints within this fraction of the span of each other are one.
+pub const BREAKPOINT_MERGE_FRAC: f64 = 1e-9;
+/// A step that would end short of a breakpoint by less than this many times
+/// itself splits the rest into two halves instead (no sliver before it).
+pub const BREAKPOINT_SPLIT: f64 = 1.9;
+/// A gmin-held operating point is settled by a transient over this span [s]
+/// before it is solved again.
+pub const GMIN_SETTLE_SPAN: f64 = 0.06;
+/// The stage Newton's tolerance floor in multiples of the machine epsilon
+/// over `rtol` (Hairer and Wanner's `fnewt`).
+pub const STAGE_TOL_FLOOR_EPS: f64 = 10.0;
 
 /// Implicit Euler stage Newton (the consistent start and restarts): the
 /// iteration budget.
@@ -408,9 +443,164 @@ pub const EVENT_REINIT_FRAC: f64 = 4.0 * EVENT_TIME_TOL;
 pub const PENCIL_INF_TOL: f64 = 1e-9;
 /// Discard finite roots larger than this magnitude (numerical infinities).
 pub const PENCIL_ROOT_MAX: f64 = 1e15;
+/// A matrix's balancing (see `pz::balance`) rescales a row and column
+/// only where it shrinks their norms below this fraction (LAPACK's `gebal`
+/// takes 0.95).
+pub const BALANCE_GAIN: f64 = 0.95;
+/// The moves, as multiples of the larger of the shift and the pencil's own
+/// rate `|M| / |N|`, a pencil's standard reduction makes off a shift the
+/// pencil is singular at (a transfer that vanishes at DC has a zero at
+/// `s = 0`): incommensurate, so a root at one is not at the next.
+pub const PENCIL_SHIFTS: [f64; 3] = [1.0, -std::f64::consts::SQRT_2, std::f64::consts::E];
+/// The most reductions (bands, and moves off a singular shift) a pencil's
+/// roots are found in. Each band resolves about `1 / PENCIL_INF_TOL` times
+/// the distance to the root nearest its shift, so a few cover every decade
+/// up to [`PENCIL_ROOT_MAX`].
+pub const PENCIL_BANDS_MAX: usize = 12;
 
 /// Transport-delay DC relaxation: damped fixed point of the history inputs
 /// onto their source values (`d = y` at DC). The damping keeps marginal
 /// reflection loops (|Gamma| = 1: open / shorted ideal lines) contractive.
 pub const DELAY_DC_MAX_ROUNDS: usize = 60;
+/// Delay DC relaxation: the fraction of the step toward the delayed signals'
+/// new values each round takes.
 pub const DELAY_DC_DAMPING: f64 = 0.5;
+/// Delay DC relaxation: the floor of its convergence test, relative.
+pub const DELAY_DC_TOL_FLOOR: f64 = 1e-12;
+
+// ===========================================================================
+// Delay history
+// ===========================================================================
+
+/// Knots a history holds before it grows, by default.
+pub const DELAY_HISTORY_KNOTS: usize = 64;
+/// Knots a transient's history is given past what its step cap leaves in the
+/// horizon: the short steps after each restart.
+pub const DELAY_KNOT_SLACK: usize = 64;
+/// The smallest ring a delayed signal's knots are kept in.
+pub const DELAY_RING_MIN: usize = 8;
+/// Knots a query walks from its cursor before it bisects instead.
+pub const DELAY_PROBE_MAX: usize = 4;
+
+// ===========================================================================
+// Harmonic balance defaults
+// ===========================================================================
+
+/// Harmonics of the fundamental kept.
+pub const HB_HARMONICS: usize = 8;
+/// Time samples per harmonic of the transform (aliasing guard).
+pub const HB_OVERSAMPLE: usize = 16;
+/// Newton tolerance on the harmonic residual.
+pub const HB_TOL: f64 = 1e-10;
+/// Newton iteration budget.
+pub const HB_MAX_ITER: usize = 60;
+/// Time samples the transform evaluates together, one lane each.
+pub const HB_LANES: usize = 4;
+
+// ===========================================================================
+// Small-signal analyses
+// ===========================================================================
+
+/// Frequencies per block of an AC sweep: one pivoting factorization each, a
+/// unit of work for one worker.
+pub const AC_BLOCK: usize = 64;
+/// Two roots pair as complex conjugates when they agree to this, relative.
+pub const PZ_CONJ_TOL: f64 = 1e-6;
+/// The floor a magnitude is held to before its logarithm in decibels.
+pub const DB_MAG_FLOOR: f64 = 1e-30;
+/// The floor a divisor or pivot magnitude is held to: a guard against an
+/// exact zero, far below any value of meaning.
+pub const DIV_FLOOR: f64 = 1e-300;
+/// Pruning: the relative contribution below which a branch is negligible.
+pub const PRUNE_REL_TOL: f64 = 1e-3;
+/// Pruning: the default frequency grid (Hz), from, to, points per decade.
+pub const PRUNE_F_MIN: f64 = 1.0;
+pub const PRUNE_F_MAX: f64 = 1e9;
+pub const PRUNE_F_PER_DECADE: usize = 6;
+/// The reference impedance of a port or a transmission line that does not
+/// give one [Ohm].
+pub const DEFAULT_Z0: f64 = 50.0;
+
+// ===========================================================================
+// Vector fitting (rational macromodels)
+// ===========================================================================
+
+/// Relative fit error the order search stops at.
+pub const VF_TOL: f64 = 1e-4;
+/// The most poles the order search tries.
+pub const VF_MAX_POLES: usize = 40;
+/// Passivity: the violation below which a fit counts as passive.
+pub const VF_PASSIVITY_THRESHOLD: f64 = 1e-2;
+/// Passivity enforcement: iteration budget.
+pub const VF_PASSIVITY_ITERS: usize = 20;
+
+// ===========================================================================
+// Netlist and element defaults
+// ===========================================================================
+
+/// The delay of a lossless line that does not give one [s].
+pub const TLINE_TD: f64 = 1e-9;
+/// Segments a distributed line is discretized into, by default and at most.
+pub const TLINE_SEGMENTS: usize = 16;
+pub const TLINE_SEGMENTS_MAX: usize = 4096;
+/// A distributed RC line's total series resistance and shunt capacitance
+/// when the deck does not give them.
+pub const URC_R: f64 = 1.0;
+pub const URC_C: f64 = 1e-12;
+/// The series resistance standing in for a line segment's zero inductance.
+pub const LADDER_PLACEHOLDER_R: f64 = 1e-9;
+/// MOSFET levels at most this are the native square law; above, a compact
+/// model (the levels are read as numbers, the cut sits between 3 and 4).
+pub const MOS_NATIVE_MAX_LEVEL: f64 = 3.5;
+/// Nesting depth of subcircuit instances and of includes (recursion guard).
+pub const SUBCKT_MAX_DEPTH: u32 = 64;
+pub const INCLUDE_MAX_DEPTH: usize = 64;
+/// A number this large or larger prints in exponent form rather than as an
+/// integer.
+pub const FMT_INT_MAX: f64 = 1e15;
+/// The width and the period of a pulse that does not give them: longer than
+/// any run, finite so the lowered waveform computes with it [s].
+pub const PULSE_FOREVER: f64 = 1e30;
+/// A switch's default on and off resistances and its hysteresis window.
+pub const SWITCH_RON: f64 = 1.0;
+pub const SWITCH_ROFF: f64 = 1e6;
+pub const SWITCH_IH: f64 = 1e-6;
+
+// ===========================================================================
+// Sparse solves and threads
+// ===========================================================================
+
+/// Factorization work per factor entry from which the supernodal paths take
+/// over from KLU (see `sane_solve::sparse`).
+pub const SUPERNODAL_FLOPS_PER_ENTRY: f64 = 25.0;
+/// Worker-thread count when `SANE_THREADS` is not set.
+pub const DEFAULT_THREADS: usize = 4;
+
+// ===========================================================================
+// Progress reporting
+// ===========================================================================
+
+/// The shortest interval between two progress lines [s], the progress a new
+/// line waits for, the bar's width in characters and the smoothing of the
+/// rate estimate.
+pub const PROGRESS_MIN_INTERVAL: f64 = 1.0;
+pub const PROGRESS_LOG_EVERY: f64 = 0.2;
+pub const PROGRESS_BAR_WIDTH: usize = 20;
+pub const PROGRESS_EMA_ALPHA: f64 = 0.3;
+/// The progress from which a time to completion is estimated.
+pub const PROGRESS_ETA_MIN: f64 = 0.01;
+/// A rate below this many iterations per second is shown per minute.
+pub const PROGRESS_PER_MINUTE_BELOW: f64 = 0.1;
+
+// ===========================================================================
+// Web host (UI defaults)
+// ===========================================================================
+
+/// The AC sweep's default end frequency [Hz] and points, the transient's
+/// output points.
+pub const UI_AC_F_MAX: f64 = 1e8;
+pub const UI_AC_POINTS: usize = 200;
+pub const UI_TRAN_POINTS: usize = 400;
+/// The graph view takes at most this many expression nodes (it lays out
+/// only what is expanded, a big circuit starting collapsed).
+pub const UI_GRAPH_MAX_NODES: usize = 200_000;

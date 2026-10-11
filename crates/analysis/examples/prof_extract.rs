@@ -1,6 +1,6 @@
 //! Profile the extraction pipeline (parse + DAE build + CompiledDc::new) for one
 //! netlist, breaking the wall time into the instrumented stages and the
-//! unaccounted remainder (parse + DAE assembly, which carry no `time_stage!`).
+//! unaccounted remainder (parse + DAE assembly, which carry no stage of their own).
 //!
 //!   cargo run --release --example prof_extract -- path.cir
 use sane_analysis::Model;

@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
 use rsdag::{sparse_jacobian, Crossing, ExprId, Node, SymbolId};
-use sane_circuit::SourceFn;
+use sane_core::stimulus::Stimulus;
 use sane_core::Graph;
 
 // Assembly of the symbolic DAE from a parsed circuit.
@@ -25,19 +25,14 @@ mod assemble;
 pub mod linearize;
 mod observers;
 mod rewrite;
-// Sensitivity machinery: directional derivatives, augmentation, Hessian blocks.
+// Sensitivity machinery: Hessian blocks, frozen Jacobians, parameter columns.
 mod sens;
 // Graph transformations (shorts / opens / exact node elimination).
-#[cfg(test)]
-mod tests;
 mod transform;
 
 pub use assemble::{assemble, assemble_at};
 pub use observers::Observers;
-pub use sens::{
-    ac_param_derivatives, augment_with_scaled_sensitivities, augment_with_sensitivities, frozen,
-    lagrangian_hessian, param_column, Frozen, HessianSym,
-};
+pub use sens::{frozen, lagrangian_hessian, param_column, Frozen, HessianSym};
 pub use transform::{eliminate_nodes, reduce_graph};
 
 pub use sane_device::{
@@ -51,7 +46,7 @@ impl Dae {
     /// the model built at those values. Limits only shape the Newton path,
     /// so this decides no result.
     pub fn keep_limits_at(&mut self, ctx: &Graph, value_of: impl Fn(SymbolId) -> Option<f64>) {
-        let whens: Vec<ExprId> = self.limits.iter().filter_map(|l| l.when).collect();
+        let whens: Vec<ExprId> = self.hints.limits.iter().filter_map(|l| l.when).collect();
         if whens.is_empty() {
             return;
         }
@@ -62,7 +57,7 @@ impl Dae {
             .collect();
         let on = rsdag::eval(ctx, &whens, &env);
         let mut on = on.into_iter();
-        self.limits.retain(|l| match l.when {
+        self.hints.limits.retain(|l| match l.when {
             None => true,
             Some(_) => on.next().is_some_and(|v| v != 0.0 || v.is_nan()),
         });
@@ -101,6 +96,100 @@ pub struct EventSpec {
     pub name: String,
 }
 
+/// What the numeric solver may use on its way to a solution and no result
+/// depends on: the devices' homotopy network, their DC starting values and
+/// their Newton-step limits. A derived system keeps what still names its
+/// unknowns (see [`Dae::rewrite`]); a linearized one none.
+#[derive(Clone, Debug, Default)]
+pub struct SolverHints {
+    /// Companion conductance network (node-KCL row, node-voltage col, value)
+    /// for homotopy continuation: each device's linear `lambda = 0` form
+    /// (see [`sane_device::DeviceModel::companion`]), by the node voltage of
+    /// the row and of the column.
+    pub companion: Vec<(SymbolId, SymbolId, f64)>,
+    /// DC Newton seeds by the unknown's symbol (`idt(u, ic)` states with a
+    /// constant ic): `.nodeset`-style starting values, not constraints.
+    pub dc_seeds: Vec<(SymbolId, f64)>,
+    /// Per-device controlling-voltage limits (SPICE `pnjlim`/`fetlim`) over
+    /// the unknowns' symbols (`None`: ground), for the Newton loops'
+    /// `device_limiting`.
+    pub limits: Vec<Limit>,
+}
+
+/// An independent source of the circuit (a `V` or `I` element).
+#[derive(Clone, Debug)]
+pub struct Source {
+    /// The element, by its name in the top frame.
+    pub element: String,
+    /// The symbol of its DC value; `None` for one a waveform drives.
+    pub value: Option<SymbolId>,
+    /// Its waveform over its parameters' symbols; `None` for a DC one.
+    pub stimulus: Option<Stimulus<SymbolId>>,
+}
+
+impl Source {
+    /// What a small-signal input at the source moves: its DC value, or the
+    /// parameters that shift its waveform's level as a whole.
+    pub fn drive(&self) -> Vec<SymbolId> {
+        match (&self.value, &self.stimulus) {
+            (Some(v), _) => vec![*v],
+            (None, Some(s)) => s.levels().into_iter().copied().collect(),
+            (None, None) => Vec::new(),
+        }
+    }
+}
+
+/// What an unknown of a [`Dae`] stands for.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum UnknownId {
+    /// The potential of the circuit's node `k` (`1..`; ground is no unknown).
+    Node(usize),
+    /// The current through an element's branch, by the element's name in the
+    /// top frame (`V1`, `X1.L2`).
+    Branch(String),
+    /// A device's own unknown (an internal node, a state) or one a derived
+    /// system adds, by its name in the top frame.
+    Internal(String),
+}
+
+impl UnknownId {
+    /// Its name: `v{k}` for node `k`, `i_{element}` for a branch current,
+    /// an internal unknown's own. The one place an unknown is named.
+    pub fn name(&self) -> String {
+        match self {
+            UnknownId::Node(k) => format!("v{k}"),
+            UnknownId::Branch(e) => format!("i_{e}"),
+            UnknownId::Internal(s) => s.clone(),
+        }
+    }
+
+    /// Whether [`name`](Self::name) is `name`, without forming it.
+    pub fn is_named(&self, name: &str) -> bool {
+        match self {
+            UnknownId::Node(k) => name.strip_prefix('v').and_then(|s| s.parse().ok()) == Some(*k),
+            UnknownId::Branch(e) => name.strip_prefix("i_") == Some(e.as_str()),
+            UnknownId::Internal(s) => s == name,
+        }
+    }
+
+    /// The same unknown in the frame of a subcircuit instance: an
+    /// element's or a device's name `rename` maps, a node as it is (the
+    /// caller binds nodes).
+    pub fn renamed(&self, rename: impl Fn(&str) -> String) -> Self {
+        match self {
+            UnknownId::Node(k) => UnknownId::Node(*k),
+            UnknownId::Branch(e) => UnknownId::Branch(rename(e)),
+            UnknownId::Internal(s) => UnknownId::Internal(rename(s)),
+        }
+    }
+}
+
+impl std::fmt::Display for UnknownId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.name())
+    }
+}
+
 /// An extracted differential-algebraic system `I(x, t) + d/dt Q(x) = 0`.
 pub struct Dae {
     /// Every row `i` as `I_i(x, t) + d/dt Q_i(x) = 0`: the current `I_i` and
@@ -109,8 +198,8 @@ pub struct Dae {
     /// model not in its charge.
     pub currents: Vec<ExprId>,
     pub charges: Vec<ExprId>,
-    /// Names of the unknowns `x`, aligned with `x`.
-    pub unknowns: Vec<String>,
+    /// What the unknowns `x` stand for, aligned with `x`.
+    pub unknowns: Vec<UnknownId>,
     /// What each unknown physically is, parallel to `unknowns` (see
     /// [`UnknownKind`]); the solver's tolerances and shunts are taken per kind.
     pub kinds: Vec<UnknownKind>,
@@ -130,40 +219,19 @@ pub struct Dae {
     /// delay-free circuits. Transforms that cannot preserve the unknown
     /// indexing drop these (the analysis layer guards misuse).
     pub delays: Vec<DelaySpec>,
-    /// Companion conductance network (node-KCL row, node-voltage col, value) for
-    /// homotopy continuation: each device's linear `lambda = 0` form (see
-    /// [`sane_device::DeviceModel::companion`]), by the node voltage of the
-    /// row and of the column.
-    pub companion: Vec<(SymbolId, SymbolId, f64)>,
     /// The small-signal noise sources (current noise generators with a PSD
     /// expression) and the operating-point variables (`(* desc *)`
     /// annotations, named expressions for OP reporting) the devices export:
     /// read-only observers, no residual references them. See
     /// [`Observers::flatten`].
     pub observers: Observers,
-    /// DC Newton seeds by unknown name (`idt(u, ic)` states with constant ic):
-    /// `.nodeset`-style starting values, not constraints. Keyed by name so the
-    /// registry survives unknown reordering; entries whose unknown no longer
-    /// exists are ignored at lookup.
-    pub dc_seeds: Vec<(String, f64)>,
-    /// Per-device controlling-voltage limits (SPICE `pnjlim`/`fetlim`) over
-    /// the unknowns' symbols (`None`: ground), for the Newton loops'
-    /// `device_limiting`.
-    pub limits: Vec<Limit>,
-    /// Independent-source stimulus shapes in the circuit, by element name. Carries
-    /// the structural facts the lowered graph cannot recover -- transient
-    /// breakpoints (waveform corners the integrator must land on) and the HB
-    /// fundamental. Empty for transformed DAEs.
-    pub sources: Vec<(String, SourceFn)>,
-    /// Names of *every* independent V/I source element (shaped or plain DC,
-    /// top-level or subcircuit-scoped like `Xop.I0`). Each name is also the
-    /// symbol of the element's DC value, so the DC source-stepping continuation
-    /// ramps exactly these -- structurally, instead of guessing from parameter
-    /// names (a dot-free V/I prefix misses every subcircuit bias source and a
-    /// name test cannot tell `X1.I0`, a source, from `Q1.Is`, a saturation
-    /// current). Empty for transformed or hand-built DAEs, where the solver
-    /// falls back to the name heuristic.
-    pub source_names: Vec<String>,
+    /// What the numeric solver may use on its way to a solution (see
+    /// [`SolverHints`]).
+    pub hints: SolverHints,
+    /// Every independent source of the circuit (see [`Source`]), top-level
+    /// or in a subcircuit: what the DC source stepping ramps, what drives a
+    /// small-signal input, and the waveforms' corners and tones.
+    pub sources: Vec<Source>,
     /// What must hold of the parameters for the residuals to be the circuit's
     /// (see [`sane_device::Assertion`]), over the circuit's parameter symbols:
     /// the devices' own and what their structure rests on (see
@@ -191,7 +259,7 @@ pub struct Dae {
     pub rest: OnceLock<Arc<(Vec<ExprId>, Vec<ExprId>)>>,
 }
 
-/// A noise source's level at an operating point (see [`Dae::noise_levels`]).
+/// A noise source's level at an operating point.
 #[derive(Clone, Debug, PartialEq)]
 pub enum NoiseLevel {
     /// White or flicker: `psd / f^fexp`.
@@ -246,23 +314,26 @@ impl Dae {
         self.injection.get_or_init(|| Arc::new(by_source)).clone()
     }
 
-    /// Every noise source's level over `env`, in one arena sweep: the sources
-    /// share the device subexpressions and calls they read.
-    pub fn noise_levels(&self, ctx: &mut Graph, env: &HashMap<SymbolId, f64>) -> Vec<NoiseLevel> {
-        let noise = self.observers.noise(ctx);
-        let roots: Vec<ExprId> = noise.iter().flat_map(|ns| ns.exprs()).collect();
-        let mut vals = rsdag::eval(ctx, &roots, env).into_iter();
-        let mut next = || vals.next().expect("one per expression");
-        noise
-            .iter()
-            .map(|ns| {
-                let (psd, fexp) = (next(), next());
-                match ns.table.len() {
-                    0 => NoiseLevel::Spectral { psd, fexp },
-                    n => NoiseLevel::Table((0..n).map(|_| (next(), next())).collect()),
-                }
-            })
-            .collect()
+    /// The values of the system's symbols at a point, for evaluating its
+    /// expressions there: the unknowns at `x`, the parameters `p`, the time
+    /// `t`, every noise generator at zero.
+    pub fn point_env(
+        &self,
+        ctx: &mut Graph,
+        x: &[f64],
+        p: impl IntoIterator<Item = (SymbolId, f64)>,
+        t: f64,
+    ) -> HashMap<SymbolId, f64> {
+        let mut env: HashMap<SymbolId, f64> = HashMap::new();
+        for g in self.observers.generators(ctx) {
+            env.insert(g, 0.0);
+        }
+        for (i, &s) in self.x.iter().enumerate() {
+            env.insert(s, x.get(i).copied().unwrap_or(0.0));
+        }
+        env.extend(p);
+        env.insert(self.t, t);
+        env
     }
 
     /// Register the system as an rsdag function carrying its roles: the
@@ -377,6 +448,39 @@ impl Dae {
 
     pub fn dim(&self) -> usize {
         self.currents.len()
+    }
+
+    /// The unknowns' names (see [`UnknownId::name`]).
+    pub fn unknown_names(&self) -> Vec<String> {
+        self.unknowns.iter().map(UnknownId::name).collect()
+    }
+
+    /// The unknown named `name`.
+    pub fn find(&self, name: &str) -> Option<usize> {
+        self.unknowns.iter().position(|u| u.is_named(name))
+    }
+
+    /// The unknown whose symbol is `s`.
+    pub fn unknown_of(&self, s: SymbolId) -> Option<usize> {
+        self.x.iter().position(|&x| x == s)
+    }
+
+    /// The unknown of the circuit's node `k`; `None` for ground and for a
+    /// node a transform eliminated.
+    pub fn node(&self, k: usize) -> Option<usize> {
+        self.unknowns.iter().position(|u| *u == UnknownId::Node(k))
+    }
+
+    /// The independent source `element` (SPICE names are case-insensitive).
+    pub fn source(&self, element: &str) -> Option<&Source> {
+        (self.sources.iter()).find(|s| s.element.eq_ignore_ascii_case(element))
+    }
+
+    /// The branch-current unknown of the element `name` (SPICE names are
+    /// case-insensitive).
+    pub fn branch(&self, name: &str) -> Option<usize> {
+        (self.unknowns.iter())
+            .position(|u| matches!(u, UnknownId::Branch(e) if e.eq_ignore_ascii_case(name)))
     }
 
     /// Classify the currents' and charges' nonlinearity in the unknowns `x`

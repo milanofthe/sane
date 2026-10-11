@@ -1,5 +1,7 @@
-use super::*;
+//! Parsing: elements, model cards, subcircuits, expressions, options.
+
 use sane_circuit::SourceFn;
+use sane_netlist::*;
 
 #[test]
 fn parse_error_carries_column_and_renders_caret() {
@@ -460,7 +462,7 @@ fn global_nodes_pass_through_subckts() {
     let mut ctx = sane_core::Graph::new();
     let dae = sane_dae::assemble(&mut ctx, &p).unwrap();
     assert!(
-        dae.unknowns.iter().any(|u| u == "vvdd" || u == "v1"),
+        dae.find("vvdd").is_some() || dae.find("v1").is_some(),
         "{:?}",
         dae.unknowns
     );

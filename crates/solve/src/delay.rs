@@ -24,6 +24,7 @@
 //! guarantees in-range brackets during normal stepping, so the clamps only
 //! fire at the boundaries.
 
+use sane_core::constants::{DELAY_HISTORY_KNOTS, DELAY_PROBE_MAX, DELAY_RING_MIN};
 use std::borrow::Borrow;
 
 use rsdag::Tape;
@@ -64,7 +65,7 @@ struct Ring {
 
 impl Ring {
     fn with_capacity(cap: usize) -> Ring {
-        let cap = cap.next_power_of_two().max(8);
+        let cap = cap.next_power_of_two().max(DELAY_RING_MIN);
         Ring {
             buf: vec![0.0; cap],
             mask: cap - 1,
@@ -141,10 +142,9 @@ pub struct DelayHistory {
 
 impl DelayHistory {
     /// A history for `n_signals` delayed signals with eviction horizon
-    /// `horizon` (the maximum delay; pass `f64::INFINITY` to keep everything,
-    /// e.g. for a stored forward pass an adjoint sweeps later).
+    /// `horizon` (the maximum delay; `f64::INFINITY` keeps everything).
     pub fn new(n_signals: usize, horizon: f64) -> DelayHistory {
-        Self::with_capacity(n_signals, horizon, 64)
+        Self::with_capacity(n_signals, horizon, DELAY_HISTORY_KNOTS)
     }
 
     /// As [`new`](Self::new), with room for `knots` knots before it grows.
@@ -335,7 +335,7 @@ impl DelayHistory {
             while i + 2 < n && self.times.get(i + 1) <= tq {
                 i += 1;
                 probes += 1;
-                if probes > 4 {
+                if probes > DELAY_PROBE_MAX {
                     i = self.bisect(tq);
                     break;
                 }
@@ -349,7 +349,7 @@ impl DelayHistory {
                 }
                 i -= 1;
                 probes += 1;
-                if probes > 4 {
+                if probes > DELAY_PROBE_MAX {
                     i = self.bisect(tq);
                     break;
                 }

@@ -2,6 +2,8 @@
 //! and behavioral sources over integer nodes.
 
 use crate::SourceFn;
+use rsdag::CmpOp;
+use sane_core::MathFn;
 
 /// Element kind. The element name doubles as its parameter symbol.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -59,10 +61,28 @@ pub enum BExpr {
     /// A named parameter (stays symbolic).
     Param(String),
     Neg(Box<BExpr>),
-    /// Binary operator, one of `+ - * / ^`.
-    Bin(char, Box<BExpr>, Box<BExpr>),
-    /// Function call (`sin`, `exp`, `sqrt`, `tanh`, `pow`, ...).
-    Call(String, Vec<BExpr>),
+    Bin(BOp, Box<BExpr>, Box<BExpr>),
+    Call(BCall, Vec<BExpr>),
+}
+
+/// A binary operator of a behavioral expression. A comparison yields 1 or
+/// 0, for `if(cond, then, else)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Pow,
+    Cmp(CmpOp),
+}
+
+/// What a behavioral expression calls: an elementary function, or
+/// `if(cond, then, else)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BCall {
+    Math(MathFn),
+    If,
 }
 
 impl BExpr {

@@ -162,19 +162,14 @@ pub(crate) fn lower_templated(
     let mf = match fns.iter().find(|mf| mf.fits(&values, lo.ctx())) {
         Some(mf) => mf.clone(),
         None => {
-            let t = sane_core::time::Instant::now();
             let ns = format!("{}#{}", dev.module.name, lo.ctx().n_funcs());
             let mf = build_function(dev, &values, lo, term_v, &ns)?;
             fns.push(mf.clone());
             lo.cache_put(key, fns);
-            sane_core::profile::record_tpl_build(t.elapsed().as_nanos());
             mf
         }
     };
-    let t = sane_core::time::Instant::now();
-    let frag = instantiate(&mf, dev, lo, term_v);
-    sane_core::profile::record_tpl_clone(t.elapsed().as_nanos());
-    Ok(frag)
+    Ok(instantiate(&mf, dev, lo, term_v))
 }
 
 /// Lower `dev`'s module into a function named `ns` over formal leaves, the

@@ -11,7 +11,6 @@ rsdag.workspace = true
 sane-core.workspace = true
 sane-dae = { path = "../dae" }
 rsdag-jit = { workspace = true, optional = true }
-sane-circuit.workspace = true
 rslab.workspace = true
 rayon.workspace = true
 realfft = "3.5"

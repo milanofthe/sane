@@ -22,10 +22,12 @@ pub fn render_snippet(
     col: u32,
     message: &str,
 ) {
-    let _ = writeln!(out, "{file}:{line}:{col}: error: {message}");
+    // a column of 0 is unknown: the line alone, no caret
     if col == 0 {
+        let _ = writeln!(out, "{file}:{line}: error: {message}");
         return;
     }
+    let _ = writeln!(out, "{file}:{line}:{col}: error: {message}");
     if let Some(src) = source.lines().nth(line.saturating_sub(1) as usize) {
         out.push_str(src);
         out.push('\n');

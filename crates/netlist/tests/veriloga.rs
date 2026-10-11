@@ -52,7 +52,7 @@ fn inline_veriloga_diode_assembles_dae() {
     let dae = sane_dae::assemble(&mut ctx, &p).unwrap();
     // nodes v1, v2 + branch i_V1.
     assert!(dae.dim() >= 3, "dim {}", dae.dim());
-    assert!(dae.unknowns.iter().any(|u| u == "v2"));
+    assert!(dae.find("v2").is_some());
 }
 
 #[test]
@@ -124,7 +124,7 @@ fn multiple_modules_per_block() {
     assert_eq!(p.devices.len(), 2);
     let mut ctx = Graph::new();
     let dae = sane_dae::assemble(&mut ctx, &p).unwrap();
-    assert!(dae.unknowns.iter().any(|u| u == "v2"));
+    assert!(dae.find("v2").is_some());
 }
 
 // Correctness: a model using an unsupported construct must fail to assemble,
@@ -171,7 +171,7 @@ R2 out 0 1k
     let mut ctx = Graph::new();
     let dae = sane_dae::assemble(&mut ctx, &p).unwrap();
     assert!(
-        dae.unknowns.iter().any(|u| u.contains("flow_")),
+        dae.unknowns.iter().any(|u| u.name().contains("flow_")),
         "promoted current unknown: {:?}",
         dae.unknowns
     );
@@ -212,11 +212,7 @@ N1 d d 0 0 ekv26_va W=10u L=1u
     let dae = sane_dae::assemble(&mut ctx, &p).unwrap();
     // node d (index 1 -> "v1") + branch i_V1.
     assert!(dae.dim() >= 2, "dim {}", dae.dim());
-    assert!(
-        dae.unknowns.iter().any(|u| u == "v1"),
-        "node present: {:?}",
-        dae.unknowns
-    );
+    assert!(dae.find("v1").is_some(), "node present: {:?}", dae.unknowns);
 }
 
 // Compact-model import: a legacy `.model ... <type> level=<n>` card instantiated
@@ -277,7 +273,7 @@ fn compact_level_card_routes_to_va_via_model_alias() {
     let mut ctx = Graph::new();
     let dae = sane_dae::assemble(&mut ctx, &p).unwrap();
     assert!(
-        dae.unknowns.iter().any(|u| u == "v1"),
+        dae.find("v1").is_some(),
         "node d present: {:?}",
         dae.unknowns
     );

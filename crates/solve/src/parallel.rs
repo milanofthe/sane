@@ -20,8 +20,7 @@ use std::sync::{Arc, OnceLock};
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use rsdag::parallel::{Parallel, Workers};
 
-/// Worker-thread count when `SANE_THREADS` is not set.
-pub const DEFAULT_THREADS: usize = 4;
+pub use sane_core::constants::DEFAULT_THREADS;
 
 static POOL: OnceLock<ThreadPool> = OnceLock::new();
 static WORKERS: OnceLock<Arc<Workers>> = OnceLock::new();

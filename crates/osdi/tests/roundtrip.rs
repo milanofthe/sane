@@ -88,11 +88,11 @@ fn osdi_resistor_divider_matches_analytic() {
         ),
     )
     .unwrap();
-    let cdc = CompiledDc::new(&mut ctx, &dae);
-    let p = params_vec(&mut ctx, &dae, &[("V1", 2.0), ("R2", 1000.0)]);
+    let cdc = CompiledDc::new(ctx, dae);
+    let p = params_vec(&mut cdc.graph(), cdc.dae(), &[("V1", 2.0), ("R2", 1000.0)]);
     let (x, conv, _) = cdc.solve_dc(&p, &[], 1e-12, 100);
     assert!(conv, "OSDI resistor DC did not converge: {x:?}");
-    let v2 = dae.unknowns.iter().position(|u| u == "v2").unwrap();
+    let v2 = cdc.dae().find("v2").unwrap();
     let want = 2.0 * 1000.0 / 3000.0;
     assert!(
         (x[v2] - want).abs() < 1e-6,
@@ -151,11 +151,11 @@ fn osdi_diode_matches_analytic() {
         &sane_circuit::Circuit::flat(&c, &[DeviceInstance::new(std::sync::Arc::new(dev), terms)]),
     )
     .unwrap();
-    let cdc = CompiledDc::new(&mut ctx, &dae);
-    let p = params_vec(&mut ctx, &dae, &[("V1", 0.7), ("R1", 1000.0)]);
+    let cdc = CompiledDc::new(ctx, dae);
+    let p = params_vec(&mut cdc.graph(), cdc.dae(), &[("V1", 0.7), ("R1", 1000.0)]);
     let (x, conv, _) = cdc.solve_dc(&p, &[], 1e-12, 200);
     assert!(conv, "OSDI diode DC did not converge: {x:?}");
-    let v2 = x[dae.unknowns.iter().position(|u| u == "v2").unwrap()];
+    let v2 = x[cdc.dae().find("v2").unwrap()];
     // Forward-biased junction: anode voltage between 0.3 and 0.7 V.
     assert!(v2 > 0.3 && v2 < 0.7, "diode anode voltage {v2} implausible");
     println!("diode OK: va = {v2}");
@@ -202,11 +202,11 @@ fn osdi_psp103_matches_symbolic_frontend() {
         ),
     )
     .unwrap();
-    let cdc = CompiledDc::new(&mut ctx, &dae);
-    let p = params_vec(&mut ctx, &dae, &[("Vd", 1.0), ("Vg", 0.8)]);
+    let cdc = CompiledDc::new(ctx, dae);
+    let p = params_vec(&mut cdc.graph(), cdc.dae(), &[("Vd", 1.0), ("Vg", 0.8)]);
     let (x, conv, _) = cdc.solve_dc(&p, &[], 1e-12, 200);
     assert!(conv, "OSDI psp103 DC did not converge");
-    let id = x[dae.unknowns.iter().position(|u| u == "i_Vd").unwrap()];
+    let id = x[cdc.dae().find("i_Vd").unwrap()];
     let reference = -7.163534299181468e-5; // symbolic frontend, same bias
     assert!(
         (id - reference).abs() < 1e-9 * (1.0 + reference.abs()) + 1e-12,
@@ -258,12 +258,12 @@ fn osdi_capacitor_transient_matches_analytic() {
         ),
     )
     .unwrap();
-    let cdc = CompiledDc::new(&mut ctx, &dae);
+    let cdc = CompiledDc::new(ctx, dae);
     let (r, cap) = (1000.0, 1e-6);
     let tau = r * cap;
-    let p = params_vec(&mut ctx, &dae, &[("V1", 1.0), ("R1", r)]);
-    let v1 = dae.unknowns.iter().position(|u| u == "v1").unwrap();
-    let v2 = dae.unknowns.iter().position(|u| u == "v2").unwrap();
+    let p = params_vec(&mut cdc.graph(), cdc.dae(), &[("V1", 1.0), ("R1", r)]);
+    let v1 = cdc.dae().find("v1").unwrap();
+    let v2 = cdc.dae().find("v2").unwrap();
     let mut x0 = vec![0.0; cdc.dim()];
     x0[v1] = 1.0;
     let times: Vec<f64> = (0..=5).map(|k| k as f64 * tau).collect();

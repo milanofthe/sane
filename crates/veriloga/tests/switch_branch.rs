@@ -41,9 +41,9 @@ fn switch_branch_single_arm_is_constrained() {
     let sw = dae
         .unknowns
         .iter()
+        .map(|u| u.name())
         .find(|u| u.contains(".sw_"))
-        .expect("a switch-branch current unknown")
-        .clone();
+        .expect("a switch-branch current unknown");
 
     // i = 1, everything else 0. Gate FALSE (v2 = 0) vs TRUE (v2 = 1).
     let base = |gate: f64| -> Vec<(&str, f64)> {
@@ -104,7 +104,7 @@ fn switchable_resistor_branch() {
     ];
     // The switch-branch current unknown (name discovered from dae.unknowns). Its
     // canonical orientation is (n,p), so the branch current is -g*V(p,n) = -i.
-    for u in &dae.unknowns {
+    for u in dae.unknown_names() {
         if u.contains(".sw_") {
             vals.push((Box::leak(u.clone().into_boxed_str()), -i));
         }
@@ -115,7 +115,7 @@ fn switchable_resistor_branch() {
         assert!(
             val < 1e-9,
             "residual {k} ({}) = {val}",
-            dae.unknowns.get(k).map(|s| s.as_str()).unwrap_or("?")
+            dae.unknowns.get(k).map(|u| u.name()).unwrap_or_default()
         );
     }
 }

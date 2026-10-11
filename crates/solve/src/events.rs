@@ -154,7 +154,7 @@ impl<'a> Discontinuities<'a> {
         let dt = next - t;
         if htry >= dt {
             dt
-        } else if htry * 1.9 > dt {
+        } else if htry * BREAKPOINT_SPLIT > dt {
             dt * 0.5
         } else {
             htry

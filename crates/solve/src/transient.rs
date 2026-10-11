@@ -13,7 +13,7 @@ use crate::events::Discontinuities;
 use crate::rosenbrock::{Rosenbrock, RODAS4};
 use crate::stage::StageWorkspace;
 use crate::transient_sens::Sens;
-use crate::{CompiledDc, TransientRun};
+use crate::{CompiledDc, Symbolic, TransientRun};
 use sane_core::constants::*;
 
 /// Step controller factor, clamped. With an accepted previous error the PI
@@ -92,25 +92,54 @@ impl<'a> DenseOutput<'a> {
     }
 }
 
-impl CompiledDc {
-    /// Integrate the DAE (see [`solve_transient`](Self::solve_transient)),
-    /// with the forward sensitivities `sens` asks for.
+/// One integration under way: the state, the step candidate and the step
+/// start (three buffers that trade places as steps are accepted), the time
+/// and the step, the controller's history, and what the integration writes
+/// and watches as it goes.
+struct Run<'a> {
+    cdc: &'a CompiledDc,
+    p: &'a [f64],
+    ws: StageWorkspace<'a>,
+    sens: Option<Sens<'a>>,
+    stepper: Rosenbrock,
+    dense: DenseOutput<'a>,
+    disc: Discontinuities<'a>,
+    tracker: sane_core::ProgressTracker,
+    x: Vec<f64>,
+    x_new: Vec<f64>,
+    x_prev: Vec<f64>,
+    t: f64,
+    t0: f64,
+    final_time: f64,
+    span: f64,
+    h: f64,
+    h_min: f64,
+    /// The step's cap: `dt_max`, and the smallest delay.
+    hcap: Option<f64>,
+    /// The error of the last ACCEPTED step, the PI controller's history
+    /// (cleared on rejects and landings, where the local smoothness
+    /// assumption breaks).
+    err_prev: Option<f64>,
+    fixed: bool,
+    trace: bool,
+}
+
+impl<'a> Run<'a> {
+    /// An integration of `cdc` at `p` from `x0` (cold where empty: the
+    /// operating point) over `t_eval`, its stage factorizations on `syms`,
+    /// up to the consistent restart into its first step.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn integrate(
-        &self,
-        p: &[f64],
+    fn start(
+        cdc: &'a CompiledDc,
+        syms: (&'a Symbolic, Option<&'a Symbolic>),
+        p: &'a [f64],
         x0: &[f64],
-        t_eval: &[f64],
-        rtol: f64,
-        atol: f64,
+        t_eval: &'a [f64],
+        (rtol, atol): (f64, f64),
         dt_max: Option<f64>,
         sens: Option<&SensRequest<'_>>,
-    ) -> Result<(TransientRun, Option<Vec<Vec<f64>>>), String> {
-        let _stage = sane_core::log::scope("tran");
-        let n = self.n;
-        if t_eval.is_empty() {
-            return Ok((TransientRun::default(), None));
-        }
+    ) -> Result<Run<'a>, String> {
+        let n = cdc.n;
         let t0 = t_eval[0];
         let final_time = t_eval[t_eval.len() - 1];
 
@@ -128,7 +157,7 @@ impl CompiledDc {
             };
             log_stage!(
                 "tran/dc_ic",
-                self.solve_dc_conv_with(p, &[], conv, GMIN_STEP_MAX_ITER, self.tricks)
+                cdc.solve_dc_conv_with(p, &[], conv, DC_OP_MAXIT, cdc.tricks)
                     .0
             )
         };
@@ -136,7 +165,7 @@ impl CompiledDc {
         // Transport delays: evaluate the taus, seed the history with the
         // initial state, and cap the step at the smallest delay so every
         // stage query lands in ACCEPTED history (t_stage - tau <= t_prev).
-        let taus = self.delay_taus(p);
+        let taus = cdc.delay_taus(p);
         if let Some(bad) = taus.iter().find(|v| !(**v > 0.0)) {
             return Err(format!(
                 "transient: delay td must be positive (got {bad:.3e})"
@@ -161,10 +190,10 @@ impl CompiledDc {
         let dhist = (!taus.is_empty()).then(|| {
             // twice the knots the cap leaves in the horizon, with room for
             // the short steps after each restart: no growth as it goes
-            let knots = hcap.map_or(0.0, |c| 2.0 * max_tau / c) as usize + 64;
+            let knots = hcap.map_or(0.0, |c| 2.0 * max_tau / c) as usize + DELAY_KNOT_SLACK;
             let mut h = crate::delay::DelayHistory::with_capacity(taus.len(), max_tau, knots);
             let mut vals = Vec::new();
-            self.delay_values(&x, p, t0, &mut vals);
+            cdc.delay_values(&x, p, t0, &mut vals);
             let ders = vec![0.0; taus.len()];
             h.push(t0, &vals, &ders);
             crate::delay::set_hist_values(&vals);
@@ -175,14 +204,11 @@ impl CompiledDc {
         // vector is fixed over the integration), the transient-wide stage
         // factorization (the first factor pays full pivoting, every refresh
         // is a numeric-only refactor), the mass matrix, scratch.
-        let sym = self
-            .stage_symbolic()
-            .ok_or("transient: stage symbolic build failed")?;
-        let mass_sym = Self::build_symbolic(n, &self.jxd_rows, &self.jxd_cols);
+        let (sym, mass_sym) = syms;
         let mut ws = StageWorkspace::new(
-            self,
-            &sym,
-            mass_sym.as_ref(),
+            cdc,
+            sym,
+            mass_sym,
             &x,
             p,
             t0,
@@ -195,8 +221,8 @@ impl CompiledDc {
         // the sensitivities, from the start before its consistent stage
         let mut sens = match sens {
             Some(r) => Some(Sens::new(
-                self,
-                &sym,
+                cdc,
+                sym,
                 p,
                 &x,
                 r.dc_start || x0.len() != n,
@@ -209,25 +235,24 @@ impl CompiledDc {
         let span = (final_time - t0).max(f64::MIN_POSITIVE);
         let h_first = dt_max
             .filter(|c| c.is_finite() && *c > 0.0)
-            .unwrap_or(span / 100.0)
+            .unwrap_or(span * TRANSIENT_H0_FRAC)
             .min(span);
         // A caller's initial state need not be consistent (SPICE's `uic`:
         // every node at zero, the sources not yet applied). One implicit
         // Euler step of a sliver of the first step, the time held, makes it
         // so: the algebraic unknowns take their values, the charges barely
-        // move. The state, the step candidate and the step start live in
-        // three buffers that trade places as steps are accepted.
+        // move.
         let mut x_new = x.clone();
         if x0.len() == n {
             let h_ic = h_first * TRANSIENT_IC_STEP_FRAC;
             ws.fac_fresh = false;
             x_new.copy_from_slice(&x);
-            let ok = self.stage_newton(&mut ws, &mut x_new, t0, h_ic);
+            let ok = cdc.stage_newton(&mut ws, &mut x_new, t0, h_ic);
             ws.fac_fresh = false;
             if !ok {
                 return Err("transient: no consistent state from the initial one".into());
             }
-            self.residual_slope(&mut ws, &x_new, t0);
+            cdc.residual_slope(&mut ws, &x_new, t0);
             std::mem::swap(&mut x, &mut x_new);
             ws.advance();
             if let Some(s) = sens.as_mut() {
@@ -236,11 +261,10 @@ impl CompiledDc {
                 }
             }
         }
-        let mut x_prev = x.clone();
+        let x_prev = x.clone();
 
         let h_min = span * TRANSIENT_SPAN_EPS_FRAC;
-        let h_init = hcap.unwrap_or(span / 100.0).min(span);
-        let mut h = h_init;
+        let h_init = hcap.unwrap_or(span * TRANSIENT_H0_FRAC).min(span);
 
         // Where the trajectory is not smooth (see `events`): the source
         // waveform kinks the integrator must land on exactly (a C0 corner
@@ -250,14 +274,14 @@ impl CompiledDc {
         // elements gives the LTE controller nothing to measure -- every
         // accepted point is an exact algebraic solve -- so its output points
         // are landed on too (the emitted rows are solves, not interpolants).
-        let kinks = if self.tricks.breakpoints {
-            self.transient_breakpoints(p, t0, final_time)
+        let kinks = if cdc.tricks.breakpoints {
+            cdc.transient_breakpoints(p, t0, final_time)
         } else {
             Vec::new() // trick off: let the controller step over discontinuities
         };
         let extra: &[f64] = if ws.mass.is_zero() { t_eval } else { &[] };
-        let mut disc = Discontinuities::new(
-            self,
+        let disc = Discontinuities::new(
+            cdc,
             p,
             &x,
             t0,
@@ -266,7 +290,7 @@ impl CompiledDc {
             &taus,
             kinks,
             extra,
-            self.tricks.events && cfg.events && !fixed,
+            cdc.tricks.events && cfg.events && !fixed,
         );
 
         let mut tracker = sane_core::ProgressTracker::with_details(
@@ -279,203 +303,243 @@ impl CompiledDc {
         // Streaming dense output: only the previous and current state are kept,
         // the requested points inside each accepted step are emitted as it
         // lands (peak memory O(n x |t_eval|), independent of the step count).
-        let mut dense = DenseOutput::new(t_eval, t0, &x);
+        let dense = DenseOutput::new(t_eval, t0, &x);
         if let Some(s) = sens.as_mut() {
             s.emit_start(t0);
         }
 
-        // PI controller history: the error of the last ACCEPTED step (cleared on
-        // rejects and landings, where the local smoothness assumption breaks).
-        let mut err_prev: Option<f64> = None;
         let mut stepper = Rosenbrock::new(&RODAS4);
         if sens.is_some() {
             stepper.keep_stage_jacobians();
         }
-        let mut t = t0;
-        // One consistent restart of the size `delta` from `(t, x)`, into the
-        // segment past it: the state moves there and the segment is emitted.
-        // `false` when its Newton fails.
-        macro_rules! restart {
-            ($delta:expr) => {{
-                let delta = $delta;
-                let ok = self.reinit_step(&mut ws, &x, t, delta, &mut x_new);
-                if ok {
-                    std::mem::swap(&mut x, &mut x_new);
-                    ws.advance();
-                    if let Some(s) = sens.as_mut() {
-                        if !s.euler(&x, t + delta, delta) {
-                            return Err(format!(
-                                "transient sensitivity: singular at the restart at t={t:.3e}"
-                            ));
-                        }
-                        s.emit(false, t, t + delta);
-                    }
-                    self.emit_step(
-                        &mut ws,
-                        &mut dense,
-                        &stepper,
-                        false,
-                        p,
-                        &x_new,
-                        &x,
-                        t,
-                        t + delta,
-                    );
-                    t += delta;
-                }
-                ok
-            }};
-        }
+        let mut run = Run {
+            cdc,
+            p,
+            ws,
+            sens,
+            stepper,
+            dense,
+            disc,
+            tracker,
+            x,
+            x_new,
+            x_prev,
+            t: t0,
+            t0,
+            final_time,
+            span,
+            h: h_init,
+            h_min,
+            hcap,
+            err_prev: None,
+            fixed,
+            trace,
+        };
         // The start is a discontinuity like a landing: the initial state
         // holds the sources at their values at `t0`, at rest, and whatever
         // moves from `t0` on -- a ramp, a sine -- moves the unknowns that are
         // rates of others (a capacitor's current across a source). One
         // consistent restart into the region beyond, as after a landing.
         if !fixed {
-            restart!((h_init * EVENT_REINIT_FRAC).max(h_min));
+            run.restart((h_init * EVENT_REINIT_FRAC).max(h_min))?;
         }
-        while t < final_time - h_min {
-            let mut htry = (final_time - t).min(h);
-            if let Some(c) = hcap {
-                htry = htry.min(c);
-            }
-            htry = disc.clamp(t, htry);
-            // Pre-step time, for the dense-output interval [t_prev, t] once
-            // accepted (the state moves to `x_prev` then).
-            let t_prev = t;
-            // The controller's step, before any event retake shortens it.
-            let h_before = htry;
-            let mut ev_rounds = 0usize;
-            // The step size that lands on a located surface; the accepted
-            // candidate is a landing only if the controller kept it.
-            let mut landing_h = f64::NAN;
-            let landed = loop {
-                let stepped = log_stage!(
-                    "tran/step",
-                    stepper.step(self, &mut ws, &x, t, htry, &mut x_new)
-                );
-                if trace {
-                    match &stepped {
-                        None => eprintln!("tran: t={t:.9e} h={htry:.3e} step failed"),
-                        Some(err) => eprintln!(
-                            "tran: t={t:.9e} h={htry:.3e} err={err:.3e} {}",
-                            if *err <= 1.0 { "ok" } else { "reject" }
-                        ),
-                    }
-                }
-                let Some(err) = stepped else {
-                    // A stage left the finite numbers or a stage matrix was
-                    // singular: shrink and retry.
-                    ws.stats.rejects += 1;
-                    htry *= STEP_SHRINK;
-                    if htry < h_min {
-                        tracker.interrupt();
-                        tracker.close();
-                        return Err(format!(
-                            "transient: step underflow at t={t:.3e} (step failed)"
-                        ));
-                    }
-                    continue;
-                };
-                // A switching surface crossed inside the candidate: retake the
-                // step to the located crossing (bounded rounds). Checked
-                // before the error verdict: the mode change inside the step is
-                // what inflates the error, and shrinking blindly would only
-                // creep up to it.
-                if !fixed && ev_rounds < EVENT_RESTEP_MAX {
-                    let mut rates = || self.end_rates(&mut ws, &x, &x_new, t, t + htry);
-                    let crossing = disc.locate(&x, &x_new, t, htry, &mut rates);
-                    if let Some(te) = crossing.filter(|te| te - t > h_min) {
-                        if trace {
-                            eprintln!(
-                                "tran:   event located at t={te:.9e}, retaking with h={:.3e}",
-                                te - t
-                            );
-                        }
-                        ev_rounds += 1;
-                        ws.stats.event_steps += 1;
-                        htry = te - t;
-                        landing_h = htry;
-                        continue;
-                    }
-                }
-                if !fixed && err > 1.0 {
-                    // Rejected: shrink and retry without advancing (pure
-                    // I-controller; the PI history no longer applies).
-                    ws.stats.rejects += 1;
-                    err_prev = None;
-                    htry *= step_factor(err, None, stepper.err_order());
-                    if htry < h_min {
-                        tracker.interrupt();
-                        tracker.close();
-                        return Err(format!(
-                            "transient: step underflow at t={t:.3e} (error control)"
-                        ));
-                    }
-                    continue;
-                }
-                // Accepted: the state advances.
-                let rescale = step_factor(err, err_prev, stepper.err_order());
-                err_prev = Some(err);
-                std::mem::swap(&mut x_prev, &mut x);
-                std::mem::swap(&mut x, &mut x_new);
-                ws.advance();
-                if let Some(s) = sens.as_mut() {
-                    if !s.rodas(&mut ws.matrix, &stepper, &x_prev, t, htry) {
-                        return Err(format!(
-                            "transient sensitivity: the step from t={t:.3e} failed"
-                        ));
-                    }
-                    s.emit(true, t, t + htry);
-                }
-                t += htry;
-                ws.stats.steps += 1;
-                tracker.update(((t - t0) / span).clamp(0.0, 1.0), true);
-                self.emit_step(
-                    &mut ws, &mut dense, &stepper, true, p, &x_prev, &x, t_prev, t,
-                );
-                if fixed {
-                    break false;
-                }
-                // Landing on a discontinuity -- a scheduled instant, or a
-                // surface landed on or crossed inside -- makes the region
-                // beyond it a fresh problem: the step heuristic restarts from
-                // a fraction of the pre-landing step, and the state is
-                // reinitialised on the far side (see `reinit_step`).
-                let landed = disc.accept(&x, t, htry == landing_h);
-                if trace && landed.fired {
-                    eprintln!("tran:   event fired at t={t:.9e}");
-                }
-                h = if landed.any() {
-                    (h_before * EVENT_RESTART_SHRINK).max(h_min)
-                } else {
-                    htry * rescale
-                };
-                break landed.any();
-            };
-            if landed {
-                err_prev = None;
-                stepper.restart();
-                if restart!((h_before * EVENT_REINIT_FRAC).max(h_min)) {
-                    if trace {
-                        eprintln!("tran:   reinitialised at t={t:.9e}");
-                    }
-                } else if trace {
-                    eprintln!("tran:   reinitialisation Newton failed at t={t:.9e}")
-                }
-            }
-            if let Some(c) = hcap {
-                h = h.min(c);
-            }
-        }
+        Ok(run)
+    }
 
-        let rows = dense.finish(&x);
-        let fired = disc.into_events();
-        ws.stats.events = fired.len();
+    /// One consistent restart of the size `delta` from `(t, x)`, into the
+    /// segment past it: the state moves there and the segment is emitted.
+    /// `false` when its Newton fails.
+    fn restart(&mut self, delta: f64) -> Result<bool, String> {
+        let t = self.t;
+        let ok = (self.cdc).reinit_step(&mut self.ws, &self.x, t, delta, &mut self.x_new);
+        if ok {
+            std::mem::swap(&mut self.x, &mut self.x_new);
+            self.ws.advance();
+            if let Some(s) = self.sens.as_mut() {
+                if !s.euler(&self.x, t + delta, delta) {
+                    return Err(format!(
+                        "transient sensitivity: singular at the restart at t={t:.3e}"
+                    ));
+                }
+                s.emit(false, t, t + delta);
+            }
+            self.cdc.emit_step(
+                &mut self.ws,
+                &mut self.dense,
+                &self.stepper,
+                false,
+                self.p,
+                &self.x_new,
+                &self.x,
+                t,
+                t + delta,
+            );
+            self.t += delta;
+        }
+        Ok(ok)
+    }
+
+    /// One step of the controller: tried, retaken to a located switching
+    /// surface, shrunk on rejection until accepted; past a landing on a
+    /// discontinuity, a consistent restart into the region beyond.
+    fn step(&mut self) -> Result<(), String> {
+        let (cdc, trace, h_min) = (self.cdc, self.trace, self.h_min);
+        let mut htry = (self.final_time - self.t).min(self.h);
+        if let Some(c) = self.hcap {
+            htry = htry.min(c);
+        }
+        htry = self.disc.clamp(self.t, htry);
+        // Pre-step time, for the dense-output interval [t_prev, t] once
+        // accepted (the state moves to `x_prev` then).
+        let t_prev = self.t;
+        // The controller's step, before any event retake shortens it.
+        let h_before = htry;
+        let mut ev_rounds = 0usize;
+        // The step size that lands on a located surface; the accepted
+        // candidate is a landing only if the controller kept it.
+        let mut landing_h = f64::NAN;
+        let landed = loop {
+            let t = self.t;
+            let stepped = log_stage!(
+                "tran/step",
+                (self.stepper).step(cdc, &mut self.ws, &self.x, t, htry, &mut self.x_new)
+            );
+            if trace {
+                match &stepped {
+                    None => eprintln!("tran: t={t:.9e} h={htry:.3e} step failed"),
+                    Some(err) => eprintln!(
+                        "tran: t={t:.9e} h={htry:.3e} err={err:.3e} {}",
+                        if *err <= 1.0 { "ok" } else { "reject" }
+                    ),
+                }
+            }
+            let Some(err) = stepped else {
+                // A stage left the finite numbers or a stage matrix was
+                // singular: shrink and retry.
+                self.ws.stats.rejects += 1;
+                htry *= STEP_SHRINK;
+                if htry < h_min {
+                    self.tracker.interrupt();
+                    self.tracker.close();
+                    return Err(format!(
+                        "transient: step underflow at t={t:.3e} (step failed)"
+                    ));
+                }
+                continue;
+            };
+            // A switching surface crossed inside the candidate: retake the
+            // step to the located crossing (bounded rounds). Checked
+            // before the error verdict: the mode change inside the step is
+            // what inflates the error, and shrinking blindly would only
+            // creep up to it.
+            if !self.fixed && ev_rounds < EVENT_RESTEP_MAX {
+                let (ws, x, x_new) = (&mut self.ws, &self.x, &self.x_new);
+                let mut rates = || cdc.end_rates(ws, x, x_new, t, t + htry);
+                let crossing = self.disc.locate(x, x_new, t, htry, &mut rates);
+                if let Some(te) = crossing.filter(|te| te - t > h_min) {
+                    if trace {
+                        eprintln!(
+                            "tran:   event located at t={te:.9e}, retaking with h={:.3e}",
+                            te - t
+                        );
+                    }
+                    ev_rounds += 1;
+                    self.ws.stats.event_steps += 1;
+                    htry = te - t;
+                    landing_h = htry;
+                    continue;
+                }
+            }
+            if !self.fixed && err > 1.0 {
+                // Rejected: shrink and retry without advancing (pure
+                // I-controller; the PI history no longer applies).
+                self.ws.stats.rejects += 1;
+                self.err_prev = None;
+                htry *= step_factor(err, None, self.stepper.err_order());
+                if htry < h_min {
+                    self.tracker.interrupt();
+                    self.tracker.close();
+                    return Err(format!(
+                        "transient: step underflow at t={t:.3e} (error control)"
+                    ));
+                }
+                continue;
+            }
+            // Accepted: the state advances.
+            let rescale = step_factor(err, self.err_prev, self.stepper.err_order());
+            self.err_prev = Some(err);
+            std::mem::swap(&mut self.x_prev, &mut self.x);
+            std::mem::swap(&mut self.x, &mut self.x_new);
+            self.ws.advance();
+            if let Some(s) = self.sens.as_mut() {
+                if !s.rodas(&mut self.ws.matrix, &self.stepper, &self.x_prev, t, htry) {
+                    return Err(format!(
+                        "transient sensitivity: the step from t={t:.3e} failed"
+                    ));
+                }
+                s.emit(true, t, t + htry);
+            }
+            self.t += htry;
+            self.ws.stats.steps += 1;
+            let progress = ((self.t - self.t0) / self.span).clamp(0.0, 1.0);
+            self.tracker.update(progress, true);
+            cdc.emit_step(
+                &mut self.ws,
+                &mut self.dense,
+                &self.stepper,
+                true,
+                self.p,
+                &self.x_prev,
+                &self.x,
+                t_prev,
+                self.t,
+            );
+            if self.fixed {
+                break false;
+            }
+            // Landing on a discontinuity -- a scheduled instant, or a
+            // surface landed on or crossed inside -- makes the region
+            // beyond it a fresh problem: the step heuristic restarts from
+            // a fraction of the pre-landing step, and the state is
+            // reinitialised on the far side (see `reinit_step`).
+            let landed = self.disc.accept(&self.x, self.t, htry == landing_h);
+            if trace && landed.fired {
+                eprintln!("tran:   event fired at t={:.9e}", self.t);
+            }
+            self.h = if landed.any() {
+                (h_before * EVENT_RESTART_SHRINK).max(h_min)
+            } else {
+                htry * rescale
+            };
+            break landed.any();
+        };
+        if landed {
+            self.err_prev = None;
+            self.stepper.restart();
+            if self.restart((h_before * EVENT_REINIT_FRAC).max(h_min))? {
+                if trace {
+                    eprintln!("tran:   reinitialised at t={:.9e}", self.t);
+                }
+            } else if trace {
+                eprintln!("tran:   reinitialisation Newton failed at t={:.9e}", self.t)
+            }
+        }
+        if let Some(c) = self.hcap {
+            self.h = self.h.min(c);
+        }
+        Ok(())
+    }
+
+    /// The run's result: the rows at the requested points, the events
+    /// fired, the sensitivities; the counters logged.
+    fn finish(mut self) -> (TransientRun, Option<Vec<Vec<f64>>>) {
+        let rows = self.dense.finish(&self.x);
+        let fired = self.disc.into_events();
+        self.ws.stats.events = fired.len();
         for ev in &fired {
             sane_core::log::debug(&format!(
                 "event: {} at t={:.6e} ({})",
-                self.event_names[ev.index],
+                self.cdc.event_names[ev.index],
                 ev.t,
                 if ev.direction > 0 {
                     "rising"
@@ -484,9 +548,9 @@ impl CompiledDc {
                 }
             ));
         }
-        let stats = &ws.stats;
-        tracker.stats.rejected_steps = stats.rejects;
-        tracker.close();
+        let stats = &self.ws.stats;
+        self.tracker.stats.rejected_steps = stats.rejects;
+        self.tracker.close();
         sane_core::log::debug(&format!(
             "transient: steps={} rejects={} evaluations={} factorizations={} events={} event_steps={} (evaluations/step={:.1}, factorizations/step={:.2})",
             stats.steps, stats.rejects, stats.iters, stats.refacs, stats.events, stats.event_steps,
@@ -497,7 +561,48 @@ impl CompiledDc {
             rows,
             events: fired,
         };
-        Ok((run, sens.map(Sens::finish)))
+        (run, self.sens.map(Sens::finish))
+    }
+}
+
+impl CompiledDc {
+    /// Integrate the DAE (see [`solve_transient`](Self::solve_transient)),
+    /// with the forward sensitivities `sens` asks for.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn integrate(
+        &self,
+        p: &[f64],
+        x0: &[f64],
+        t_eval: &[f64],
+        rtol: f64,
+        atol: f64,
+        dt_max: Option<f64>,
+        sens: Option<&SensRequest<'_>>,
+    ) -> Result<(TransientRun, Option<Vec<Vec<f64>>>), String> {
+        let _stage = sane_core::log::scope("tran");
+        if t_eval.is_empty() {
+            return Ok((TransientRun::default(), None));
+        }
+        // The symbolic analyses the stage factorization and the mass matrix
+        // refactor on, for the whole integration.
+        let sym = self
+            .stage_symbolic()
+            .ok_or("transient: stage symbolic build failed")?;
+        let mass_sym = Self::build_symbolic(self.n, &self.jxd_rows, &self.jxd_cols);
+        let mut run = Run::start(
+            self,
+            (&sym, mass_sym.as_ref()),
+            p,
+            x0,
+            t_eval,
+            (rtol, atol),
+            dt_max,
+            sens,
+        )?;
+        while run.t < run.final_time - run.h_min {
+            run.step()?;
+        }
+        Ok(run.finish())
     }
 
     /// After a segment `[t_prev, t]` -- the method's step (`own`), or the

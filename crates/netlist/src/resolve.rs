@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use crate::{err, ParseError};
 
 /// Guards against include cycles and runaway recursion.
-const MAX_INCLUDE_DEPTH: usize = 64;
+use sane_core::constants::INCLUDE_MAX_DEPTH as MAX_INCLUDE_DEPTH;
 
 /// Expand all `.include` / `.lib` references in `text`. `base_dir` is the
 /// directory relative paths in the *top-level* text resolve against (`None`

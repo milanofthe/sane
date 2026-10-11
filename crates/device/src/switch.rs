@@ -80,8 +80,14 @@ impl DeviceModel for CSwitch {
     }
 
     fn default_params(&self) -> Vec<(&'static str, f64)> {
-        // Ih defaults to a narrow 1 uA window (near-hard but differentiable).
-        vec![("Ron", 1.0), ("Roff", 1e6), ("It", 0.0), ("Ih", 1e-6)]
+        // Ih defaults to a narrow window (near-hard but differentiable).
+        use sane_core::constants::{SWITCH_IH, SWITCH_ROFF, SWITCH_RON};
+        vec![
+            ("Ron", SWITCH_RON),
+            ("Roff", SWITCH_ROFF),
+            ("It", 0.0),
+            ("Ih", SWITCH_IH),
+        ]
     }
 
     fn lower_behavioral(

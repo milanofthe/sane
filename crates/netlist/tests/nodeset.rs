@@ -26,27 +26,27 @@ B1 0 a I=0.5 - 0.3183098862*atan(10*(V(b)-0.5))
 B2 0 b I=0.5 - 0.3183098862*atan(10*(V(a)-0.5))
 .end";
 
-fn build() -> (Graph, Circuit, Dae, CompiledDc, Vec<f64>) {
+fn build() -> (Circuit, CompiledDc, Vec<f64>) {
     let parsed = parse(LATCH).expect("parse");
     let mut ctx = Graph::new();
     let dae = sane_dae::assemble(&mut ctx, &parsed).unwrap();
-    let cdc = CompiledDc::new(&mut ctx, &dae);
-    let p: Vec<f64> = parsed.pvec(&cdc.param_names(&ctx));
-    (ctx, parsed, dae, cdc, p)
+    let cdc = CompiledDc::new(ctx, dae);
+    let p: Vec<f64> = parsed.pvec(cdc.param_names());
+    (parsed, cdc, p)
 }
 
 fn node_idx(parsed: &Circuit, dae: &Dae, node: &str) -> usize {
     let k = parsed.find_node(node).expect("node");
-    dae.unknowns
-        .iter()
-        .position(|u| *u == format!("v{k}"))
-        .expect("node unknown")
+    dae.node(k).expect("node unknown")
 }
 
 #[test]
 fn cold_solve_lands_on_the_unstable_symmetric_root() {
-    let (_ctx, parsed, dae, cdc, p) = build();
-    let (ia, ib) = (node_idx(&parsed, &dae, "a"), node_idx(&parsed, &dae, "b"));
+    let (parsed, cdc, p) = build();
+    let (ia, ib) = (
+        node_idx(&parsed, cdc.dae(), "a"),
+        node_idx(&parsed, cdc.dae(), "b"),
+    );
     let (x, conv, _) = cdc.solve_dc(&p, &[], 1e-10, 100);
     assert!(conv, "cold DC should converge");
     // Symmetric start -> symmetric (metastable) root a = b = 0.5.
@@ -56,8 +56,11 @@ fn cold_solve_lands_on_the_unstable_symmetric_root() {
 
 #[test]
 fn nodeset_breaks_symmetry_onto_a_stable_branch() {
-    let (_ctx, parsed, dae, cdc, p) = build();
-    let (ia, ib) = (node_idx(&parsed, &dae, "a"), node_idx(&parsed, &dae, "b"));
+    let (parsed, cdc, p) = build();
+    let (ia, ib) = (
+        node_idx(&parsed, cdc.dae(), "a"),
+        node_idx(&parsed, cdc.dae(), "b"),
+    );
 
     // Pin a high: the solve must land on the a-high / b-low stable branch.
     let (xh, ch, _) = cdc.solve_dc_nodeset_with(

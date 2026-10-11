@@ -179,7 +179,7 @@ fn render_chained(out: &mut String, map: &SourceMap, d: &Diagnostic) {
     // Walk outward: macro frames to their invocation sites, included files to
     // their `include` directives, until the root file.
     let mut hops = 0;
-    while hops < 32 {
+    while hops < sane_core::constants::DIAG_MAX_HOPS {
         hops += 1;
         match map.ctx(ctx) {
             Some(SpanCtx::Macro {
@@ -231,7 +231,7 @@ impl fmt::Display for Diagnostics {
             if let Some(map) = &self.map {
                 let mut ctx = d.span.ctx;
                 let mut hops = 0;
-                while hops < 32 {
+                while hops < sane_core::constants::DIAG_MAX_HOPS {
                     hops += 1;
                     match map.ctx(ctx) {
                         Some(SpanCtx::Macro {

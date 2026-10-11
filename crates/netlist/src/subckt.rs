@@ -247,7 +247,7 @@ fn resolve_node(
 /// Format an f64 as a re-lexable token (integer-valued numbers stay integers so
 /// numeric node names inside `V()` round-trip).
 fn fmt_num(x: f64) -> String {
-    if x.fract() == 0.0 && x.abs() < 1e15 {
+    if x.fract() == 0.0 && x.abs() < sane_core::constants::FMT_INT_MAX {
         format!("{}", x as i64)
     } else {
         format!("{x:e}")
@@ -428,7 +428,7 @@ impl Expander<'_> {
         env_caller: &HashMap<String, f64>,
         depth: u32,
     ) -> Result<Body, ParseError> {
-        if depth > 64 {
+        if depth > sane_core::constants::SUBCKT_MAX_DEPTH {
             return Err(err(inst.line, "subcircuit nesting too deep (recursion?)"));
         }
         let (subckts, globals) = (self.subckts, self.globals);

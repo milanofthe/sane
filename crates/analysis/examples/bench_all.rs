@@ -127,7 +127,7 @@ fn run_circuit(path: &str, input: &str, output: &str) {
     let (r, ms, prof) = timed(|| model.at(&[]).and_then(|pt| pt.noise(&[output], &freqs)));
     report("noise", r.is_ok(), ms, &prof);
 
-    // Transient over a short window (exercises the BDF path + DC IC).
+    // Transient over a short window (exercises the Rodas4 path + DC IC).
     let t_eval: Vec<f64> = (0..=200).map(|k| k as f64 * 1e-6 / 200.0).collect();
     let (r, ms, prof) = timed(|| {
         (model.at(&[])).and_then(|pt| pt.transient(&t_eval, &TransientOptions::default()))

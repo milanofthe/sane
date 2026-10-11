@@ -6,7 +6,7 @@
 ##          Wrap SANE's differentiable analysis functions into native
 ##          autograd nodes: `as_torch` -> torch.autograd.Function,
 ##          `as_jax` -> jax.custom_vjp. The engine runs the physics and
-##          the exact adjoint; the framework composes the rest of the
+##          its exact derivatives; the framework composes the rest of the
 ##          loss graph. Imports of torch/jax are deferred so the core
 ##          package stays dependency-light.
 ##
@@ -29,7 +29,7 @@ def as_torch(f):
 
     Returns a callable ``F(p: Tensor) -> Tensor`` that participates in
     autograd: the forward runs the engine analysis, the backward its exact
-    adjoint. The solver state is stashed per call, so several forwards may be
+    derivative. The solver state is stashed per call, so several forwards may be
     in flight before their backwards run.
 
     Example
@@ -40,7 +40,7 @@ def as_torch(f):
         F = sane.interop.as_torch(f)
         p = torch.tensor([1e3, 100e-9], dtype=torch.float64, requires_grad=True)
         loss = ((F(p) - ref) ** 2).sum()
-        loss.backward()               # p.grad via the engine adjoint
+        loss.backward()               # p.grad from the engine's sensitivities
     """
     import torch
 

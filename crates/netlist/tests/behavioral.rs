@@ -1,4 +1,4 @@
-﻿//! Behavioral (`B`) source robustness: unknown functions and wrong arity are
+//! Behavioral (`B`) source robustness: unknown functions and wrong arity are
 //! hard parse errors (never a silent zero), and the comparison operators + the
 //! `if(cond, then, else)` conditional lower correctly through to the DC solve.
 
@@ -11,17 +11,13 @@ fn dc_node(src: &str, node: &str) -> f64 {
     let parsed = parse(src).expect("parse");
     let mut ctx = Graph::new();
     let dae = sane_dae::assemble(&mut ctx, &parsed).unwrap();
-    let cdc = CompiledDc::new(&mut ctx, &dae);
-    let pnames = cdc.param_names(&ctx);
+    let cdc = CompiledDc::new(ctx, dae);
+    let pnames = cdc.param_names();
     let p: Vec<f64> = parsed.pvec(&pnames);
     let (x, conv, _) = cdc.solve_dc(&p, &[], 1e-10, 100);
     assert!(conv, "DC did not converge for:\n{src}");
     let k = parsed.find_node(node).expect("node");
-    let idx = dae
-        .unknowns
-        .iter()
-        .position(|u| *u == format!("v{k}"))
-        .expect("node unknown");
+    let idx = cdc.dae().node(k).expect("node unknown");
     x[idx]
 }
 
@@ -83,21 +79,21 @@ fn diode_series_resistance_drops_voltage() {
     let dae = sane_dae::assemble(&mut ctx, &parsed).unwrap();
     // The internal node adds one unknown.
     assert!(
-        dae.unknowns.iter().any(|u| u == "D1.ai"),
+        dae.find("D1.ai").is_some(),
         "internal node missing: {:?}",
         dae.unknowns
     );
-    let cdc = CompiledDc::new(&mut ctx, &dae);
-    let pnames = cdc.param_names(&ctx);
+    let cdc = CompiledDc::new(ctx, dae);
+    let pnames = cdc.param_names();
     let p: Vec<f64> = parsed.pvec(&pnames);
     let (x, conv, _) = cdc.solve_dc(&p, &[], 1e-10, 100);
     assert!(conv, "DC did not converge");
-    let idx = |name: &str| dae.unknowns.iter().position(|u| u == name).unwrap();
-    let a = parsed.find_node("a").unwrap();
-    let v_a = x[idx(&format!("v{a}"))];
+    let idx = |name: &str| cdc.dae().find(name).unwrap();
+    let node = |name: &str| cdc.dae().node(parsed.find_node(name).unwrap()).unwrap();
+    let v_a = x[node("a")];
     let v_int = x[idx("D1.ai")];
     // Diode current = current through R1 = (v_in - v_a)/R1.
-    let v_in = x[idx(&format!("v{}", parsed.find_node("in").unwrap()))];
+    let v_in = x[node("in")];
     let i = (v_in - v_a) / 1000.0;
     let drop = v_a - v_int;
     assert!(
@@ -145,4 +141,17 @@ fn comparison_yields_indicator() {
     assert!((t - 1.0).abs() < 1e-9, "got {t}, expected 1");
     let f = dc_node("V1 in 0 1\nB1 out 0 V=V(in) > 2.0\n.end", "out");
     assert!(f.abs() < 1e-9, "got {f}, expected 0");
+}
+
+#[test]
+fn log_is_the_natural_logarithm_as_in_spice() {
+    // ngspice: log(100) = ln(100) in a B source and in a parameter
+    // expression alike; log10 is the decimal one
+    let ln100 = 100f64.ln();
+    let b = dc_node("B1 out 0 V=log(100)\nR1 out 0 1k\n.end", "out");
+    assert!((b - ln100).abs() < 1e-12, "B source: {b}");
+    let p = dc_node(".param p={log(100)}\nV1 out 0 {p}\n.end", "out");
+    assert!((p - ln100).abs() < 1e-12, "parameter: {p}");
+    let d = dc_node("B1 out 0 V=log10(100)\nR1 out 0 1k\n.end", "out");
+    assert!((d - 2.0).abs() < 1e-12, "log10: {d}");
 }

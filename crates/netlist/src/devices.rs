@@ -336,7 +336,7 @@ pub(crate) fn place_osdi_device(
             report.unknown_param(name, k);
         }
     }
-    let temperature = temp_c + 273.15;
+    let temperature = temp_c + sane_core::constants::ZERO_CELSIUS_K;
     let dev = sane_osdi::OsdiDevice::new(name, lib, module, params, temperature);
     // Set up eagerly so parameter/collapse errors surface at parse time.
     dev.setup()

@@ -13,6 +13,7 @@ pub mod hooks;
 pub mod log;
 pub mod mathfn;
 pub mod profile;
+pub mod stimulus;
 pub mod time;
 
 pub use config::{config, set_config, update_config, Config};
@@ -21,5 +22,5 @@ pub use config::{config, set_config, update_config, Config};
 /// constants, so a model's coefficients stay exact until it is evaluated.
 pub type Graph = rsdag::Graph<rsdag::BigRational>;
 pub use log::{LogLevel, ProgressTracker};
-pub use mathfn::lower_math_call;
+pub use mathfn::MathFn;
 pub use profile::Profile;

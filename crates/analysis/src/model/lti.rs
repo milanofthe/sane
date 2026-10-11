@@ -98,7 +98,7 @@ impl Point {
         }
         let model = &self.model;
         model.ensure_no_delays("zeros")?;
-        input_param(model, input)?;
+        input_drive(model, input)?;
         let x = self.operating_point()?.x;
         let outs = model.inner.outputs(outputs)?;
         let zeros = (outs.iter())
@@ -130,14 +130,18 @@ impl Point {
         let model = &self.model;
         model.ensure_no_delays("state_space")?;
         for input in inputs {
-            input_param(model, input)?;
+            input_drive(model, input)?;
         }
         let x = self.operating_point()?.x;
         let outs = model.inner.outputs(outputs)?;
         let n = model.dim();
         let cdc = model.cdc();
-        let a = -super::stack(&cdc.system_matrix_dc(&x, &self.p, 0.0), n);
-        let e = super::stack(&cdc.jacobian_q_x(&x, &self.p, 0.0), n);
+        let a = -super::stack(&cdc.system_triplets_dc(&x, &self.p).to_dense(cdc.dim()), n);
+        let e = super::stack(
+            &cdc.jacobian_q_x_sparse(&x, &self.p, 0.0)
+                .to_dense(cdc.dim()),
+            n,
+        );
         let mut b = Array2::zeros((n, inputs.len()));
         for (m, input) in inputs.iter().enumerate() {
             let col = model.jacobian_i_input(input, x.clone(), self.p.clone(), 0.0)?;
@@ -176,36 +180,68 @@ impl Point {
         }
         let model = &self.model;
         model.ensure_no_delays("reduce")?;
-        input_param(model, input)?;
+        input_drive(model, input)?;
+        if order == 0 || freqs.iter().any(|&f| !(f >= 0.0)) {
+            return Err(ModelError::Invalid(
+                "reduce needs order >= 1 and frequencies >= 0".into(),
+            ));
+        }
         let x = self.operating_point()?.x;
         let out = model.inner.outputs(&[output])?[0];
-        let r = {
-            let arc = model.context_arc();
-            let mut c = arc.lock().unwrap();
-            let (dae, cdc) = (model.dae(), model.cdc());
-            crate::model_reduce_on_dae(&mut c, dae, cdc, input, out, &x, &self.p, order, freqs)
-                .map_err(ModelError::Numeric)?
+        // The dominant poles and zeros of the transfer, the gain fitted to
+        // its DC value; the full transfer from the AC sweep.
+        let roots = |v: Vec<(f64, f64)>| v.into_iter().map(|(re, im)| [re, im]).collect::<Vec<_>>();
+        let poles = roots(model.poles(x.clone(), self.p.clone()).unwrap_or_default());
+        let zeros = roots(
+            model
+                .zeros(input, out, x.clone(), self.p.clone())
+                .unwrap_or_default(),
+        );
+        let kept_poles = super::pz::dominant_subset(&poles, order);
+        let kept_zeros = super::pz::dominant_subset(&zeros, order.min(kept_poles.len()));
+        let mut at = vec![0.0];
+        at.extend_from_slice(freqs);
+        let mut full: Vec<Complex64> = (model.ac_solve(input, &[out], &x, &self.p, &at)?)
+            .into_iter()
+            .map(|row| row[0])
+            .collect();
+        let h0 = full.remove(0);
+        let prod = |roots: &[[f64; 2]], s: Complex64| -> Complex64 {
+            (roots.iter()).fold(Complex64::new(1.0, 0.0), |acc, r| {
+                acc * (s - Complex64::new(r[0], r[1]))
+            })
         };
-        let roots = |v: Vec<[f64; 2]>| v.into_iter().map(|r| Complex64::new(r[0], r[1])).collect();
+        let s0 = Complex64::new(0.0, 0.0);
+        let (pz, pp) = (prod(&kept_zeros, s0), prod(&kept_poles, s0));
+        let gain = if pz.norm() > 0.0 {
+            h0 * pp / pz
+        } else {
+            h0 * pp
+        };
+        let reduced = (freqs.iter())
+            .map(|&f| {
+                let s = Complex64::new(0.0, 2.0 * std::f64::consts::PI * f);
+                gain * prod(&kept_zeros, s) / prod(&kept_poles, s)
+            })
+            .collect();
+        let as_c = |v: Vec<[f64; 2]>| v.into_iter().map(|r| Complex64::new(r[0], r[1])).collect();
         Ok(ReducedModel {
             input: input.to_string(),
             output: output.to_string(),
-            poles: roots(r.poles),
-            zeros: roots(r.zeros),
-            gain: r.gain,
+            poles: as_c(kept_poles),
+            zeros: as_c(kept_zeros),
+            gain,
             freqs: freqs.to_vec(),
-            full: r.full,
-            reduced: r.reduced,
+            full,
+            reduced,
         })
     }
 }
 
-/// Rejects an input that is no source parameter of the model.
-fn input_param(model: &Model, input: &str) -> Result<(), ModelError> {
-    match model.is_param(input) {
-        true => Ok(()),
-        false => Err(ModelError::UnknownParam(input.to_string())),
-    }
+/// Rejects an input that drives nothing: neither its value nor its
+/// waveform's level is a parameter of the model (see `ModelInner::drive`).
+fn input_drive(model: &Model, input: &str) -> Result<(), ModelError> {
+    model.inner.drive(input).map(|_| ())
 }
 
 /// The root gradients `grads` (as the eigenvalue perturbation returns them,
@@ -299,6 +335,6 @@ impl ReducedModel {
 
 fn db(h: &[Complex64]) -> Vec<f64> {
     h.iter()
-        .map(|v| 20.0 * v.norm().max(1e-30).log10())
+        .map(|v| 20.0 * v.norm().max(sane_core::constants::DB_MAG_FLOOR).log10())
         .collect()
 }

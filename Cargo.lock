@@ -1239,7 +1239,7 @@ dependencies = [
 
 [[package]]
 name = "sane-analysis"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "faer",
  "mimalloc",
@@ -1247,7 +1247,6 @@ dependencies = [
  "num-complex",
  "rayon",
  "rsdag",
- "rslab",
  "sane-circuit",
  "sane-core",
  "sane-dae",
@@ -1258,7 +1257,7 @@ dependencies = [
 
 [[package]]
 name = "sane-circuit"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "rsdag",
  "rustc-hash 2.1.2",
@@ -1269,14 +1268,14 @@ dependencies = [
 
 [[package]]
 name = "sane-core"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "rsdag",
 ]
 
 [[package]]
 name = "sane-dae"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "num-complex",
  "rsdag",
@@ -1289,7 +1288,7 @@ dependencies = [
 
 [[package]]
 name = "sane-device"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "num-complex",
  "rsdag",
@@ -1299,7 +1298,7 @@ dependencies = [
 
 [[package]]
 name = "sane-netlist"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "num-complex",
  "rsdag",
@@ -1315,7 +1314,7 @@ dependencies = [
 
 [[package]]
 name = "sane-osdi"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "libloading",
  "rsdag",
@@ -1329,7 +1328,7 @@ dependencies = [
 
 [[package]]
 name = "sane-py"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "mimalloc",
  "num-complex",
@@ -1338,17 +1337,14 @@ dependencies = [
  "sane-analysis",
  "sane-circuit",
  "sane-core",
- "sane-dae",
- "sane-device",
  "sane-netlist",
  "sane-solve",
- "sane-veriloga",
  "vectfit",
 ]
 
 [[package]]
 name = "sane-solve"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "num-complex",
  "rayon",
@@ -1365,7 +1361,7 @@ dependencies = [
 
 [[package]]
 name = "sane-veriloga"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "num-complex",
  "rsdag",

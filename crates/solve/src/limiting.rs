@@ -10,7 +10,7 @@
 //! declares only which voltages to limit and their kind (see [`sane_dae::Limit`]);
 //! the solver limits them by unknown index ([`Limit`]).
 
-use sane_core::constants::{LIMIT_VCRIT, LIMIT_VT, LIMIT_VTO};
+use sane_core::constants::*;
 use sane_dae::LimitKind;
 
 /// A controlling-voltage limit over the unknowns: `x[hi] - x[lo]` (`None`
@@ -28,7 +28,7 @@ pub struct Limit {
 /// through unchanged), so it never perturbs a nearly-converged junction.
 pub fn pnjlim(vnew: f64, vold: f64) -> f64 {
     let (vt, vcrit) = (LIMIT_VT, LIMIT_VCRIT);
-    if vnew > vcrit && (vnew - vold).abs() > 2.0 * vt {
+    if vnew > vcrit && (vnew - vold).abs() > PNJLIM_STEP_VT * vt {
         if vold > 0.0 {
             // Step onto the logarithmic curve relative to the old voltage.
             let arg = 1.0 + (vnew - vold) / vt;
@@ -51,9 +51,9 @@ pub fn pnjlim(vnew: f64, vold: f64) -> f64 {
 /// `DEVfetlim` with the threshold from [`LIMIT_VTO`].
 pub fn fetlim(vnew: f64, vold: f64) -> f64 {
     let vto = LIMIT_VTO;
-    let vtsthi = (2.0 * (vold - vto)).abs() + 2.0;
-    let vtstlo = 0.5 * vtsthi + 2.0;
-    let vtox = vto + 3.5;
+    let vtsthi = (FETLIM_STEP_GAIN * (vold - vto)).abs() + FETLIM_STEP;
+    let vtstlo = 0.5 * vtsthi + FETLIM_STEP;
+    let vtox = vto + FETLIM_STRONG;
     let delv = vnew - vold;
     let mut v = vnew;
     if vold >= vto {
@@ -64,24 +64,24 @@ pub fn fetlim(vnew: f64, vold: f64) -> f64 {
                         v = vold - vtstlo;
                     }
                 } else {
-                    v = vnew.max(vto + 2.0);
+                    v = vnew.max(vto + FETLIM_STEP);
                 }
             } else if delv > vtsthi {
                 v = vold + vtsthi;
             }
         } else if delv <= 0.0 {
-            if vnew < vto + 0.5 {
-                v = vnew.max(vto - 0.5);
+            if vnew < vto + FETLIM_NEAR {
+                v = vnew.max(vto - FETLIM_NEAR);
             }
         } else {
-            v = vnew.min(vto + 4.0);
+            v = vnew.min(vto + FETLIM_TURN_ON);
         }
     } else if delv <= 0.0 {
         if -delv > vtsthi {
             v = vold - vtsthi;
         }
-    } else if vnew > vto + 0.5 {
-        v = vto + 0.5;
+    } else if vnew > vto + FETLIM_NEAR {
+        v = vto + FETLIM_NEAR;
     }
     v
 }

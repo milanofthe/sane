@@ -25,10 +25,7 @@ numpy = "0.22"
 mimalloc = "0.1"
 sane-core.workspace = true
 sane-circuit.workspace = true
-sane-dae = { path = "../dae" }
-sane-device = { path = "../device" }
 sane-netlist = { path = "../netlist" }
-sane-veriloga = { path = "../veriloga" }
 sane-solve = { path = "../solve", default-features = false }
 sane-analysis = { path = "../analysis", default-features = false }
 num-complex.workspace = true

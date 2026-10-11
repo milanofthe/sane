@@ -23,14 +23,20 @@ fn bistable_deck(ic: f64) -> String {
     )
 }
 
-/// The constant ic lands in the DAE's seed registry under the state's name.
+/// The name of the unknown a seed starts.
+fn seeded(dae: &sane_dae::Dae, s: rsdag::SymbolId) -> String {
+    dae.unknowns[dae.unknown_of(s).expect("a seed's unknown")].name()
+}
+
+/// The constant ic lands in the DAE's seed registry on the state.
 #[test]
 fn idt_ic_registers_a_dc_seed() {
     let model = Model::from_netlist(&bistable_deck(0.9)).expect("model");
     let dae = model.dae();
-    assert_eq!(dae.dc_seeds.len(), 1);
-    assert_eq!(dae.dc_seeds[0].0, "N1.idt0");
-    assert!((dae.dc_seeds[0].1 - 0.9).abs() < 1e-15);
+    let seeds = &dae.hints.dc_seeds;
+    assert_eq!(seeds.len(), 1);
+    assert_eq!(seeded(dae, seeds[0].0), "N1.idt0");
+    assert!((seeds[0].1 - 0.9).abs() < 1e-15);
 }
 
 /// The seed steers the cold DC solve onto the matching stable root; DC still
@@ -65,19 +71,13 @@ R2 y 0 1k
 .end
 ";
     let model = Model::from_netlist(deck).expect("model");
-    let mut names: Vec<&str> = model
-        .dae()
-        .dc_seeds
-        .iter()
-        .map(|(n, _)| n.as_str())
+    let dae = model.dae();
+    let mut names: Vec<String> = (dae.hints.dc_seeds.iter())
+        .map(|&(s, _)| seeded(dae, s))
         .collect();
     names.sort();
     assert_eq!(names, ["N1.idt0", "N2.idt0"]);
-    assert!(model
-        .dae()
-        .dc_seeds
-        .iter()
-        .all(|(_, c)| (*c - 0.25).abs() < 1e-15));
+    assert!((dae.hints.dc_seeds.iter()).all(|(_, c)| (*c - 0.25).abs() < 1e-15));
 }
 
 /// A non-constant ic cannot seed a numeric solve: it warns (captured) and the
@@ -102,7 +102,7 @@ R1 x 0 1k
         warns.iter().any(|(_, w)| w.contains("not a constant")),
         "expected a non-constant-ic warning, got {warns:?}"
     );
-    assert!(model.dae().dc_seeds.is_empty());
+    assert!(model.dae().hints.dc_seeds.is_empty());
     let op = model
         .at(&[])
         .and_then(|pt| pt.operating_point())

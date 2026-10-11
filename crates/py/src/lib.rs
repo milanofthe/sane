@@ -15,6 +15,9 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use sane_core::constants::{
+    DEFAULT_Z0, VF_MAX_POLES, VF_PASSIVITY_ITERS, VF_PASSIVITY_THRESHOLD, VF_TOL,
+};
 
 /// The thread count for the parallel work (the sweeps, and in every solve
 /// the device instances of each evaluation): `0` = the default, `n` = `n`
@@ -40,9 +43,9 @@ fn set_log_level(level: &str) {
 /// return the deterministic Verilog-A macromodel source targeting SANE's
 /// AD-friendly grammar subset. Returns `(va_source, fit_error, n_poles)`.
 #[pyfunction]
-#[pyo3(signature = (freqs, y_re, y_im, n_ports, name, port_names=None, z0=50.0,
-                    tol=1e-4, max_poles=40, enforce_passivity=true,
-                    threshold=1e-2, force=false, date=String::new()))]
+#[pyo3(signature = (freqs, y_re, y_im, n_ports, name, port_names=None, z0=DEFAULT_Z0,
+                    tol=VF_TOL, max_poles=VF_MAX_POLES, enforce_passivity=true,
+                    threshold=VF_PASSIVITY_THRESHOLD, force=false, date=String::new()))]
 #[allow(clippy::too_many_arguments)]
 fn vectfit_verilog_a(
     freqs: Vec<f64>,
@@ -93,7 +96,7 @@ fn vectfit_verilog_a(
         vec![z0; n_ports],
     );
     if enforce_passivity {
-        model.enforce_passivity(20);
+        model.enforce_passivity(VF_PASSIVITY_ITERS);
     }
     let va = model
         .to_verilog_a(&name, &date, force, threshold)
@@ -103,7 +106,7 @@ fn vectfit_verilog_a(
 
 /// Begin collecting the engine's internal per-stage timings into the global
 /// profiling sink (clearing any prior run). Every instrumented stage that flows
-/// through the native logger -- `log_stage!` / `time_stage!` / `log::scope`,
+/// through the native logger -- `log_stage!` / `log::scope`,
 /// e.g. `dc/newton`, `ac/eval_b`, `tran/irk_step`, the extract/compile phases --
 /// is recorded, independent of the log level. Pair with [`profile_take`].
 #[pyfunction]
@@ -194,16 +197,25 @@ pub(crate) fn surface(py: Python<'_>) -> PyResult<()> {
 
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    // No thread setting here: the linear solves are sequential by construction
-    // (rslab's KLU) and the parallelism lives in
-    // the outer sweeps, on the worker pool with its own default. `1` used to
-    // mean "faer sequential" and would now shrink that pool to one thread.
+    // No thread setting here: the parallelism lives in the outer sweeps, on
+    // the worker pool with its own default.
     m.add_class::<circuit::PyCircuit>()?;
     m.add_class::<circuit::PyWaveform>()?;
     m.add_class::<PyModel>()?;
     m.add_class::<model::Point>()?;
     m.add_class::<model::ParamGroup>()?;
     results::register(m)?;
+    // The engine's defaults, which the Python wrappers read rather than
+    // restate.
+    use sane_core::constants as k;
+    m.add("TRANSIENT_RTOL", k::TRANSIENT_RTOL)?;
+    m.add("TRANSIENT_ATOL", k::TRANSIENT_ATOL)?;
+    m.add("HB_HARMONICS", k::HB_HARMONICS)?;
+    m.add("HB_OVERSAMPLE", k::HB_OVERSAMPLE)?;
+    m.add("DEFAULT_Z0", DEFAULT_Z0)?;
+    m.add("VF_TOL", VF_TOL)?;
+    m.add("VF_MAX_POLES", VF_MAX_POLES)?;
+    m.add("VF_PASSIVITY_THRESHOLD", VF_PASSIVITY_THRESHOLD)?;
     m.add_function(wrap_pyfunction!(set_parallelism, m)?)?;
     m.add_function(wrap_pyfunction!(set_log_level, m)?)?;
     m.add_function(wrap_pyfunction!(vectfit_verilog_a, m)?)?;

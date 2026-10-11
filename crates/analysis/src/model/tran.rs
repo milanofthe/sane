@@ -26,8 +26,8 @@ pub struct TransientOptions {
 impl Default for TransientOptions {
     fn default() -> Self {
         TransientOptions {
-            rtol: 1e-4,
-            atol: 1e-7,
+            rtol: sane_core::constants::TRANSIENT_RTOL,
+            atol: sane_core::constants::TRANSIENT_ATOL,
             dt_max: None,
             x0: None,
         }
@@ -108,7 +108,7 @@ impl Point {
             at: self.clone(),
             opts: opts.clone(),
             t: t.to_vec(),
-            x: super::stack(&rows, inner.dae.dim()),
+            x: super::stack(&rows, inner.cdc.dim()),
             there: None,
             events,
         })
@@ -143,13 +143,6 @@ impl Trajectory {
             "sens_tran",
             &format!("(params: {}, points: {})", cols.len(), self.t.len()),
         );
-        {
-            let arc = model.context_arc();
-            let mut c = arc.lock().unwrap();
-            inner
-                .cdc
-                .ensure_transient_sensitivity(&mut c, &inner.dae, &cols);
-        }
         let o = &self.opts;
         let x0 = (o.x0.clone())
             .or_else(|| self.at.transient_start())

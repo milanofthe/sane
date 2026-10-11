@@ -255,9 +255,9 @@ pub fn drain_captured() -> Vec<(Concern, String)> {
 }
 
 /// Emit a stage-timing line at DEBUG, e.g. `stage ac/assemble_gc : 12.345 ms`.
-/// The single sink behind the [`time_stage!`](crate::time_stage) and
-/// [`log_stage!`](crate::log_stage) macros, so every instrumented stage in the
-/// engine logs in one consistent format, gated by the global level.
+/// The single sink behind the [`log_stage!`](crate::log_stage) macro and
+/// [`scope`], so every instrumented stage in the engine logs in one
+/// consistent format, gated by the global level.
 #[inline]
 pub fn stage(name: &str, dur: std::time::Duration) {
     // Always offer the span to the global profile sink (a no-op unless a
@@ -422,10 +422,10 @@ impl ProgressTracker {
             last_log_time: now,
             last_log_progress: 0.0,
             ema_rate: 0.0,
-            min_log_interval: 1.0,
-            update_log_every: 0.2,
-            bar_width: 20,
-            ema_alpha: 0.3,
+            min_log_interval: crate::constants::PROGRESS_MIN_INTERVAL,
+            update_log_every: crate::constants::PROGRESS_LOG_EVERY,
+            bar_width: crate::constants::PROGRESS_BAR_WIDTH,
+            ema_alpha: crate::constants::PROGRESS_EMA_ALPHA,
             interrupted: false,
         }
     }
@@ -521,7 +521,7 @@ impl ProgressTracker {
         let filled = filled.min(self.bar_width);
         let bar: String = "#".repeat(filled) + &"-".repeat(self.bar_width - filled);
         let elapsed_str = format_time(elapsed);
-        let eta = if progress > 0.01 {
+        let eta = if progress > crate::constants::PROGRESS_ETA_MIN {
             format_time(elapsed / progress * (1.0 - progress))
         } else {
             "--:--".to_string()
@@ -558,7 +558,7 @@ fn format_time(secs: f64) -> String {
 fn format_rate(rate: f64) -> String {
     if rate <= 0.0 || rate.is_nan() {
         "N/A".to_string()
-    } else if rate < 0.1 {
+    } else if rate < crate::constants::PROGRESS_PER_MINUTE_BELOW {
         format!("{:.1} it/min", rate * 60.0)
     } else if rate < 1.0 {
         format!("{:.2} it/s", rate)

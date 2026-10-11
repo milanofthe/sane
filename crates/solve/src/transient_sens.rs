@@ -44,10 +44,10 @@ use sane_core::constants::GMIN_DC;
 
 use crate::program::{Need, Program};
 use crate::rosenbrock::{Rosenbrock, RODAS4};
-use crate::sens::{Bound, FrozenState, SensProgram};
+use crate::sens::{FrozenState, SensProgram};
 use crate::stage_matrix::StageMatrix;
 use crate::transient::fraction;
-use crate::{CompiledDc, Symbolic};
+use crate::{Bound, CompiledDc, Symbolic};
 
 /// The sensitivities of one integration by the parameter columns `cols`,
 /// and their rows at the requested times for the unknowns `outputs`.
@@ -118,9 +118,7 @@ impl<'a> Sens<'a> {
     ) -> Result<Self, String> {
         let (n, np) = (cdc.n, cols.len());
         let t0 = t_eval.first().copied().unwrap_or(0.0);
-        let prog = cdc
-            .sens_program(cols)
-            .ok_or("transient sensitivity: call ensure_transient_sensitivity first")?;
+        let prog = cdc.sens_program(cols);
         let by_param = |rows: &[usize], of: &[usize], offset: usize| {
             let mut by = vec![Vec::new(); np];
             for (k, (&r, &j)) in rows.iter().zip(of).enumerate() {
@@ -129,9 +127,7 @@ impl<'a> Sens<'a> {
             by
         };
         let iq_of = by_param(&prog.iq_rows, &prog.iq_of, 0);
-        let frozen = cdc
-            .frozen()
-            .ok_or("transient sensitivity: call ensure_transient_sensitivity first")?;
+        let frozen = cdc.frozen();
         let mut e_of = vec![Vec::new(); np];
         for (k, (&at, &j)) in prog.e_at.iter().zip(&prog.e_of).enumerate() {
             let place = frozen.hx_w.len() + k;
@@ -139,7 +135,7 @@ impl<'a> Sens<'a> {
         }
         let mut s = Sens {
             cdc,
-            program: Program::new(cdc, x0, p, t0),
+            program: Program::new(cdc, p),
             euler: StageMatrix::new(cdc, sym),
             np,
             outputs: outputs.to_vec(),
@@ -149,8 +145,8 @@ impl<'a> Sens<'a> {
             sqb: vec![vec![0.0; n]; np],
             ux: vec![vec![vec![0.0; n]; np]; RODAS4.b.len()],
             uq: vec![vec![vec![0.0; n]; np]; RODAS4.b.len()],
-            iq_bound: Bound::new(cdc, &prog.iq, p),
-            e_bound: Bound::new(cdc, &prog.e, p),
+            iq_bound: Bound::new(cdc, &prog.iq, p, &[]),
+            e_bound: Bound::new(cdc, &prog.e, p, &[]),
             prog,
             frozen,
             iq_of,

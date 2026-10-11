@@ -107,6 +107,76 @@ fn lead_network_zero_and_its_sensitivity() {
 }
 
 #[test]
+fn poles_over_twenty_one_decades() {
+    // three RC sections off one source, poles at -1/(R C): -1e-12, -1 and
+    // -1e9 rad/s, more decades than one reduction resolves
+    let net = "V1 a 0 1
+R1 a b 1
+C1 b 0 1T
+R2 a c 1k
+C2 c 0 1m
+R3 a d 1
+C3 d 0 1n
+";
+    let m = Model::from_netlist(net).unwrap();
+    let pt = m.at(&[]).unwrap();
+    let poles = pt.poles().unwrap();
+    assert_eq!(poles.poles.len(), 3, "{:?}", poles.poles);
+    for p in [-1e-12, -1.0, -1e9] {
+        let near = |r: &Complex64| (r - Complex64::new(p, 0.0)).norm() < 1e-6 * p.abs();
+        assert!(
+            poles.poles.iter().any(near),
+            "no pole at {p}: {:?}",
+            poles.poles
+        );
+    }
+    // d p / d C3 = 1 / (R3 C3^2) for p = -1/(R3 C3)
+    let g = poles.sensitivity(&["C3"]).unwrap();
+    let k = (g.roots.iter())
+        .position(|r| (r.re + 1e9).abs() < 1e3)
+        .unwrap();
+    assert!(
+        (g.grad[[k, 0]].re - 1e18).abs() < 1e-6 * 1e18,
+        "{:?}",
+        g.grad
+    );
+}
+
+#[test]
+fn a_zero_at_the_origin_and_its_neighbours() {
+    // C1 in series blocks DC: H = Z / (Z + 1/(s C1)) with Z = R1 || (R2 + 1/(s C2)),
+    // zeros at s = 0 and at -1/(R2 C2); the pencil is singular at s = 0.
+    let net = "V1 in 0 1
+C1 in out 1u
+R1 out 0 1k
+R2 out mid 1k
+C2 mid 0 1u
+";
+    let m = Model::from_netlist(net).unwrap();
+    let pt = m.at(&[]).unwrap();
+    let zeros = pt.zeros("V1", &["out"]).unwrap();
+    let z = zeros.of("out").unwrap();
+    assert_eq!(z.len(), 2, "{z:?}");
+    assert!(z.iter().any(|z| z.norm() < 1e-6), "{z:?}");
+    let k = (z.iter())
+        .position(|z| (z - Complex64::new(-1000.0, 0.0)).norm() < 1e-6 * 1000.0)
+        .unwrap_or_else(|| panic!("no zero at -1/(R2 C2): {z:?}"));
+    // d z / d R2 = 1 / (R2^2 C2), d z / d C2 = 1 / (R2 C2^2), the origin's none.
+    let g = &zeros.sensitivity(&["R2", "C2"]).unwrap()[0];
+    let k = (g.roots.iter())
+        .position(|r| (r - z[k]).norm() < 1e-9)
+        .unwrap();
+    assert!((g.grad[[k, 0]].re - 1.0).abs() < 1e-6, "{:?}", g.grad);
+    assert!((g.grad[[k, 1]].re - 1e9).abs() < 1e-6 * 1e9, "{:?}", g.grad);
+    let o = 1 - k;
+    assert!(
+        g.grad.row(o).iter().all(|d| d.norm() < 1e-6),
+        "{:?}",
+        g.grad
+    );
+}
+
+#[test]
 fn state_space_reproduces_the_ac_response() {
     // Two sources, two outputs: C (jwE - A)^-1 B is the AC response of
     // every pair.
@@ -182,4 +252,36 @@ fn gauss(a: &mut [Vec<Complex64>], b: &mut [Complex64]) -> Vec<Complex64> {
         x[r] = (b[r] - s) / a[r][r];
     }
     x
+}
+
+#[test]
+fn a_waveform_driven_input_is_its_level() {
+    // The small-signal input is the source's level, whether the source holds
+    // a value or a transient waveform: the zeros, the state space and the
+    // reduced model see the same input either way.
+    let body = "R1 in out 1k\nC1 out 0 1u\nR2 out x 100\nC2 x 0 1n\n";
+    let plain = Model::from_netlist(&format!("V1 in 0 0.5\n{body}")).unwrap();
+    let sine = Model::from_netlist(&format!("V1 in 0 SIN(0.5 1 1k)\n{body}")).unwrap();
+    let (a, b) = (plain.at(&[]).unwrap(), sine.at(&[]).unwrap());
+    let (za, zb) = (
+        a.zeros("V1", &["out"]).unwrap().zeros,
+        b.zeros("V1", &["out"]).unwrap().zeros,
+    );
+    assert_eq!(za.len(), zb.len());
+    for (x, y) in za[0].iter().zip(&zb[0]) {
+        assert!((x - y).norm() <= 1e-9 * x.norm().max(1.0), "{x} vs {y}");
+    }
+    let (sa, sb) = (
+        a.state_space(&["V1"], &["out"]).unwrap(),
+        b.state_space(&["V1"], &["out"]).unwrap(),
+    );
+    assert_eq!(sa.b, sb.b);
+    let freqs = log_grid(10.0, 1e5, 5);
+    let (ra, rb) = (
+        a.reduce("V1", "out", 1, &freqs).unwrap(),
+        b.reduce("V1", "out", 1, &freqs).unwrap(),
+    );
+    for (x, y) in ra.full.iter().zip(&rb.full) {
+        assert!((x - y).norm() <= 1e-12 * x.norm().max(1e-30), "{x} vs {y}");
+    }
 }

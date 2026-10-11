@@ -8,13 +8,15 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use rsdag::{CmpOp, ExprId, FuncId, ParamRole, ReduceOp, SymbolId};
-use sane_circuit::{BExpr, BKind, Circuit, Element, Instance, Kind, SourceFn};
+use rsdag::{ExprId, FuncId, ParamRole, ReduceOp, SymbolId};
+use sane_circuit::{BCall, BExpr, BKind, BOp, Circuit, Element, Instance, Kind};
 use sane_core::Graph;
 use sane_device::Lowerer;
 
 use crate::observers::Observers;
-use crate::{sym2, Dae, DelaySpec, EventSpec, NoiseSource, UnknownKind};
+use crate::{
+    sym2, Dae, DelaySpec, EventSpec, NoiseSource, SolverHints, Source, UnknownId, UnknownKind,
+};
 
 /// Symbol for an element's value parameter, mapped out of the reserved unknown
 /// namespace (see [`sane_circuit::value_symbol_name`]) so e.g. a voltage source
@@ -84,40 +86,23 @@ fn translate_bexpr(
             let x = translate_bexpr(ctx, a, v, branch_i_of_name, t_e);
             let y = translate_bexpr(ctx, b, v, branch_i_of_name, t_e);
             match op {
-                '+' => ctx.add(x, y),
-                '-' => ctx.sub(x, y),
-                '*' => ctx.mul(x, y),
-                '/' => ctx.div(x, y),
-                '^' => sane_core::mathfn::pow(ctx, x, y),
-                // Comparison sentinels (see `sane_netlist::behavioral::cmp_sentinel`):
-                // each yields 1.0 / 0.0, to be consumed by `if(cond, then, else)`.
-                '<' => ctx.cmp(CmpOp::Lt, x, y),
-                '>' => ctx.cmp(CmpOp::Gt, x, y),
-                'l' => ctx.cmp(CmpOp::Le, x, y),
-                'g' => ctx.cmp(CmpOp::Ge, x, y),
-                'e' => ctx.cmp(CmpOp::Eq, x, y),
-                'n' => ctx.cmp(CmpOp::Ne, x, y),
-                _ => x,
+                BOp::Add => ctx.add(x, y),
+                BOp::Sub => ctx.sub(x, y),
+                BOp::Mul => ctx.mul(x, y),
+                BOp::Div => ctx.div(x, y),
+                BOp::Pow => sane_core::mathfn::pow(ctx, x, y),
+                // 1 or 0, for `if(cond, then, else)`
+                BOp::Cmp(c) => ctx.cmp(*c, x, y),
             }
         }
-        BExpr::Call(name, args) => {
+        BExpr::Call(call, args) => {
             let a: Vec<ExprId> = args
                 .iter()
                 .map(|e| translate_bexpr(ctx, e, v, branch_i_of_name, t_e))
                 .collect();
-            match name.as_str() {
-                "if" if a.len() == 3 => ctx.select(a[0], a[1], a[2]),
-                // Everything else is the shared elementary-function table in
-                // `sane_core::mathfn` (`pwr` is the B-source spelling of `pow`).
-                // The `None` arm is unreachable for parsed netlists: the netlist
-                // parser validates every B-source function name and arity (see
-                // `sane_netlist::behavioral::validate_call`), so an unknown name
-                // is a hard parse error, never a silent zero. It only guards a
-                // programmatically constructed `BExpr`.
-                other => {
-                    let canonical = if other == "pwr" { "pow" } else { other };
-                    sane_core::lower_math_call(ctx, canonical, &a).unwrap_or_else(|| ctx.zero())
-                }
+            match call {
+                BCall::If => ctx.select(a[0], a[1], a[2]),
+                BCall::Math(f) => f.lower(ctx, &a),
             }
         }
     }
@@ -126,7 +111,7 @@ fn translate_bexpr(
 /// An unknown a body mints beyond its nodes (a branch current, a device
 /// extra), with its row `current + d/dt charge = 0`.
 struct Unknown {
-    name: String,
+    id: UnknownId,
     kind: UnknownKind,
     x: SymbolId,
     current: ExprId,
@@ -165,12 +150,11 @@ struct Part {
     /// The noise sources and op-vars: its own, and its instances'.
     observers: Observers,
     param_defaults: rustc_hash::FxHashMap<SymbolId, f64>,
-    dc_seeds: Vec<(String, f64)>,
+    dc_seeds: Vec<(SymbolId, f64)>,
     /// `(row, col, g)` over node indices `k - 1`.
     companion: Vec<(usize, usize, f64)>,
     limits: Vec<sane_device::FragmentLimit>,
-    sources: Vec<(String, SourceFn)>,
-    source_names: Vec<String>,
+    sources: Vec<Source>,
     /// Display names (see [`Dae::labels`]).
     labels: Vec<(ExprId, String)>,
     /// See [`Dae::assertions`].
@@ -243,7 +227,7 @@ pub fn assemble_at(
     let mut v = vec![zero; n + 1];
     let mut x = Vec::new();
     for k in 1..=n {
-        let (e, s) = sym2(ctx, &format!("v{k}"));
+        let (e, s) = sym2(ctx, &UnknownId::Node(k).name());
         v[k] = e;
         x.push(s);
     }
@@ -256,17 +240,8 @@ pub fn assemble_at(
     drop(lo); // release the &mut Graph borrow before reusing `ctx` below
     sane_core::log::stage("dae/devices", dev_t0.elapsed());
     sane_core::log::stage("dae/devices_lower", bodies.lower_t);
-    let (tpl_b, tpl_c, n_b, n_c) = sane_core::profile::take_tpl_stats();
-    sane_core::log::stage(
-        "dae/tpl_build",
-        std::time::Duration::from_nanos(tpl_b as u64),
-    );
-    sane_core::log::stage(
-        "dae/tpl_clone",
-        std::time::Duration::from_nanos(tpl_c as u64),
-    );
     sane_core::log::debug(&format!(
-        "dae/devices: {n_b} template builds, {n_c} clones, {} subcircuit functions",
+        "dae/devices: {} subcircuit functions",
         bodies.funcs.len()
     ));
 
@@ -309,15 +284,15 @@ pub fn assemble_at(
         .collect();
     charges.extend(part.branches.iter().chain(&part.extras).map(|u| u.charge));
 
-    let mut unknowns: Vec<String> = (1..=n).map(|k| format!("v{k}")).collect();
+    let mut unknowns: Vec<UnknownId> = (1..=n).map(UnknownId::Node).collect();
     let mut kinds = vec![UnknownKind::NodeVoltage; n];
     for u in &part.branches {
-        unknowns.push(u.name.clone());
+        unknowns.push(u.id.clone());
         kinds.push(UnknownKind::BranchCurrent);
         x.push(u.x);
     }
     for u in &part.extras {
-        unknowns.push(u.name.clone());
+        unknowns.push(u.id.clone());
         kinds.push(u.kind);
         x.push(u.x);
     }
@@ -356,7 +331,7 @@ pub fn assemble_at(
         .filter_map(|&(ref name, v)| match ctx.node(v) {
             rsdag::Node::Symbol(s) => unknown_of
                 .get(s)
-                .map(|&k| (name.clone(), Some(unknowns[k].clone()))),
+                .map(|&k| (name.clone(), Some(unknowns[k].name()))),
             _ if ctx.const_f64(v) == Some(0.0) => Some((name.clone(), None)),
             _ => None,
         })
@@ -379,12 +354,13 @@ pub fn assemble_at(
         kinds,
         x,
         t,
-        companion,
         observers: part.observers,
-        dc_seeds: part.dc_seeds,
-        limits: part.limits,
+        hints: SolverHints {
+            companion,
+            dc_seeds: part.dc_seeds,
+            limits: part.limits,
+        },
         sources: part.sources,
-        source_names: part.source_names,
         labels: part.labels.into_iter().collect(),
         injection: Default::default(),
         rest: std::sync::OnceLock::from(rest),
@@ -440,7 +416,7 @@ fn lower_body(
             e.kind,
             Kind::VoltageSource | Kind::Inductor | Kind::Vcvs | Kind::Ccvs
         ) {
-            let (ie, is) = sym2(ctx, &format!("i_{}", e.name));
+            let (ie, is) = sym2(ctx, &UnknownId::Branch(e.name.clone()).name());
             branch_elem_idx.push(idx);
             branch_i.push((ie, is));
             branch_i_of_name.insert(e.name.to_ascii_lowercase(), ie);
@@ -453,7 +429,7 @@ fn lower_body(
     let mut bhv_v: Vec<(usize, ExprId, SymbolId)> = Vec::new();
     for (bi, b) in circuit.behavioral().iter().enumerate() {
         if b.kind == BKind::V {
-            let (ie, is) = sym2(ctx, &format!("i_{}", b.name));
+            let (ie, is) = sym2(ctx, &UnknownId::Branch(b.name.clone()).name());
             branch_i_of_name.insert(b.name.to_ascii_lowercase(), ie);
             bhv_v.push((bi, ie, is));
         }
@@ -612,10 +588,10 @@ fn lower_body(
         let zero = lo.ctx().zero();
         for (j, (ex, &current)) in extras.iter().zip(&frag.currents).enumerate() {
             if let Some(c) = ex.dc_seed {
-                part.dc_seeds.push((ex.name.clone(), c));
+                part.dc_seeds.push((ex.value_sym, c));
             }
             part.extras.push(Unknown {
-                name: ex.name.clone(),
+                id: UnknownId::Internal(ex.name.clone()),
                 kind: ex.kind,
                 x: ex.value_sym,
                 current,
@@ -753,7 +729,7 @@ fn lower_body(
             _ => unreachable!(),
         };
         part.branches.push(Unknown {
-            name: format!("i_{}", e.name),
+            id: UnknownId::Branch(e.name.clone()),
             kind: UnknownKind::BranchCurrent,
             x: branch_i[pos].1,
             current,
@@ -786,7 +762,7 @@ fn lower_body(
         let dv = ctx.sub(v[b.a], v[b.b]);
         let val = translate_bexpr(ctx, &b.expr, v, &branch_i_of_name, t_e);
         part.branches.push(Unknown {
-            name: format!("i_{}", b.name),
+            id: UnknownId::Branch(b.name.clone()),
             kind: UnknownKind::BranchCurrent,
             x: is,
             current: ctx.sub(dv, val),
@@ -794,19 +770,21 @@ fn lower_body(
         });
     }
 
-    // Retain each independent source's stimulus shape (by element name) for the
-    // analyses that need the structural facts lowering destroys (transient
-    // breakpoints, the HB fundamental), and every independent V/I element by
-    // name: the element's value symbol doubles as its DC value, and the DC
-    // source-stepping continuation ramps exactly this set.
+    // Every independent source with what the lowering no longer shows: its
+    // DC value's symbol or its waveform's parameters.
     for e in circuit.elements() {
-        if let Some(s) = e.source {
-            part.sources.push((e.name.clone(), s));
+        if !matches!(e.kind, Kind::VoltageSource | Kind::CurrentSource) {
+            continue;
         }
-        if matches!(e.kind, Kind::VoltageSource | Kind::CurrentSource) {
-            part.source_names
-                .push(sane_circuit::value_symbol_name(&e.name));
-        }
+        let mut sym = |name: &str| {
+            let s = ctx.sym(name);
+            sym_of(ctx, s).expect("a fresh name is a symbol")
+        };
+        part.sources.push(Source {
+            element: e.name.clone(),
+            value: (e.source.is_none()).then(|| sym(&sane_circuit::value_symbol_name(&e.name))),
+            stimulus: (e.source).map(|s| s.stimulus(&e.name).map(|n| sym(n))),
+        });
     }
 
     for inst in instances {
@@ -1054,7 +1032,7 @@ fn instantiate(
     let n_branch = body.branches.len();
     for (j, u) in body.branches.iter().chain(&body.extras).enumerate() {
         let u = Unknown {
-            name: inst.rename(&u.name),
+            id: u.id.renamed(|s| inst.rename(s)),
             kind: u.kind,
             x: actual_sym(ctx, u.x).expect("an unknown is a symbol"),
             current: calls[low.out_unknown + j],
@@ -1099,11 +1077,11 @@ fn instantiate(
             part.param_defaults.insert(a, val);
         }
     }
-    part.dc_seeds.extend(
-        body.dc_seeds
-            .iter()
-            .map(|(name, c)| (inst.rename(name), *c)),
-    );
+    for &(s, c) in &body.dc_seeds {
+        if let Some(s) = actual_sym(ctx, s) {
+            part.dc_seeds.push((s, c));
+        }
+    }
     for &(r, c, g) in &body.companion {
         let (pr, pc) = (inst.node(r + 1), inst.node(c + 1));
         if pr != 0 && pc != 0 {
@@ -1126,10 +1104,16 @@ fn instantiate(
             when,
         });
     }
-    part.sources
-        .extend(body.sources.iter().map(|(name, s)| (inst.rename(name), *s)));
-    part.source_names
-        .extend(body.source_names.iter().map(|s| inst.rename(s)));
+    // a source parameter the instance binds to an expression keeps its own
+    // symbol, unbound
+    for s in &body.sources {
+        let mut sym = |s: SymbolId| actual_sym(ctx, s).unwrap_or(s);
+        part.sources.push(Source {
+            element: inst.rename(&s.element),
+            value: s.value.map(&mut sym),
+            stimulus: s.stimulus.as_ref().map(|st| st.map(|&p| sym(p))),
+        });
+    }
     // The body's assertions and structure over the instance's parameters,
     // and its collapsed nodes in the instance's names and nodes.
     let exprs: Vec<ExprId> = (body.assertions.iter().chain(&body.structure))

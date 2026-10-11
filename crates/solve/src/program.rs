@@ -2,17 +2,16 @@
 //! `I ++ Q`, the same with their Jacobians `I ++ Q ++ G ++ C`, and `C`
 //! alone, each a view of the one lowered program (see `compile`).
 //!
-//! A [`Program`] holds the input vector in the programs' layout, with the
-//! parameters written once, and each program's prolog token and work: the
-//! parameter-pure prefix ran when the program was bound, an evaluation
-//! patches the state, the time and the delayed values into the inputs and
-//! runs the main phase into buffers it keeps. Nothing allocates once the
+//! A [`Program`] holds each program bound to the parameters (see
+//! [`Bound`]): the parameter-pure prefix ran when the program was bound, an
+//! evaluation patches the state, the time and the delayed values into the
+//! inputs and runs the main phase into buffers it keeps. Nothing allocates once the
 //! first evaluations have sized them. With transport delays the program
 //! keeps their accepted history, and every evaluation at `t` reads the
 //! delayed values at `t − τ` off it: no evaluation sees another time's.
 
 use crate::delay::DelayHistory;
-use crate::{CompiledDc, PrologToken};
+use crate::{Bound, CompiledDc};
 
 /// The transport delays of an integration: their accepted history, the
 /// delays, and the delayed values last published, at `at` (NaN: none since
@@ -37,12 +36,11 @@ pub(crate) enum Need {
 
 pub(crate) struct Program<'a> {
     cdc: &'a CompiledDc,
-    inputs: Vec<f64>,
-    res_tok: PrologToken,
-    res_work: Vec<f64>,
-    step_tok: PrologToken,
-    step_work: Vec<f64>,
-    c_work: Vec<f64>,
+    /// `I ++ Q`, `I ++ Q ++ G ++ C`, `C` and the time rates, bound.
+    res: Bound,
+    step: Bound,
+    c: Bound,
+    dt: Option<Bound>,
     /// `I ++ Q` of the latest evaluation, `++ G ++ C` after one with the
     /// Jacobians.
     out: Vec<f64>,
@@ -50,33 +48,23 @@ pub(crate) struct Program<'a> {
     /// The evaluations into `out` so far.
     evals: u64,
     c_out: Vec<f64>,
-    dt_work: Vec<f64>,
     dt_out: Vec<f64>,
     delays: Option<Delays>,
 }
 
 impl<'a> Program<'a> {
-    /// The programs of `cdc` bound to the parameters `p`, the inputs at
-    /// `(x, t)`.
-    pub fn new(cdc: &'a CompiledDc, x: &[f64], p: &[f64], t: f64) -> Self {
-        let mut inputs = Vec::new();
-        cdc.fill_inputs(x, p, t, &mut inputs);
-        let (mut res_work, mut step_work) = (Vec::new(), Vec::new());
-        let res_tok = cdc.tape_tran_res.eval_prolog(&inputs, &mut res_work);
-        let step_tok = cdc.tape_tran_step.eval_prolog(&inputs, &mut step_work);
+    /// The programs of `cdc` bound to the parameters `p`.
+    pub fn new(cdc: &'a CompiledDc, p: &[f64]) -> Self {
         Program {
             cdc,
-            inputs,
-            res_tok,
-            res_work,
-            step_tok,
-            step_work,
-            c_work: Vec::new(),
+            res: Bound::new(cdc, &cdc.tape_tran_res, p, &[]),
+            step: Bound::new(cdc, &cdc.tape_tran_step, p, &[]),
+            c: Bound::new(cdc, &cdc.tape_c, p, &[]),
+            dt: (cdc.tape_dt.as_ref()).map(|tape| Bound::new(cdc, tape, p, &[])),
             out: Vec::new(),
             jacobian: false,
             evals: 0,
             c_out: Vec::new(),
-            dt_work: Vec::new(),
             dt_out: Vec::new(),
             delays: None,
         }
@@ -126,23 +114,12 @@ impl<'a> Program<'a> {
     pub fn eval(&mut self, x: &[f64], t: f64, need: Need) {
         let cdc = self.cdc;
         self.publish(t);
-        cdc.patch_inputs(x, t, &mut self.inputs);
         self.jacobian = need == Need::Jacobian;
         self.evals += 1;
         if self.jacobian {
-            cdc.tape_tran_step.eval_main(
-                &mut self.step_tok,
-                &self.inputs,
-                &mut self.step_work,
-                &mut self.out,
-            );
+            (self.step).eval(cdc, &cdc.tape_tran_step, x, t, &mut self.out);
         } else {
-            cdc.tape_tran_res.eval_main(
-                &mut self.res_tok,
-                &self.inputs,
-                &mut self.res_work,
-                &mut self.out,
-            );
+            (self.res).eval(cdc, &cdc.tape_tran_res, x, t, &mut self.out);
         }
     }
 
@@ -151,9 +128,7 @@ impl<'a> Program<'a> {
     pub fn eval_c(&mut self, x: &[f64], t: f64) -> &[f64] {
         let cdc = self.cdc;
         self.publish(t);
-        cdc.patch_inputs(x, t, &mut self.inputs);
-        cdc.tape_c
-            .eval(&self.inputs, &mut self.c_work, &mut self.c_out);
+        (self.c).eval(cdc, &cdc.tape_c, x, t, &mut self.c_out);
         &self.c_out
     }
 
@@ -178,8 +153,11 @@ impl<'a> Program<'a> {
             }
             None => &[],
         };
-        cdc.patch_inputs(x, t, &mut self.inputs);
-        tape.eval(&self.inputs, &mut self.dt_work, &mut self.dt_out);
+        let dt = self
+            .dt
+            .as_mut()
+            .expect("bound with the time rates' program");
+        dt.eval(cdc, tape, x, t, &mut self.dt_out);
         let n = cdc.n;
         let (direct, hist) = self.dt_out.split_at(cdc.dt_rows.len());
         let terms = (cdc.dt_rows.iter().zip(direct).map(|(&row, &v)| (row, v)))

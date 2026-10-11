@@ -8,6 +8,10 @@ use pyo3::exceptions::{PyAttributeError, PyKeyError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyTuple};
 use sane_analysis::{DcOptions, HbOptions, TransientOptions};
+use sane_core::constants::{
+    HB_HARMONICS, HB_MAX_ITER, HB_OVERSAMPLE, HB_TOL, PRUNE_F_MAX, PRUNE_F_MIN, PRUNE_F_PER_DECADE,
+    PRUNE_REL_TOL, TRANSIENT_ATOL, TRANSIENT_RTOL,
+};
 
 use crate::arrays::{floats, vec1, Floats, Names};
 use crate::results::*;
@@ -29,8 +33,8 @@ type Coo<'py> = (
     Bound<'py, PyArray1<f64>>,
 );
 
-fn coo(py: Python<'_>, (r, c, v): (Vec<usize>, Vec<usize>, Vec<f64>)) -> Coo<'_> {
-    (vec1(py, r), vec1(py, c), vec1(py, v))
+fn coo(py: Python<'_>, t: sane_solve::Triplets) -> Coo<'_> {
+    (vec1(py, t.rows), vec1(py, t.cols), vec1(py, t.vals))
 }
 
 /// A binding: a dict of name -> value and keyword values, merged.
@@ -83,7 +87,16 @@ impl PyModel {
     /// The model of a SPICE-like netlist.
     #[staticmethod]
     fn from_netlist(py: Python<'_>, netlist: &str) -> PyResult<PyModel> {
-        run(py, || sane_analysis::Model::from_netlist(netlist)).map(|inner| PyModel { inner })
+        let model = py.allow_threads(|| sane_analysis::Model::from_netlist(netlist));
+        crate::surface(py)?;
+        match model {
+            Ok(inner) => Ok(PyModel { inner }),
+            // a parse error shown at its line, as `Circuit.parse` shows it
+            Err(sane_analysis::ModelError::Parse(e)) => {
+                Err(pyo3::exceptions::PyValueError::new_err(e.render(netlist)))
+            }
+            Err(e) => Err(crate::err(e)),
+        }
     }
 
     /// The parameters, in the order of a parameter vector.
@@ -581,7 +594,7 @@ impl Point {
     /// The transient response at the times `t` (the first the start), by
     /// adaptive Rodas4 to the tolerances `rtol`, `atol`, its steps capped at
     /// `dt_max`; `x0` a state to start from instead of the operating point.
-    #[pyo3(signature = (t, *, rtol=1e-4, atol=1e-7, dt_max=None, x0=None))]
+    #[pyo3(signature = (t, *, rtol=TRANSIENT_RTOL, atol=TRANSIENT_ATOL, dt_max=None, x0=None))]
     fn transient(
         &self,
         py: Python<'_>,
@@ -653,21 +666,22 @@ impl Point {
     /// The model reduced at the operating point: branches negligible at DC
     /// and at `freqs` (Hz; 1 Hz to 1 GHz for `None`) opened, dominating ones
     /// shorted; and what was done, `(element, "open" | "short")` each.
-    #[pyo3(signature = (rel_tol=1e-3, freqs=None))]
+    #[pyo3(signature = (rel_tol=PRUNE_REL_TOL, freqs=None))]
     fn prune(
         &self,
         py: Python<'_>,
         rel_tol: f64,
         freqs: Option<Floats<'_>>,
     ) -> PyResult<(PyModel, Vec<(String, String)>)> {
-        let f = freqs.map_or_else(|| sane_analysis::log_grid(1.0, 1e9, 6), |f| floats(&f));
+        let grid = || sane_analysis::log_grid(PRUNE_F_MIN, PRUNE_F_MAX, PRUNE_F_PER_DECADE);
+        let f = freqs.map_or_else(grid, |f| floats(&f));
         run(py, || self.inner.prune(rel_tol, &f)).map(|(inner, gone)| (PyModel { inner }, gone))
     }
     /// The periodic steady state under the circuit's periodic drive.
     /// `f0` the fundamental (Hz; the periodic source's for `None`),
     /// `continuation` source stepping (`None`: where the direct Newton
     /// fails).
-    #[pyo3(signature = (*, f0=None, harmonics=8, oversample=16, samples=None, tol=1e-10, max_iter=60, continuation=None))]
+    #[pyo3(signature = (*, f0=None, harmonics=HB_HARMONICS, oversample=HB_OVERSAMPLE, samples=None, tol=HB_TOL, max_iter=HB_MAX_ITER, continuation=None))]
     #[allow(clippy::too_many_arguments)]
     fn harmonic_balance(
         &self,

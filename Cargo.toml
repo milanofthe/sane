@@ -18,7 +18,7 @@ members = [
 exclude = ["vendor/rslab", "vendor/vectfit", "vendor/rsdag"]
 
 [workspace.package]
-version = "4.0.0"
+version = "4.1.0"
 edition = "2021"
 license = "LicenseRef-PolyForm-Noncommercial-1.0.0"
 authors = ["Milan Rother"]

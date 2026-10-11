@@ -288,7 +288,7 @@ impl Placer<'_> {
                     None
                 }
             })
-            .unwrap_or(50.0);
+            .unwrap_or(sane_core::constants::DEFAULT_Z0);
         (self.circuit.port(name, tok[1], tok[2], z0)).map_err(|m| err_at(line_no, line_col, &m))?;
         Ok(())
     }
@@ -398,7 +398,7 @@ impl Placer<'_> {
         // Polarity from the model type (PMOS -> P, else N-channel).
         let is_p = card.is_some_and(|c| c.mtype.eq_ignore_ascii_case("PMOS"));
         let lvl = level.unwrap_or(1.0);
-        if lvl > 3.5 {
+        if lvl > sane_core::constants::MOS_NATIVE_MAX_LEVEL {
             // Compact model: no native square law. Route it to a Verilog-A
             // module if one is bound -- either the card's type token names
             // a loaded module directly (the OSDI/Spectre idiom), or a
@@ -779,18 +779,25 @@ impl Placer<'_> {
                 }
             })
         };
-        let nseg = kv("N").map(|v| (v as usize).clamp(1, 4096)).unwrap_or(16);
+        let nseg = (kv("N")
+            .map(|v| (v as usize).clamp(1, sane_core::constants::TLINE_SEGMENTS_MAX)))
+        .unwrap_or(sane_core::constants::TLINE_SEGMENTS);
         // Total series (R, L) and shunt (G, C) of the whole line.
         let (r_tot, l_tot, g_tot, c_tot) = match el.kind {
             'T' => {
                 // Lossless: L = Z0*TD, C = TD/Z0.
-                let z0 = kv("Z0").unwrap_or(50.0);
-                let td = kv("TD").unwrap_or(1e-9);
+                let z0 = kv("Z0").unwrap_or(sane_core::constants::DEFAULT_Z0);
+                let td = kv("TD").unwrap_or(sane_core::constants::TLINE_TD);
                 (0.0, z0 * td, 0.0, td / z0)
             }
             'U' => {
                 // Distributed RC (URC): series R, shunt C totals.
-                (kv("R").unwrap_or(1.0), 0.0, 0.0, kv("C").unwrap_or(1e-12))
+                (
+                    kv("R").unwrap_or(sane_core::constants::URC_R),
+                    0.0,
+                    0.0,
+                    kv("C").unwrap_or(sane_core::constants::URC_C),
+                )
             }
             _ => {
                 // Lossy (LTRA-like): R, L, G, C given as line totals.
@@ -844,9 +851,10 @@ impl Placer<'_> {
                 }
                 (false, false) => {
                     self.circuit.elements.resistor(&rn, prev, node);
-                    self.circuit
-                        .values
-                        .insert(sane_circuit::value_symbol_name(&rn), 1e-9);
+                    self.circuit.values.insert(
+                        sane_circuit::value_symbol_name(&rn),
+                        sane_core::constants::LADDER_PLACEHOLDER_R,
+                    );
                 }
             }
             if cs != 0.0 {

@@ -5,7 +5,8 @@
 ##
 ##          Analyses as function objects an optimizer can call and
 ##          differentiate: parameters in, response out, exact gradients
-##          through the engine's adjoints. One uniform shape across
+##          through the engine's adjoints and forward sensitivities.
+##          One uniform shape across
 ##          DC / AC / S-parameters / transient / harmonic balance / poles --
 ##          and the surface the torch/JAX wrappers in `sane.interop` build on:
 ##
@@ -17,12 +18,14 @@
 
 import numpy as np
 
+from . import _core
+
 
 class ParamFunction:
     """Shared base: parameter handling and the VJP contract.
 
     Subclasses implement ``_forward(point) -> (y, stash)`` and
-    ``_vjp(cotangent, stash) -> ndarray`` over the engine's adjoints. The
+    ``_vjp(cotangent, stash) -> ndarray`` over the engine's derivatives. The
     parameters are a vector in ``wrt`` order (or a ``name -> value`` dict);
     everything not in ``wrt`` keeps its bound value. The result a forward
     computed is the stash its backward pass differentiates, so several
@@ -237,16 +240,16 @@ class HbFunction(ParamFunction):
     ``f0=None`` takes the fundamental of the deck's periodic source.
     """
 
-    def __init__(self, model, output, f0=None, harmonics=8, wrt=None,
-                 metric="mag", oversample=16, warm=True):
+    def __init__(self, model, output, f0=None, harmonics=None, wrt=None,
+                 metric="mag", oversample=None, warm=True):
         super().__init__(model, wrt, warm)
         if metric not in ("mag", "complex"):
             raise ValueError("metric must be 'mag' or 'complex'")
         self.output = output
         self.f0 = f0
-        self.harmonics = int(harmonics)
+        self.harmonics = int(_core.HB_HARMONICS if harmonics is None else harmonics)
         self.metric = metric
-        self.oversample = int(oversample)
+        self.oversample = int(_core.HB_OVERSAMPLE if oversample is None else oversample)
 
     @property
     def out_len(self):

@@ -19,7 +19,7 @@ mod hierarchy;
 mod source;
 
 pub use circuit::{Circuit, DcSettings, PortDef};
-pub use elements::{BExpr, BKind, BehavioralSource, Coupling, Element, Elements, Kind};
+pub use elements::{BCall, BExpr, BKind, BOp, BehavioralSource, Coupling, Element, Elements, Kind};
 pub use hierarchy::{rename, topology, Instance};
 pub use source::{SourceFn, Waveform};
 

@@ -25,10 +25,9 @@ fn main() {
         .and_then(|pt| pt.operating_point())
         .expect("operating point");
     let p = model.pvec(&[]);
+    let mut values: BTreeMap<String, f64> = model.params().iter().cloned().zip(p).collect();
     let arc = model.context_arc();
     let mut ctx = arc.lock().unwrap();
-    let mut values: BTreeMap<String, f64> =
-        model.cdc().param_names(&ctx).into_iter().zip(p).collect();
     let circuit = model.dae().register_function(&mut ctx, "circuit");
     // A parameter the solve does not vary (no device reads it as a DC
     // parameter) takes its module default, the temperature its nominal.

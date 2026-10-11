@@ -1,6 +1,10 @@
-use super::*;
+//! Assembly and transforms of the DAE on small circuits.
+
 use rsdag::eval;
+use rsdag::{ExprId, Node, SymbolId};
 use sane_circuit::{Elements, SourceFn};
+use sane_core::Graph;
+use sane_dae::*;
 use sane_device::Lowerer;
 use std::collections::{HashMap, HashSet};
 
@@ -97,7 +101,7 @@ fn behavioral_capacitor_matches_native() {
     cn.voltage_source("V1", 1, 0)
         .resistor("R", 1, 2)
         .capacitor("C", 2, 0);
-    let native = crate::assemble(&mut ctx, &sane_circuit::Circuit::flat(&cn, &[])).unwrap();
+    let native = sane_dae::assemble(&mut ctx, &sane_circuit::Circuit::flat(&cn, &[])).unwrap();
 
     let mut cb = Elements::new();
     cb.voltage_source("V1", 1, 0).resistor("R", 1, 2);
@@ -105,7 +109,7 @@ fn behavioral_capacitor_matches_native() {
         std::sync::Arc::new(BehavioralCap { name: "C".into() }),
         vec![2, 0],
     )];
-    let behav = crate::assemble(&mut ctx, &sane_circuit::Circuit::flat(&cb, &devs)).unwrap();
+    let behav = sane_dae::assemble(&mut ctx, &sane_circuit::Circuit::flat(&cb, &devs)).unwrap();
 
     assert_eq!(native.unknowns, behav.unknowns, "same unknown layout");
     assert_eq!(behav.dim(), 3, "behavioral cap mints no extra unknown");
@@ -151,12 +155,12 @@ fn mfactor_scales_terminal_current() {
             vec![2, 0],
         )
         .with_mfactor(m)];
-        crate::assemble(ctx, &sane_circuit::Circuit::flat(&cb, &devs)).unwrap()
+        sane_dae::assemble(ctx, &sane_circuit::Circuit::flat(&cb, &devs)).unwrap()
     };
     let d1 = build(&mut ctx, 1.0);
     let d2 = build(&mut ctx, 2.0);
     assert_eq!(d1.unknowns, d2.unknowns);
-    assert_eq!(d1.unknowns, vec!["v1", "v2", "i_V1"]);
+    assert_eq!(d1.unknown_names(), vec!["v1", "v2", "i_V1"]);
 
     let cap = 1e-6;
     let env = env_of(
@@ -196,9 +200,9 @@ fn rc_dae_consistent_point() {
     c.voltage_source("V1", 1, 0)
         .resistor("R", 1, 2)
         .capacitor("C", 2, 0);
-    let dae = crate::assemble(&mut ctx, &sane_circuit::Circuit::flat(&c, &[])).unwrap();
+    let dae = sane_dae::assemble(&mut ctx, &sane_circuit::Circuit::flat(&c, &[])).unwrap();
     assert_eq!(dae.dim(), 3);
-    assert_eq!(dae.unknowns, vec!["v1", "v2", "i_V1"]);
+    assert_eq!(dae.unknown_names(), vec!["v1", "v2", "i_V1"]);
 
     // A consistent transient point: v1 forced, v2 free, vdot2 = (v1-v2)/(R*C).
     let (r, cap, v1, v2) = (1000.0, 1e-6, 1.0, 0.5);
@@ -230,14 +234,14 @@ fn eliminate_resistive_node_preserves_point() {
         .resistor("R1", 1, 2)
         .resistor("R2", 2, 3)
         .resistor("Rload", 3, 0);
-    let dae = crate::assemble(&mut ctx, &sane_circuit::Circuit::flat(&c, &[])).unwrap();
-    assert_eq!(dae.unknowns, vec!["v1", "v2", "v3", "i_V1"]);
+    let dae = sane_dae::assemble(&mut ctx, &sane_circuit::Circuit::flat(&c, &[])).unwrap();
+    assert_eq!(dae.unknown_names(), vec!["v1", "v2", "v3", "i_V1"]);
 
     let mut keep = HashSet::new();
     keep.insert("v3".to_string()); // protect the probe; node 2 is eliminated
     let (red, gone) = eliminate_nodes(&mut ctx, &dae, &keep);
     assert_eq!(gone, vec!["v2".to_string()]);
-    assert_eq!(red.unknowns, vec!["v1", "v3", "i_V1"]);
+    assert_eq!(red.unknown_names(), vec!["v1", "v3", "i_V1"]);
 
     // Divider: v3 = 2 * Rload/(R1+R2+Rload) = 2/3, i_V1 = -(v1-v3)/(R1+R2).
     let env = env_of(
@@ -265,7 +269,7 @@ fn diode_rectifier_consistent_point() {
         std::sync::Arc::new(sane_veriloga::builtin_device("sane_diode", "D1", &[])),
         vec![2, 0], // anode = node 2, cathode = ground
     )];
-    let dae = crate::assemble(&mut ctx, &sane_circuit::Circuit::flat(&c, &devs)).unwrap();
+    let dae = sane_dae::assemble(&mut ctx, &sane_circuit::Circuit::flat(&c, &devs)).unwrap();
     assert_eq!(dae.dim(), 3);
 
     // Pick a diode voltage, derive the rest so F = 0. The diode's thermal
@@ -303,7 +307,7 @@ fn ccvs_consistent_point() {
         .resistor("R1", 1, 0)
         .ccvs("H1", 2, 0, "V1")
         .resistor("RL", 2, 0);
-    let dae = crate::assemble(&mut ctx, &sane_circuit::Circuit::flat(&c, &[])).unwrap();
+    let dae = sane_dae::assemble(&mut ctx, &sane_circuit::Circuit::flat(&c, &[])).unwrap();
     assert_eq!(dae.dim(), 4); // v1, v2, i_V1, i_H1
 
     let (vin, r1, gain, rl) = (1.0, 1000.0, 5.0, 2000.0);
@@ -333,8 +337,8 @@ fn sin_source_residual_is_time_dependent() {
     let mut c = Elements::new();
     c.voltage_source("V1", 1, 0).set_source(SourceFn::Sin);
     c.resistor("R1", 1, 0);
-    let dae = crate::assemble(&mut ctx, &sane_circuit::Circuit::flat(&c, &[])).unwrap();
-    let i_v1 = dae.unknowns.iter().position(|u| u == "i_V1").unwrap();
+    let dae = sane_dae::assemble(&mut ctx, &sane_circuit::Circuit::flat(&c, &[])).unwrap();
+    let i_v1 = dae.find("i_V1").unwrap();
     let s = rsdag::to_string(&ctx, dae.currents[i_v1]);
     assert!(
         s.contains("sin("),
@@ -351,9 +355,9 @@ fn current_switch_uses_control_current() {
         std::sync::Arc::new(sane_device::CSwitch::new("W1", "Vc")),
         vec![2, 0],
     )];
-    let dae = crate::assemble(&mut ctx, &sane_circuit::Circuit::flat(&c, &devs)).unwrap();
+    let dae = sane_dae::assemble(&mut ctx, &sane_circuit::Circuit::flat(&c, &devs)).unwrap();
     // node 2 KCL carries the switch conductance (a Select on I(Vc)).
-    let v2 = dae.unknowns.iter().position(|u| u == "v2").unwrap();
+    let v2 = dae.find("v2").unwrap();
     let s = rsdag::to_string(&ctx, dae.currents[v2]);
     assert!(s.contains("select("), "switch should use Select: {s}");
     assert!(
@@ -371,8 +375,8 @@ fn mutual_inductance_couples_constraints() {
         .inductor("L2", 2, 0)
         .resistor("RL", 2, 0)
         .mutual("K1", "L1", "L2");
-    let dae = crate::assemble(&mut ctx, &sane_circuit::Circuit::flat(&c, &[])).unwrap();
-    let i_l1 = dae.unknowns.iter().position(|u| u == "i_L1").unwrap();
+    let dae = sane_dae::assemble(&mut ctx, &sane_circuit::Circuit::flat(&c, &[])).unwrap();
+    let i_l1 = dae.find("i_L1").unwrap();
     // the coupling is in the L1 row's flux
     let s = rsdag::to_string(&ctx, dae.charges[i_l1]);
     assert!(s.contains("K1"), "L1 flux missing mutual coeff: {s}");

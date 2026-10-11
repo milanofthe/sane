@@ -14,6 +14,8 @@ other port source dead (the AC stimulus is per-input by construction).
 
 import numpy as np
 
+from . import _core
+
 __all__ = [
     "SParams",
     "read_touchstone",
@@ -118,7 +120,7 @@ def read_touchstone(path):
     return SParams(freqs, s, z0)
 
 
-def s_to_y(s, z0=50.0):
+def s_to_y(s, z0=_core.DEFAULT_Z0):
     """Scattering to admittance matrices, per frequency:
     ``Y = sqrt(Y0) (I - S) (I + S)^-1 sqrt(Y0)`` with ``Y0 = diag(1/z0)``."""
     s = np.asarray(s, dtype=complex)
@@ -129,7 +131,7 @@ def s_to_y(s, z0=50.0):
     return np.stack([ry @ (eye - sk) @ np.linalg.inv(eye + sk) @ ry for sk in s])
 
 
-def y_to_s(y, z0=50.0):
+def y_to_s(y, z0=_core.DEFAULT_Z0):
     """Admittance to scattering matrices, per frequency (inverse of
     :func:`s_to_y`): ``S = (I - Z) (I + Z)^-1`` with ``Z = sqrt(z0) Y sqrt(z0)``."""
     y = np.asarray(y, dtype=complex)
@@ -144,9 +146,9 @@ def y_to_s(y, z0=50.0):
     return np.stack(out)
 
 
-def fit_verilog_a(freqs, s, z0=50.0, name="sparam_macro", port_names=None,
-                  tol=1e-4, max_poles=40, enforce_passivity=True,
-                  threshold=1e-2, force=False):
+def fit_verilog_a(freqs, s, z0=_core.DEFAULT_Z0, name="sparam_macro", port_names=None,
+                  tol=_core.VF_TOL, max_poles=_core.VF_MAX_POLES, enforce_passivity=True,
+                  threshold=_core.VF_PASSIVITY_THRESHOLD, force=False):
     """Rational macromodel of an S-parameter sweep as Verilog-A source.
 
     The sweep is converted to admittances, fitted with relaxed vector
@@ -159,7 +161,6 @@ def fit_verilog_a(freqs, s, z0=50.0, name="sparam_macro", port_names=None,
 
     Returns ``(va_source, fit_error, n_poles)``.
     """
-    from . import _core
 
     freqs = np.atleast_1d(np.asarray(freqs, dtype=float))
     y = s_to_y(s, z0)
@@ -174,7 +175,7 @@ def fit_verilog_a(freqs, s, z0=50.0, name="sparam_macro", port_names=None,
     )
 
 
-def write_touchstone(path, freqs, s, z0=50.0, fmt="RI"):
+def write_touchstone(path, freqs, s, z0=_core.DEFAULT_Z0, fmt="RI"):
     """Write a Touchstone v1 file in ``RI``, ``MA`` or ``DB`` format (Hz
     frequency unit, common reference impedance ``z0``)."""
     freqs = np.atleast_1d(np.asarray(freqs, dtype=float))

@@ -26,11 +26,11 @@
 //! GMRES with a per-harmonic block preconditioner, exact spectral convolution
 //! through polynomial subgraphs, and multitone come later.
 
+use crate::sparse::{factor_triplets, ComplexFactor, ComplexPattern, Csc, TripletLu, Triplets};
 use crate::CompiledDc;
 use num_complex::Complex64;
 use rayon::prelude::*;
 use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
-use rslab::{GeneralCsc, KluSettings, KluSolver, KluSymbolic};
 use sane_core::constants::{
     GMIN_DC, HB_BACKTRACK_GROWTH, HB_CONT_DLAM0, HB_CONT_DLAM_MAX, HB_CONT_DLAM_MIN,
     HB_CONT_EASY_ITERS, HB_CONT_GROW, HB_CONT_LAMBDA_EPS, HB_CONT_SHRINK, LINE_SEARCH_TRIES,
@@ -50,8 +50,8 @@ struct Harmonics<'h, 'a> {
     /// The fused pass's sample buffer (time-major, output sequences
     /// contiguous).
     aft: Vec<f64>,
-    csc: GeneralCsc<Complex64>,
-    solver: Option<KluSolver<Complex64>>,
+    /// The Jacobian's factorization over the compiled pattern.
+    fac: ComplexFactor<'h>,
     /// The max-norm of the last residual.
     norm: f64,
     /// The spectra of the iterate, per unknown.
@@ -97,7 +97,9 @@ impl crate::newton::System<Complex64> for Harmonics<'_, '_> {
         // Scatter the values straight into the CSC skeleton from the slot
         // recipe (duplicate positions sum).
         sane_core::log_stage!("hb/scatter", {
-            self.csc.values.fill(Complex64::new(0.0, 0.0));
+            let slot_of = &hb.pattern.csc().slot;
+            let values = self.fac.values_mut();
+            values.fill(Complex64::new(0.0, 0.0));
             for (e, slot) in hb.slots.iter().enumerate() {
                 let v = match *slot {
                     Slot::G { nz, dk } => spec_at(&gx_spec[nz], dk),
@@ -106,37 +108,14 @@ impl crate::newton::System<Complex64> for Harmonics<'_, '_> {
                     }
                     Slot::Gmin => Complex64::new(GMIN_DC, 0.0),
                 };
-                self.csc.values[hb.slot_of[e]] += v;
+                values[slot_of[e]] += v;
             }
         });
-        let refactored = sane_core::log_stage!(
-            "hb/refactor",
-            matches!(
-                self.solver.as_mut().map(|sl| sl.refactor(&self.csc)),
-                Some(Ok(()))
-            )
-        );
-        if !refactored {
-            self.solver = sane_core::log_stage!(
-                "hb/factor",
-                hb.sym.factor(&self.csc, &KluSettings::default())
-            )
-            .ok();
-        }
-        self.solver.is_some()
+        sane_core::log_stage!("hb/factor", self.fac.factor())
     }
 
     fn solve(&mut self, rhs: &[Complex64], dx: &mut [Complex64]) -> bool {
-        let Some(lu) = &self.solver else {
-            return false;
-        };
-        match sane_core::log_stage!("hb/backsolve", lu.solve(rhs)) {
-            Ok(d) => {
-                dx.copy_from_slice(&d);
-                true
-            }
-            Err(_) => false,
-        }
+        sane_core::log_stage!("hb/backsolve", self.fac.solve_into(rhs, dx))
     }
 
     /// The DC harmonic stays real.
@@ -217,23 +196,19 @@ pub struct CompiledHb<'a> {
     m: usize,
     r2c: Arc<dyn RealToComplex<f64>>,
     c2r: Arc<dyn ComplexToReal<f64>>,
-    /// Fixed Jacobian pattern (harmonic blocks over the DC sparsity) as a CSC
-    /// skeleton plus KLU's symbolic analysis (BTF + per-block AMD); only the
-    /// values change between Newton steps.
-    col_ptr: Vec<usize>,
-    row_idx: Vec<usize>,
-    sym: KluSymbolic,
-    /// One per pattern *entry*, in value-buffer order: how to fill it each
-    /// step; `slot_of[e]` is the CSC value slot entry `e` sums into.
+    /// Fixed Jacobian pattern (harmonic blocks over the DC sparsity) with
+    /// its analysis; only the values change between Newton steps.
+    pattern: ComplexPattern,
+    /// One per pattern *entry*, in the layout's entry order: how to fill it
+    /// each step.
     slots: Vec<Slot>,
-    slot_of: Vec<usize>,
 }
 
 /// The factorized two-sided Toeplitz harmonic-balance Jacobian plus the
 /// parameter-Jacobian pattern and spectra. Built once by an AFT pass and shared
 /// by the coefficient gradient and Hessian (both adjoint-solve against it).
 struct ToeplitzJacobian {
-    lu: KluSolver<Complex64>,
+    lu: TripletLu<Complex64>,
     pj_rows: Vec<usize>,
     pj_cols: Vec<usize>,
     pjs: Vec<Vec<Complex64>>,
@@ -283,7 +258,18 @@ impl<'a> CompiledHb<'a> {
                 xv[i] = x_time[i][mm];
             }
             let t = mm as f64 / m as f64 * period;
-            let ((ir, ic, iv), (qr, qc, qv)) = self.cdc.jacobian_p_sparse(&xv, p, t);
+            let (
+                Triplets {
+                    rows: ir,
+                    cols: ic,
+                    vals: iv,
+                },
+                Triplets {
+                    rows: qr,
+                    cols: qc,
+                    vals: qv,
+                },
+            ) = self.cdc.jacobian_p_sparse(&xv, p, t);
             if mm == 0 {
                 ni = iv.len();
                 pj_rows = ir.into_iter().chain(qr).collect();
@@ -356,8 +342,7 @@ impl<'a> CompiledHb<'a> {
                 tv.push(Complex64::new(GMIN_DC, 0.0));
             }
         }
-        let a = GeneralCsc::from_triplets(dim, &tr, &tc, &tv).ok()?;
-        let lu = KluSolver::factor(&a, &KluSettings::default()).ok()?;
+        let lu = factor_triplets(dim, &tr, &tc, &tv)?;
         Some(ToeplitzJacobian {
             lu,
             pj_rows,
@@ -469,35 +454,11 @@ impl<'a> CompiledHb<'a> {
             }
         }
 
-        // Deduplicate into a CSC skeleton with per-entry slots (duplicate
-        // positions sum), then analyze once (KLU BTF + per-block AMD).
-        let dim = n * h;
-        let total = rows.len();
-        let mut order: Vec<usize> = (0..total).collect();
-        order.sort_unstable_by_key(|&e| (cols[e], rows[e]));
-        let mut col_ptr = vec![0usize; dim + 1];
-        let mut row_idx: Vec<usize> = Vec::with_capacity(total);
-        let mut slot_of = vec![0usize; total];
-        let (mut prev_r, mut prev_c) = (usize::MAX, usize::MAX);
-        for &e in &order {
-            let (r, c) = (rows[e], cols[e]);
-            if r != prev_r || c != prev_c {
-                row_idx.push(r);
-                col_ptr[c + 1] += 1;
-                (prev_r, prev_c) = (r, c);
-            }
-            slot_of[e] = row_idx.len() - 1;
-        }
-        for j in 0..dim {
-            col_ptr[j + 1] += col_ptr[j];
-        }
-        let skeleton = GeneralCsc {
-            n: dim,
-            col_ptr: col_ptr.clone(),
-            row_idx: row_idx.clone(),
-            values: vec![Complex64::new(1.0, 0.0); row_idx.len()],
-        };
-        let sym = KluSymbolic::analyze(&skeleton, &KluSettings::default()).ok()?;
+        // The layout (duplicate positions sum), analyzed once (KLU BTF +
+        // per-block AMD).
+        let csc = Csc::new(n * h, &rows, &cols)?;
+        let ones = vec![Complex64::new(1.0, 0.0); csc.nnz()];
+        let pattern = ComplexPattern::new(csc, &ones)?;
         Some(CompiledHb {
             cdc,
             n,
@@ -506,11 +467,8 @@ impl<'a> CompiledHb<'a> {
             m,
             r2c,
             c2r,
-            col_ptr,
-            row_idx,
-            sym,
+            pattern,
             slots,
-            slot_of,
         })
     }
 
@@ -610,7 +568,7 @@ impl<'a> CompiledHb<'a> {
     fn eval_aft(&self, x_time: &[Vec<f64>], p: &[f64], w0: f64, buf: &mut Vec<f64>) {
         let period = 2.0 * std::f64::consts::PI / w0;
         let n = self.n;
-        const L: usize = 4;
+        const L: usize = sane_core::constants::HB_LANES;
         let m = self.m;
         let width = 2 * n + self.cdc.jx_rows.len() + self.cdc.jxd_rows.len();
         // Each chunk returns one flat block `v[o * lanes + lane]` over its
@@ -718,13 +676,7 @@ impl<'a> CompiledHb<'a> {
             p,
             w0,
             aft: Vec::new(),
-            csc: GeneralCsc {
-                n: n * h,
-                col_ptr: self.col_ptr.clone(),
-                row_idx: self.row_idx.clone(),
-                values: vec![Complex64::new(0.0, 0.0); self.row_idx.len()],
-            },
-            solver: None,
+            fac: self.pattern.factorizer(),
             norm: f64::INFINITY,
             spectra: vec![vec![Complex64::new(0.0, 0.0); h]; n],
         };
@@ -884,7 +836,6 @@ impl<'a> CompiledHb<'a> {
     /// `(dI/dp_j)_k + jkw0 (dQ/dp_j)_k`, the parameter Jacobians routed through
     /// the same AFT. One transpose solve per output harmonic then yields the
     /// adjoint, and a sparse contraction the gradient.
-    /// Requires `ensure_param_jac` on the backing `CompiledDc`.
     pub fn coeff_gradient(
         &self,
         spectra: &[Vec<Complex64>],
@@ -912,7 +863,7 @@ impl<'a> CompiledHb<'a> {
         for k0 in 0..=self.k {
             let mut e = vec![Complex64::new(0.0, 0.0); dim];
             e[flat(out_idx, k0 as i64)] = Complex64::new(1.0, 0.0);
-            let lam = lu.solve_transpose(&e).ok()?; // J^T lambda = e_{(out, k0)}
+            let lam = lu.solve_transpose(&e)?; // J^T lambda = e_{(out, k0)}
             for nz in 0..pjs.len() {
                 let (i, j) = (pj_rows[nz], pj_cols[nz]);
                 if j >= nparams {
@@ -931,9 +882,8 @@ impl<'a> CompiledHb<'a> {
     /// Exact second-order-adjoint Hessian of the steady-state coefficient
     /// `X_{out_idx, k_metric}` w.r.t. the parameter subset `subset` (indices into
     /// `param_names`). Dense `|subset| x |subset|` complex matrix
-    /// `H_ab = d^2 X_{out,k}/dp_a dp_b`, or `None` if `ensure_hessian` /
-    /// `ensure_param_jac` were not called, the AFT grid is too coarse
-    /// (`m/2 < 2K`), or the system is singular.
+    /// `H_ab = d^2 X_{out,k}/dp_a dp_b`, or `None` if the AFT grid is too
+    /// coarse (`m/2 < 2K`) or the system is singular.
     ///
     /// The metric is linear in the unknowns, so with the adjoint `J^T lambda =
     /// e_{(out,k)}` and the forward state sensitivities `J s_a = -dR/dp_a`,
@@ -979,7 +929,7 @@ impl<'a> CompiledHb<'a> {
         // --- adjoint lambda (one transpose solve) and forward state sens s_a ---
         let mut e = vec![Complex64::new(0.0, 0.0); dim];
         e[flat(out_idx, k_metric as i64)] = Complex64::new(1.0, 0.0);
-        let lam = lu.solve_transpose(&e).ok()?;
+        let lam = lu.solve_transpose(&e)?;
         let ns = subset.len();
         let mut svec: Vec<Vec<Complex64>> = Vec::with_capacity(ns);
         for &a in subset {
@@ -991,7 +941,7 @@ impl<'a> CompiledHb<'a> {
                     }
                 }
             }
-            svec.push(lu.solve(&rhs).ok()?);
+            svec.push(lu.solve(&rhs)?);
         }
 
         // --- adjoint waveforms l_i(t), mu_i(t) and state-sensitivity waveforms sigma_a,j(t) ---
@@ -1023,7 +973,7 @@ impl<'a> CompiledHb<'a> {
         }
 
         // --- per-sample Lagrangian-Hessian contraction (re/im of the multipliers separately) ---
-        let [xx_rc, xp_rc, pp_rc] = self.cdc.hessian_block_pattern()?;
+        let [xx_rc, xp_rc, pp_rc] = self.cdc.hessian_block_pattern();
         // Map a parameter index to its position in `subset` (for the L_pp lookup).
         let np = self.cdc.param_count();
         let mut loc = vec![usize::MAX; np];
@@ -1042,12 +992,8 @@ impl<'a> CompiledHb<'a> {
                 xv[i] = x_time[i][mm];
             }
             let t = mm as f64 / self.m as f64 * period;
-            let [xxr, xpr, ppr] = self
-                .cdc
-                .hessian_block_values(&xv, p, t, &part[0], &part[2])?;
-            let [xxi, xpi, ppi] = self
-                .cdc
-                .hessian_block_values(&xv, p, t, &part[1], &part[3])?;
+            let [xxr, xpr, ppr] = self.cdc.hessian_block_values(&xv, p, t, &part[0], &part[2]);
+            let [xxi, xpi, ppi] = self.cdc.hessian_block_values(&xv, p, t, &part[1], &part[3]);
             // L_pp restricted to the subset (mirrors the DC dense `lpp[ja][jb]` read).
             let mut lpp = vec![vec![zero; ns]; ns];
             for kix in 0..pp_rc.0.len() {

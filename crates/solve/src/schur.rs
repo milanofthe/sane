@@ -42,7 +42,8 @@ impl CompiledDc {
     /// `(|L|, |V|)`: sizes of the linear and nonlinear blocks, or `None` if the
     /// system is not partitioned (used for diagnostics / tests).
     pub fn partition_sizes(&self) -> Option<(usize, usize)> {
-        self.partition
+        self.dc
+            .partition
             .as_ref()
             .map(|p| (p.lin.len(), p.nonlin.len()))
     }

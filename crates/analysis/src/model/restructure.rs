@@ -45,7 +45,7 @@ enum Source {
 impl Layout {
     /// The layout of `of` in `from`'s.
     fn between(from: &ModelInner, of: &ModelInner) -> Layout {
-        let at = (from.unknowns.iter())
+        let at = (from.unknowns().iter())
             .map(|u| match of.resolve_unknown(u) {
                 Some(Some(j)) => Source::At(j),
                 Some(None) => Source::Ground,
@@ -136,13 +136,13 @@ impl ModelInner {
     /// collapsed it, the index of the unknown it collapsed onto (`None`
     /// inside: ground); `None` when the model has no such unknown.
     pub(super) fn resolve_unknown(&self, name: &str) -> Option<Option<usize>> {
-        if let Some(k) = self.unknowns.iter().position(|u| u == name) {
+        if let Some(k) = self.dae().find(name) {
             return Some(Some(k));
         }
-        let (_, onto) = self.dae.aliases.iter().find(|(n, _)| n == name)?;
+        let (_, onto) = self.dae().aliases.iter().find(|(n, _)| n == name)?;
         match onto {
             None => Some(None),
-            Some(o) => self.unknowns.iter().position(|u| u == o).map(Some),
+            Some(o) => self.dae().find(o).map(Some),
         }
     }
 }
